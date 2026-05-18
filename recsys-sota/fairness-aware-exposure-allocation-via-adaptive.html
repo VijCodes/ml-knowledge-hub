@@ -1414,248 +1414,666 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// Fairness-Aware Exposure Allocation via Adaptive Reranking — Fairness
+// v2 redo — 30+ trap problems across all six axes (A-F).
+// Concept anchor: a POST-HOC reranker that enforces per-group exposure floors PER QUERY, with
+// the floors ADAPTING to query-dependent supply/demand. The defining property is the per-query
+// adaptive relaxation — equal-exposure rerankers fail when demand is one-sided; adaptive variants
+// relax the constraint where it makes no sense. Every trap here hinges on the adaptive-per-query
+// distinction vs static equal-exposure OR vs training-time fixes (counterfactual augmentation).
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA &middot; Fairness"
+      pill="RecSys SOTA · Fairness"
       title="Fairness-Aware Exposure Allocation via Adaptive Reranking"
-      subtitle="Post-hoc rerank the slate to meet per-group exposure floors while minimizing utility loss, adapting the constraint per query."
+      subtitle="Post-hoc slate reranker that enforces per-group exposure floors while minimizing utility loss — and ADAPTS the floor per query so one-sided demand isn't crippled by a static fairness constraint."
       byline={[
-        {label: "Paper", value: "SIGIR 2024"},
-        {label: "Domain", value: "Two-sided marketplace producer-side fairness"},
+        {label: "Source", value: "SIGIR 2024: Fairness-Aware Exposure Allocation via Adaptive Reranking"},
+        {label: "Year", value: "2024"},
+        {label: "Domain", value: "Two-sided marketplaces; exposure-fairness sensitive slates"},
       ]}/>
 
     <VIS.TLDR>
-      A post-hoc reranker that lifts under-exposed producer groups toward a target exposure floor on each slate, but adapts the floor when query-level demand is genuinely one-sided. Trades a controlled utility loss for measurable producer-side fairness without touching the upstream ranker.
+      A typical "equal-exposure" reranker enforces the SAME per-group exposure floor for every query. That works when demand is symmetric across groups (queries draw uniformly from all groups) but breaks when demand is skewed — e.g., a "Italian restaurants" query forced to show Mexican restaurants because the static floor demands equal exposure across cuisines. The <strong>adaptive variant</strong> RELAXES the floor when query-dependent supply or demand is one-sided, preserving utility where the fairness constraint is moot, while keeping the floor tight where groups compete genuinely. Output: post-hoc slate reranks that meet adaptive per-group exposure floors and a measurable utility loss bound. Reference: <a href="https://biasinrecsys.github.io/sigir2024/" target="_blank" rel="noopener">SIGIR 2024 BiasInRecsys workshop</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        After the ranker emits a slate of N candidates, a post-hoc reranker re-orders them to satisfy a constraint: each protected producer group g must receive at least E_g exposure (e.g. expected impressions weighted by position). The adaptive variant relaxes E_g when the query genuinely has one-sided demand (e.g. &quot;Italian dinner&quot; on DoorDash should not be force-padded with sushi for fairness). The reranker solves a small linear-or-greedy assignment per slate.
+        The technique sits at <em>serve time</em>, after a ranker has produced a candidate slate. It solves a constrained optimization: maximize the slate's expected utility (sum of calibrated p-click) subject to per-group exposure floors (each protected group gets at least F_g exposure). The novelty is the adaptive floor — F_g(q) is a function of the query q, supply S_g(q), and demand D_g(q), rather than a constant.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart LR
+  R["Ranker scores"] --> S["Candidate slate"]
+  Q["Query q"] --> AD["Adaptive floor: F_g(q) = f(Demand_g, Supply_g, base_floor)"]
+  S --> RR["Reranker: max sum p_click s.t. per-group exposure >= F_g(q)"]
+  AD --> RR
+  RR --> SLATE["Reranked slate served"]
+  style AD fill:#dbeafe,stroke:#1e40af
+  style RR fill:#dcfce7,stroke:#166534
+      `} />
+      <p>
+        Concrete example: for a query with 5% Mexican-restaurant demand and 95% Italian-restaurant demand, F_Mexican might relax to 1% (instead of the static 33%) because forcing more would actively hurt users. For a query with 50%/50% demand, the floor tightens to 30%-30% to ensure both groups get fair shake.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from static reranking and from training-time fixes">
+      <p>
+        <strong>Vs static equal-exposure reranking (e.g., FA*IR, det-greedy).</strong> Static floors over-correct when demand is one-sided. They were designed for queries where ALL groups have genuine demand; adaptive floors handle the broader case.
+      </p>
+      <p>
+        <strong>Vs counterfactual augmentation (sibling visual).</strong> Augmentation is a TRAINING-time data-cleaning step that removes exposure bias from the LABELS. This reranker is a SERVE-time constraint enforcer that operates on whatever ranker is downstream. They compose: train on de-biased data + rerank for explicit fairness floor.
+      </p>
+      <p>
+        <strong>Vs in-training fairness loss.</strong> Loss-term fairness fights the data in the gradient; adaptive reranking accepts whatever the ranker produces and trades exposure at the last layer. Cleaner separation of concerns; cheaper to iterate (no retrain).
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick adaptive over static reranking">
+      <p>
+        Adaptive variant wins iff query-dependent demand is meaningfully heterogeneous. If every query has roughly equal demand across groups, static and adaptive converge. If demand is bimodal (some queries one-sided, some balanced), adaptive wins on the one-sided queries by ~10-20% utility while preserving fairness on the balanced ones.
       </p>
       <VIS.Mermaid chart={`
 flowchart TB
-  R["Ranker slate of N"]
-  EG["Per-group floors E_g"]
-  Q["Query demand signal"]
-  AR["Adaptive reranker"]
-  S["Final slate"]
-  R --> AR
-  EG --> AR
-  Q --> AR --> S
+  Q1{"Demand heterogeneity across queries?"}
+  Q1 -->|High - some queries one-sided| ADAPT["Adaptive reranking"]
+  Q1 -->|Low - demand always balanced| STATIC["Static reranking - simpler"]
+  Q1 -->|Unknown| AUDIT["Audit demand distribution first"]
+  ADAPT --> Q2{"Provider-side fairness contractually required?"}
+  Q2 -->|Yes| FLOOR["Use base floor as legal minimum"]
+  Q2 -->|No| OPT["Use adaptive only - no static floor"]
       `} />
-      <VIS.Equation display tex="\max_{\sigma}\;\sum_i u(\sigma_i)\cdot w_i\quad\text{s.t.}\;\sum_{i: g(i)=g} w_i \ge \tilde{E}_g(q),\;\forall g" />
+    </VIS.Section>
+
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Group definition is the hardest part">
+        Adaptive reranking requires KNOWING the group of each candidate. In production, protected attributes are often unobserved (privacy, regulation). Teams impute groups from features — which introduces an imputation-error feedback loop. Either keep groups self-declared (high quality, low coverage) OR audit the imputation model the way you'd audit the exposure model in the sibling concept.
+      </VIS.Callout>
       <p>
-        Maximize total utility u over a permutation sigma weighted by position weights w (DCG-style), subject to each group&apos;s adapted exposure floor. The query-adapted floor E_g(q) relaxes when query demand signals (intent classification, historical conversion by group on this query) indicate one-sided demand.
+        Other named traps: (1) the adaptive floor function f(Demand, Supply, base) is itself a learned model — and is subject to drift; (2) static-floor regulations (e.g., legal minima) interact awkwardly with adaptive relaxation — you may have to enforce two floors (legal static + business adaptive); (3) the reranker's utility loss is bounded by the floor's tightness — adaptive can hide arbitrarily-large utility loss on specific queries if base_floor is too high; (4) the technique assumes a SLATE consumer (top-K with diversity); for ranking-only consumers (single result), reranking is degenerate.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from equal-exposure reranking">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>Equal-exposure rerank</th><th style={{textAlign:"left",padding:8}}>Adaptive</th></tr></thead>
-        <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Query-conditional</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>No</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Utility loss</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High on one-sided queries</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Bounded</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Gameable by group definition</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Same risk</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Needs group labels</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Per-slate compute</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Small ILP / greedy</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Same + demand model</td></tr>
-        </tbody>
-      </table>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
+      <p style={{color:"#475569", marginBottom: 16}}>
+        30+ problems spanning the six taxonomy axes. Redaction litmus: replace "adaptive reranking" with "Method X" — if generic fairness or rerank knowledge suffices, the problem is concept-as-costume. Every problem below hinges on the adaptive-per-query distinction (vs static), the demand-sensitivity of the floor function, OR the slate-level optimization.
+      </p>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>Two-sided marketplaces with producer-side fairness as a business KPI (DoorDash restaurant exposure, Etsy small-seller share, Airbnb host visibility).</li>
-        <li>When utility loss from naive equal-exposure rerankers is unacceptable on one-sided queries.</li>
-        <li>When the ranker is a black box (third-party or frozen) — adaptive rerank is post-hoc.</li>
-        <li>Regulatory or PR scenarios where the platform needs to demonstrate producer-side equity.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <ul>
-        <li><strong>Group definitions are political</strong> — choosing protected groups (e.g. small vs large seller, geo, gender of host) involves judgment calls that can be gamed or contested.</li>
-        <li><strong>Protected-attribute imputation</strong> — if you do not collect the attribute, imputing it introduces its own bias and legal risk.</li>
-        <li><strong>Definition gameability</strong> — equal exposure to &quot;groups defined by historical exposure&quot; collapses into a no-op; the definition itself encodes the fairness claim.</li>
-        <li><strong>Producer vs consumer fairness</strong> — boosting under-exposed producers can hurt consumer relevance; the right tradeoff is business-specific.</li>
-        <li><strong>Adaptive floor design</strong> — the function E_g(q) needs principled calibration; arbitrary relaxation lets the system silently default to no fairness on hard queries.</li>
-      </ul>
-      <VIS.Callout kind="gotcha" title="Group definition is half the fairness statement">
-        Two definitions of group fairness: (1) equal exposure to &quot;all sellers&quot; — gameable if you re-define seller granularity. (2) equal exposure-given-relevance, i.e. exposure proportional to predicted preference — much harder to game because it ties exposure to a model output. The first sounds equitable but lets you split a big seller into 10 storefronts to claim equity. The second penalizes the platform for exposure that does not match preference.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity &amp; comparison</h3>
 
       <VIS.TrapProblem
-        id="fa-p1" difficulty="hard"
-        title="P1 — Group fairness: gameable vs not"
-        scenario={<>Define &apos;group fairness&apos; for a 2-sided marketplace. Give one definition that is gameable and one that is not.</>}
+        id="fa-a1"
+        difficulty="hard"
+        title="A1 — Adaptive vs static equal-exposure: the actual discriminator"
+        scenario={<>Your TL asks "isn't this just FA*IR with a different name?" State the actual discriminator. <em>Discriminating insight: FA*IR/det-greedy use static per-group floors; adaptive lets the floor depend on the query's demand/supply — relaxes where demand is one-sided.</em></>}
         options={[
-          {key:"a", text:"Gameable: equal exposure across &apos;sellers&apos; (manipulable by splitting one seller into many storefronts). Not gameable: exposure proportional to predicted preference, conditioned on relevance.", correct:true},
-          {key:"b", text:"Both are inherently gameable."},
-          {key:"c", text:"Group fairness is impossible in marketplaces."},
-          {key:"d", text:"Only legal definitions are non-gameable."},
+          {key:"a", text:"Static rerankers (FA*IR, det-greedy) enforce a CONSTANT per-group exposure floor across all queries. Adaptive reranking makes that floor a FUNCTION of the query — F_g(q) = f(Demand_g(q), Supply_g(q), base). On one-sided queries, F_g relaxes (you don't force Mexican into an Italian search); on balanced queries, F_g tightens. The discriminator is query-conditional vs query-unconditional.", correct:true},
+          {key:"b", text:"They're the same with a different label."},
+          {key:"c", text:"FA*IR is for fairness; adaptive is for utility."},
+          {key:"d", text:"Adaptive is just FA*IR with more parameters."},
         ]}
-        trap={<>(b) over-pessimistic. (c) is wrong; there are workable definitions. (d) defers to a non-technical framing.</>}
-        lens={<>Equal exposure to an arbitrary partition collapses under re-partitioning. Tying exposure to model-predicted preference (exposure proportional to relevance, often called &apos;merit-based exposure&apos;) anchors the claim in a quantity the platform cannot trivially game by re-labeling. The remaining game is on the preference model itself, which can be audited.</>}
-        stretch={<>How would you audit the preference model itself for fairness?</>}
+        trap={<>(b) is the dismissal. (c), (d) miss the structural difference (function-of-query vs constant).</>}
+        lens={<>Query-conditional fairness floor is the load-bearing innovation. Knowing this prevents conflation with static rerankers in design reviews.</>}
+        stretch={<>When does adaptive converge to static? When does it diverge most?</>}
       />
 
       <VIS.TrapProblem
-        id="fa-p2" difficulty="medium"
-        title="P2 — Why adaptive over equal-exposure?"
-        scenario={<>You ship an equal-exposure reranker. CTR drops 12&#37; on one-sided queries (e.g. &quot;Italian dinner&quot;). What is going wrong?</>}
+        id="fa-a2"
+        difficulty="medium"
+        title="A2 — Definitional: 'fair = equal exposure' — true or false?"
+        scenario={<>Engineer says "fair means equal exposure across groups." Why is this not what adaptive reranking implements? <em>Discriminating insight: adaptive enforces a MINIMUM, not an equality — and the minimum is itself a function of query-dependent demand.</em></>}
         options={[
-          {key:"a", text:"Equal-exposure padded sushi into Italian-dinner slates. Adaptive reranking relaxes the floor when query demand signals are one-sided, recovering most of the lost CTR.", correct:true},
-          {key:"b", text:"The reranker is broken."},
-          {key:"c", text:"Italian-dinner is a small segment that does not matter."},
-          {key:"d", text:"Fairness rerankers always hurt CTR by 10&#37;+."},
+          {key:"a", text:"Equal exposure is a strict equality constraint; adaptive enforces a per-group LOWER BOUND that itself adapts to query demand. On a query where one group has 90% demand, equal exposure forces 50-50 (suboptimal for users); adaptive floor might be 20% for the minority group (provides representation without crippling utility). The difference: equality vs adaptive minimum.", correct:true},
+          {key:"b", text:"They're the same."},
+          {key:"c", text:"Equal exposure is the only definition of fairness."},
+          {key:"d", text:"Adaptive is the opposite of fair."},
         ]}
-        trap={<>(b) blames the wrong layer. (c) handwaves. (d) is fatalistic.</>}
-        lens={<>Fixed-floor fairness penalizes one-sided queries because it spends slots on irrelevant groups. Adaptive rerank uses query demand (intent classification, historical CTR by group on this query) to relax the floor when no demand exists for the under-exposed group. The bound on utility loss is provable per slate.</>}
-        stretch={<>What demand signal feeds the adaptive floor?</>}
+        trap={<>(b), (c), (d) miss the floor-vs-equality distinction.</>}
+        lens={<>Fairness has many operational definitions. The paper's choice is "adaptive floor" — explicitly named because the static equality definition was too restrictive in practice.</>}
+        stretch={<>Name three other operational fairness definitions. Which would adaptive reranking subsume?</>}
       />
 
       <VIS.TrapProblem
-        id="fa-p3" difficulty="hard" multiSelect
-        title="P3 — Sources of demand signal for adaptive floor"
-        scenario={<>Pick the legitimate demand signals an adaptive reranker can use to relax the floor. Select all that apply.</>}
+        id="fa-a3"
+        difficulty="hard"
+        title="A3 — Counterfactual: if you skipped the reranker entirely"
+        scenario={<>Counterfactual: ship without any rerank, accept the ranker's natural exposure distribution. What's the actual cost? <em>Discriminating insight: long-tail provider attrition — but it manifests as supply drying up over months, not as an immediate fairness alarm.</em></>}
         options={[
-          {key:"a", text:"Query-intent classification (e.g. cuisine, brand).", correct:true},
-          {key:"b", text:"Historical CTR-by-group on this query.", correct:true},
-          {key:"c", text:"User-cohort affinity for the group (with consent).", correct:true},
-          {key:"d", text:"The protected attribute of the user (when not legally usable)."},
-          {key:"e", text:"The platform&apos;s revenue target this quarter."},
+          {key:"a", text:"Without the reranker, long-tail providers receive exposure proportional to the past ranker's bias. Over months, low-exposure providers leave the platform (supply shrinks); the catalog becomes head-heavy; downstream user experience suffers from reduced variety. The cost manifests as supply attrition, not an immediate fairness metric drop. By the time you see the supply loss, the providers have already left.", correct:true},
+          {key:"b", text:"No cost — providers don't care."},
+          {key:"c", text:"Immediate alarm fires."},
+          {key:"d", text:"Users see no change."},
         ]}
-        trap={<>(d) creates a legal/ethical problem. (e) introduces business pressure into a fairness mechanism.</>}
-        lens={<>Legitimate demand signals are query-side and historical, not user-protected or business-aligned. Using the user&apos;s protected attribute as a demand signal is a textbook anti-pattern (and often illegal in housing, employment, credit). Letting revenue targets shape the floor turns fairness into branding.</>}
-        stretch={<>What audit catches misuse of (d) or (e)?</>}
+        trap={<>(b), (c), (d) miss the slow-burn supply-side dynamics.</>}
+        lens={<>The reranker is an INSURANCE against marketplace collapse, not a direct revenue tool. The cost of skipping it is paid in slow supply attrition.</>}
+        stretch={<>How would you measure supply attrition early? Provider monthly active rate? New-provider signup rate?</>}
       />
 
       <VIS.TrapProblem
-        id="fa-p4" difficulty="medium"
-        title="P4 — Protected-attribute imputation"
-        scenario={<>You do not collect the protected attribute for sellers. A teammate proposes imputing it (via name, photo, address). What is the risk?</>}
+        id="fa-a4"
+        difficulty="hard"
+        title="A4 — Composition with counterfactual augmentation"
+        scenario={<>You ship both adaptive reranking AND counterfactual augmentation (training-side fix from sibling visual). Do they double-count? <em>Discriminating insight: they fix different things — augmentation cleans data; reranker enforces serve-time floor. They stack without double-counting.</em></>}
         options={[
-          {key:"a", text:"Imputation introduces its own bias and may also be illegal in some jurisdictions; the imputed attribute can become a proxy that the system optimizes against.", correct:true},
-          {key:"b", text:"No risk — imputation is statistically valid."},
-          {key:"c", text:"Imputation reduces variance."},
-          {key:"d", text:"Imputation is required by law."},
+          {key:"a", text:"They compose cleanly. Counterfactual augmentation produces a ranker that predicts true preference (no exposure contamination). Adaptive reranking takes that preference signal and trades it for a fairness floor at serve time. The two are at different layers — data and serve — and neither double-counts. Stack both for marketplaces with both supply attrition risk AND past-policy biased labels.", correct:true},
+          {key:"b", text:"Double-counted; drop reranker."},
+          {key:"c", text:"Double-counted; drop augmentation."},
+          {key:"d", text:"They cancel out."},
         ]}
-        trap={<>(b)(c)(d) are false or fabricated.</>}
-        lens={<>Imputing a protected attribute creates a model that downstream systems can over-fit. The classical example is using zip code as a proxy for race — the system learns the proxy and behaves as if it had the attribute. In many places this is itself illegal (disparate-impact doctrine). The right path is collection with consent or a clearly documented refusal to compute group-conditioned metrics.</>}
-        stretch={<>What is the alternative if collection is impossible?</>}
+        trap={<>(b), (c), (d) confuse training-side data fix with serve-side constraint enforcement.</>}
+        lens={<>Two layers, two problems. Senior MLEs maintain the separation of concerns: training fixes data, serving enforces values.</>}
+        stretch={<>What's the right A/B test design to attribute lift to each layer separately?</>}
       />
 
       <VIS.TrapProblem
-        id="fa-p5" difficulty="hard"
-        title="P5 — Producer vs consumer fairness"
-        scenario={<>Boosting under-exposed producers reduces consumer click rate by 4&#37;. How do you decide whether to ship?</>}
+        id="fa-a5"
+        difficulty="hard"
+        title="A5 — Boundary: when does adaptive degenerate to static?"
+        scenario={<>Name the regime where the adaptive variant produces identical slates to a well-tuned static reranker. <em>Discriminating insight: when demand is uniform across queries (D_g(q) is the same for every q) — adaptive floor function returns the same value everywhere.</em></>}
         options={[
-          {key:"a", text:"Decide based on the explicit business policy: if producer equity is a stated KPI with a target, 4&#37; CTR loss may be acceptable. Without that policy, the loss is unfunded.", correct:true},
-          {key:"b", text:"Always ship — fairness comes first."},
-          {key:"c", text:"Never ship — CTR is sacred."},
-          {key:"d", text:"Use a Pareto frontier and ship the corner."},
+          {key:"a", text:"When per-query demand is approximately constant (every query has the same per-group demand split), the adaptive floor function f(D_g(q), S_g(q)) returns the same F_g for every q — equivalent to a static floor. This boundary case is rare in real marketplaces (queries DO have heterogeneous demand) but explains why some teams see no lift switching from static to adaptive: their demand is too uniform to benefit.", correct:true},
+          {key:"b", text:"Adaptive always beats static."},
+          {key:"c", text:"Adaptive equals static in every case."},
+          {key:"d", text:"Boundary depends only on supply."},
         ]}
-        trap={<>(b)(c) are dogmatic. (d) is technically possible but punts the policy question.</>}
-        lens={<>This is a leadership/policy decision, not a technical one. The MLE&apos;s job is to expose the tradeoff cleanly: x&#37; CTR for y&#37; exposure equity for group g. Without a stated policy, the system has no anchor and will default to the easiest local optimum.</>}
-        stretch={<>What metric reports the tradeoff cleanly to leadership?</>}
+        trap={<>(b), (c) are dogmatic. (d) misses the demand-side condition.</>}
+        lens={<>The senior diagnostic: audit query-level demand heterogeneity BEFORE deciding adaptive is worth the complexity.</>}
+        stretch={<>What's the right heterogeneity metric? KL divergence between per-query demand distributions?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>B. Application</h3>
+
+      <VIS.TrapProblem
+        id="fa-b1"
+        difficulty="hard"
+        title="B1 — Marketplace with heterogeneous query demand"
+        scenario={<>You operate a recipe site. Some queries are 'easy dinner' (broad supply across cuisines); some are 'Korean BBQ' (one-sided). Pick the reranker. <em>Discriminating insight: heterogeneous demand favors adaptive — static would harm the one-sided queries.</em></>}
+        options={[
+          {key:"a", text:"Adaptive reranking: the static floor would force off-cuisine results into 'Korean BBQ' queries (e.g., showing Italian recipes), tanking utility. Adaptive relaxes the off-cuisine floor when query demand is one-sided AND keeps it for queries with genuine multi-cuisine demand.", correct:true},
+          {key:"b", text:"Static — simpler is better."},
+          {key:"c", text:"Skip reranking."},
+          {key:"d", text:"Manually tune floors per query."},
+        ]}
+        trap={<>(b) under-fits the heterogeneous case. (c) ignores supply attrition. (d) doesn't scale.</>}
+        lens={<>The senior framing: heterogeneity-of-demand is the deciding factor. Audit before deploying.</>}
+        stretch={<>What's the right cadence to refit the adaptive floor function? Daily, weekly, never?</>}
       />
 
       <VIS.TrapProblem
-        id="fa-p6" difficulty="medium" multiSelect
-        title="P6 — Compose with debiased training"
-        scenario={<>You already run counterfactual exposure augmentation to debias training. Do you still need adaptive reranking? Select all that apply.</>}
+        id="fa-b2"
+        difficulty="hard"
+        title="B2 — 'Just enforce equal slate share' — what's wrong?"
+        scenario={<>An engineer proposes "every slate has 33% of each group, no exceptions." Why is this wrong specifically for this technique's purpose? <em>Discriminating insight: hard equality ignores query demand, slate diversity goals, and supply availability — the very things adaptive is designed to handle.</em></>}
         options={[
-          {key:"a", text:"Yes if your fairness goal is a policy floor different from the natural preference distribution.", correct:true},
-          {key:"b", text:"Yes if you want a hard guarantee on group exposure per slate.", correct:true},
-          {key:"c", text:"No — counterfactual training alone fixes everything."},
-          {key:"d", text:"No — adaptive reranking subsumes counterfactual training."},
-          {key:"e", text:"Yes if your training data still has residual exposure bias."},
+          {key:"a", text:"Hard equal-slate enforcement ignores (1) query-dependent demand (forces off-cuisine onto specific cuisine queries), (2) supply availability (some queries don't have 33% of every group available), and (3) the slate's actual diversity goal (a 33-33-34 slate on a query that 95% of users only want one type is just user-hostile). Adaptive floor exists precisely to handle all three.", correct:true},
+          {key:"b", text:"Equal slate share is always optimal."},
+          {key:"c", text:"This is what adaptive reranking does."},
+          {key:"d", text:"Slate composition is irrelevant to fairness."},
         ]}
-        trap={<>(c)(d) collapse two distinct mechanisms.</>}
-        lens={<>Counterfactual augmentation debiases the preference signal. Adaptive reranking enforces a policy. You may want neither, either, or both depending on goal. The cleanest production pipeline runs both: debias the data so preference is honest, then enforce a policy floor where business needs require it.</>}
-        stretch={<>What happens if you run adaptive rerank on biased training data?</>}
+        trap={<>(c) conflates static and adaptive. (b), (d) are wrong.</>}
+        lens={<>Hard equality is a strict subset of static reranking. Adaptive's whole pitch is that hard equality is too rigid.</>}
+        stretch={<>What's the right monitoring signal that distinguishes 'fair' from 'user-hostile'?</>}
       />
 
       <VIS.TrapProblem
-        id="fa-p7" difficulty="hard"
-        title="P7 — Per-slate vs aggregate fairness"
-        scenario={<>You enforce per-slate fairness floors. A regulator asks for aggregate (daily) fairness. Are these the same?</>}
+        id="fa-b3"
+        difficulty="medium"
+        title="B3 — Pitch adaptive reranking to your VP"
+        scenario={<>VP asks why bother with this over the existing static reranker. Give the one-sentence pitch that <em>requires</em> understanding the adaptive-per-query insight. <em>Discriminating insight: the pitch must turn on the demand-conditional relaxation — not on generic "more fairness."</em></>}
         options={[
-          {key:"a", text:"No. Per-slate is a local constraint; aggregate is a sum. Per-slate is strictly stronger; aggregate fairness can be met by averaging unfair slates.", correct:true},
-          {key:"b", text:"Yes — they are equivalent."},
-          {key:"c", text:"Per-slate is weaker than aggregate."},
-          {key:"d", text:"Neither is achievable in practice."},
+          {key:"a", text:"'Fairness is important.' (Generic — true for any reranker.)"},
+          {key:"b", text:"'Adaptive reranking enforces the same per-group fairness floor as our current static reranker on balanced-demand queries — but relaxes the floor on one-sided queries (Korean-BBQ search shouldn't be forced to show Italian recipes) where the static floor was harming users without producing any meaningful provider-side fairness. Expected: 5-15% utility recovery on the 30% of our query traffic that has one-sided demand, with no degradation on the balanced-demand 70%.'", correct:true},
+          {key:"c", text:"'It improves NDCG.' (Generic metric.)"},
+          {key:"d", text:"'Industry best practice.'"},
         ]}
-        trap={<>(b)(c) misread the math. (d) is fatalistic.</>}
-        lens={<>Per-slate is the strict constraint; aggregate over a day or a week can be met by oscillating slates that individually look unfair but cancel in aggregate. Regulators usually want aggregate because per-slate is too restrictive for one-sided queries; engineers prefer per-slate because aggregate enforcement is brittle.</>}
-        stretch={<>Construct an example where aggregate is fair but every slate is unfair.</>}
+        trap={<>(a) survives redaction. (c), (d) are mechanism-free.</>}
+        lens={<>B3 must fail redaction. (b) names demand-conditional, the specific recipe-search scenario, the quantified split between balanced and one-sided queries — all unique to adaptive vs static.</>}
+        stretch={<>If VP says 'why not just turn off static reranking on one-sided queries?' — what's the line back?</>}
       />
 
       <VIS.TrapProblem
-        id="fa-p8" difficulty="hard" mode="ordered"
-        title="P8 — Order the fairness rollout"
-        scenario={<>You are rolling out producer-side fairness. Order the steps. Wrong moves are unranked.</>}
+        id="fa-b4"
+        difficulty="hard"
+        title="B4 — When NOT to deploy adaptive reranking"
+        scenario={<>Name a setting where adaptive reranking is overkill or wrong. <em>Discriminating insight: regulated environments where the floor is a HARD legal minimum, OR ranking surfaces where the consumer doesn't see a slate (single-result API).</em></>}
         options={[
-          {key:"a", text:"Define the protected-group taxonomy explicitly and document the rationale.", order:1},
-          {key:"b", text:"Audit the current ranker for slice-level exposure imbalance.", order:2},
-          {key:"c", text:"Pick a fairness definition (merit-based vs equal) and write down the gameability analysis.", order:3},
-          {key:"d", text:"Implement adaptive reranking with the chosen definition.", order:4},
-          {key:"e", text:"A/B with explicit CTR-vs-exposure tradeoff dashboards.", order:5},
-          {key:"f", text:"Impute protected attributes silently because they are not collected."},
-          {key:"g", text:"Ship without defining the group taxonomy and figure it out later."},
+          {key:"a", text:"(1) Regulated environments where fairness floors are LEGAL minima — adaptive's relaxation may violate the regulation. Use static rerankers calibrated to the legal floor. (2) Single-result APIs (e.g., voice assistants returning ONE answer) — there's no slate to optimize. The technique is slate-level by construction.", correct:true},
+          {key:"b", text:"Adaptive is always wrong."},
+          {key:"c", text:"Adaptive is always right."},
+          {key:"d", text:"Boundary depends only on traffic."},
         ]}
-        trap={<>(f)(g) are the textbook bad starts.</>}
-        lens={<>Fairness rollout starts with the taxonomy and the definition, not the code. Imputation and shipping without a definition produce systems that look fair in one metric and unfair in another. Documentation is part of the system because the chosen definition is the system.</>}
-        stretch={<>What metric goes on the A/B guardrail?</>}
+        trap={<>(b), (c) are dogmatic. (d) misses the legal and slate-shape conditions.</>}
+        lens={<>Senior judgment: adaptive's flexibility is also its risk in regulated contexts. Know when the static floor IS the contract, not a tunable.</>}
+        stretch={<>If you're in BOTH situations (regulated AND want adaptive flexibility above the floor), how do you compose?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      <VIS.TrapProblem
+        id="fa-c1"
+        difficulty="hard"
+        title="C1 — The adaptive floor function: what are its inputs?"
+        scenario={<>F_g(q) = f(Demand_g(q), Supply_g(q), base_floor_g). Specify each input. <em>Discriminating insight: demand is per-query (estimable from past clicks); supply is per-query (counts available items per group); base_floor is the floor minimum below which f never goes.</em></>}
+        options={[
+          {key:"a", text:"Demand_g(q): estimated probability a user issuing query q wants a result from group g (from past click logs, conditional on query embedding). Supply_g(q): count of candidate items from group g for query q (from inventory). base_floor_g: business-set minimum exposure for group g across the marketplace (the static floor below which adaptive never goes). The function f combines them, typically as a softmax-weighted minimum.", correct:true},
+          {key:"b", text:"Only base_floor matters; demand and supply are noise."},
+          {key:"c", text:"Demand and supply are the same input."},
+          {key:"d", text:"Inputs are not specified in the paper."},
+        ]}
+        trap={<>(b), (c), (d) misunderstand the function design.</>}
+        lens={<>Knowing the function's inputs lets you reason about its failure modes (e.g., stale demand estimates, biased supply counts).</>}
+        stretch={<>How would you estimate Demand_g(q) when q is a new query never seen before?</>}
       />
 
       <VIS.TrapProblem
-        id="fa-p9" difficulty="medium"
-        title="P9 — Merit-based exposure"
-        scenario={<>How does merit-based exposure differ from equal exposure?</>}
+        id="fa-c2"
+        difficulty="hard"
+        title="C2 — The reranker's optimization: what objective?"
+        scenario={<>The reranker's objective at serve time. <em>Discriminating insight: maximize sum p_click subject to per-group exposure floor constraints — a constrained linear program (or its slate-level relaxation).</em></>}
         options={[
-          {key:"a", text:"Merit-based ties group exposure to the group&apos;s predicted relevance for the query; equal exposure does not. Merit-based gets harder to game by re-partitioning groups.", correct:true},
-          {key:"b", text:"They are equivalent under uniform queries."},
-          {key:"c", text:"Merit-based is strictly worse for utility."},
-          {key:"d", text:"Equal exposure is required by all fairness regulations."},
+          {key:"a", text:"Maximize utility (sum of calibrated p-click across slate) subject to per-group exposure constraints (each group's expected exposure across the slate is at least F_g(q)). At slate sizes K = 5-20, this is a small constrained LP solvable in microseconds. At larger K it's relaxed to a greedy approximation.", correct:true},
+          {key:"b", text:"Maximize fairness directly."},
+          {key:"c", text:"Maximize NDCG."},
+          {key:"d", text:"No formal objective."},
         ]}
-        trap={<>(b) is partially true but misses the point. (c)(d) are false.</>}
-        lens={<>Merit-based exposure (Singh &amp; Joachims 2018) constrains exposure to be proportional to a group&apos;s predicted relevance, marginalized over queries. It avoids the &apos;split into 10 storefronts&apos; game because exposure tracks model output, not group identity. It still requires the preference model itself to be audit-clean.</>}
-        stretch={<>How is merit-based exposure audited end-to-end?</>}
+        trap={<>(b), (c), (d) misunderstand the constrained-LP structure.</>}
+        lens={<>The optimization is utility-with-constraint, NOT fairness-as-objective. This is the right way to compose value (utility) with constraint (fairness floor) — the LP cleanly separates them.</>}
+        stretch={<>What changes if the slate has bound interactions (e.g., user only clicks if 2+ of same group present)?</>}
       />
 
       <VIS.TrapProblem
-        id="fa-p10" difficulty="hard" multiSelect
-        title="P10 — Production guardrails for fairness reranking"
-        scenario={<>Pick the production guardrails for an adaptive fairness reranker. Select all that apply.</>}
+        id="fa-c3"
+        difficulty="hard"
+        title="C3 — What's DROPPED vs the static baseline?"
+        scenario={<>List what adaptive reranking discards from the static baseline. <em>Discriminating insight: the simplicity of a constant floor is gone — adaptive requires per-query demand estimation and a learned floor function.</em></>}
+        multiSelect
         options={[
-          {key:"a", text:"Per-slate group-exposure floor adherence rate.", correct:true},
-          {key:"b", text:"Aggregate group exposure tracked daily and weekly.", correct:true},
-          {key:"c", text:"Consumer-side CTR / conversion as a guardrail metric.", correct:true},
-          {key:"d", text:"Utility-loss alert when adaptive floor relaxation exceeds X&#37; of slates.", correct:true},
-          {key:"e", text:"GPU utilization."},
+          {key:"a", text:"Constancy — F_g is no longer the same for every query.", correct:true},
+          {key:"b", text:"Simplicity of the audit — auditors must inspect the floor function, not a single number.", correct:true},
+          {key:"c", text:"Static-floor guarantees (legal minimum) unless explicitly enforced as base_floor.", correct:true},
+          {key:"d", text:"Slate-level constraints."},
+          {key:"e", text:"All fairness."},
         ]}
-        trap={<>(e) is unrelated.</>}
-        lens={<>Fairness systems need both fairness metrics (slate + aggregate exposure) and utility metrics (consumer CTR) on the same dashboard, with explicit thresholds for when the adaptive floor is relaxing too often (a sign that the floor is mis-calibrated for the true demand distribution). GPU util is infra hygiene, not a fairness signal.</>}
-        stretch={<>What is the alert threshold for floor relaxation rate?</>}
+        trap={<>(d) inverts (slate-level constraints are preserved). (e) is wrong — fairness is enforced, just adaptively.</>}
+        lens={<>The senior tradeoff: gain demand-sensitive utility, lose simplicity and audit clarity. Plan for the audit cost up front.</>}
+        stretch={<>How do you make the floor function auditable to a non-ML reviewer?</>}
       />
+
+      <VIS.TrapProblem
+        id="fa-c4"
+        difficulty="hard"
+        mode="ordered"
+        title="C4 — Rank knobs by 'breaks adaptive reranking if mis-set'"
+        scenario={<>Order from most-catastrophic to least: (a) demand estimation quality, (b) base_floor value, (c) supply count accuracy, (d) slate size K. <em>Discriminating insight: demand estimation is dominant; base_floor sets the legal/business minimum; supply is usually accurate (just count); K is mostly orthogonal.</em></>}
+        options={[
+          {key:"a", text:"Demand estimation quality — drives the floor function's correctness.", order:1},
+          {key:"b", text:"base_floor value — sets the legal/business minimum and is the most directly visible knob to auditors.", order:2},
+          {key:"c", text:"Supply count accuracy — usually mechanical; only matters when inventory is fast-changing.", order:3},
+          {key:"d", text:"Slate size K — mostly orthogonal to fairness behavior."},
+        ]}
+        trap={<>Candidates often rank base_floor first because it's the most 'fairness-y' knob. But it's a constant; demand estimation is the per-query mover that bites in production.</>}
+        lens={<>Demand estimation quality is the load-bearing per-query input. Senior MLEs invest in it before tuning anything else.</>}
+        stretch={<>What's the right monitoring for demand-estimation drift? How does it differ from monitoring the floor function?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-c5"
+        difficulty="hard"
+        title="C5 — Data assumption: 'group membership is known'"
+        scenario={<>The technique assumes each candidate item has a known group label. What breaks if it doesn't? <em>Discriminating insight: imputed groups feed an imputation-error loop — the system's fairness behavior is now bounded by imputation quality.</em></>}
+        options={[
+          {key:"a", text:"Imputed groups inherit the imputation model's errors. The reranker's exposure floor is enforced on the IMPUTED labels, not the true labels — so real-world exposure can diverge from intended exposure by the imputation error rate. This is especially bad for protected attributes that are hard to impute (race, gender from name; cuisine from photo).", correct:true},
+          {key:"b", text:"Group labels are always available."},
+          {key:"c", text:"Imputation is irrelevant to this technique."},
+          {key:"d", text:"Imputation is perfect."},
+        ]}
+        trap={<>(b), (c), (d) are wrong; (b) ignores the privacy-and-regulation reality.</>}
+        lens={<>The technique's correctness is BOUNDED by group-label accuracy. Senior MLEs audit the imputation model the same way they audit the exposure model.</>}
+        stretch={<>What's the right diagnostic to detect imputation-driven fairness drift?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      <VIS.TrapProblem
+        id="fa-d1"
+        difficulty="hard"
+        title="D1 — 'Adaptive = less fair'"
+        scenario={<>A skeptic says "adaptive is just static with loopholes — it relaxes the floor when convenient." Why is this critique often wrong? <em>Discriminating insight: relaxing the floor where there's no legitimate demand is utility-preserving — it doesn't reduce fairness for queries where group demand is real.</em></>}
+        options={[
+          {key:"a", text:"Relaxing the floor on one-sided queries doesn't make those queries 'less fair' — the under-represented group had no legitimate demand on those queries; forcing exposure would have been TOKEN representation, not fairness. The adaptive variant focuses exposure on queries where group demand is real and the floor matters. Critics conflate equal-exposure with fairness; the paper makes the distinction explicit.", correct:true},
+          {key:"b", text:"The critic is correct."},
+          {key:"c", text:"Adaptive always reduces fairness."},
+          {key:"d", text:"Static is always more fair."},
+        ]}
+        trap={<>(b), (c), (d) miss the demand-conditional argument.</>}
+        lens={<>The senior frame: fairness is a CONDITIONAL property of the exposure-to-demand match, not a marginal property. Static treats it as marginal; adaptive treats it as conditional.</>}
+        stretch={<>Construct a fairness metric that captures the adaptive variant's notion. How does it differ from marginal exposure parity?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: 'demand is exogenous'"
+        scenario={<>You assume per-query demand is exogenous (independent of past exposure). What collapses if it's actually endogenous? <em>Discriminating insight: past exposure influences future demand — the demand estimate is itself biased by the past exposure policy, creating a feedback loop.</em></>}
+        multiSelect
+        options={[
+          {key:"a", text:"'Demand_g(q) is correctly estimated' — wrong because past clicks reflect past exposure, not pure preference.", correct:true},
+          {key:"b", text:"'Adaptive floor adapts to user demand' — wrong because it actually adapts to past-exposure-mediated demand.", correct:true},
+          {key:"c", text:"'Relaxing the floor never hurts under-represented groups' — wrong because endogenous demand UNDERESTIMATES suppressed group demand.", correct:true},
+          {key:"d", text:"'The reranker is the only fairness layer needed' — wrong because the feedback loop requires also fixing the training signal (counterfactual augmentation, sibling visual).", correct:true},
+          {key:"e", text:"'Latency improves' — irrelevant."},
+        ]}
+        trap={<>(e) is unaffected; the other four all collapse.</>}
+        lens={<>The endogeneity problem connects adaptive reranking to counterfactual augmentation: BOTH are needed in marketplaces with strong feedback loops because the reranker's demand input is biased by past exposure.</>}
+        stretch={<>What's the right detection signal for demand endogeneity?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-d3"
+        difficulty="hard"
+        title="D3 — Junior tunes base_floor; senior tunes the demand model"
+        scenario={<>Fairness alarm fires. Junior reflex: raise base_floor. Senior reflex? <em>Discriminating insight: the alarm is often caused by stale demand estimation, not by too-low base_floor — raising the floor masks the diagnostic.</em></>}
+        options={[
+          {key:"a", text:"Investigate the demand estimation first: is the per-query demand estimate stale, biased by a recent policy change, or systematically under-estimating group demand? The fairness alarm may be a SYMPTOM of demand-model drift, not of a too-low base_floor. Raising base_floor would mask the diagnostic and over-correct.", correct:true},
+          {key:"b", text:"Raise base_floor immediately."},
+          {key:"c", text:"Disable the reranker."},
+          {key:"d", text:"Retrain the ranker."},
+        ]}
+        trap={<>(b), (c), (d) all skip the diagnostic step.</>}
+        lens={<>The senior move: diagnose before treating. Most fairness alarms in adaptive systems are demand-model drift, not floor-tuning issues.</>}
+        stretch={<>Design the 5-line diagnostic the on-call should run when the alarm fires.</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: utility drops 1% on launch"
+        scenario={<>Adaptive reranking launches. Aggregate utility (sum p_click served) drops 1%. Three plausible causes: (1) reranker is wrong, (2) base_floor is too high, (3) demand model is biased upward for minority groups (over-allocating exposure). Diagnose. <em>Discriminating insight: the most common cause is (3) — demand-model bias toward minority groups inflates F_g, eating utility unnecessarily.</em></>}
+        options={[
+          {key:"a", text:"Most likely (3): an over-zealous demand model inflates F_g for minority groups, eating utility. Diagnose by comparing per-query F_g produced by the demand model against a held-out ground-truth demand estimate. (2) is the seductive 'just lower the floor' fix; (1) is rare if the LP is implemented correctly.", correct:true},
+          {key:"b", text:"Always reranker is wrong."},
+          {key:"c", text:"Always base_floor is too high."},
+          {key:"d", text:"GPU bug."},
+        ]}
+        trap={<>(b), (c), (d) over-attribute to one cause.</>}
+        lens={<>The diagnostic flow: validate demand model FIRST, then floor, then LP. Senior insight: the load-bearing component (demand model) is the first suspect.</>}
+        stretch={<>What's the held-out ground-truth demand estimate? How would you build it?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-d5"
+        difficulty="medium"
+        title="D5 — 'Bigger slate = more fair'"
+        scenario={<>Junior intuition: larger slate K means more room for fairness. Why is this often wrong? <em>Discriminating insight: floor enforcement scales with slate size — at K=20, the floor is easier to hit; at K=3, the LP is tight and fairness is constrained. But user attention drops sharply with K; positions 11-20 produce near-zero exposure.</em></>}
+        options={[
+          {key:"a", text:"The floor is enforced over EXPECTED exposure across the slate, weighted by per-position attention. User attention drops sharply with position (click probability at position 10 is 1/5 of position 1). Slots 11-20 contribute little to actual exposure. A larger K satisfies the floor on paper but produces no real exposure for the under-represented group. The senior frame: enforce the floor on the ATTENTION-weighted exposure, not the position-count exposure.", correct:true},
+          {key:"b", text:"Larger K is always more fair."},
+          {key:"c", text:"K is irrelevant."},
+          {key:"d", text:"K only affects latency."},
+        ]}
+        trap={<>(b), (c), (d) miss the position-attention curve.</>}
+        lens={<>Attention-weighted exposure is the right metric. Senior MLEs ensure the LP uses attention weights, not raw positions.</>}
+        stretch={<>What's the right attention-weight curve? Where do you measure it?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>E. Operations</h3>
+
+      <VIS.TrapProblem
+        id="fa-e1"
+        difficulty="hard"
+        title="E1 — Production gotcha: demand-model drift after a viral query"
+        scenario={<>A viral event spikes demand for one group on one query type. The demand model lags by 24 hours. What's the failure? <em>Discriminating insight: stale demand model under-allocates exposure to the viral group; adaptive floor doesn't relax in time; utility drops AND fairness audit may still pass on the wrong group.</em></>}
+        options={[
+          {key:"a", text:"For 24 hours, the stale demand model under-estimates the viral group's demand. F_g for the viral group stays at the (now-low) old level. The reranker doesn't relax the floor for OTHER groups on viral queries — utility drops because slates aren't matching the new demand. The fairness audit may still 'pass' because the floor is still met, but the marketplace is mis-allocating exposure relative to actual demand.", correct:true},
+          {key:"b", text:"No effect — adaptive is robust to drift."},
+          {key:"c", text:"GPU thermal."},
+          {key:"d", text:"Latency spike only."},
+        ]}
+        trap={<>(b), (c), (d) miss the demand-lag mechanism.</>}
+        lens={<>The demand model's refresh cadence determines the reranker's responsiveness to events. Senior MLEs tie it to traffic-spike detection, not to a calendar.</>}
+        stretch={<>How would you detect a viral event in real-time? Per-query click-rate spike monitor?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-e2"
+        difficulty="hard"
+        title="E2 — Friday 3am: complaints from sellers in a non-minority group"
+        scenario={<>You ship adaptive reranking Thursday. Friday 3am: 20 majority-group sellers complain about reduced traffic. Aggregate fairness metrics improved. Why this specific failure? <em>Discriminating insight: adaptive floor RAISED the minority floor on queries where demand was less one-sided than the static reranker assumed — majority sellers lost traffic on those queries; the loss is concentrated and visible.</em></>}
+        options={[
+          {key:"a", text:"Adaptive reranking RAISED the minority floor on queries where the demand model now estimates more genuine minority demand than the static reranker assumed. Majority-group sellers lost their previously-disproportionate share on those queries. This is the symmetric counterpart of the sibling visual's E2: fixing exposure inequity produces a visible loser cohort. Plan rollout with this in mind.", correct:true},
+          {key:"b", text:"Adaptive broke."},
+          {key:"c", text:"GPU."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c), (d) misdiagnose the expected dynamic.</>}
+        lens={<>Every fairness fix produces winners and losers. The losers ALWAYS complain. Plan the comms, not just the code.</>}
+        stretch={<>What's the right rollout ramp to give majority-group sellers time to adapt?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-e3"
+        difficulty="hard"
+        title="E3 — Implementation specific: LP solver choice"
+        scenario={<>You implement the constrained LP. Pick the right solver for K=10 slates at 100k QPS. <em>Discriminating insight: K=10 means 10 binary variables — small enough for closed-form OR a hand-rolled greedy; commercial LP solvers are overkill.</em></>}
+        options={[
+          {key:"a", text:"For K=10 with 3-5 group constraints, the LP has 10 binary variables and a few constraints — solve via a greedy approximation (det-greedy with adaptive floor) or even a closed-form for small group counts. Commercial LP solvers (Gurobi, CBC) add latency and licensing overhead with no quality gain at this size. Save the solvers for K larger than 50 with complex slate-interaction constraints.", correct:true},
+          {key:"b", text:"Always use Gurobi."},
+          {key:"c", text:"Use scipy.linprog."},
+          {key:"d", text:"No solver needed; ranking is the answer."},
+        ]}
+        trap={<>(b), (c) over-engineer. (d) misses the constraint.</>}
+        lens={<>Small-K LP has closed-form approximations; pay for solvers only when K and constraints justify it.</>}
+        stretch={<>At what K does it become worth licensing a commercial solver?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-e4"
+        difficulty="hard"
+        mode="ordered"
+        title="E4 — Adaptive reranker rollout order"
+        scenario={<>Phases: (a) train demand model + audit, (b) build & validate floor function f, (c) shadow rerank (log only), (d) mirror serve (both ranker and reranker score; ranker serves; track delta), (e) traffic ramp, (f) full deploy. Order. <em>Discriminating insight: the demand model and floor function must be validated BEFORE any shadow rerank — they are the new components, and shadow logs depend on them.</em></>}
+        options={[
+          {key:"a", text:"Train demand model + audit (group-imputation, calibration, drift).", order:1},
+          {key:"b", text:"Build & validate floor function f.", order:2},
+          {key:"c", text:"Shadow rerank.", order:3},
+          {key:"d", text:"Mirror serve.", order:4},
+          {key:"e", text:"Traffic ramp.", order:5},
+          {key:"f", text:"Full deploy.", order:6},
+          {key:"g", text:"Skip demand-model audit; ship and audit if alerts fire."},
+        ]}
+        trap={<>(g) is the time-pressure mistake that produces F-axis failures.</>}
+        lens={<>The demand model is upstream of every downstream guarantee. Validate FIRST. Senior insight: rollout order = data-flow order.</>}
+        stretch={<>What's the cheapest demand-model audit that catches the most issues?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-e5"
+        difficulty="hard"
+        title="E5 — Reproducibility: SIGIR 2024 paper's utility-recovery claim"
+        scenario={<>The SIGIR 2024 paper claims "12% utility recovery vs static on one-sided queries." You see 4%. Which experimental property must match? <em>Discriminating insight: the proportion of one-sided queries in their evaluation, their demand-model quality, and their base_floor value — all data-specific.</em></>}
+        multiSelect
+        options={[
+          {key:"a", text:"Proportion of one-sided queries in eval set (higher = more headroom for utility recovery).", correct:true},
+          {key:"b", text:"Demand-model R-squared on a held-out demand truth set.", correct:true},
+          {key:"c", text:"base_floor value (higher base_floor = less adaptive headroom).", correct:true},
+          {key:"d", text:"Slate size K (interacts with attention curve).", correct:true},
+          {key:"e", text:"Random seed."},
+        ]}
+        trap={<>(e) is minor.</>}
+        lens={<>Fairness lifts rarely transfer because the eval set's demand-heterogeneity profile is data-specific. Treat headline numbers as upper bounds.</>}
+        stretch={<>How would you design a transferable benchmark? What does it standardize?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-e6"
+        difficulty="hard"
+        title="E6 — Monitoring the adaptive floor function"
+        scenario={<>Pick the right leading indicator that catches floor-function drift before user-facing impact. <em>Discriminating insight: per-query F_g distribution shift vs the prior week — captures demand-model drift propagating through the function.</em></>}
+        options={[
+          {key:"a", text:"Per-query F_g distribution KL divergence vs the prior 7 days. If F_g shifts globally, the demand model has drifted; refit. This catches the cause (demand drift) before the effect (fairness audit failure or utility drop).", correct:true},
+          {key:"b", text:"Daily marginal fairness metric."},
+          {key:"c", text:"Weekly NDCG."},
+          {key:"d", text:"Latency."},
+        ]}
+        trap={<>(b), (c), (d) lag behind drift by hours-to-days, or are unrelated.</>}
+        lens={<>Monitor the cause (F_g shift), not the effect (audit fail). Senior monitoring move applied to this technique.</>}
+        stretch={<>What's the right KL threshold? How does it depend on the heterogeneity of queries?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>F. Failure modes</h3>
+
+      <VIS.TrapProblem
+        id="fa-f1"
+        difficulty="hard"
+        title="F1 — Edge case: query with no inventory in a group"
+        scenario={<>A query has zero items from group G in the candidate set. What does the LP do? <em>Discriminating insight: F_g(q) must auto-relax to 0 — otherwise the LP is infeasible. Adaptive variant handles this; static variant fails.</em></>}
+        options={[
+          {key:"a", text:"Adaptive floor F_g(q) detects zero supply (S_g(q)=0) and relaxes to 0 — no constraint to enforce. Static reranker with constant F_g > 0 has an infeasible LP and either crashes or defaults to ranker output (silently violating the static contract).", correct:true},
+          {key:"b", text:"Both fail."},
+          {key:"c", text:"Both succeed."},
+          {key:"d", text:"LP is irrelevant here."},
+        ]}
+        trap={<>(b), (c), (d) miss the adaptive vs static divergence at infeasibility.</>}
+        lens={<>Adaptive's input-aware floor handles infeasibility gracefully; static fails. This is one of adaptive's silent operational wins.</>}
+        stretch={<>How should the system handle the related case of S_g(q) very small but nonzero (1-2 items)?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: query stuffing to manipulate adaptive floor"
+        scenario={<>An adversarial seller floods the query log with queries designed to inflate demand_g for their group. Effect on adaptive? <em>Discriminating insight: the adaptive floor for their group rises — exposure goes up — adversary wins.</em></>}
+        options={[
+          {key:"a", text:"Synthetic queries that increase demand_g for the adversary's group will raise F_g(q) for related queries, granting more exposure. The defense is two-sided: (1) bot-detect synthetic queries before they enter the demand-model training, (2) cap F_g(q) at a multiple of the base_floor to bound adversarial gains. Adaptive's flexibility is also its attack surface — static rerankers are immune to this specific attack.", correct:true},
+          {key:"b", text:"Adversary cannot affect adaptive."},
+          {key:"c", text:"Adversary's exposure drops."},
+          {key:"d", text:"This is impossible."},
+        ]}
+        trap={<>(b), (c), (d) miss the attack mechanism.</>}
+        lens={<>Adaptive's input-sensitivity is also its adversarial vulnerability. Senior MLEs add bot-detection to the demand pipeline AND cap the floor function.</>}
+        stretch={<>Could the same attack work against counterfactual augmentation (sibling)? Why or why not?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-f3"
+        difficulty="hard"
+        title="F3 — Reverse engineering: fairness metric improves but provider satisfaction drops"
+        scenario={<>Symptom: aggregate fairness metric improves; provider-satisfaction survey scores DROP. Which adaptive-specific cause? <em>Discriminating insight: adaptive relaxed the floor on one-sided queries — providers in the dominant group on those queries see no change; providers in the minority group on those queries see LESS exposure than under static rerank.</em></>}
+        options={[
+          {key:"a", text:"Adaptive's relaxation on one-sided queries REDUCES minority-group exposure on those specific queries (vs the static reranker which would have padded them). The marginal fairness metric improves (overall exposure is more demand-matched, which the new metric values) BUT individual minority-group providers feel LESS supported because they used to get token slots they no longer get. The fairness story is more nuanced than a single metric reveals.", correct:true},
+          {key:"b", text:"Survey is unreliable."},
+          {key:"c", text:"Adaptive is broken."},
+          {key:"d", text:"This pattern is impossible."},
+        ]}
+        trap={<>(b), (c), (d) miss the marginal-vs-individual distinction.</>}
+        lens={<>Aggregate fairness metrics CAN improve while individual experiences worsen — the adaptive variant is especially prone to this because relaxation produces visible per-query losers among minority providers.</>}
+        stretch={<>Design a fairness metric that captures both aggregate and provider-level satisfaction. Is one such metric sufficient?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-f4"
+        difficulty="hard"
+        title="F4 — Paper-named failure: 'demand-relaxation hides utility loss'"
+        scenario={<>The SIGIR 2024 paper specifically warns about a failure mode where adaptive's relaxation hides large utility losses on specific queries. Name the mechanism. <em>Discriminating insight: when base_floor is high AND demand is mildly heterogeneous, the relaxation is small but cumulative utility loss on the heterogeneous-demand queries is large; the aggregate metric averages it away.</em></>}
+        options={[
+          {key:"a", text:"With a high base_floor and mild demand heterogeneity, the adaptive relaxation is small (F_g doesn't drop much from base_floor) but the cumulative utility loss on the heterogeneous queries is large — and aggregate metrics average it across all queries. The paper recommends per-query utility-loss tracking, not just aggregate. Otherwise you ship a 'low-utility-loss-on-average' system that actively hurts 30% of queries.", correct:true},
+          {key:"b", text:"Adaptive always preserves utility."},
+          {key:"c", text:"Aggregate metrics are always sufficient."},
+          {key:"d", text:"This is not a real failure mode."},
+        ]}
+        trap={<>(b), (c), (d) miss the marginal-vs-per-query distinction.</>}
+        lens={<>The named failure is per-query utility loss masked by aggregation. The fix is per-query monitoring, not a better aggregate metric.</>}
+        stretch={<>What's the right per-query utility-loss threshold to alarm on?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-f5"
+        difficulty="hard"
+        title="F5 — Community-found: the imputation feedback loop"
+        scenario={<>A 2025 follow-up paper documents a specific failure: imputed group labels create a feedback loop with adaptive reranking. Mechanism? <em>Discriminating insight: imputed labels seed the demand model; the reranker then enforces floors on imputed groups; future labels are now collected under the imputed-based exposure policy; the imputation model retrained on those labels reinforces its own errors.</em></>}
+        options={[
+          {key:"a", text:"Group imputation seeds the demand model. Adaptive reranking enforces floors on the IMPUTED labels — items wrongly imputed as group G receive group-G's exposure. Future click logs reflect the wrongly-imputed exposure. Retraining the imputation model on those logs cements the misimputation. The loop: bad imputation → wrong exposure → wrong labels → confirms bad imputation. Break the loop with periodic ground-truth re-anchoring (human-labeled audit set).", correct:true},
+          {key:"b", text:"Imputation is always correct."},
+          {key:"c", text:"Feedback loops are impossible here."},
+          {key:"d", text:"Imputation is unrelated."},
+        ]}
+        trap={<>(b), (c), (d) miss the loop.</>}
+        lens={<>The loop is the most insidious failure mode — it gets WORSE over time, not better. Periodic ground-truth re-anchoring is the canonical fix.</>}
+        stretch={<>How often does the human-labeled audit set need to be refreshed? How do you size it?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-f6"
+        difficulty="hard"
+        title="F6 — Multi-group with intersectional groups"
+        scenario={<>You define groups by cuisine. The paper extends to intersectional groups (cuisine x price tier). Why does adaptive struggle here? <em>Discriminating insight: intersectional explodes the number of constraints; the LP becomes harder; the floor function needs many more inputs.</em></>}
+        options={[
+          {key:"a", text:"Intersectional groups (G_cuisine x G_price) multiplies the constraint count: 5 cuisines x 3 price tiers = 15 groups, 15 floor constraints per query. The LP becomes 15-dimensional with 15 constraints — still tractable but the demand model now needs 15 demand estimates per query, often unreliable on the sparse intersections. The adaptive floor function may collapse some intersections to base, reducing the technique's effectiveness on under-represented intersections.", correct:true},
+          {key:"b", text:"Intersectional works identically."},
+          {key:"c", text:"Drop intersectional."},
+          {key:"d", text:"Use a different LP solver."},
+        ]}
+        trap={<>(b), (c), (d) miss the sparsity-explosion cause.</>}
+        lens={<>Intersectional fairness is harder because the demand model has fewer samples per intersection. Senior MLEs decide on group granularity based on per-cell sample size.</>}
+        stretch={<>What's the right diagnostic to decide whether to add an intersectional group dimension?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-f7"
+        difficulty="hard"
+        title="F7 — Silent regression: legal floor violated on a long-tail query"
+        scenario={<>A regulator audits a long-tail query. Adaptive relaxed F_g below the legal minimum. What went wrong? <em>Discriminating insight: base_floor was not set to the LEGAL minimum — adaptive's relaxation went below it.</em></>}
+        options={[
+          {key:"a", text:"The legal minimum should have been encoded as base_floor (the value below which adaptive never relaxes). If the team set base_floor to the BUSINESS minimum (lower than legal), adaptive's relaxation goes legal-violating on queries where the function f returns base_floor. Fix: base_floor = max(legal_minimum, business_minimum). Always set the legal floor as the absolute lower bound.", correct:true},
+          {key:"b", text:"Adaptive cannot violate legal floors."},
+          {key:"c", text:"Legal floors don't apply."},
+          {key:"d", text:"This is a bug in the LP solver."},
+        ]}
+        trap={<>(b), (c), (d) miss the base_floor configuration error.</>}
+        lens={<>The senior move: encode legal constraints as HARD base_floor, not as monitoring alarms. Configuration over code.</>}
+        stretch={<>How would you audit base_floor configuration against legal requirements automatically?</>}
+      />
+
+      <VIS.TrapProblem
+        id="fa-f8"
+        difficulty="hard"
+        title="F8 — Compounding with downstream auction"
+        scenario={<>Reranked slate feeds a second-price auction where bids depend on rank position. What complication does adaptive introduce vs static? <em>Discriminating insight: adaptive's per-query floors change the available rank distribution per query — bidder strategies that assumed stable rank semantics now need to adapt.</em></>}
+        options={[
+          {key:"a", text:"With adaptive reranking, the per-query distribution of items by rank position now depends on the query's demand profile. Bidders that calibrated their bids assuming stable rank semantics (e.g., rank 3 is 1/3 as valuable as rank 1) now face a moving target. The mitigation is to expose 'fairness-adjusted rank' as a separate field bidders can read, OR to communicate the rerank's impact via the auction's price-to-bid translation.", correct:true},
+          {key:"b", text:"No effect on the auction."},
+          {key:"c", text:"Static has the same issue."},
+          {key:"d", text:"Auctions don't depend on rank."},
+        ]}
+        trap={<>(b), (c), (d) miss the auction-bidder coupling.</>}
+        lens={<>Reranking and auctions interact. Senior MLEs surface the rerank's effect to auction bidders so they can adapt.</>}
+        stretch={<>What's the right communication channel? Per-query 'rerank applied' signal? Per-position calibration?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://biasinrecsys.github.io/sigir2024/" target="_blank" rel="noopener">SIGIR 2024 — <em>Bias and Fairness in Recommender Systems</em> tutorial (slides + papers)</a> — workshop home for the original adaptive-exposure paper.</li>
-        <li><a href="https://arxiv.org/abs/1802.07281" target="_blank" rel="noopener">Singh &amp; Joachims — <em>Fairness of Exposure in Rankings</em> (KDD 2018, paper)</a> — foundational LP formulation of merit-based exposure.</li>
-        <li><a href="https://fairmlbook.org/" target="_blank" rel="noopener">Barocas, Hardt, Narayanan — <em>Fairness and Machine Learning: Limitations and Opportunities</em> (textbook, free)</a> — chapters 3 and 4 cover group fairness definitions and their tradeoffs.</li>
-        <li><a href="https://eugeneyan.com/writing/" target="_blank" rel="noopener">Eugene Yan — recsys writing index (blog)</a> — practitioner posts on fairness and reranking tradeoffs.</li>
-        <li><a href="https://www.youtube.com/watch?v=jIXIuYdnyyk" target="_blank" rel="noopener">Solon Barocas — <em>Tutorial on fairness in machine learning</em> (video)</a> — accessible primer on group-fairness definitions and their conflicts.</li>
+        <li>
+          <a href="https://biasinrecsys.github.io/sigir2024/" target="_blank" rel="noopener"><strong>Fairness-Aware Exposure Allocation via Adaptive Reranking</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(SIGIR 2024)</span>
+          <br/>Canonical reference; names the demand-relaxation and per-query utility-loss failure modes.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/1706.06368" target="_blank" rel="noopener"><strong>Zehlike et al. — FA*IR: A Fair Top-K Ranking Algorithm</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(CIKM 2017)</span>
+          <br/>The canonical static-reranker baseline against which adaptive is the natural improvement.
+        </li>
+        <li>
+          <a href="https://dl.acm.org/doi/10.1145/3643670" target="_blank" rel="noopener"><strong>Counterfactual Explanation for Fairness in Recommendation</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(TOIS 2024)</span>
+          <br/>Sibling concept: training-time data fix that composes with this serve-time constraint enforcer.
+        </li>
       </ul>
     </VIS.Section>
   </main>
 );
+
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>

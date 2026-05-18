@@ -1414,250 +1414,667 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// Provider-side Exposure-DP-CP (counterfactual) — Fairness
+// v2 redo — 30+ trap problems across all six axes (A-F).
+// Concept anchor: augment training with counterfactual exposure samples — "what if seller X had
+// been shown at rank 1?" — to DISENTANGLE exposure bias from true preference. The technique is
+// specifically about producing a preference-only signal that ISN'T conflated with the platform's
+// past exposure decisions; every trap here hinges on that disentanglement (and on the
+// counterfactual augmentation being distinct from generic IPS or rerank-only fairness).
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA &middot; Fairness"
+      pill="RecSys SOTA · Fairness"
       title="Provider-side Exposure-DP-CP (counterfactual)"
-      subtitle="Augment training data with &apos;what if seller X had been ranked at position 1?&apos; counterfactuals to disentangle exposure bias from genuine preference."
+      subtitle="Augment training with counterfactual exposure samples to disentangle exposure bias from true preference — a training-time fix for the marketplace feedback loop where the past policy's exposure decisions contaminate every label."
       byline={[
-        {label: "Paper", value: "TOIS 2024 + SIGIR 2024"},
-        {label: "Domain", value: "Marketplace fairness with exposure feedback loops"},
+        {label: "Source", value: "Counterfactual Explanation for Fairness in Recommendation (TOIS 2024); SIGIR 2024 counterfactual augmentation paper"},
+        {label: "Year", value: "2024"},
+        {label: "Domain", value: "Two-sided marketplaces (DoorDash, Etsy, Uber Eats)"},
       ]}/>
 
     <VIS.TLDR>
-      In a marketplace, vanilla supervised training entangles user preference with the exposure the system already chose to give the seller. <VIS.Term def="Synthetically generated training samples that ask 'what would have happened if a different action had been taken?'. Used to break feedback loops between policy and observed outcomes.">Counterfactual augmentation</VIS.Term> — &quot;what if seller X had appeared at rank 1?&quot; — produces a preference-only signal, the foundation for honest fairness measurement.
+      In a marketplace, the labels you observe (clicks, conversions) are a product of <em>two</em> things — user preference AND platform exposure. A vanilla ranker trained on logged labels learns the entangled product. <strong>Provider-side counterfactual augmentation</strong> generates synthetic training samples of the form "what would the user have done if seller X had been shown at rank 1 instead of rank 8?" via an <VIS.Term def="A model that estimates the probability an item was shown to a user given features — used to weight or augment data so the model learns preference, not exposure.">exposure model</VIS.Term>, producing a <strong>preference-only signal</strong> that downstream rankers can fit without inheriting the past policy's exposure bias. The output is differential-privacy-and-conformal-prediction (DP-CP)-aware: noise is calibrated, coverage is guaranteed, and the augmented dataset can be released without leaking individual sellers. References: <a href="https://dl.acm.org/doi/10.1145/3643670" target="_blank" rel="noopener">Counterfactual Explanation for Fairness in Recommendation (TOIS 2024)</a>; SIGIR 2024 counterfactual exposure augmentation.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        In a two-sided marketplace (DoorDash, Etsy, Airbnb) the ranker decides which sellers a user sees. A click is only possible on a seller that was shown. Training on (user, seller, click) data fits a model that learns BOTH user preference AND the historical exposure pattern. Worse, sellers shown more get clicked more, which trains the next model to show them more — a runaway feedback loop. <VIS.Term def="The condition where the model's predictions affect what data it sees next, which then biases the next training round. Recommender systems are especially prone to this because the policy chooses both the action and the source of feedback.">Feedback loop</VIS.Term> dynamics make raw observational training unreliable for any fairness statement.
+        Two-sided marketplaces have a structural problem: the items you serve today determine the labels you collect today, which trains the model that serves tomorrow. A seller never shown at rank 1 produces zero rank-1 click data — the model learns "this seller doesn't get clicks at rank 1" and continues to under-rank them. The exposure feedback loop locks in past inequity.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart LR
+  L["Logged data: clicks AT past ranks"] --> EM["Exposure model: P(shown | item, user, rank)"]
+  EM --> AUG["Counterfactual augmentation: synthetic 'if shown at rank 1' samples"]
+  L --> AUG
+  AUG --> T["Training set: preference-only signal"]
+  T --> R["Ranker"]
+  R --> P["Serve - feedback loop fixed"]
+  style EM fill:#dbeafe,stroke:#1e40af
+  style AUG fill:#dcfce7,stroke:#166534
+      `} />
+      <p>
+        The counterfactual generator answers "given that this user/item pair was actually shown at rank 8 and not clicked, what would the click rate have been at rank 1?" — using the exposure model to back out the preference component. Then it augments the training set with these counterfactual labels. The result: the ranker fits PREFERENCE, not the policy-mediated joint of preference and exposure.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from IPS, post-hoc reranking, and equal exposure">
+      <p>
+        <strong>Vs Inverse Propensity Scoring (IPS).</strong> IPS reweights observed examples by 1/P(shown). It does not generate new samples — it just down-weights over-represented ones. Counterfactual augmentation goes further: it INVENTS labels for unobserved (item, rank) cells via the exposure model. IPS has lower variance (no synthetic noise) but cannot fill in entirely-unobserved cells (where propensity is zero or near-zero).
       </p>
       <p>
-        Counterfactual augmentation generates samples of the form &quot;at context x, if seller s_alt had been at rank 1 instead of s_orig, what is the predicted click?&quot;. The augmentation comes from an exposure model that estimates P(click | shown, context). Training on the augmented set yields a preference signal that is independent of historical exposure choices.
+        <strong>Vs post-hoc reranking with equal-exposure constraints.</strong> Reranking is a TEST-TIME fix — it accepts whatever ranker you trained and adjusts at serving. Counterfactual augmentation is a TRAINING-TIME fix — the ranker itself learns to predict preference, not policy. Reranking inherits the ranker's biases; counterfactual augmentation removes them at the source.
+      </p>
+      <p>
+        <strong>Vs raw preference labels.</strong> If you had true preference signal (e.g., from an A/B test that uniform-randomized exposure), you wouldn't need counterfactual augmentation. The technique exists because uniform randomization is too costly in production marketplaces (it tanks revenue for the test period).
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
+      <p>
+        Marketplaces with strong exposure feedback loops, asymmetric supply, and provider-side fairness goals (DoorDash restaurant slates, Etsy seller pages, Uber Eats restaurant carousels). NOT for content recommenders where the supply is effectively infinite (e.g., social-media feed where any of 1B posts could fill the slot — the feedback loop is weaker because the cold start is shared across so many items).
       </p>
       <VIS.Mermaid chart={`
 flowchart TB
-  L["Logged (user, seller, click)"]
-  EM["Exposure model"]
-  CF["Counterfactual aug"]
-  T["Training set"]
-  M["Ranker"]
-  L --> EM
-  L --> T
-  EM --> CF --> T --> M
+  Q1{"Two-sided marketplace?"}
+  Q1 -->|Yes| Q2{"Provider-side fairness value (regulatory, business)?"}
+  Q1 -->|No| SKIP["Vanilla supervised + rerank if needed"]
+  Q2 -->|Yes| Q3{"Exposure model trustworthy?"}
+  Q2 -->|No| RR["Post-hoc rerank may suffice"]
+  Q3 -->|Yes| USE["Counterfactual augmentation"]
+  Q3 -->|No| IPS["IPS reweighting; build exposure model first"]
       `} />
-      <VIS.Equation display tex="\hat{p}_{\text{pref}}(u, s) = \mathbb{E}_{\text{rank} \sim \pi_{\text{cf}}}\big[\,p(\text{click} \mid u, s, \text{rank})\,\big]" />
+    </VIS.Section>
+
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Augmentation quality is bounded by exposure-model quality">
+        The counterfactual labels are only as good as the exposure model that generated them. If your exposure model is biased (e.g., undercounts mobile traffic), the counterfactual augmentation INJECTS that bias into the ranker as truth. Validate the exposure model FIRST.
+      </VIS.Callout>
       <p>
-        The right-hand side marginalizes out the rank — what the user would prefer, averaged over a counterfactual exposure policy that does not bake in historical bias.
+        Other named traps: (1) confusing "fixing exposure bias" with "enforcing fairness" — they overlap but are not the same (a perfectly de-biased ranker may still produce unequal outcomes if user preference is itself non-uniform); (2) DP noise interacts with the augmentation — if you add Gaussian noise to the exposure-model output, the counterfactual labels have higher variance than the observed labels, which can dominate training; (3) conformal-prediction coverage on the augmented set is over-claimed when authors compute coverage including augmented samples (which are not real held-out); (4) the augmentation introduces a covariate shift between training and serving distributions if the counterfactual ranks are sampled differently than serving ranks.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from vanilla training">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>Vanilla training</th><th style={{textAlign:"left",padding:8}}>Counterfactual aug</th></tr></thead>
-        <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Disentangles exposure from preference</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>No</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes (if exposure model is right)</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Feedback loop sensitivity</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Amplifies</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Dampens</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Extra component to maintain</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Exposure model</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Failure mode</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Confirms status quo</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Propagates exposure-model errors</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Cost</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Low</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>2-3x training data + extra model</td></tr>
-        </tbody>
-      </table>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
+      <p style={{color:"#475569", marginBottom: 16}}>
+        30+ problems spanning the six taxonomy axes. Redaction litmus: replace "counterfactual augmentation" with "Method X" — if generic fairness or IPS knowledge suffices, the problem is concept-as-costume. Every problem below hinges on a property unique to provider-side counterfactual exposure augmentation (training-time disentanglement via exposure model, the DP-CP packaging, the augmentation-vs-reweighting distinction).
+      </p>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>Two-sided marketplaces where producer-side fairness is a real business KPI (DoorDash restaurant exposure equity, Etsy small-seller share).</li>
-        <li>Cold-start sellers — counterfactual aug gives a preference signal even when the seller has zero clicks.</li>
-        <li>Pre-cursor to any fairness-constrained reranker; you need the unbiased preference signal first.</li>
-        <li>When historical exposure is so unequal that vanilla training will never see the long tail.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <ul>
-        <li><strong>Exposure-model error propagates</strong> — if P(click | shown, context) is wrong, the counterfactual labels are wrong; the ranker learns a biased preference.</li>
-        <li><strong>Exposure != fairness</strong> — fixing exposure bias is necessary but not sufficient for fairness; you still need a fairness objective in training or post-hoc.</li>
-        <li><strong>Compute overhead</strong> — 2-3x training samples, plus the exposure model lifecycle.</li>
-        <li><strong>Validation</strong> — counterfactual claims are hard to validate offline; the gold-standard check is interleaving or randomized exposure A/B.</li>
-      </ul>
-      <VIS.Callout kind="gotcha" title="&quot;Fixing exposure bias&quot; vs &quot;enforcing fairness&quot;">
-        These are distinct. Exposure bias is a measurement problem: the data does not reflect preference because exposure was non-uniform. Fairness is a policy problem: even with unbiased preference, you may want to constrain the deployed policy to meet a group-level exposure floor for business reasons. Counterfactual augmentation fixes the first; a fairness-constrained reranker fixes the second. Confusing them is a common interview trap.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity &amp; comparison</h3>
 
       <VIS.TrapProblem
-        id="cf-p1" difficulty="hard"
-        title="P1 — &quot;Fixing exposure bias&quot; vs &quot;enforcing fairness&quot;"
-        scenario={<>Distinguish these two phrases. When are they the same thing?</>}
+        id="pe-a1"
+        difficulty="hard"
+        title="A1 — Counterfactual augmentation vs IPS reweighting"
+        scenario={<>Your TL says "isn't counterfactual augmentation just IPS with extra steps?" State the actual discriminator. <em>Discriminating insight: IPS reweights observed cells; augmentation invents labels for unobserved cells via the exposure model — the latter handles propensity-zero regions IPS cannot.</em></>}
         options={[
-          {key:"a", text:"They are different. Exposure bias is a data/measurement issue (unbiased preference signal); fairness is a policy objective (constrained allocation). They coincide ONLY when the fairness goal is exactly &apos;train on preference, not on historical exposure&apos;.", correct:true},
-          {key:"b", text:"They are always the same."},
-          {key:"c", text:"Fairness is a strict superset of exposure bias."},
-          {key:"d", text:"Exposure bias is a strict superset of fairness."},
+          {key:"a", text:"IPS reweights observed (item, rank) pairs by 1/propensity — it cannot fix cells where propensity is zero (item never shown at that rank). Counterfactual augmentation generates synthetic labels for those unobserved cells via the exposure model. The fundamental difference: IPS uses only observed data; augmentation invents new data. Augmentation handles structural under-exposure; IPS cannot.", correct:true},
+          {key:"b", text:"They're identical methods with different names."},
+          {key:"c", text:"IPS is for fairness; augmentation is for accuracy."},
+          {key:"d", text:"Augmentation is cheaper to compute."},
         ]}
-        trap={<>(b)(c)(d) collapse the distinction.</>}
-        lens={<>Counterfactual exposure aug debiases the training signal. A fairness-constrained reranker enforces a policy. You can have unbiased preference and still want to over-allocate to small sellers for business reasons. Conversely, you can ship fairness constraints on biased data and produce nonsense. They compose: debias the data first, then enforce policy.</>}
-        stretch={<>Construct an example where debiased data alone produces what looks like fair outcomes.</>}
+        trap={<>(b) is the seductive dismissal. (c) confuses purpose (both target the same exposure-bias problem). (d) inverts (augmentation requires the exposure model — more compute, not less).</>}
+        lens={<>The dimensionality of the fix is the real discriminator. IPS lives in a subspace of observed (item, rank) cells; augmentation fills the entire (item, rank) matrix. When the matrix is sparse (most items never seen at top ranks), augmentation does work IPS cannot.</>}
+        stretch={<>At what level of exposure-matrix sparsity does augmentation strictly beat IPS? Order of magnitude.</>}
       />
 
       <VIS.TrapProblem
-        id="cf-p2" difficulty="hard"
-        title="P2 — Exposure-model error propagation"
-        scenario={<>Your exposure model has 10&#37; error on (shown, context) probabilities. What is the impact on the trained ranker?</>}
+        id="pe-a2"
+        difficulty="medium"
+        title="A2 — 'Exposure bias' vs 'fairness' — definitional trap"
+        scenario={<>A PM asks whether you're fixing "fairness" or "exposure bias." Distinguish. <em>Discriminating insight: exposure bias is a statistical property of the data; fairness is a value-laden constraint on outcomes — fixing one doesn't automatically fix the other.</em></>}
         options={[
-          {key:"a", text:"The counterfactual labels inherit the exposure model error; the ranker learns a preference signal that is biased by the exposure model&apos;s residual.", correct:true},
-          {key:"b", text:"No effect — counterfactual augmentation is robust to exposure errors."},
-          {key:"c", text:"The ranker gets better because of regularization."},
-          {key:"d", text:"The error cancels out in expectation."},
+          {key:"a", text:"Exposure bias is statistical (the joint of preference and exposure is not the marginal of preference); fairness is normative (an equal-treatment constraint on outcomes). Fixing exposure bias removes the policy's contamination of the label, giving you the true preference signal. The preference signal can still be unequal across groups — in which case fairness requires an ADDITIONAL constraint (e.g., exposure floor per group). They overlap when user preference is itself uniform across groups; they diverge when preference is unequal.", correct:true},
+          {key:"b", text:"They're synonyms."},
+          {key:"c", text:"Fairness is statistical; exposure bias is normative."},
+          {key:"d", text:"Both require the same fix."},
         ]}
-        trap={<>(b) overstates robustness. (c) confuses noise with signal. (d) is false unless the error is symmetric AND mean-zero conditional on context, which it almost never is.</>}
-        lens={<>The whole pipeline is a Markov chain: exposure model -&gt; counterfactual labels -&gt; ranker training. Errors propagate. The mitigation is to validate the exposure model with an interleaved A/B or a randomized small-exposure test, and only use counterfactual aug when the exposure model is honest.</>}
-        stretch={<>What experiment validates the exposure model directly?</>}
+        trap={<>(b) is the conflation the problem targets. (c) inverts. (d) is the over-simple answer.</>}
+        lens={<>The provider-side exposure paper makes this distinction explicit. Counterfactual augmentation is necessary but not sufficient for fairness; you still need an exposure floor or post-hoc rerank if user preference produces unequal outcomes.</>}
+        stretch={<>Give one production scenario where exposure-bias-fixed ranker is still 'unfair,' and one where it suffices.</>}
       />
 
       <VIS.TrapProblem
-        id="cf-p3" difficulty="medium" multiSelect
-        title="P3 — Signals that vanilla training is exposure-biased"
-        scenario={<>Pick the symptoms of vanilla training that suggest exposure bias is dominant. Select all that apply.</>}
+        id="pe-a3"
+        difficulty="hard"
+        title="A3 — Counterfactual: what if we just uniform-randomized exposure?"
+        scenario={<>Counterfactual: you A/B test by uniformly randomizing exposure for 10% of traffic for a month, then train on that clean slice. Why is counterfactual augmentation preferred? <em>Discriminating insight: uniform randomization tanks short-term revenue; augmentation uses logged data + an exposure model to get the same preference signal without paying the revenue cost.</em></>}
         options={[
-          {key:"a", text:"Top sellers&apos; CTR predictions match observed, but new-seller CTR predictions are uniformly low.", correct:true},
-          {key:"b", text:"After deployment, top sellers gain more share week over week.", correct:true},
-          {key:"c", text:"A/B tests of a tiny exploration variant show new sellers convert at unexpected rates.", correct:true},
-          {key:"d", text:"Inference latency is high."},
-          {key:"e", text:"The training loss is high."},
+          {key:"a", text:"Uniform-random exposure on 10% of traffic for a month costs millions in unclicked-impression revenue, AND the resulting training set is 10x smaller than the full log. Counterfactual augmentation uses the full logged data + an exposure model to recover the same preference signal without paying that revenue cost or losing data. Tradeoff: augmentation introduces model variance; uniform-rand introduces zero variance but real revenue loss.", correct:true},
+          {key:"b", text:"Uniform randomization is illegal."},
+          {key:"c", text:"There's no benefit to augmentation."},
+          {key:"d", text:"Uniform randomization always wins."},
         ]}
-        trap={<>(d)(e) are unrelated to exposure bias.</>}
-        lens={<>Exposure bias fingerprints: model is confident on what it has seen, uniformly pessimistic on the tail; market share concentrates over time (positive feedback loop); exploration reveals unexpected preference. Latency and loss are orthogonal.</>}
-        stretch={<>What size exploration arm is enough to detect this?</>}
+        trap={<>(b) is rarely true. (c) inverts. (d) misses the revenue cost.</>}
+        lens={<>The strategic value of counterfactual augmentation is REUSE of logged data. You don't pay for exploration; you pay for an exposure model. This is the same tradeoff as IPS but with augmentation as the data-amplification step.</>}
+        stretch={<>What size of exploration slice would tip the tradeoff back toward uniform randomization?</>}
       />
 
       <VIS.TrapProblem
-        id="cf-p4" difficulty="hard"
-        title="P4 — Why is producing counterfactual samples expensive?"
-        scenario={<>You estimate that adding counterfactual augmentation triples training time. Where does the cost come from?</>}
+        id="pe-a4"
+        difficulty="hard"
+        title="A4 — Composition: counterfactual augmentation + post-hoc rerank"
+        scenario={<>You stack counterfactual augmentation in training with adaptive-reranking-for-fairness at serve time. Does this double-count? <em>Discriminating insight: no — they fix different things. Augmentation gives you a preference ranker; rerank trades preference for fairness at serving.</em></>}
         options={[
-          {key:"a", text:"For each logged event, you generate multiple alternative-rank samples and score each via the exposure model; each sample is a new (user, seller, simulated-rank, simulated-click) row.", correct:true},
-          {key:"b", text:"Counterfactuals require a 3x larger model."},
-          {key:"c", text:"Counterfactuals require GPUs."},
-          {key:"d", text:"The compute is fixed; tripling is incorrect."},
+          {key:"a", text:"They compose cleanly. Augmentation produces a ranker that predicts true preference (no exposure contamination). Reranking then accepts that preference signal and trades it off against a fairness constraint at serve time. The augmentation does NOT also enforce fairness — only the rerank does. Stack both.", correct:true},
+          {key:"b", text:"Double-counted; drop the rerank."},
+          {key:"c", text:"Double-counted; drop the augmentation."},
+          {key:"d", text:"They're equivalent."},
         ]}
-        trap={<>(b)(c) confuse data volume with model size. (d) denies the empirical observation.</>}
-        lens={<>The dominant cost is data volume: each logged event spawns k alternative-rank counterfactual rows. The exposure model scores each one. Storage, shuffling, and training all 3x. The mitigation is to subsample counterfactuals smartly — emphasize tail sellers, cap k.</>}
-        stretch={<>How would you choose which logged events to augment most?</>}
+        trap={<>(b), (c) confuse exposure-bias-fixing with fairness-enforcing. (d) is the conflation A2 targeted.</>}
+        lens={<>The augmentation operates in the data layer; the rerank operates in the serving layer. They fix orthogonal problems and stack additively in the production pipeline.</>}
+        stretch={<>What's the right monitoring signal that confirms each layer is doing its job?</>}
       />
 
       <VIS.TrapProblem
-        id="cf-p5" difficulty="medium"
-        title="P5 — Validating counterfactual claims offline"
-        scenario={<>You want to verify offline that your counterfactual augmentation actually fixes exposure bias. Which check is most informative?</>}
+        id="pe-a5"
+        difficulty="hard"
+        title="A5 — Boundary: when is counterfactual augmentation overkill?"
+        scenario={<>Name the regime where vanilla supervised training + IPS reweighting suffices and counterfactual augmentation is overkill. <em>Discriminating insight: when the exposure matrix is dense (every item shown at every rank often enough) — IPS suffices and you avoid the augmentation's model variance.</em></>}
         options={[
-          {key:"a", text:"Run an interleaved offline replay against a uniformly randomized exposure A/B log if you have one; compare predicted vs observed CTR per seller decile.", correct:true},
-          {key:"b", text:"Compare training loss before and after augmentation."},
-          {key:"c", text:"Increase counterfactual sample count until loss converges."},
-          {key:"d", text:"Eyeball the rank list."},
+          {key:"a", text:"When the exposure matrix is dense — every item has been shown at every rank often enough that propensity is bounded away from zero. IPS reweighting handles this without the variance cost of synthetic samples. Common in mature marketplaces with a small item catalog (top-100 restaurants in a city); rare in long-tail marketplaces (millions of Etsy sellers).", correct:true},
+          {key:"b", text:"Augmentation is always preferred."},
+          {key:"c", text:"Augmentation is never preferred."},
+          {key:"d", text:"Boundary depends only on traffic volume."},
         ]}
-        trap={<>(b) does not test bias; (c)(d) are vibes-based.</>}
-        lens={<>The gold-standard check is a randomized exposure log (a small-percentage A/B that shows random items to a fraction of users) that breaks the feedback loop in the data itself. Predictions trained on counterfactual aug should match the randomized log&apos;s empirical CTR per seller decile. Without that data, all offline checks are weak.</>}
-        stretch={<>How small can the randomized A/B be and still give a useful check?</>}
+        trap={<>(b), (c) are dogmatic. (d) misses that traffic per (item, rank) cell matters, not total traffic.</>}
+        lens={<>Sparsity-of-the-exposure-matrix is the boundary. Senior MLEs know to compute this before choosing a method.</>}
+        stretch={<>What's the right metric to threshold on? Min propensity per cell?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>B. Application</h3>
+
+      <VIS.TrapProblem
+        id="pe-b1"
+        difficulty="hard"
+        title="B1 — DoorDash restaurant carousel: choose the right fix"
+        scenario={<>You operate a 4-restaurant carousel at the top of DoorDash home. Catalog: 50k restaurants per metro. Long tail: most restaurants have never appeared in the carousel. Goal: surface high-preference restaurants regardless of past exposure. Pick the fix. <em>Discriminating insight: extreme exposure-matrix sparsity = augmentation; IPS cannot extrapolate to unseen cells.</em></>}
+        options={[
+          {key:"a", text:"Counterfactual augmentation with a strong exposure model — sparsity means IPS hits propensity-zero cells. Train the ranker on logged + synthetic counterfactuals. Optionally rerank at serve for explicit fairness floor.", correct:true},
+          {key:"b", text:"IPS only — augmentation is over-engineering."},
+          {key:"c", text:"Uniform-random the carousel for a month."},
+          {key:"d", text:"Skip both — just rerank at serve."},
+        ]}
+        trap={<>(b) cannot handle propensity-zero. (c) is the costly path A3 covered. (d) inherits the ranker's exposure bias.</>}
+        lens={<>Long-tail marketplaces are the canonical augmentation use case. The senior decision: which fix to use depends on the sparsity of YOUR exposure matrix, not on what's fashionable.</>}
+        stretch={<>How large does the exposure model need to be for a 50k-restaurant catalog? What features matter most?</>}
       />
 
       <VIS.TrapProblem
-        id="cf-p6" difficulty="hard" multiSelect
-        title="P6 — Components needed for an exposure-aware training pipeline"
-        scenario={<>Pick the components you must have in production to run counterfactual exposure augmentation. Select all that apply.</>}
+        id="pe-b2"
+        difficulty="hard"
+        title="B2 — 'Just add a fairness loss term' — what's wrong?"
+        scenario={<>A teammate proposes adding a per-group exposure-equality term directly to the ranker's loss. Why is this NOT counterfactual augmentation, and what does it miss? <em>Discriminating insight: the fairness loss fights the data but doesn't fix the data — the ranker still sees biased labels and just over-rides them at the last layer.</em></>}
         options={[
-          {key:"a", text:"Exposure model that estimates P(click | shown, context).", correct:true},
-          {key:"b", text:"Logged propensities or position information for each shown event.", correct:true},
-          {key:"c", text:"A counterfactual sample generator that walks alternative ranks.", correct:true},
-          {key:"d", text:"A small uniformly-randomized exposure A/B arm for validation.", correct:true},
-          {key:"e", text:"A separate vector database."},
+          {key:"a", text:"A loss-term fix fights the biased data in the gradient — the model learns to balance two opposing signals (the biased labels and the fairness penalty), often landing at a noisy compromise. Counterfactual augmentation fixes the DATA itself: the ranker sees preference-only labels and doesn't need to fight the gradient. The two methods can be combined but the augmentation produces cleaner training dynamics.", correct:true},
+          {key:"b", text:"Fairness loss is illegal."},
+          {key:"c", text:"Fairness loss is strictly better."},
+          {key:"d", text:"They're identical."},
         ]}
-        trap={<>(e) is a retrieval infra concern, not part of the exposure pipeline.</>}
-        lens={<>The pipeline is: log positions, train exposure model, generate counterfactuals, validate with randomized A/B, train ranker. All four (a-d) are required; the vector DB is for a different stage of the system.</>}
-        stretch={<>What if you cannot get randomized A/B approval?</>}
+        trap={<>(c), (d) misunderstand the augmentation-vs-loss distinction. (b) is rarely true.</>}
+        lens={<>Senior MLEs know that fixing the data is usually cleaner than fighting it via loss terms. The augmentation produces a better-conditioned optimization problem because the labels themselves are unbiased.</>}
+        stretch={<>When IS the fairness loss approach preferred over augmentation? (Hint: small N, untrusted exposure model.)</>}
       />
 
       <VIS.TrapProblem
-        id="cf-p7" difficulty="medium"
-        title="P7 — Cold-start sellers"
-        scenario={<>A new seller has zero clicks in the logs. How does counterfactual augmentation help?</>}
+        id="pe-b3"
+        difficulty="medium"
+        title="B3 — Pitch counterfactual augmentation to your VP"
+        scenario={<>VP asks why this is worth a 3-month implementation. Give the one-sentence pitch that <em>requires</em> understanding counterfactual augmentation's specific mechanism. <em>Discriminating insight: the pitch must turn on the data-fix vs serve-fix distinction AND the long-tail extrapolation capability — not on generic 'fairness improves.'</em></>}
         options={[
-          {key:"a", text:"The exposure model can score &apos;what if this seller were at rank 1&apos; using features (category, price, photos) without needing click history; the counterfactual label seeds the cold-start signal.", correct:true},
-          {key:"b", text:"It does not help — cold-start needs explicit exploration."},
-          {key:"c", text:"It hurts cold-start because the augmentation amplifies popular sellers."},
-          {key:"d", text:"It only helps if the seller has at least 100 impressions."},
+          {key:"a", text:"'Our marketplace has a long-tail seller problem.' (Generic — true for any approach.)"},
+          {key:"b", text:"'Counterfactual augmentation lets the RANKER itself learn true preference instead of the biased preference-times-exposure joint that vanilla training learns — and the augmentation extrapolates to long-tail sellers that IPS cannot reweight because they have zero past exposure. This means our top-of-carousel slot is allocated by user preference, not by which sellers our 2022 model happened to show, and the fix lives in training so we are not paying a serving-time tax forever.'", correct:true},
+          {key:"c", text:"'It improves NDCG.' (Metric-only, no mechanism.)"},
+          {key:"d", text:"'Industry best practice.' (Authority, not mechanism.)"},
         ]}
-        trap={<>(b) overstates — augmentation IS a form of exploration. (c) reverses the effect. (d) is fabricated.</>}
-        lens={<>Counterfactual augmentation is feature-based, not click-based. New sellers can have predicted counterfactual clicks even with zero history, as long as the exposure model uses content features. It is a soft alternative to explicit exploration that does not require ramping a randomized arm.</>}
-        stretch={<>How does this compare to Thompson sampling for cold-start?</>}
+        trap={<>(a) survives redaction (replace 'counterfactual augmentation' with 'any method'). (c), (d) are mechanism-free.</>}
+        lens={<>B3 pitches must fail the redaction test. (b) names data-fix-vs-serve-fix, long-tail extrapolation, and the propagation through the production stack — all specific to counterfactual augmentation.</>}
+        stretch={<>If VP says 'we already do post-hoc rerank' — what's the one-line follow-up?</>}
       />
 
       <VIS.TrapProblem
-        id="cf-p8" difficulty="hard" mode="ordered"
-        title="P8 — Order the pipeline rollout"
-        scenario={<>You are rolling out counterfactual augmentation for the first time. Order the steps. Wrong moves are unranked.</>}
+        id="pe-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use counterfactual augmentation"
+        scenario={<>Name a production setting where augmentation is the wrong tool. <em>Discriminating insight: low-trust exposure model OR effectively-infinite catalog (e.g., social feed) — both make the augmentation inputs unreliable.</em></>}
         options={[
-          {key:"a", text:"Ship a small uniformly-randomized exposure A/B (1&#37; traffic) and collect logs.", order:1},
-          {key:"b", text:"Train and validate the exposure model on those randomized logs.", order:2},
-          {key:"c", text:"Generate counterfactual training samples for a held-out window.", order:3},
-          {key:"d", text:"Train the ranker with augmented data; verify predictions match randomized A/B per decile.", order:4},
-          {key:"e", text:"Ramp the augmented ranker behind a guarded A/B against the vanilla ranker.", order:5},
-          {key:"f", text:"Skip the randomized A/B and train the exposure model on observational logs."},
-          {key:"g", text:"Ship the new ranker without comparing it against the vanilla baseline."},
+          {key:"a", text:"When your exposure model is poorly calibrated OR the catalog is effectively-infinite (social feeds with billions of posts). Untrusted exposure model means the counterfactual labels inject the exposure model's errors into the ranker as truth. Infinite catalog means there's no provider-side fairness goal (no specific seller to protect; any of 1B items could fill the slot).", correct:true},
+          {key:"b", text:"Always — augmentation is always wrong."},
+          {key:"c", text:"Never — augmentation always works."},
+          {key:"d", text:"Only depends on traffic volume."},
         ]}
-        trap={<>(f) creates a circular dependency (the model that creates the labels is trained on biased data). (g) loses the comparison.</>}
-        lens={<>The dependency order is: randomized logs -&gt; honest exposure model -&gt; counterfactual labels -&gt; ranker -&gt; A/B vs baseline. Each step depends on the previous one being unbiased. Skipping the randomized A/B is the headline failure that turns counterfactual aug into elaborate observational bias laundering.</>}
-        stretch={<>If you cannot get randomized A/B approval, what is the next-best validation?</>}
+        trap={<>(b), (c) are dogmatic. (d) misses the trust and catalog-shape conditions.</>}
+        lens={<>The right framing: counterfactual augmentation is a TRADE — you trade revenue (no exploration) for variance (synthetic labels). The trade is worth it iff the exposure model is trustworthy AND there's a defined provider-side fairness goal.</>}
+        stretch={<>How would you 'audit' an exposure model before trusting it for augmentation?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      <VIS.TrapProblem
+        id="pe-c1"
+        difficulty="hard"
+        title="C1 — The exposure model: what does it predict?"
+        scenario={<>You build the exposure model. What is its target variable? <em>Discriminating insight: P(shown at rank R | item, user, context) — NOT P(click) and NOT P(rank R is correct).</em></>}
+        options={[
+          {key:"a", text:"P(item shown at rank R | item features, user features, context) — the probability the past serving policy decided to place this item at this rank for this user. It is purely an exposure probability, no label information. Fitting this requires logged (item, rank, served-or-not) tuples; clicks are NOT used.", correct:true},
+          {key:"b", text:"P(click | item, user) — clicks are the target."},
+          {key:"c", text:"P(rank R is correct given preference) — a calibration metric."},
+          {key:"d", text:"P(item exists)."},
+        ]}
+        trap={<>(b) is the seductive conflation. (c), (d) are mis-specified.</>}
+        lens={<>The exposure model is about the SERVING POLICY, not the user. Mixing in click information breaks the disentanglement — you'd be predicting the same biased joint you're trying to remove.</>}
+        stretch={<>What features matter most for the exposure model? Why might the past policy's features be incomplete?</>}
       />
 
       <VIS.TrapProblem
-        id="cf-p9" difficulty="medium"
-        title="P9 — Counterfactual aug vs IPS"
-        scenario={<>How does counterfactual augmentation compare to inverse propensity scoring (IPS) for the same problem?</>}
+        id="pe-c2"
+        difficulty="hard"
+        title="C2 — The augmentation step: where does the synthetic label come from?"
+        scenario={<>How do you generate a counterfactual label "what if rank 1 instead of rank 8"? <em>Discriminating insight: you do NOT predict P(click | rank 1) from scratch — you DIVIDE the observed click signal by the propensity ratio to back out the preference component.</em></>}
         options={[
-          {key:"a", text:"IPS reweights existing logged events to estimate counterfactual rewards; counterfactual augmentation synthesizes new events. They tackle similar bias from opposite directions.", correct:true},
-          {key:"b", text:"They are identical."},
-          {key:"c", text:"IPS is for evaluation, counterfactual aug is for training — they never overlap."},
-          {key:"d", text:"Counterfactual aug is strictly better than IPS."},
+          {key:"a", text:"For each (user, item) pair observed at rank R with click y, compute the propensity ratio P(shown at rank 1) / P(shown at R) using the exposure model. The counterfactual label is a Bayesian update on y using this ratio (or, in the simplest case, IPW: y_cf = y * P(shown at rank 1) / P(shown at R)). The synthesis is RE-WEIGHTING observed clicks by the propensity difference — not predicting clicks from scratch.", correct:true},
+          {key:"b", text:"Pre-train a click model and predict P(click | rank 1)."},
+          {key:"c", text:"Generate clicks via a GAN."},
+          {key:"d", text:"Use the exposure model's output directly as the click label."},
         ]}
-        trap={<>(b) collapses. (c) under-states the overlap. (d) over-states.</>}
-        lens={<>IPS = reweight existing events; var explodes for low propensity. Counterfactual aug = synthesize new events from an exposure model; bias from the model. Both fight the same exposure bias. Stacking them (IPS-weighted training on counterfactual-augmented data) is a real production pattern.</>}
-        stretch={<>When does counterfactual aug add over IPS?</>}
+        trap={<>(b) is the seductive 'just predict it' answer — but you've lost the connection to the actual user's revealed preference. (c), (d) are wrong.</>}
+        lens={<>The augmentation is causal: you keep the user's revealed preference and re-attribute it via propensity. Predicting clicks from scratch loses the user-specific signal.</>}
+        stretch={<>What's the variance of the IPW-style synthetic label? When does it become too noisy?</>}
       />
 
       <VIS.TrapProblem
-        id="cf-p10" difficulty="hard" multiSelect
-        title="P10 — Telltales of a broken exposure model"
-        scenario={<>Pick the signals that suggest your exposure model is broken (and therefore the counterfactual labels are unreliable). Select all that apply.</>}
+        id="pe-c3"
+        difficulty="hard"
+        title="C3 — What's DROPPED from vanilla supervised training?"
+        scenario={<>List what counterfactual augmentation discards from the vanilla supervised baseline. <em>Discriminating insight: the policy's exposure decisions are explicitly removed — that's the whole point. Also dropped: the joint structure of (preference, exposure) that vanilla learned.</em></>}
+        multiSelect
         options={[
-          {key:"a", text:"Exposure model predicts identical P(click) regardless of position.", correct:true},
-          {key:"b", text:"Counterfactual-augmented predictions disagree with randomized A/B by &gt; 5&#37; per decile.", correct:true},
-          {key:"c", text:"Exposure model AUC on a held-out fold is near 0.5.", correct:true},
-          {key:"d", text:"The new ranker has lower top-1 latency."},
-          {key:"e", text:"User feedback dashboard shows complaints."},
+          {key:"a", text:"The past policy's exposure decisions are explicitly removed from the training signal.", correct:true},
+          {key:"b", text:"The joint structure of (preference, exposure) — only marginal preference survives.", correct:true},
+          {key:"c", text:"Any information that the exposure model failed to capture (e.g., serving features not in the model).", correct:true},
+          {key:"d", text:"User preference signal."},
+          {key:"e", text:"Item-level features."},
         ]}
-        trap={<>(d) is a serving metric. (e) is a downstream user signal, not an exposure-model signal.</>}
-        lens={<>Diagnose the exposure model directly: position should affect P(click); predictions should match randomized logs; AUC should be meaningfully above 0.5. User complaints come too late, latency is orthogonal. The exposure model failure is upstream of every other signal.</>}
-        stretch={<>What automated alert do you set on (a)-(c)?</>}
+        trap={<>(d) inverts (preference is PRESERVED). (e) is wrong (item features still used).</>}
+        lens={<>The technique's design choice is 'drop exposure, keep preference.' Knowing what's dropped vs preserved tells you when augmentation is the right hammer.</>}
+        stretch={<>Of the three things dropped, which is hardest to verify is actually dropped?</>}
       />
+
+      <VIS.TrapProblem
+        id="pe-c4"
+        difficulty="hard"
+        mode="ordered"
+        title="C4 — Rank knobs by 'breaks the augmentation if mis-set'"
+        scenario={<>Order from most-catastrophic to least: (a) exposure-model calibration, (b) propensity clipping threshold, (c) augmentation-to-real sample ratio, (d) ranker architecture. <em>Discriminating insight: exposure-model calibration is dominant; clipping is a known fix; ratio is tuning; architecture is mostly orthogonal.</em></>}
+        options={[
+          {key:"a", text:"Exposure-model calibration — drives all downstream signal quality.", order:1},
+          {key:"b", text:"Propensity clipping threshold — extreme propensities create unbounded variance in synthetic labels.", order:2},
+          {key:"c", text:"Augmentation-to-real sample ratio — controls how much synthetic noise enters training.", order:3},
+          {key:"d", text:"Ranker architecture — mostly orthogonal."},
+        ]}
+        trap={<>Candidates often rank architecture high (it's the most 'model-y' choice) but it's last because augmentation is upstream of any architecture.</>}
+        lens={<>The exposure model is the load-bearing component. Senior MLEs know to invest in calibrating IT before tuning anything else.</>}
+        stretch={<>What's the right propensity clipping threshold? Why is it both data- and goal-dependent?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-c5"
+        difficulty="hard"
+        title="C5 — Data assumption: 'positivity' — what breaks if violated?"
+        scenario={<>The causal-inference 'positivity' assumption is P(shown at any rank) larger than 0 for all (user, item). What breaks if violated? <em>Discriminating insight: items with zero past exposure get propensity-zero — augmentation requires the exposure model to extrapolate, which is structurally impossible from data alone.</em></>}
+        options={[
+          {key:"a", text:"Items never shown at any rank have propensity zero — the IPW ratio in the augmentation formula blows up (division by zero). The exposure model MUST extrapolate to never-seen cells, which requires structural assumptions (e.g., feature-based generalization) that may not hold. The augmentation's correctness is bounded by the extrapolation quality.", correct:true},
+          {key:"b", text:"Positivity is irrelevant to this method."},
+          {key:"c", text:"All items are always shown; positivity never fails."},
+          {key:"d", text:"Positivity is automatic given enough data."},
+        ]}
+        trap={<>(b), (c), (d) are wrong; (c) is the empirically-false assumption.</>}
+        lens={<>Positivity is a structural assumption inherited from causal inference. Knowing it's required tells you to MONITOR exposure-matrix density before deploying augmentation.</>}
+        stretch={<>What's the right monitor? Per-item exposure histogram? Per-(item, rank) propensity histogram?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      <VIS.TrapProblem
+        id="pe-d1"
+        difficulty="hard"
+        title="D1 — 'Counterfactual = causal; this is causal inference'"
+        scenario={<>Engineer says "counterfactual augmentation is causal inference, so it solves the fairness problem completely." Why is this overclaim wrong? <em>Discriminating insight: causal disentanglement of exposure from preference removes ONE bias source, not all of them. Fairness as a value still needs an explicit constraint.</em></>}
+        options={[
+          {key:"a", text:"Counterfactual augmentation removes the EXPOSURE confounder from the training signal — that's a causal-inference move. But fairness is a NORMATIVE constraint on outcomes, and even causally-clean preference signals can produce unequal group outcomes (because user preference itself may correlate with protected attributes). Causal inference is a tool; fairness is a value. They're connected but not identical.", correct:true},
+          {key:"b", text:"Causal inference solves all bias problems."},
+          {key:"c", text:"Counterfactual augmentation has nothing to do with causality."},
+          {key:"d", text:"Fairness is automatic given clean data."},
+        ]}
+        trap={<>(b), (d) are the overclaims. (c) under-claims.</>}
+        lens={<>Causal inference and fairness are adjacent fields with overlapping vocabulary ('counterfactual'). Senior MLEs distinguish them carefully — augmentation handles the causal part; an exposure floor or rerank handles the normative part.</>}
+        stretch={<>Construct a scenario where the causally-clean preference signal still violates demographic parity. What would you add?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: 'exposure model is correct'"
+        scenario={<>You assume the exposure model is correct. What follows-on beliefs collapse if it isn't? <em>Discriminating insight: every downstream guarantee — counterfactual labels, fairness audits, DP coverage — rests on the exposure model's correctness.</em></>}
+        multiSelect
+        options={[
+          {key:"a", text:"'Counterfactual labels are unbiased' — wrong; bias in exposure model becomes bias in labels.", correct:true},
+          {key:"b", text:"'The ranker learns true preference' — wrong; it learns preference-mediated-by-exposure-model-errors.", correct:true},
+          {key:"c", text:"'Fairness audits on the augmented set are reliable' — wrong; audits see the same biased synthetic labels.", correct:true},
+          {key:"d", text:"'Conformal-prediction coverage holds on augmented samples' — wrong; coverage was computed assuming the augmented samples are real.", correct:true},
+          {key:"e", text:"'Latency improves' — actually irrelevant and unaffected."},
+        ]}
+        trap={<>(e) is the only inheritance unaffected. The other four ALL collapse on exposure-model error — and many teams ship without auditing.</>}
+        lens={<>One wrong assumption (correct exposure model) cascades into FOUR downstream wrongs. The senior MLE audits the exposure model FIRST.</>}
+        stretch={<>What's the cheapest single audit that catches exposure-model error before deploying augmentation?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-d3"
+        difficulty="hard"
+        title="D3 — Junior fixes fairness; senior fixes upstream first"
+        scenario={<>Fairness audit fails. Junior reflex: add a fairness loss term. What does the senior do? <em>Discriminating insight: senior first asks 'is the data biased?' — if yes, fix data via augmentation; if no, add a fairness constraint; junior conflates the two.</em></>}
+        options={[
+          {key:"a", text:"Senior first investigates whether the data itself is biased (compare propensity-weighted vs naive estimates of preference). If the bias comes from exposure, augment the data. If the data is clean but outcomes are still unequal, add a fairness constraint. The order matters: fixing data first gives a cleaner foundation for any subsequent fairness constraint.", correct:true},
+          {key:"b", text:"Add fairness loss immediately."},
+          {key:"c", text:"Skip the audit."},
+          {key:"d", text:"Retrain from scratch."},
+        ]}
+        trap={<>(b), (c), (d) all skip the diagnostic step.</>}
+        lens={<>The senior move: diagnose before treating. The fairness audit fires for two distinct reasons (biased data vs unequal preference); the right response differs.</>}
+        stretch={<>Design a 2-line decision tree the team can apply when the audit fires.</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: NDCG drops 1% post-launch"
+        scenario={<>You ship counterfactual augmentation. Offline NDCG (on logged biased labels) drops 1%. Three plausible causes: (1) augmentation broke the ranker, (2) NDCG is now measuring the biased baseline against the de-biased ranker, (3) feature drift. Diagnose. <em>Discriminating insight: NDCG on biased logged labels is now the WRONG metric — your ranker outperforms on TRUE preference but underperforms on the contaminated label.</em></>}
+        options={[
+          {key:"a", text:"Almost certainly (2): NDCG computed on the original biased labels rewards a ranker that REPRODUCES the past policy's exposure decisions. The new ranker, trained on de-biased labels, deliberately deviates. The 1% drop is the SIGNAL of success, not a regression. The right metric is NDCG on a held-out exploration slice OR an offline IPS-corrected NDCG.", correct:true},
+          {key:"b", text:"Augmentation broke the ranker."},
+          {key:"c", text:"Feature drift."},
+          {key:"d", text:"GPU bug."},
+        ]}
+        trap={<>(b), (c), (d) attribute to the wrong cause. The metric is the problem, not the ranker.</>}
+        lens={<>When you change the data-cleaning step, your offline metric may need to change too. Senior MLEs anticipate this — they fix the metric BEFORE deploying the data fix.</>}
+        stretch={<>What's the right metric to use during the A/B test of counterfactual augmentation?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-d5"
+        difficulty="medium"
+        title="D5 — 'More synthetic samples is always better'"
+        scenario={<>Engineer proposes 10x augmenting (10 synthetic samples per real). Why is this often worse? <em>Discriminating insight: each synthetic sample has variance from the exposure model; too many synthetics drown out the real signal.</em></>}
+        options={[
+          {key:"a", text:"Each synthetic sample carries the exposure model's variance. Stacking 10 synthetics per real sample multiplies that variance contribution to the training loss. The ranker now fits the noise more than the signal — accuracy degrades. The right ratio is typically 1-3x and tuned empirically.", correct:true},
+          {key:"b", text:"More data is always better."},
+          {key:"c", text:"Synthetic samples have zero variance."},
+          {key:"d", text:"Ratio doesn't matter."},
+        ]}
+        trap={<>(b), (c), (d) miss the variance compounding.</>}
+        lens={<>Synthetic data has variance from the generator. More-is-better is true ONLY when synthetic samples are as low-variance as real ones, which is rarely the case for IPW-style augmentation.</>}
+        stretch={<>How would you choose the right ratio? Cross-validation? A diagnostic on the calibration set?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>E. Operations</h3>
+
+      <VIS.TrapProblem
+        id="pe-e1"
+        difficulty="hard"
+        title="E1 — Production gotcha: exposure model staleness"
+        scenario={<>The serving policy changed last week. You re-fit the augmentation but kept the old exposure model. What's the failure? <em>Discriminating insight: the exposure model now predicts the OLD policy's exposure decisions; counterfactual labels are computed against an outdated baseline.</em></>}
+        options={[
+          {key:"a", text:"The exposure model was trained on logs from the old policy. After the policy changed, the actual P(shown at rank R) is different, but your model still predicts the old probabilities. Counterfactual labels are now computed against a fictional baseline that no longer exists. The augmentation systematically biases the ranker toward what the old policy would have done.", correct:true},
+          {key:"b", text:"Exposure model never goes stale."},
+          {key:"c", text:"This is a Platt problem."},
+          {key:"d", text:"Latency only."},
+        ]}
+        trap={<>(b), (c), (d) miss the staleness mechanism.</>}
+        lens={<>Exposure model must be refit whenever the serving policy changes. Senior MLEs tie its retrain cadence to policy deploys, not to the calendar.</>}
+        stretch={<>How would you detect exposure-model staleness automatically?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-e2"
+        difficulty="hard"
+        title="E2 — Friday 3am: provider-side complaints spiking"
+        scenario={<>You shipped counterfactual augmentation Thursday. Friday 3am: 30 medium-tail sellers email customer support saying "we're getting LESS traffic than before." Aggregate fairness metrics look better. Why this specific failure mode? <em>Discriminating insight: 'fairness improved' is marginal; specific sellers who BENEFITED from the old policy's biases LOST that advantage — and they're the loud ones.</em></>}
+        options={[
+          {key:"a", text:"Aggregate fairness improved (the de-biased ranker spreads exposure more evenly across the long tail) — but specific sellers who DISPROPORTIONATELY benefited from the past policy's biased exposure decisions are now getting LESS traffic. They're not 'unfairly losing' — they were 'unfairly winning' before. The complaint flow is a sign of correctly working augmentation, not a bug. Communication and graceful rollout (e.g., gradual ramp) would have mitigated.", correct:true},
+          {key:"b", text:"Augmentation broke."},
+          {key:"c", text:"GPU thermal."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c), (d) misdiagnose; this is the expected dynamic of correctly fixing a feedback loop.</>}
+        lens={<>Fixing a biased feedback loop ALWAYS produces winners and losers. The losers are vocal; the winners are dispersed. Senior MLEs plan the rollout (and the comms) around this expected dynamic.</>}
+        stretch={<>What's the right ramp policy? 1%-5%-25%? Per-seller cap on traffic shift per week?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-e3"
+        difficulty="hard"
+        title="E3 — Implementation specific: which library?"
+        scenario={<>Pick the right open-source tooling for the augmentation step. <em>Discriminating insight: counterfactual augmentation is NOT IPS — most "counterfactual learning" libraries are IPS-only and don't synthesize new samples.</em></>}
+        options={[
+          {key:"a", text:"Most 'counterfactual learning' libraries (e.g., DoWhy, scikit-uplift, EconML) implement IPS / doubly-robust estimators but NOT the augmentation step where synthetic (item, rank, label) tuples are generated. The augmentation is typically a custom build: exposure model in PyTorch, propensity ratio computation in NumPy, augmented dataset materialized to Parquet. Plan for in-house code, not a library import.", correct:true},
+          {key:"b", text:"DoWhy implements it out of the box."},
+          {key:"c", text:"PyTorch has a built-in counterfactual loss."},
+          {key:"d", text:"All libraries support it."},
+        ]}
+        trap={<>(b), (c), (d) are false.</>}
+        lens={<>Knowing the library landscape is part of the senior role. Counterfactual augmentation is a 2024 technique without mature library support; budget for build, not buy.</>}
+        stretch={<>If you had to pick ONE existing primitive to start from, which? Why?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-e4"
+        difficulty="hard"
+        mode="ordered"
+        title="E4 — Rollout order for counterfactual augmentation"
+        scenario={<>Phases: (a) build & validate exposure model, (b) generate counterfactual augmented dataset, (c) train ranker on augmented data, (d) shadow scoring with new ranker, (e) mirror traffic ramp, (f) full deploy. Order them. <em>Discriminating insight: exposure model validation MUST come before any augmentation — otherwise you're augmenting on garbage.</em></>}
+        options={[
+          {key:"a", text:"Build & validate exposure model (must be calibrated; positivity must hold).", order:1},
+          {key:"b", text:"Generate counterfactual augmented dataset.", order:2},
+          {key:"c", text:"Train ranker on augmented data.", order:3},
+          {key:"d", text:"Shadow scoring with new ranker.", order:4},
+          {key:"e", text:"Mirror traffic ramp.", order:5},
+          {key:"f", text:"Full deploy.", order:6},
+          {key:"g", text:"Skip exposure model validation — train and ship."},
+        ]}
+        trap={<>(g) is the time-pressure mistake that produces F2/F3 failures.</>}
+        lens={<>The exposure model is upstream of every downstream guarantee. Skipping its validation is the most common production failure for this technique.</>}
+        stretch={<>What's the exposure-model validation step that takes the LEAST time but catches the MOST issues?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-e5"
+        difficulty="hard"
+        title="E5 — Reproducibility: the TOIS 2024 paper's results"
+        scenario={<>You can't reproduce the TOIS 2024 paper's '5% provider-side fairness lift.' Which experimental property must match? <em>Discriminating insight: their exposure-matrix sparsity, their exposure-model calibration quality, and their propensity-clipping threshold — none of which are typically published.</em></>}
+        multiSelect
+        options={[
+          {key:"a", text:"Their exposure-matrix sparsity profile (long-tail distribution shape).", correct:true},
+          {key:"b", text:"Their exposure-model calibration (ECE, per-segment).", correct:true},
+          {key:"c", text:"Their propensity-clipping threshold and synthetic-to-real ratio.", correct:true},
+          {key:"d", text:"Their GPU vendor."},
+          {key:"e", text:"Their random seed."},
+        ]}
+        trap={<>(d), (e) are minor.</>}
+        lens={<>Fairness benchmarks rarely transfer because the exposure profile is data-specific and the calibration is rarely published. Treat 5% lifts as upper bounds.</>}
+        stretch={<>Design a reproducible counterfactual augmentation benchmark. What does it standardize?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-e6"
+        difficulty="hard"
+        title="E6 — Monitoring exposure-matrix sparsity"
+        scenario={<>Pick the right monitor for catching positivity violations before they break augmentation. <em>Discriminating insight: per-(item, rank) propensity histogram with a min-propensity threshold — generic 'coverage metrics' miss the cells that are critically near zero.</em></>}
+        options={[
+          {key:"a", text:"Per-(item, rank) propensity histogram with a min-propensity alarm. If any cell drops below the clipping threshold, alarm. This catches structural exposure failures BEFORE the augmentation produces unbounded-variance labels.", correct:true},
+          {key:"b", text:"Aggregate click-through rate."},
+          {key:"c", text:"Daily NDCG."},
+          {key:"d", text:"Latency."},
+        ]}
+        trap={<>(b), (c), (d) are downstream symptoms or unrelated.</>}
+        lens={<>The right monitor watches the propensity SUPPORT (the cells the augmentation needs), not the realized clicks. Senior monitoring move: watch the CAUSE (sparsity) not the EFFECT (label noise).</>}
+        stretch={<>What's the right alarm threshold? Why is per-(item, rank) needed rather than just per-item?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>F. Failure modes</h3>
+
+      <VIS.TrapProblem
+        id="pe-f1"
+        difficulty="hard"
+        title="F1 — Edge case: zero-exposure new sellers"
+        scenario={<>A new seller joins the marketplace. Zero past exposure. What's the augmentation's behavior? <em>Discriminating insight: propensity is exactly zero — IPW blows up; augmentation must fall back to a structural prior (e.g., feature-based extrapolation from similar sellers).</em></>}
+        options={[
+          {key:"a", text:"Counterfactual augmentation cannot generate synthetic labels for zero-propensity cells (division by zero). Fall back to a feature-based exposure model that extrapolates from similar sellers, OR explicit cold-start exploration traffic for new sellers. Standard augmentation is silent on this case and silently drops new sellers from the training set — exactly the wrong behavior for the fairness goal.", correct:true},
+          {key:"b", text:"Augmentation handles zero exposure natively."},
+          {key:"c", text:"Drop new sellers from training."},
+          {key:"d", text:"This isn't a real edge case."},
+        ]}
+        trap={<>(b) is false. (c) is what augmentation would silently do, which is the failure mode. (d) is wrong.</>}
+        lens={<>The positivity-violation edge case is the most common production failure of counterfactual augmentation — and it's especially ironic because new-seller fairness is often the GOAL of using the method.</>}
+        stretch={<>How do you allocate exploration budget across new sellers efficiently?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: an attacker games the exposure model"
+        scenario={<>An adversarial seller manipulates features to inflate their propensity in the exposure model (e.g., self-clicks to look more "served"). What's the attack's effect on the augmentation? <em>Discriminating insight: inflated propensity makes counterfactual labels too small (the IPW ratio shrinks) — adversary appears LESS preferred than they actually are; the system under-ranks them.</em></>}
+        options={[
+          {key:"a", text:"Inflated propensity reduces the IPW ratio P(rank 1) / P(rank R), making the counterfactual labels smaller. The ranker learns the attacker is less preferred than they actually are. Counterintuitively, the attacker's manipulation HURTS their ranking. Defense: validate exposure model on adversarial features; don't include self-clicks.", correct:true},
+          {key:"b", text:"Attacker ranking improves."},
+          {key:"c", text:"No effect."},
+          {key:"d", text:"System crashes."},
+        ]}
+        trap={<>(b) is the naive answer (attacker expects 'more exposure = more rank'). (c), (d) are wrong.</>}
+        lens={<>The augmentation's IPW formula INVERTS the naive intuition — feature manipulation that inflates exposure hurts ranking. Senior insight: counterfactual augmentation has counterintuitive robustness properties.</>}
+        stretch={<>Could an adversary game the system in the OTHER direction (deflated propensity)? What would that attack look like?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-f3"
+        difficulty="hard"
+        title="F3 — Reverse engineering: fairness audit passes, real outcomes still skew"
+        scenario={<>Symptom: fairness audit on the augmented training set shows balanced exposure across protected groups. After deploying, realized exposure remains skewed. Which augmentation-specific cause? <em>Discriminating insight: covariate shift between training and serving distributions — the augmentation samples ranks differently than serving does.</em></>}
+        options={[
+          {key:"a", text:"The counterfactual augmentation sampled synthetic ranks uniformly (or via some sampling distribution) that doesn't match the serving rank distribution. At serving, the rank distribution is determined by user impressions per session, which is itself skewed. The ranker, trained on a different rank distribution than it serves, produces biased outcomes. Fix: match the augmentation's rank-sampling distribution to the serving rank distribution.", correct:true},
+          {key:"b", text:"Audit is broken."},
+          {key:"c", text:"Augmentation never works."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c), (d) miss the covariate-shift mechanism.</>}
+        lens={<>Training-serving covariate shift is THE most common silent failure of augmentation — the ranker passes its own offline audit but fails online. Match the training and serving distributions.</>}
+        stretch={<>How would you detect this covariate shift BEFORE deploy?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-f4"
+        difficulty="hard"
+        title="F4 — Paper-named failure: DP noise + augmentation interaction"
+        scenario={<>The DP-CP variant adds Gaussian noise to the exposure model output for differential privacy. The TOIS 2024 paper warns about a specific interaction. Name it. <em>Discriminating insight: DP noise on propensity inflates IPW variance — synthetic labels' effective variance is dominated by the DP epsilon at small epsilon (strict privacy).</em></>}
+        options={[
+          {key:"a", text:"DP Gaussian noise on the exposure model's propensity output propagates through the IPW formula (1/propensity) as multiplicative noise. At strict privacy (small epsilon), the synthetic-label variance grows unboundedly — training becomes unstable. The paper recommends a clipping threshold + ratio of DP-noised augmentation to clean augmentation to bound the variance contribution.", correct:true},
+          {key:"b", text:"DP has no effect on augmentation."},
+          {key:"c", text:"Privacy and accuracy are independent."},
+          {key:"d", text:"DP improves augmentation."},
+        ]}
+        trap={<>(b), (c), (d) miss the propagation mechanism.</>}
+        lens={<>DP noise stacks multiplicatively through the IPW step — this is what makes the DP-CP variant nontrivial vs vanilla counterfactual augmentation. Knowing this distinguishes the technique from its non-private cousin.</>}
+        stretch={<>What's the right epsilon-vs-utility curve? At what point does DP make augmentation worse than vanilla supervised?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-f5"
+        difficulty="hard"
+        title="F5 — Community-found: SIGIR 2024 augmentation paper's negative result"
+        scenario={<>The SIGIR 2024 counterfactual exposure augmentation paper reports a regime where the technique UNDERPERFORMS vanilla supervised. Name it. <em>Discriminating insight: when exposure-model error variance dominates true-preference variance — the augmentation injects more noise than signal.</em></>}
+        options={[
+          {key:"a", text:"When the exposure model's error variance exceeds the true preference signal variance — common in poorly-instrumented marketplaces or new product surfaces. The augmentation's synthetic labels are then noise-dominated; vanilla supervised on biased-but-low-variance labels beats augmentation. The paper recommends: only deploy augmentation when exposure-model R-squared is above a domain-specific threshold.", correct:true},
+          {key:"b", text:"Augmentation always works."},
+          {key:"c", text:"Negative results are unusual in this literature."},
+          {key:"d", text:"This claim is wrong."},
+        ]}
+        trap={<>(b), (c), (d) are false.</>}
+        lens={<>The technique has known failure regimes named in the literature. Senior MLEs read the negative results, not just the headline lifts.</>}
+        stretch={<>What's the R-squared threshold the paper recommends? What's it sensitive to?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-f6"
+        difficulty="hard"
+        title="F6 — Multi-objective: augmenting one objective at a time"
+        scenario={<>You have 3 objectives (click, conversion, return-customer). Do you build 3 exposure models? <em>Discriminating insight: exposure is per-(user, item, rank) — not per-objective; one exposure model is enough, but the IPW step is applied per-objective.</em></>}
+        options={[
+          {key:"a", text:"One exposure model — exposure is a function of (user, item, rank), not of the objective. Apply the same IPW propensity ratio to each objective's label. The augmentation produces a multi-objective augmented dataset; the ranker fits all heads on the de-biased data.", correct:true},
+          {key:"b", text:"Three exposure models."},
+          {key:"c", text:"Exposure depends on the objective."},
+          {key:"d", text:"Skip exposure modeling for some objectives."},
+        ]}
+        trap={<>(b), (c), (d) double-count. The exposure model is objective-agnostic.</>}
+        lens={<>Exposure is a property of the SERVING policy, not the objective. One exposure model serves all objectives.</>}
+        stretch={<>What if one objective is observed only post-conversion (e.g., return-customer)? Does the exposure model need a different conditioning?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-f7"
+        difficulty="hard"
+        title="F7 — Silent regression: conformal coverage drops on augmented set"
+        scenario={<>You add a conformal-prediction layer on top of the de-biased ranker. Coverage on augmented samples is 90%; on the held-out real-data slice it's 78%. Why? <em>Discriminating insight: conformal coverage was computed on the AUGMENTED calibration set, which doesn't match the real-world distribution — augmented samples have lower nonconformity than real ones.</em></>}
+        options={[
+          {key:"a", text:"The conformal quantile was fit on the augmented calibration set. Augmented samples have lower nonconformity scores than real samples (because they're predictions of a model that fit on similar augmented data). Coverage on real data is then under-quantile. Fix: compute conformal coverage on a held-out REAL slice, never on augmented samples.", correct:true},
+          {key:"b", text:"Conformal is distribution-free; coverage cannot drop."},
+          {key:"c", text:"This is a Platt problem."},
+          {key:"d", text:"More data."},
+        ]}
+        trap={<>(b) is the distribution-free misreading. (c), (d) misdiagnose.</>}
+        lens={<>Augmented samples are NOT held-out — they were involved in shaping the model. Computing coverage on them is the conformal equivalent of evaluating on train.</>}
+        stretch={<>How much real held-out is enough for conformal coverage? How does this interact with the augmentation ratio?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pe-f8"
+        difficulty="hard"
+        title="F8 — Compounding bias: augmentation on augmentation"
+        scenario={<>You ship augmentation once, then a year later retrain. The retrained model's serving traffic is now affected by the previous augmentation. Do you compound? <em>Discriminating insight: the new logged data was generated under the augmented model's policy; building a new exposure model on it requires accounting for the augmented policy, not assuming a single-policy log.</em></>}
+        options={[
+          {key:"a", text:"The new logs reflect the augmented policy's exposure decisions. Building a new exposure model on these logs gives propensities for the augmented policy, not for the user's true preference. Counterfactual augmentation on the new logs would then de-bias against the augmented policy, NOT against the original biased policy. This is correct but the cumulative chain of fixes can drift; senior MLEs version-control the exposure model and the augmentation generation.", correct:true},
+          {key:"b", text:"No compounding; augmentation is one-shot."},
+          {key:"c", text:"You have to undo the previous augmentation."},
+          {key:"d", text:"Logs are policy-agnostic."},
+        ]}
+        trap={<>(b), (c), (d) misunderstand the policy-log dependence.</>}
+        lens={<>Counterfactual augmentation is policy-relative. Re-applying it requires tracking the policy chain. Senior versioning move: log the exposure model used for each augmentation pass.</>}
+        stretch={<>Sketch the versioning schema. What's the audit trail for "this label was generated by augmentation v3 on top of policy v7"?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://dl.acm.org/doi/10.1145/3643670" target="_blank" rel="noopener">TOIS 2024 — <em>Counterfactual Explanation for Fairness in Recommendation</em> (paper)</a> — the source for the exposure-DP-CP idea adapted here.</li>
-        <li><a href="https://dl.acm.org/doi/10.1145/3626772.3657767" target="_blank" rel="noopener">SIGIR 2024 — <em>Improving Sequential Recommenders through Counterfactual Augmentation of System Exposure</em> (paper)</a> — companion work on sequential setting.</li>
-        <li><a href="https://eugeneyan.com/writing/counterfactual-evaluation/" target="_blank" rel="noopener">Eugene Yan — <em>Counterfactual Evaluation for Recommendation Systems</em> (blog)</a> — practitioner&apos;s tour of debiasing recsys via counterfactuals.</li>
-        <li><a href="https://www.cs.cornell.edu/people/tj/" target="_blank" rel="noopener">Thorsten Joachims&apos; group — counterfactual learning publications (page)</a> — the canonical academic home for IPS / DR / counterfactual training in recsys.</li>
-        <li><a href="https://github.com/awarebayes/RecNN" target="_blank" rel="noopener">Awesome counterfactual recsys (curated repo)</a> — index of papers, code, and tutorials.</li>
+        <li>
+          <a href="https://dl.acm.org/doi/10.1145/3643670" target="_blank" rel="noopener"><strong>Counterfactual Explanation for Fairness in Recommendation</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(TOIS 2024)</span>
+          <br/>The DP-CP packaging; named failure modes for noise interaction.
+        </li>
+        <li>
+          <a href="https://dl.acm.org/doi/10.1145/3626772.3657725" target="_blank" rel="noopener"><strong>Improving Sequential Recommenders through Counterfactual Augmentation of System Exposure</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(SIGIR 2024)</span>
+          <br/>The augmentation-vs-IPS comparison; the long-tail extrapolation case.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2103.04559" target="_blank" rel="noopener"><strong>Inverse Propensity Scoring for recommendation systems — a survey</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(2021)</span>
+          <br/>Background reading for the IPS comparison.
+        </li>
       </ul>
     </VIS.Section>
   </main>
 );
+
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>

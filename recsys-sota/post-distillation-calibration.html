@@ -1414,247 +1414,664 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// Post-distillation calibration — Calibration & uncertainty
+// v2 redo — 30+ trap problems across all six axes (A-F).
+// Concept anchor: distillation MOVES the student's logit distribution off the teacher's calibrator —
+// so a Platt/isotonic curve fit on the teacher is WRONG on the student. The fix is mechanically
+// trivial (refit on held-out student outputs) but the trap is that ranking metrics (AUC, NDCG)
+// stay flat while calibration silently breaks — every problem here hinges on that asymmetry
+// (rank preserved, scale not) which is unique to soft-label distillation.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA &middot; Calibration"
+      pill="RecSys SOTA · Calibration & uncertainty"
       title="Post-distillation calibration"
-      subtitle="Re-fit isotonic on the distilled student because distillation moved the score distribution off the teacher&apos;s calibrator."
+      subtitle="Distillation softens and rescales the student's logits — the teacher's calibrator becomes wrong on the student. Refit Platt/isotonic on held-out student outputs after every distillation cycle."
       byline={[
-        {label: "Source", value: "OpenReview KD survey 2024 + industry practice"},
-        {label: "Domain", value: "Production rankers compressed via distillation"},
+        {label: "Source", value: "OpenReview KD Survey 2024; industry practice"},
+        {label: "Year", value: "2024"},
+        {label: "Domain", value: "Compressed production rankers (distilled CTR/CVR)"},
       ]}/>
 
     <VIS.TLDR>
-      A distilled student does NOT inherit its teacher&apos;s calibration. <VIS.Term def="Training a smaller student model to mimic a larger teacher's softened outputs (temperature-scaled logits, KL divergence loss). The student learns the teacher's full output distribution, not just the argmax label.">Knowledge distillation</VIS.Term> reshapes the student&apos;s logits, so the teacher&apos;s isotonic curve is wrong on the student. Always re-fit calibration on the student&apos;s held-out outputs after every distillation cycle.
+      <VIS.Term def="Training a smaller student model to mimic a larger teacher's softened (temperature-scaled) output distribution via KL divergence loss, instead of one-hot labels.">Knowledge distillation</VIS.Term> preserves the student's <em>ranking</em> (AUC/NDCG move under 1%) but reshapes its <em>logit distribution</em>: temperature softens the spread, the student's narrower capacity contracts the tails. The teacher's <VIS.Term def="A two-parameter logistic P=sigmoid(a*s+b) fit on a held-out calibration set, mapping raw scores to calibrated probabilities.">Platt</VIS.Term> or <VIS.Term def="A non-parametric piecewise-constant monotonically-non-decreasing map fit by pool-adjacent-violators on a held-out calibration set.">isotonic</VIS.Term> curve was fit on teacher logits — it is wrong on student logits. The student's ECE blows up from 0.5% to 3% even though AUC barely moves. <strong>Refit calibration on held-out student outputs after every distillation cycle.</strong> Reference: <a href="https://openreview.net/pdf?id=3cbJzdR78B" target="_blank" rel="noopener">A Comprehensive Survey on Knowledge Distillation (OpenReview 2024)</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        You train a big teacher ranker and calibrate it (Platt or isotonic) — ECE drops to 0.5&#37;. To meet latency budgets you distill it into a smaller student using a temperature-scaled KL loss. The student&apos;s ranking metrics look fine; AUC drops by &lt;1&#37;. But ECE on the student is 3&#37;. The bug is structural: distillation softens and rescales the logit distribution, so the calibrator fit to the teacher does not apply.
+        You train a big teacher ranker and calibrate it (Platt or isotonic) until <VIS.Term def="Expected Calibration Error — average absolute gap between predicted probability and empirical positive rate, bucketed by prediction.">ECE</VIS.Term> is around 0.5%. To meet latency budgets you distill the teacher into a smaller student with a temperature-scaled KL loss against the teacher's softened probabilities. Student AUC drops by under 1%. But student ECE is 3%. <em>Nothing about the calibrator changed — yet calibration broke.</em>
+      </p>
+      <VIS.Mermaid chart={`
+flowchart LR
+  T["Teacher ranker (large)"] --> CT["Platt fit on teacher logits"]
+  T -. KL/temperature .-> S["Student ranker (small)"]
+  S --> X["Student logits"]
+  X -.WRONG curve.-> CT
+  X --> CS["Platt REFIT on student logits"]
+  CS --> P["Calibrated p-hat for auction"]
+  style CT fill:#fee2e2,stroke:#991b1b
+  style CS fill:#dcfce7,stroke:#166534
+      `} />
+      <p>
+        The root cause: distillation is rank-preserving but scale-distorting. The teacher's calibrator was tuned to the teacher's logit distribution; the student's logits live on a different scale and shape.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from generic calibration">
+      <p>
+        <strong>Generic recalibration</strong> (after feature drift or retrain) refits the same calibrator family on fresh data because the input distribution moved. <strong>Post-distillation calibration</strong> is forced not by data drift but by an architectural transformation — the teacher to student step itself reshapes the score distribution even if the underlying data is stationary.
+      </p>
+      <p>
+        <strong>Temperature inheritance.</strong> Naive teams assume "the teacher was calibrated, the student mimics the teacher, therefore the student is calibrated." This is wrong: KL distillation matches the teacher's <em>softmax</em>, not its <em>raw logits</em>; the temperature flattens the student's logits and the inverse-temperature unflatten only approximately recovers the teacher's scale.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-when" title="Beat 3 — When this bites">
+      <p>
+        Any pipeline that does (calibrate teacher) then (distill) then (serve student) without a refit step. Industry surveys (OpenReview 2024) note that the majority of production distillation pipelines miss this; the symptom is a silent revenue regression that the offline AUC dashboard misses entirely.
       </p>
       <VIS.Mermaid chart={`
 flowchart TB
-  T["Teacher ranker"]
-  S["Student ranker"]
-  CT["Teacher calibrator"]
-  CS["Student calibrator (re-fit)"]
-  H["Held-out events"]
-  T --> CT
-  T -. distill .-> S
-  H --> CS
-  S --> CS
+  D["After distillation:"]
+  D --> Q1{"Auction or pacer consumer?"}
+  Q1 -->|Yes| FIX["MUST refit on held-out student outputs"]
+  Q1 -->|No, ranking only| OK["Skip refit if AUC is only metric"]
+  FIX --> Q2{"Held-out fresh and on-distribution?"}
+  Q2 -->|Yes| GO["Refit and ship"]
+  Q2 -->|No| BIAS["Sampling bias - fix data first"]
       `} />
-      <VIS.Equation display tex="L_{\text{distill}} = \alpha \cdot \mathrm{KL}\big(\sigma(z_T/\tau)\,\Vert\,\sigma(z_S/\tau)\big) + (1-\alpha)\cdot \mathrm{CE}(y, \sigma(z_S))" />
+    </VIS.Section>
+
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Rank-preserved, scale-not — the silent break">
+        Distillation almost always preserves order on the held-out set (otherwise distillation would be failing entirely). So AUC, NDCG, MRR all look fine. ECE, Brier, log-loss are scale-sensitive — they break. If your QA dashboard only tracks ranking metrics, this regression is invisible.
+      </VIS.Callout>
       <p>
-        The temperature tau in the KL term softens the teacher&apos;s distribution and forces the student to match those soft targets. After training, the student&apos;s logits live on a different scale than the teacher&apos;s — the calibrator fit on the teacher&apos;s scale silently mismaps the student&apos;s.
+        Other named traps: (1) refitting on the teacher's calibration set rather than fresh student outputs (the calibration set may be leaked into student training via teacher-soft-labels); (2) inheriting the teacher's Platt parameters and only refitting the temperature (under-parameterized — Platt's intercept needs to move too); (3) refitting once at distillation time but not on the cadence the student then needs (distilled students typically drift faster because their narrower capacity makes tails more brittle); (4) using the same calibration <em>family</em> the teacher used (the teacher's logit distribution may have been sigmoidal so Platt was fine; distillation introduces kinks that Platt cannot fit — isotonic becomes the right choice for the student even when Platt was right for the teacher).
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the &apos;reuse the teacher&apos;s calibrator&apos; baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>Reuse teacher calibrator</th><th style={{textAlign:"left",padding:8}}>Re-fit on student</th></tr></thead>
-        <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Effort</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Zero</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>One isotonic fit per release</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>ECE after distillation</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Silently regresses</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Restored</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Catches distillation bugs</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>No</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes (large q_hat shift)</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Downstream auction</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Distorted bids</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Accurate bids</td></tr>
-        </tbody>
-      </table>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
+      <p style={{color:"#475569", marginBottom: 16}}>
+        30+ problems spanning the six taxonomy axes. Redaction litmus: replace "distillation" with "compression X" — if generic calibration knowledge suffices, the problem is concept-as-costume. Every problem below hinges on a property specific to soft-label KL distillation (temperature, KD-induced rank-preservation, the teacher-calibrator-doesn't-transfer asymmetry).
+      </p>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>Every distillation release in production — student-vs-teacher score distributions differ by construction.</li>
-        <li>Quantization releases (INT8 / FP16) also shift the logit distribution; same recipe applies.</li>
-        <li>Any model change that touches the loss function or the final linear layer (focal loss, label smoothing, head swap).</li>
-        <li>Cost is small: a single isotonic fit on a few hundred thousand held-out events.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <ul>
-        <li><strong>Held-out staleness</strong> — recalibration needs FRESH data per cycle; reusing the same calibration fold across iterations leaks information.</li>
-        <li><strong>Capacity-bound mis-calibration</strong> — if the student is too small to capture the teacher&apos;s decision surface, calibration recovers marginal ECE but not the lost AUC.</li>
-        <li><strong>Temperature-dependent</strong> — different distillation temperatures produce different student scales; a calibrator fit at T=4 will not transfer when you retrain at T=2.</li>
-        <li><strong>Multi-task heads</strong> — students with multiple output heads need a calibrator per head; one global isotonic is wrong.</li>
-      </ul>
-      <VIS.Callout kind="gotcha" title="Teacher ECE = 0.5&#37; does not imply student ECE = 0.5&#37;">
-        Engineers often assume calibration is a property the student inherits from the teacher because the student is trained to match the teacher&apos;s outputs. In fact, distillation matches outputs only on the softmax-temperature-scaled distribution; the final softmax (at T=1) lives on a different scale. The student&apos;s ECE is independent of the teacher&apos;s and must be re-measured on fresh data after every distillation run.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity &amp; comparison</h3>
 
       <VIS.TrapProblem
-        id="pdc-p1" difficulty="hard"
-        title="P1 — Why does the student&apos;s ECE jump after distillation?"
-        scenario={<>You distill a teacher (ECE 0.5&#37;) into a student. The student&apos;s AUC drops by 0.8&#37; (acceptable) but ECE is 3&#37;. The teacher&apos;s calibrator was copied onto the student. Diagnose.</>}
+        id="pdc-a1"
+        difficulty="hard"
+        title="A1 — Why post-distill calibration differs from post-retrain calibration"
+        scenario={<>You already recalibrate after every weekly retrain. Why is post-distillation calibration a separate concern? <em>Discriminating insight: retrains move the score distribution within the same architecture; distillation moves it across architectures — and the change is induced by the temperature/KL objective, not data drift.</em></>}
         options={[
-          {key:"a", text:"Distillation reshapes the student&apos;s logits to a different scale than the teacher&apos;s; the teacher&apos;s calibrator no longer maps correctly. Re-fit on the student.", correct:true},
-          {key:"b", text:"The student is over-fitting and needs more data."},
-          {key:"c", text:"The teacher&apos;s calibrator was wrong from the start."},
-          {key:"d", text:"AUC and ECE always co-vary."},
+          {key:"a", text:"Retraining moves the score distribution because data shifts; distillation moves it because the temperature-scaled KL objective deliberately softens probabilities and the smaller student capacity contracts the tails. Both require refit, but the distillation change is structural and predictable from the loss alone, not a drift signal you can wait to observe.", correct:true},
+          {key:"b", text:"They're the same — just refit on a schedule."},
+          {key:"c", text:"Distillation never changes calibration; only retraining does."},
+          {key:"d", text:"Retraining preserves calibration; distillation needs no refit."},
         ]}
-        trap={<>(b) confuses fit vs scale. (c) blames the wrong stage. (d) is false: a model can keep AUC while losing ECE because ranking and calibration are independent properties.</>}
-        lens={<>The KL distillation loss matches softened teacher probabilities, not raw logits. The student&apos;s final logits land on a different scale. A calibrator is a function fit to a specific score distribution; transplanting it across distributions is a category error. Fresh isotonic on the student fixes ECE without touching ranking.</>}
-        stretch={<>How would you also test whether the student is capacity-bound?</>}
+        trap={<>(b) misses that distillation is a deterministic architectural change, not a drift event. (c), (d) invert reality.</>}
+        lens={<>The senior frame: retrain-induced miscalibration is a drift you measure; distillation-induced miscalibration is a transformation you predict. Two different mental models, two different monitoring cadences.</>}
+        stretch={<>Could you derive the right student Platt parameters analytically from the teacher's Platt + the distillation temperature? Why or why not?</>}
       />
 
       <VIS.TrapProblem
-        id="pdc-p2" difficulty="medium"
-        title="P2 — Distillation temperature and calibration"
-        scenario={<>You retrain the distillation pipeline with T = 2 instead of T = 4 and ship the student. Should you re-fit calibration?</>}
+        id="pdc-a2"
+        difficulty="medium"
+        title="A2 — 'Just inherit the teacher's temperature' — what's wrong?"
+        scenario={<>An engineer ships the student with the teacher's Platt parameters (a, b) and only refits the temperature T in P = sigmoid((a/T) * s + b). What's the structural flaw? <em>Discriminating insight: temperature is a 1-param fix; distillation moves both slope AND intercept of the student's logit-vs-prob curve because the student's tails shrink asymmetrically.</em></>}
         options={[
-          {key:"a", text:"Yes — temperature changes the soft-target distribution, hence the student&apos;s logit scale.", correct:true},
-          {key:"b", text:"No — temperature is only used during training, not serving."},
-          {key:"c", text:"Only if AUC changed."},
-          {key:"d", text:"Only if you also changed the dataset."},
+          {key:"a", text:"Temperature-only refit cannot move Platt's intercept — but distillation shifts the student's logit distribution mean (the softer student has a different operating point on the sigmoid). Both a and b must be refit on the student's held-out outputs.", correct:true},
+          {key:"b", text:"Temperature scaling is exactly Platt; refitting T is equivalent."},
+          {key:"c", text:"You should refit only the intercept."},
+          {key:"d", text:"Temperature has no effect on calibration."},
         ]}
-        trap={<>(b) confuses serving (T=1 always) with the gradient signal during training. (c)(d) miss the structural reason.</>}
-        lens={<>Lower T means sharper teacher targets; the student trained against sharper targets ends up with sharper, more confident output logits. The same isotonic curve will under-shoot or over-shoot at the new scale. Treat any change to the distillation hyperparams as a calibration trigger.</>}
-        stretch={<>What other hyperparameters in distillation force a recalibration?</>}
+        trap={<>(b) confuses temperature scaling (intercept forced to 0) with full Platt. (c), (d) are textbook wrong.</>}
+        lens={<>Temperature scaling = Platt with b=0. That suffices when miscalibration is symmetric (pure scale). Distillation makes it asymmetric (the student's high-confidence tail collapses more than its low-confidence tail). Full Platt is required.</>}
+        stretch={<>Sketch a logit distribution where temperature-only refit lands within 0.1% ECE but full Platt is needed for 0.01% ECE.</>}
       />
 
       <VIS.TrapProblem
-        id="pdc-p3" difficulty="hard" multiSelect
-        title="P3 — Cases where calibration must be re-fit"
-        scenario={<>Select the model changes after which calibration MUST be re-fit. Select all that apply.</>}
+        id="pdc-a3"
+        difficulty="hard"
+        title="A3 — Counterfactual: never distill, never have this problem"
+        scenario={<>Counterfactual: you keep the teacher in production (no distillation). What's the actual cost of avoiding post-distill calibration entirely? <em>Discriminating insight: latency/cost, not calibration — distillation exists because the teacher cannot meet the latency budget, full stop.</em></>}
         options={[
-          {key:"a", text:"Distillation into a smaller student.", correct:true},
-          {key:"b", text:"INT8 post-training quantization.", correct:true},
-          {key:"c", text:"Switching the final loss from BCE to focal loss.", correct:true},
-          {key:"d", text:"Adding a new categorical feature to the input.", correct:true},
-          {key:"e", text:"Changing the random seed of the data loader."},
+          {key:"a", text:"The teacher cannot serve at the latency budget (e.g., 50ms p99 for ad ranking). The choice is not 'distill or not' — it's 'distill + refit calibrator vs serve a different architecture'. Avoiding distillation only buys back calibration if you can afford the latency hit, which is precisely the constraint that motivated distillation.", correct:true},
+          {key:"b", text:"There's no cost — just keep the teacher."},
+          {key:"c", text:"You'd lose AUC."},
+          {key:"d", text:"The calibrator would still drift."},
         ]}
-        trap={<>(e) does not change the score distribution in expectation; (a)-(d) all do.</>}
-        lens={<>Anything that changes the output score distribution requires recalibration. Distillation softens; quantization rounds; focal loss reshapes the loss landscape; new features shift the score support. Seed changes affect a particular run but not the population distribution.</>}
-        stretch={<>How would you detect the (e) edge case empirically?</>}
+        trap={<>(b) is the seductive non-answer. (c) is exactly inverted. (d) is true but unrelated.</>}
+        lens={<>Distillation is forced by latency, not chosen for fun. The right framing for senior MLEs: post-distill calibration is the <em>price</em> of the latency win, paid once per distillation cycle on a few thousand held-out events.</>}
+        stretch={<>For which production constraints (latency, memory, energy) is distillation overkill, and what's the alternative that doesn't require post-hoc calibrator refits?</>}
       />
 
       <VIS.TrapProblem
-        id="pdc-p4" difficulty="medium"
-        title="P4 — How fresh must the calibration data be?"
-        scenario={<>Your team ships a distilled student every 2 weeks. How fresh should the calibration data be?</>}
+        id="pdc-a4"
+        difficulty="hard"
+        title="A4 — Stacking with conformal prediction"
+        scenario={<>You distill, then refit Platt, then wrap the student in a conformal calibration layer. Does the conformal layer need refitting after distillation, or only Platt? <em>Discriminating insight: conformal coverage is computed over the student's score distribution — the conformal layer also depends on the student logits and must be refit.</em></>}
         options={[
-          {key:"a", text:"Use a held-out window from the same training cycle the student was trained on, drawn from data the student has not seen.", correct:true},
-          {key:"b", text:"Reuse the teacher&apos;s calibration data."},
-          {key:"c", text:"Use data from 6 months ago."},
-          {key:"d", text:"Use synthetic data generated by the teacher."},
+          {key:"a", text:"Both must be refit. Conformal's quantile threshold is computed over the calibration set's nonconformity scores — those scores depend on the student's predictions, not the teacher's. Skipping the conformal refit leaves coverage at the teacher's quantile, which is wrong for the student.", correct:true},
+          {key:"b", text:"Only Platt needs refitting; conformal is distribution-free."},
+          {key:"c", text:"Distribution-free means conformal needs no calibration set at all."},
+          {key:"d", text:"Conformal subsumes Platt; drop Platt."},
         ]}
-        trap={<>(b)(c) use stale data; (d) is wrong because the calibrator must see real labels.</>}
-        lens={<>Calibration data must be (a) held-out from the student&apos;s training and (b) drawn from the same period the student will serve. Reuse of teacher data is fine if it was held out from BOTH; otherwise a fresh slice. Synthetic data does not have the real label noise distribution.</>}
-        stretch={<>What guarantees the held-out fold is unbiased across model versions?</>}
+        trap={<>(b) confuses 'distribution-free coverage guarantee' (true) with 'doesn't need recalibration on a new distribution' (false). (c), (d) misunderstand conformal's mechanics.</>}
+        lens={<>Distribution-free means the guarantee holds for any distribution from which the calibration set is drawn. Change the distribution (e.g., from teacher to student outputs) and you need a new calibration set drawn from THAT distribution.</>}
+        stretch={<>How large a held-out set does the conformal layer need vs how large Platt needs? Why the difference?</>}
       />
 
       <VIS.TrapProblem
-        id="pdc-p5" difficulty="hard"
-        title="P5 — Capacity-bound mis-calibration"
-        scenario={<>You re-fit isotonic on the student. ECE drops from 3&#37; to 0.4&#37; (good) but auction allocator revenue prediction is still off by 5&#37; on premium inventory. What is going on?</>}
+        id="pdc-a5"
+        difficulty="hard"
+        title="A5 — Boundary: when is post-distill refit unnecessary?"
+        scenario={<>Name the regime where you can ship a distilled student with the teacher's calibrator and not regress. <em>Discriminating insight: identical architecture + identity distillation (T=1, student=teacher size) — basically a fine-tune, no scale change.</em></>}
         options={[
-          {key:"a", text:"Marginal ECE is fixed but the student is too small to fit the teacher&apos;s decision surface on premium inventory; conditional calibration on that slice is still broken.", correct:true},
-          {key:"b", text:"Isotonic was fit incorrectly."},
-          {key:"c", text:"The teacher was also broken on premium."},
-          {key:"d", text:"Recalibration is not necessary."},
+          {key:"a", text:"When T=1 (no softening) and the student matches the teacher architecturally so the logit distribution is preserved up to weight noise. In practice, this is fine-tuning, not distillation; any real distillation with T larger than 1 and a smaller student needs refit.", correct:true},
+          {key:"b", text:"When AUC is preserved."},
+          {key:"c", text:"When the student is larger than the teacher."},
+          {key:"d", text:"Always — the refit is cosmetic."},
         ]}
-        trap={<>(b) over-rotates on calibrator quality; (c)(d) miss the capacity story.</>}
-        lens={<>Distillation losses information. A capacity-bound student cannot replicate the teacher on the long tail of contexts. Calibration restores marginal alignment but conditional gaps remain. Fixes: increase student capacity, train with multi-objective on the slice that matters, or stratify calibration by slice.</>}
-        stretch={<>How to detect capacity-bound conditional failure before deploying?</>}
+        trap={<>(b) is the seductive wrong: AUC preservation is the symptom that hides the break. (c) inverts use-case. (d) is the cost-cutting failure mode the problem is targeting.</>}
+        lens={<>The boundary case is degenerate (T=1, same size). All real distillation pipelines need refit. Knowing this prevents the "we tested AUC, looks fine, ship" trap.</>}
+        stretch={<>If you observe both T larger than 1 AND student smaller, by how much can the teacher's calibrator drift before pacers notice? Order of magnitude.</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>B. Application</h3>
+
+      <VIS.TrapProblem
+        id="pdc-b1"
+        difficulty="hard"
+        title="B1 — CTR pipeline with nightly distillation"
+        scenario={<>You distill nightly to refresh the student. What cadence does the post-distill calibrator need? <em>Discriminating insight: same cadence as distillation — every distillation event is a calibration event.</em></>}
+        options={[
+          {key:"a", text:"One calibrator refit per distillation cycle. The student's logit distribution changes with every new student weights — even a tiny distillation step moves the scale. Anchor calibrator-refit to distillation-deploy, not to the calendar.", correct:true},
+          {key:"b", text:"Weekly — calibrators are slow-moving."},
+          {key:"c", text:"Hourly — to be safe."},
+          {key:"d", text:"Once per quarter."},
+        ]}
+        trap={<>(b), (d) under-fit cadence. (c) over-refits without benefit (no new student weights between refits = no new logit distribution).</>}
+        lens={<>Tie the calibrator's cadence to the structural event that moves the distribution (distillation deploy), not to the calendar. This is the universal "monitor the cause, not the schedule" senior move.</>}
+        stretch={<>What's the rollback procedure if today's distillation produces a worse student? Does the calibrator roll back too?</>}
       />
 
       <VIS.TrapProblem
-        id="pdc-p6" difficulty="medium" multiSelect
-        title="P6 — Symptoms that the teacher calibrator was reused on the student"
-        scenario={<>Pick the symptoms that suggest the team forgot to re-fit calibration after distillation. Select all that apply.</>}
+        id="pdc-b2"
+        difficulty="hard"
+        title="B2 — 'Distill on hard labels — calibration won't break'"
+        scenario={<>A teammate proposes distilling on hard labels (argmax-only) instead of softened teacher probs. They argue this avoids the post-distill calibration problem. Are they right? <em>Discriminating insight: hard-label distillation IS just retraining on teacher predictions — it loses the dark-knowledge benefit AND still moves the student's logit scale.</em></>}
         options={[
-          {key:"a", text:"Marginal ECE jumps from &lt;1&#37; to several percent after the distillation release.", correct:true},
-          {key:"b", text:"Auction over- or under-predicts revenue right after the release.", correct:true},
-          {key:"c", text:"Reliability diagram shows a consistent over- or under-confidence pattern.", correct:true},
-          {key:"d", text:"AUC drops by 10 points."},
-          {key:"e", text:"Inference latency increases."},
+          {key:"a", text:"Wrong on both counts: hard-label 'distillation' is just supervised retraining on teacher argmax labels (you've lost the dark-knowledge benefit of distillation) AND the student's logit distribution still differs from the teacher's because the student is smaller and trained on a different label noise pattern. You need to refit calibration AND you've thrown away the reason to distill.", correct:true},
+          {key:"b", text:"Yes, hard labels skip the softening step that breaks calibration."},
+          {key:"c", text:"Hard labels are always better for production."},
+          {key:"d", text:"Calibration is unaffected by label format."},
         ]}
-        trap={<>(d) is too extreme for calibration alone (suggests training failure). (e) is unrelated.</>}
-        lens={<>The fingerprint of stale calibration is: marginal ECE regression, downstream revenue prediction error, and a tilted reliability diagram. AUC drops of 10 points are training failures, not calibration. Latency is a serving issue.</>}
-        stretch={<>What does the reliability diagram look like under temperature mismatch?</>}
+        trap={<>(b) is the technically-true-but-misleading take that loses the dark-knowledge benefit. (c) is wrong. (d) confuses cause and effect.</>}
+        lens={<>Senior MLEs know the dark-knowledge / scale-stability tradeoff. You cannot escape post-distill calibration by skipping soft labels — you can only sacrifice the distillation benefit AND still need calibration work.</>}
+        stretch={<>What would be the right tradeoff if the calibration step is itself the bottleneck (e.g., no held-out data)?</>}
       />
 
       <VIS.TrapProblem
-        id="pdc-p7" difficulty="hard"
-        title="P7 — Multi-head student"
-        scenario={<>Your student has 3 output heads (CTR, CVR, dwell). One global isotonic on top is wrong. Why?</>}
+        id="pdc-b3"
+        difficulty="medium"
+        title="B3 — Pitch post-distill calibration to your director"
+        scenario={<>Director asks why the team is spending eng cycles on "another calibration job." Give the one-sentence pitch that <em>requires</em> understanding the distillation-specific mechanism. <em>Discriminating insight: the pitch must turn on rank-preserved/scale-broken asymmetry — not on generic 'calibration matters'.</em></>}
         options={[
-          {key:"a", text:"Each head has its own score distribution and label distribution; one calibrator cannot be marginally correct on all three.", correct:true},
-          {key:"b", text:"Calibration only applies to binary outputs."},
-          {key:"c", text:"Multi-head models are uncalibrable in principle."},
-          {key:"d", text:"You only need to calibrate the most-trafficked head."},
+          {key:"a", text:"'Calibration matters for accurate bidding.' (Generic — true for any ranker.)"},
+          {key:"b", text:"'Distillation preserves the student's ranking (AUC stays flat) but moves its logit scale (temperature softens, smaller capacity contracts tails) — so the teacher's Platt curve becomes wrong on the student even though our AUC dashboard says nothing changed. One refit per distillation cycle on 10k held-out events costs five minutes and prevents a silent ECE drift from 0.5% to 3%, which is invisible to ranking metrics but moves auction bids by 5-15%.'", correct:true},
+          {key:"c", text:"'ECE drift causes revenue loss.' (Symptom-only — no mechanism.)"},
+          {key:"d", text:"'It's industry best practice.' (Authority, not mechanism.)"},
         ]}
-        trap={<>(b)(c)(d) overstate or fabricate.</>}
-        lens={<>Each head is a separate prediction task with its own label rate and score distribution. Fit a separate isotonic per head, on a head-specific held-out fold. If heads share a backbone, fit calibrators downstream of the heads, not the backbone.</>}
-        stretch={<>What if two heads share a head (e.g. CTR -&gt; CVR)?</>}
+        trap={<>(a) survives redaction (replace 'distillation' with 'any model change' and (a) still reads correctly). (c), (d) are mechanism-free.</>}
+        lens={<>B3 pitches must fail the redaction test — they must require understanding the specific mechanism. (b) names rank-preservation, temperature-softening, capacity-contraction, the offline-online gap — all distillation-specific.</>}
+        stretch={<>If your director responds 'we already track ECE in our QA dashboard' — what's the one-line follow-up?</>}
       />
 
       <VIS.TrapProblem
-        id="pdc-p8" difficulty="hard" mode="ordered"
-        title="P8 — Order the distillation release calibration steps"
-        scenario={<>You are shipping a freshly distilled student. Order the calibration steps. Wrong moves are unranked.</>}
+        id="pdc-b4"
+        difficulty="hard"
+        title="B4 — When NOT to bother with post-distill calibration"
+        scenario={<>Name a production setting where the post-distill refit is genuinely overkill. <em>Discriminating insight: pure-ranking surfaces (e.g., search retrieval, where downstream consumers see only the rank order) don't depend on scale.</em></>}
         options={[
-          {key:"a", text:"Hold out a fresh slice of recent data NOT seen by the student during distillation.", order:1},
-          {key:"b", text:"Run the student on the held-out slice; record (score, label) pairs.", order:2},
-          {key:"c", text:"Fit isotonic on those pairs.", order:3},
-          {key:"d", text:"Verify marginal ECE on a second held-out fold and slice-ECE on key segments.", order:4},
-          {key:"e", text:"Shadow-deploy: log new vs old calibrated probabilities on live traffic.", order:5},
-          {key:"f", text:"Copy the teacher&apos;s calibrator parameters to save time."},
-          {key:"g", text:"Skip slice-ECE because marginal looks fine."},
+          {key:"a", text:"A pure-ranking surface where the downstream consumer (e.g., search results page) takes the top-K by rank only, never reads the probability. Distillation preserves rank; calibration is irrelevant. Common example: organic search retrieval feeding a UI list, not an auction.", correct:true},
+          {key:"b", text:"Any classification task."},
+          {key:"c", text:"Any deep-learning model."},
+          {key:"d", text:"There's never a case where it's safe to skip."},
         ]}
-        trap={<>(f) is the headline bug. (g) silently leaves auction allocator pain.</>}
-        lens={<>The recipe: fresh held-out data, fit, verify both marginal and slice, shadow, ramp. Skipping ANY of these has hit production incidents. Copy-the-teacher and skip-slice-ECE are the two recurring shortcuts that have caused real outages.</>}
-        stretch={<>What if the shadow shows drift in just one slice?</>}
+        trap={<>(b), (c) overgeneralize. (d) is the cult-of-rigor answer — a senior MLE knows when to skip.</>}
+        lens={<>Calibration matters iff a downstream consumer reads the probability magnitude. Pure ranking surfaces don't. Distillation preserves rank; therefore, no calibration job needed. Senior judgment: don't pay a cost where there's no consumer.</>}
+        stretch={<>What's the cheapest test to confirm 'no downstream consumer reads probabilities'? How would you find a hidden consumer?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      <VIS.TrapProblem
+        id="pdc-c1"
+        difficulty="hard"
+        title="C1 — Why temperature breaks calibration mechanically"
+        scenario={<>Explain mechanically why a temperature-scaled KL distillation forces the student's logits to a different distribution than the teacher's. <em>Discriminating insight: KL with T larger than 1 matches softmax(teacher_logits/T) — the student fits this softened target, then at inference the student outputs raw logits NOT divided by T, so the scale is asymmetric.</em></>}
+        options={[
+          {key:"a", text:"During distillation, the student minimizes KL between softmax(student_logits / T) and softmax(teacher_logits / T). The student's logits learn to match the SCALED teacher targets. At inference, the student outputs raw logits — but those logits live on the scale T*teacher (approximately), not the teacher's scale. The teacher's Platt parameters were fit on teacher scale and are wrong for the student's T*teacher scale.", correct:true},
+          {key:"b", text:"Temperature has no effect — softmax cancels it."},
+          {key:"c", text:"Distillation uses a different loss function — calibration is unrelated."},
+          {key:"d", text:"The student's gradient is bigger, so logits are bigger."},
+        ]}
+        trap={<>(b) is the seductive wrong (T does affect the gradient direction even if softmax-equivariant). (c) is hand-wavy. (d) is unsupported.</>}
+        lens={<>The math is concrete: T enters the loss directly, the student learns scaled targets, and the inference scale is shifted. Knowing this lets you predict the scale shift and pre-compute the calibration delta analytically.</>}
+        stretch={<>For T=4 and teacher Platt a=2.5, what's the analytic prediction for the student's Platt a (assuming pure scale)?</>}
       />
 
       <VIS.TrapProblem
-        id="pdc-p9" difficulty="medium"
-        title="P9 — Quantization vs distillation calibration"
-        scenario={<>You ship INT8 post-training quantization on the student. Should you re-fit calibration again?</>}
+        id="pdc-c2"
+        difficulty="hard"
+        title="C2 — The KL loss is asymmetric — what does that imply for tails?"
+        scenario={<>Distillation KL is asymmetric: KL(p_teacher || p_student) penalizes the student when teacher confident and student uncertain, but is permissive in reverse. What does this asymmetry do to the student's calibration at the tails? <em>Discriminating insight: the student over-predicts on the teacher-confident tail (forced match) but under-predicts on the teacher-uncertain tail (KL doesn't pressure).</em></>}
         options={[
-          {key:"a", text:"Yes — quantization rounds the score distribution and can shift ECE; treat it as a new model release.", correct:true},
-          {key:"b", text:"No — quantization preserves order so calibration is unchanged."},
-          {key:"c", text:"Only if you also quantized the input embeddings."},
-          {key:"d", text:"Only for INT4, not INT8."},
+          {key:"a", text:"The student is pressured to match teacher confidence (high-prob tail) but under-pressured on teacher uncertainty (low-prob tail). Result: the student's calibration error is asymmetric — over-confident on the high tail, under-confident on the low. The teacher's calibrator was fit on symmetric residuals; it cannot fix this asymmetric break.", correct:true},
+          {key:"b", text:"KL is symmetric — no asymmetry."},
+          {key:"c", text:"The student is uniformly over-confident."},
+          {key:"d", text:"The student is uniformly under-confident."},
         ]}
-        trap={<>(b) confuses monotonicity with point-equivalence; quantization is approximately monotonic but loses precision near decision boundaries. (c)(d) over-specify.</>}
-        lens={<>Any score-distribution-shifting change triggers recalibration. INT8 is mostly faithful but loses 8 bits of precision; near the boundary, rounding shifts the empirical CTR per score bin. The recipe is identical: fresh held-out, fit, verify.</>}
-        stretch={<>Is there a hardware-aware calibration that bakes quantization in?</>}
+        trap={<>(b) confuses KL with Jensen-Shannon. (c), (d) miss the asymmetric tail pattern.</>}
+        lens={<>The asymmetric KL produces asymmetric tail miscalibration — and the standard Platt (sigmoidal) cannot capture asymmetric tails. Isotonic or a two-piece calibrator becomes the right choice on the student even when Platt was right on the teacher.</>}
+        stretch={<>Sketch the reliability diagram you'd expect to see. Which decile is most off?</>}
       />
 
       <VIS.TrapProblem
-        id="pdc-p10" difficulty="hard" multiSelect
-        title="P10 — Calibration provenance for an audit"
-        scenario={<>An audit asks: &quot;On day X, what calibrator was applied to the student model serving traffic?&quot; What must your logs contain to answer? Select all that apply.</>}
+        id="pdc-c3"
+        difficulty="hard"
+        title="C3 — What information does the student lose vs the teacher?"
+        scenario={<>Identify what the student fundamentally cannot calibrate to. <em>Discriminating insight: aleatoric uncertainty in the teacher's softened probs (the dark knowledge) is partially preserved; structural capacity gaps are not.</em></>}
+        multiSelect
         options={[
-          {key:"a", text:"Calibrator version ID joined to every prediction.", correct:true},
-          {key:"b", text:"Student model version ID joined to every prediction.", correct:true},
-          {key:"c", text:"The held-out fold ID used to fit that calibrator.", correct:true},
-          {key:"d", text:"The teacher model version that distilled into that student.", correct:true},
-          {key:"e", text:"The user&apos;s click history for that day."},
+          {key:"a", text:"Fine-grained logit differences below the student's representational granularity (a 1B-param teacher distinguishing P=0.617 vs 0.621 cannot be matched by a 50M-param student).", correct:true},
+          {key:"b", text:"Multi-modal score distributions if the student's architecture forces uni-modality (e.g., simple MLP head).", correct:true},
+          {key:"c", text:"The teacher's calibrated probability scale (lost via the temperature transform).", correct:true},
+          {key:"d", text:"The teacher's ranking on the calibration set."},
+          {key:"e", text:"The teacher's training data."},
         ]}
-        trap={<>(e) is user-side data, not model provenance.</>}
-        lens={<>Audit trail = (calibrator version, student version, fold ID, teacher version). Without all four you cannot reproduce the exact calibrated probability that was served. Click history is downstream and not part of the calibration provenance chain.</>}
-        stretch={<>Which of these is hardest to retrofit if missing?</>}
+        trap={<>(d) inverts: ranking IS preserved (that's the whole point of distillation). (e) is irrelevant — student doesn't see teacher's training data directly.</>}
+        lens={<>The student loses fine-grained representational capacity, multi-modality, and the calibrated scale — but inherits ranking. Calibration must therefore be re-fit, and possibly with a more flexible family (isotonic over Platt) to capture any new structure introduced by capacity loss.</>}
+        stretch={<>Which of (a)/(b)/(c) is hardest to detect at QA time, and how would you catch it?</>}
       />
+
+      <VIS.TrapProblem
+        id="pdc-c4"
+        difficulty="hard"
+        mode="ordered"
+        title="C4 — Rank distillation hyperparameters by 'breaks calibration if mis-set'"
+        scenario={<>Order from most-catastrophic to least: (a) distillation temperature T, (b) KL vs MSE on logits, (c) student depth, (d) batch size. <em>Discriminating insight: T is the dominant knob — directly scales logits; family choice is secondary; depth shapes capacity but only on the tail; batch size is mostly noise.</em></>}
+        options={[
+          {key:"a", text:"Temperature T — directly scales the student's logit operating point.", order:1},
+          {key:"b", text:"KL vs MSE — KL on softmax preserves probability geometry; MSE on logits preserves raw scale (and breaks calibration less).", order:2},
+          {key:"c", text:"Student depth — affects capacity to match tail; secondary effect on calibration.", order:3},
+          {key:"d", text:"Batch size — mostly noise on calibration."},
+        ]}
+        trap={<>Candidates often rank depth high (it's the most 'architectural') but it's secondary to T. The temperature knob is unique to distillation and the dominant calibration mover.</>}
+        lens={<>If you tune one knob to control post-distill calibration drift, it's T. Architecture matters but only on the long tail; the bulk of the calibration shift comes from temperature.</>}
+        stretch={<>Why does MSE-on-logits preserve scale where KL-on-softmax doesn't? What does each loss explicitly minimize?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-c5"
+        difficulty="hard"
+        title="C5 — Data-assumption violation: refitting on the SAME held-out set the teacher used"
+        scenario={<>You refit Platt on the student using the teacher's held-out calibration set. What's wrong? <em>Discriminating insight: the teacher's held-out set may have leaked into the student's training because the teacher's soft labels carried information from that set — the 'held-out' is now contaminated.</em></>}
+        options={[
+          {key:"a", text:"The teacher's calibration set leaks into student training via the teacher's softened soft labels — even if the student never directly sees the set, the teacher's outputs on those examples encode them. Calibrating on contaminated held-out data gives an optimistic fit. Use a fresh held-out slice never touched by either model.", correct:true},
+          {key:"b", text:"The teacher's set is too small for the student."},
+          {key:"c", text:"There's no contamination issue."},
+          {key:"d", text:"The student needs more data, not different data."},
+        ]}
+        trap={<>(b) misses the specific contamination. (c) is wrong. (d) misses the leak vector.</>}
+        lens={<>Soft-label distillation is a leak vector for ANY data the teacher saw. Held-out integrity post-distillation requires a fresh slice. This is invisible to teams thinking of 'held-out' as the set the model didn't update on.</>}
+        stretch={<>What's the smallest fresh held-out slice that gives a reliable Platt fit? Order of magnitude.</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      <VIS.TrapProblem
+        id="pdc-d1"
+        difficulty="hard"
+        title="D1 — 'AUC is fine, calibration is fine' — why the inference fails"
+        scenario={<>The student's AUC is within 0.5% of the teacher. Engineer concludes calibration is fine. Why is this wrong? <em>Discriminating insight: AUC measures order, calibration measures scale; distillation preserves order and breaks scale — AUC is exactly the wrong proxy.</em></>}
+        options={[
+          {key:"a", text:"AUC is a rank-only metric; it is invariant to monotone transformations of the score. Distillation preserves the rank, so AUC stays flat, but it shifts the score scale (the actual probability), which AUC cannot detect. The team needs a scale-sensitive metric (ECE, Brier, log-loss) to see the calibration break.", correct:true},
+          {key:"b", text:"AUC drift below 1% is always tolerable."},
+          {key:"c", text:"Calibration is implicit in AUC."},
+          {key:"d", text:"You need higher AUC precision."},
+        ]}
+        trap={<>(c) is the intuition the question targets — AUC and calibration are orthogonal. (b), (d) are red herrings.</>}
+        lens={<>AUC is orthogonal to calibration. Distillation is the cleanest demonstration: AUC stays flat by design, calibration breaks by mechanism. Knowing which metric senses which property is the senior signal.</>}
+        stretch={<>Construct a calibrator that destroys AUC. Construct a distillation that destroys AUC. Are they the same thing?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: 'student inherits everything'"
+        scenario={<>You assume 'student inherits teacher's calibration.' What downstream beliefs collapse? <em>Discriminating insight: assuming inheritance cascades into 'no recalibration needed', 'AUC suffices for QA', 'bid pacing works', 'A/B test treats them as equivalent' — all wrong.</em></>}
+        multiSelect
+        options={[
+          {key:"a", text:"'No recalibration needed' — wrong because the student's logit scale differs.", correct:true},
+          {key:"b", text:"'AUC suffices to validate the student' — wrong because AUC is scale-invariant.", correct:true},
+          {key:"c", text:"'Bid pacing will adapt automatically' — wrong because pacers consume calibrated probabilities directly.", correct:true},
+          {key:"d", text:"'A/B testing teacher vs student is fair' — wrong because uncalibrated student under-bids; A/B sees a confound.", correct:true},
+          {key:"e", text:"'Latency improves' — actually true and unrelated."},
+        ]}
+        trap={<>(e) is the only correct inheritance, and it's not a 'collapse'. The other four all collapse — every one is a real production failure mode.</>}
+        lens={<>One wrong assumption (inheritance) cascades through QA, monitoring, allocation, and experimentation. The senior MLE traces the cascade BEFORE shipping, not after.</>}
+        stretch={<>Which of (a)-(d) is hardest to detect post-launch? Why?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-d3"
+        difficulty="hard"
+        title="D3 — Junior fixes ECE by changing student loss; senior fixes by..."
+        scenario={<>ECE spikes after distillation. Junior reflex: change the student's loss to include a calibration term. What does the senior do? <em>Discriminating insight: junior changes the model (expensive, risky, slow iteration); senior refits the calibrator (cheap, deterministic, 5 minutes).</em></>}
+        options={[
+          {key:"a", text:"Refit the post-hoc calibrator on fresh held-out student outputs. The break is structural and post-hoc-fixable; changing the training loss is over-engineering and incurs another retraining cycle without addressing the root cause (scale shift, not loss design).", correct:true},
+          {key:"b", text:"Add a calibration term to the distillation loss."},
+          {key:"c", text:"Retrain the student from scratch."},
+          {key:"d", text:"Switch to a larger student."},
+        ]}
+        trap={<>(b), (c), (d) are all expensive-and-wrong. They confuse the symptom (ECE high) with the cause (calibrator stale).</>}
+        lens={<>Post-hoc calibration is the right hammer for scale shift. Senior MLEs reach for the cheap fix first; the model retrain is a last resort.</>}
+        stretch={<>When IS adding a calibration term to the distillation loss the right move?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: 'student under-bids because it's smaller'"
+        scenario={<>Distilled student under-bids in the auction by 8%. Three plausible causes: (1) smaller capacity, (2) post-distill calibration not refit, (3) feature pipeline drift. Diagnose. <em>Discriminating insight: under-bidding right after a distillation deploy with stable features is almost always (2) — capacity loss would show up as AUC drop, not bid drift.</em></>}
+        options={[
+          {key:"a", text:"Almost certainly post-distill calibration: a smaller student would show AUC degradation (which the team would have seen), and feature drift would predate the distillation deploy. The temporal lock-step with the deploy implicates the calibrator.", correct:true},
+          {key:"b", text:"Smaller capacity, always."},
+          {key:"c", text:"Feature drift, always."},
+          {key:"d", text:"GPU vendor."},
+        ]}
+        trap={<>(b), (c), (d) are alternative attributions that can be ruled out by checking AUC and timing.</>}
+        lens={<>Diagnosis is by elimination using the dashboard tools you already have (AUC trend, feature drift monitor) plus the temporal coincidence with the deploy. The senior frame: when distillation deploys, calibration is the first suspect, not the last.</>}
+        stretch={<>What's the fastest 5-minute test that confirms it's calibration before paging the model team?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-d5"
+        difficulty="medium"
+        title="D5 — 'I'll just use a larger student' is not the fix"
+        scenario={<>Engineer proposes a 2x larger student to fix post-distill calibration. Why is this not the fix? <em>Discriminating insight: capacity changes the bias-variance of the rank predictions, but the temperature-induced scale shift is independent of capacity — it persists.</em></>}
+        options={[
+          {key:"a", text:"Increasing student size reduces the rank-error gap to the teacher but does NOT remove the temperature-induced scale shift. The student's logits still live on a different scale than the teacher's, regardless of student capacity. The calibrator refit is the right fix; bigger student is the wrong knob.", correct:true},
+          {key:"b", text:"Bigger student means bigger ECE."},
+          {key:"c", text:"Calibration scales with size."},
+          {key:"d", text:"Larger students don't distill."},
+        ]}
+        trap={<>(b) inverts (the gap closes with size on the AUC dim, not ECE). (c), (d) are wrong.</>}
+        lens={<>Scale shift is a property of the loss + temperature, not of capacity. The fix lives in the calibrator layer, not the model.</>}
+        stretch={<>For T=4, how much student capacity would you need to make the scale shift negligible? Why is this not a sensible production plan?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>E. Operations</h3>
+
+      <VIS.TrapProblem
+        id="pdc-e1"
+        difficulty="hard"
+        title="E1 — Production gotcha: refit cadence vs distill cadence"
+        scenario={<>You distill nightly but recalibrate weekly. What goes wrong? <em>Discriminating insight: 6 of 7 nights ship a student with a stale calibrator; bid pacing drifts each day until the Sunday refit.</em></>}
+        options={[
+          {key:"a", text:"6 of 7 nights deploy with a calibrator stale-by-one-distill. ECE creeps each night; auction bids drift by a few percent per night, compounding to 10-20% by Saturday. The Sunday refit fixes it but Sat night's revenue is already lost.", correct:true},
+          {key:"b", text:"Nothing — weekly is fine."},
+          {key:"c", text:"The calibrator catches up via auto-decay."},
+          {key:"d", text:"Latency spikes."},
+        ]}
+        trap={<>(b) is the seductive 'monitoring will catch it' assumption (it won't, on AUC). (c) is wishful. (d) is unrelated.</>}
+        lens={<>Refit cadence must lock to distillation cadence, not to a calendar. Senior insight: the structural mover sets the cadence.</>}
+        stretch={<>Sketch the dashboard that catches this within hours of the first stale-refit night.</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-e2"
+        difficulty="hard"
+        title="E2 — Friday 3am: distilled student deployed Thursday, alerts firing now"
+        scenario={<>Thursday: new distilled student deployed, AUC parity confirmed, calibrator refit. Friday 3am: per-segment auction alerts firing for two advertiser segments at 12-25% off-pacing. Latency, GPU, NDCG all fine. Why distillation-specifically? <em>Discriminating insight: the refit was on the MARGINAL student distribution; the two segments under-represented in the refit set are now segment-miscalibrated specifically because the student's capacity-loss showed up worst on those segments.</em></>}
+        options={[
+          {key:"a", text:"The Platt refit was on a marginal held-out sample. The student's smaller capacity made it harder to match the teacher's segment-level discrimination on under-represented advertiser segments — the marginal refit doesn't fix segment-level drift. This is a distillation-specific failure: the smaller student's tails are more brittle than the teacher's, and that brittleness is segment-shaped.", correct:true},
+          {key:"b", text:"GPU thermal."},
+          {key:"c", text:"Random."},
+          {key:"d", text:"The team forgot to refit Platt."},
+        ]}
+        trap={<>(d) is the seductive wrong (problem says they DID refit). (b), (c) are red herrings.</>}
+        lens={<>Distillation amplifies segment-level miscalibration even when the marginal refit succeeds. The fix is per-segment Platt or covariate-aware calibrator — not a bigger held-out set.</>}
+        stretch={<>How would you design the QA gate to catch this BEFORE Friday 3am?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-e3"
+        difficulty="hard"
+        title="E3 — Implementation specific: training/inference temperature mismatch"
+        scenario={<>HuggingFace and other KD trainers have a default that silently breaks calibration if not handled. Name it. <em>Discriminating insight: T applied inside the KL loss during training but NOT applied to inference outputs — the deployed logits are on the un-corrected scale.</em></>}
+        options={[
+          {key:"a", text:"The distillation temperature is applied during training (logits divided by T inside the KL loss) but the student's inference call returns RAW logits (not divided by T). Many pipelines forget to apply T at inference — the deployed student outputs logits on the wrong scale. Either apply T at inference OR refit Platt on the raw outputs that production actually sees.", correct:true},
+          {key:"b", text:"The default temperature is 100."},
+          {key:"c", text:"The trainer auto-calibrates."},
+          {key:"d", text:"There's no temperature parameter."},
+        ]}
+        trap={<>(b), (c), (d) are false.</>}
+        lens={<>The training-vs-inference T mismatch is the most common silent bug in distillation pipelines. The fix is mechanically trivial (apply T consistently OR refit the calibrator on what production actually outputs) but the bug survives a year in many teams.</>}
+        stretch={<>Which is preferred: apply T at inference, or refit calibrator on raw output? Why?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-e4"
+        difficulty="hard"
+        mode="ordered"
+        title="E4 — Distillation deploy rollout order"
+        scenario={<>Phases: (a) train student via KD, (b) refit Platt on held-out student outputs, (c) shadow-score (no serve), (d) mirror auction (both teacher and student score; teacher serves), (e) traffic ramp, (f) retire teacher. Order them. <em>Discriminating insight: Platt refit MUST come before shadow scoring — otherwise the shadow numbers are uncalibrated and meaningless.</em></>}
+        options={[
+          {key:"a", text:"Train student via KD.", order:1},
+          {key:"b", text:"Refit Platt on held-out student outputs.", order:2},
+          {key:"c", text:"Shadow-score student (no serve).", order:3},
+          {key:"d", text:"Mirror auction (both score; teacher serves).", order:4},
+          {key:"e", text:"Traffic ramp.", order:5},
+          {key:"f", text:"Retire teacher.", order:6},
+          {key:"g", text:"Skip the refit; ship and refit if alerts fire."},
+        ]}
+        trap={<>(g) is the time-pressure mistake. Many teams skip the refit until ramp; mirror auction numbers are then garbage.</>}
+        lens={<>Calibrator refit is upstream of every comparison step. Without it, shadow scoring and mirror auction comparisons are not apples-to-apples.</>}
+        stretch={<>If mirror auction shows the student under-bidding even AFTER the refit, what's the next step?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-e5"
+        difficulty="hard"
+        title="E5 — Reproducibility: can't replicate the OpenReview KD survey ECE claim"
+        scenario={<>The OpenReview 2024 KD survey claims 'ECE drops from 3% to 0.4% after post-distill refit.' You see 3% to 1.2%. Which experimental property must match? <em>Discriminating insight: temperature, student/teacher size ratio, and held-out distribution — the gap is dominated by these, not by the calibrator family.</em></>}
+        multiSelect
+        options={[
+          {key:"a", text:"Distillation temperature T — the survey's T may be larger than yours, amplifying the scale shift and the refit's headroom.", correct:true},
+          {key:"b", text:"Student-to-teacher parameter ratio — smaller ratio means larger capacity-induced miscalibration.", correct:true},
+          {key:"c", text:"Held-out set's segment composition — if their held-out is from a high-traffic segment, the refit is more effective.", correct:true},
+          {key:"d", text:"Random seed."},
+          {key:"e", text:"GPU vendor."},
+        ]}
+        trap={<>(d), (e) are irrelevant.</>}
+        lens={<>Distillation benchmarks rarely transfer because T, size ratio, and held-out properties are usually unpublished. Treat survey numbers as upper bounds on your own.</>}
+        stretch={<>How would you design a transferable benchmark for post-distill calibration?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-e6"
+        difficulty="hard"
+        title="E6 — Monitoring for post-distill staleness"
+        scenario={<>Pick the leading indicator that catches stale post-distill calibration fastest. <em>Discriminating insight: student logit distribution KL vs the refit-time distribution — catches it BEFORE the realized labels show up.</em></>}
+        options={[
+          {key:"a", text:"KL divergence between today's student logit distribution and the distribution at refit time. If KL exceeds a threshold, the student has drifted from the calibrator's fit region; refit before ECE shows up on the dashboard.", correct:true},
+          {key:"b", text:"Daily marginal ECE."},
+          {key:"c", text:"Weekly Brier."},
+          {key:"d", text:"Volume of clicks."},
+        ]}
+        trap={<>(b), (c) lag by hours-to-days. (d) is downstream.</>}
+        lens={<>Monitor the CAUSE (student distribution shift) not the EFFECT (ECE on labels). KL on logits is the canonical leading indicator. This is a distillation-specific extension of the general "monitor inputs not labels" senior heuristic.</>}
+        stretch={<>What's a good KL threshold? How would you calibrate it?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>F. Failure modes</h3>
+
+      <VIS.TrapProblem
+        id="pdc-f1"
+        difficulty="hard"
+        title="F1 — Edge case: distilling with very small held-out set"
+        scenario={<>Your held-out set has 500 positives. Refit Platt — what specific failure mode kicks in? <em>Discriminating insight: Platt's MLE on small N over-confidences extreme probabilities — exactly the tails where distillation already broke things.</em></>}
+        options={[
+          {key:"a", text:"Small-N Platt MLE over-confidences extreme probabilities (a known property of Platt; the original 1999 paper introduces Laplace smoothing for this reason). The distilled student already has tail miscalibration; small-N refit amplifies it. Use Platt with Laplace smoothing OR isotonic with a Bayesian prior.", correct:true},
+          {key:"b", text:"Nothing — Platt is robust at small N."},
+          {key:"c", text:"Isotonic always wins at small N."},
+          {key:"d", text:"Calibration is impossible below 1k."},
+        ]}
+        trap={<>(b) is false. (c) inverts. (d) overgeneralizes.</>}
+        lens={<>Platt's small-N pathology stacks with distillation's tail damage. Senior MLEs reach for Laplace-smoothed Platt OR Bayesian isotonic when held-out is small. This is THE concrete case where 'just use isotonic' is wrong.</>}
+        stretch={<>What's the Laplace smoothing target value, and how is it derived?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: attack that breaks distilled calibration specifically"
+        scenario={<>Design an attack on the calibration set that degrades the distilled student more than it would degrade the teacher's calibration. <em>Discriminating insight: inject high-score items into the held-out — the student's narrower tails get pooled aggressively by isotonic, far more than the teacher's broader tails would.</em></>}
+        options={[
+          {key:"a", text:"Inject a small number of high-score positive examples into the post-distill held-out set. The student's narrower-tailed logit distribution means isotonic's pool-adjacent-violators step collapses a large fraction of the student's top decile into a single calibrated value — far more aggressive than the same attack on the teacher's wider tails.", correct:true},
+          {key:"b", text:"Random noise to the held-out."},
+          {key:"c", text:"Empty held-out set."},
+          {key:"d", text:"Wrong labels."},
+        ]}
+        trap={<>(b), (c), (d) hurt every calibrator equally. The asymmetric vulnerability is the student's narrower tails.</>}
+        lens={<>Narrower student tails make the student MORE vulnerable to the same data-poisoning attack. Distillation doesn't just shift calibration — it changes the attack surface.</>}
+        stretch={<>What monitor would catch this attack faster than a reliability diagram?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-f3"
+        difficulty="hard"
+        title="F3 — Reverse engineering: student is wildly miscalibrated despite fresh refit"
+        scenario={<>Symptom: refit Platt on fresh held-out student outputs, ECE is still 4%. Marginal reliability looks flat after refit, but per-decile reliability is wildly off. Which distillation-specific cause? <em>Discriminating insight: the student's logit distribution has become bimodal due to the small capacity + the teacher's two-cluster structure — Platt's sigmoid cannot fit bimodal targets.</em></>}
+        options={[
+          {key:"a", text:"The student's capacity loss collapsed the teacher's nuanced logit distribution into a bimodal one. Platt's sigmoid family cannot fit a bimodal score-vs-probability curve — the marginal looks flat (averaging over the bimodality) but per-decile is broken. Switch to isotonic OR refit a two-piece sigmoid.", correct:true},
+          {key:"b", text:"Refit needs more data."},
+          {key:"c", text:"Distillation always fails."},
+          {key:"d", text:"GPU bug."},
+        ]}
+        trap={<>(b) over-attributes to data. (c), (d) are wrong.</>}
+        lens={<>Distillation can change the SHAPE of the score-vs-probability curve, not just its scale. When shape changes, the calibrator FAMILY may need to change too. Senior insight: don't just refit Platt — verify Platt is still the right family for the student.</>}
+        stretch={<>How would you detect bimodality in the student's score-vs-prob curve before refitting?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-f4"
+        difficulty="hard"
+        title="F4 — Paper-named failure: 'temperature mismatch at inference'"
+        scenario={<>The OpenReview 2024 KD survey calls out a specific failure mode: temperature applied during training, NOT applied at inference. What's the symptom, and why is this distillation-specific? <em>Discriminating insight: the student's deployed logits are T*scaled relative to where the KL loss expected them — the calibrator fit on training-side outputs is wrong for inference-side outputs.</em></>}
+        options={[
+          {key:"a", text:"Training divides logits by T inside the KL loss; inference does not. The deployed student's logits are therefore on a scale T-times-larger than the training-time calibration set saw. The calibrator is systematically wrong by a factor proportional to T. Fix: refit on the inference-time output distribution, OR apply T at inference and refit on the corrected scale.", correct:true},
+          {key:"b", text:"Temperature mismatch is unrelated to calibration."},
+          {key:"c", text:"This is a general ML bug."},
+          {key:"d", text:"It only affects very large T."},
+        ]}
+        trap={<>(b), (c), (d) miss the specific mechanism.</>}
+        lens={<>This is the most common production bug in distillation — and it's named in the survey precisely because every team rediscovers it independently. Refit on what production actually outputs.</>}
+        stretch={<>If you must apply T at inference for some other reason (e.g., to match a downstream API), how does the refit change?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-f5"
+        difficulty="hard"
+        title="F5 — Community-found: 'self-distillation' and calibration"
+        scenario={<>A 2024 follow-up paper claims self-distillation (student equals teacher size) STILL needs post-hoc calibration refit. Why, given there's no capacity shift? <em>Discriminating insight: even at identical size, the temperature softening and KL gradient bias the student's logit operating point away from the teacher's.</em></>}
+        options={[
+          {key:"a", text:"Self-distillation still uses T larger than 1 KL targets, which shifts the student's logit operating point even though architecture is identical. The student converges to a different local optimum than the teacher (one that better matches softmax(teacher/T), not teacher) — and that optimum has a different logit distribution.", correct:true},
+          {key:"b", text:"Self-distillation is a no-op."},
+          {key:"c", text:"Calibration is preserved at same size."},
+          {key:"d", text:"This claim is wrong; refit isn't needed."},
+        ]}
+        trap={<>(b), (c), (d) miss the temperature-as-scale-mover insight.</>}
+        lens={<>Capacity is one cause of scale shift; temperature is another. Even with capacity fixed, temperature alone forces a calibration refit. This rules out 'just match sizes' as a workaround.</>}
+        stretch={<>Could you avoid the refit by setting T=1 for self-distillation? Would the distillation still provide its claimed benefit?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-f6"
+        difficulty="hard"
+        title="F6 — Multi-objective: refit calibration on which head?"
+        scenario={<>Teacher has 3 heads (P(click), P(watch beyond 30s), P(share)) with per-head Platts. Distill into a multi-head student. Refit policy? <em>Discriminating insight: each head's logit distribution shifts independently — must refit each Platt separately on the student's head outputs.</em></>}
+        options={[
+          {key:"a", text:"Each head's logit distribution shifts independently under distillation (different temperatures may apply per-head, different KL weights, different label sparsities). Refit a separate Platt per head on the student's outputs. Do NOT share calibrator parameters across heads.", correct:true},
+          {key:"b", text:"Share one calibrator across heads."},
+          {key:"c", text:"Refit only the click head."},
+          {key:"d", text:"Recombine, then calibrate the sum."},
+        ]}
+        trap={<>(b) under-fits. (c) ignores other heads. (d) is the multi-objective gotcha from the sibling visual — wrong here because each head is consumed separately, not summed.</>}
+        lens={<>Per-head independence after distillation. The multi-objective gotcha (composed calibration is not calibrated composition) is orthogonal — this is just about preserving each head's individual calibration.</>}
+        stretch={<>If consumers DO use weighted-sum across heads, does (d) become right? Sketch the right architecture.</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-f7"
+        difficulty="hard"
+        title="F7 — Silent regression: refit succeeded offline, fails online"
+        scenario={<>Offline: refit Platt, ECE drops from 3% to 0.4%. Online: ECE stays at 2.5%. Why? <em>Discriminating insight: held-out is offline-logged (biased by teacher's policy); online traffic is served by student (different distribution); refit calibrated to the wrong distribution.</em></>}
+        options={[
+          {key:"a", text:"The held-out set was logged when the teacher was serving — it represents the teacher's served distribution. After the student deploys, the online distribution shifts (different items get scored, different rank positions are realized). The refit Platt is calibrated for the teacher's served distribution, not the student's. Fix: refit on a reserved exploration slice OR IPS-weight the refit.", correct:true},
+          {key:"b", text:"Online ECE is always higher than offline."},
+          {key:"c", text:"Platt is wrong; switch to isotonic."},
+          {key:"d", text:"More data."},
+        ]}
+        trap={<>(b) is the seductive folk belief. (c), (d) misdiagnose.</>}
+        lens={<>Offline-online gap in calibration tracking is a logged-data selection-bias problem stacked on top of the distillation problem. Both need addressing: refit on a fresh slice AND ideally from an exploration policy.</>}
+        stretch={<>How much exploration traffic do you need? Order of magnitude per segment.</>}
+      />
+
+      <VIS.TrapProblem
+        id="pdc-f8"
+        difficulty="hard"
+        title="F8 — Conformal-prediction interplay"
+        scenario={<>You add a conformal layer on top of the refit Platt for risk-aware bidding. After the next distillation, the conformal coverage drops from 90% to 78%. Why? <em>Discriminating insight: the conformal nonconformity scores are computed against the student's predictions; new student = new score distribution = stale conformal quantile.</em></>}
+        options={[
+          {key:"a", text:"Conformal's coverage quantile is computed over the calibration set's nonconformity scores. Those scores depend on the student's outputs. A new student produces new nonconformity scores; the old quantile is at the wrong percentile. Re-compute the conformal quantile on the new student's held-out outputs every time you distill.", correct:true},
+          {key:"b", text:"Conformal is distribution-free; coverage cannot drop."},
+          {key:"c", text:"This is a Platt problem, not conformal."},
+          {key:"d", text:"Coverage drift is random."},
+        ]}
+        trap={<>(b) is the distribution-free misreading from sibling A4. (c), (d) misdiagnose.</>}
+        lens={<>Distribution-free does not mean refit-free. Every model change is a calibration event for every calibration layer in the stack — Platt, isotonic, conformal.</>}
+        stretch={<>What's the cheapest single refit pass that handles both Platt and conformal in one shot?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">Hinton, Vinyals, Dean — <em>Distilling the Knowledge in a Neural Network</em> (NIPS 2014, paper)</a> — the original distillation paper; understand the temperature math.</li>
-        <li><a href="https://openreview.net/pdf?id=3cbJzdR78B" target="_blank" rel="noopener">OpenReview — <em>A Comprehensive Survey on Knowledge Distillation</em> (2024)</a> — taxonomy of distillation flavors and calibration interactions.</li>
-        <li><a href="https://arxiv.org/abs/1706.04599" target="_blank" rel="noopener">Guo et al. — <em>On Calibration of Modern Neural Networks</em> (ICML 2017)</a> — foundational on temperature scaling, ECE, reliability diagrams.</li>
-        <li><a href="https://eugeneyan.com/writing/calibration-of-probabilistic-models/" target="_blank" rel="noopener">Eugene Yan — <em>Calibration of Probabilistic Models</em> (blog)</a> — practitioner tour.</li>
-        <li><a href="https://www.youtube.com/watch?v=PpZmCnk6oWo" target="_blank" rel="noopener">Andrej Karpathy — <em>Lecture on knowledge distillation</em> (video clip)</a> — short, intuitive explanation of why distillation softens the output distribution.</li>
+        <li>
+          <a href="https://openreview.net/pdf?id=3cbJzdR78B" target="_blank" rel="noopener"><strong>A Comprehensive Survey on Knowledge Distillation</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(OpenReview 2024)</span>
+          <br/>The canonical reference; names the temperature-mismatch failure mode and the post-hoc refit recipe.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener"><strong>Hinton, Vinyals, Dean — Distilling the Knowledge in a Neural Network</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(NeurIPS 2014 workshop)</span>
+          <br/>Origin paper; introduces the temperature-scaled KL loss whose scale shift is the root cause of post-distill miscalibration.
+        </li>
+        <li>
+          <a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener"><strong>Eugene Yan — System design for discovery</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog, 2024)</span>
+          <br/>Practical lens on where post-hoc calibration sits in a production recsys stack.
+        </li>
       </ul>
     </VIS.Section>
   </main>
 );
+
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
