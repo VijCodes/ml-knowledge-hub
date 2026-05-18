@@ -1414,240 +1414,469 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// REDO v2 — RecSys-SOTA batch 11
+// MAFCDR — Meta-Adversarial Cross-Domain Cold-Start Recommendation (DSE 2024)
+// Unique mechanism: ADVERSARIAL DOMAIN DISCRIMINATOR is bolted onto the SOURCE-DOMAIN
+// encoder INSIDE the MAML meta-training loop, forcing the SHARED LATENT to be
+// DOMAIN-INVARIANT before MAML inner-loop adapts to a cold TARGET user/item.
+// Cross-visual caution (meta-learning trio):
+//   - MAFCDR = adversarial domain discriminator + cross-domain (THIS visual)
+//   - CFSM   = content-feature prior + double-tower mutual attention (no domain shift)
+//   - PAM    = popularity-trajectory stratification at meta-task sampling
+// Don't let "MAML inner-loop sensitivity" / "few-shot variance" be the punchline here;
+// the punchline is GRADIENT-REVERSAL on a domain head INSIDE the meta-loop.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Cold-start"
+      pill="RecSys SOTA · Cold-start (cross-domain)"
       title="MAFCDR — Meta-Adversarial Cross-Domain Cold-Start"
-      subtitle="Multi-level feature attention plus meta-adversarial training pushes the source-domain feature encoder toward domain-invariant embeddings before MAML fine-tunes on the cold target."
+      subtitle="A domain-adversarial discriminator with gradient reversal sits INSIDE the MAML meta-loop so the encoder that feeds the inner-loop is already domain-invariant when the cold target user/item arrives."
       byline={[
-        {label: "Paper", value: "DSE 2024 (Springer 10.1007/s41019-024-00245-y)"},
-        {label: "Domain", value: "Cold-start when source domain is plentiful"},
+        {label: "Paper", value: "Wang et al., DSE 2024 (Springer 10.1007/s41019-024-00245-y)"},
+        {label: "Surface", value: "Cold target domain, plentiful source domain, shared user/item modality"},
+        {label: "Anchor that survives redaction", value: "Adversarial domain head INSIDE MAML — not MAML alone, not DANN alone"},
       ]}/>
 
     <VIS.TLDR>
-      Vanilla <VIS.Term def="Model-Agnostic Meta-Learning — trains an initialization that adapts to a new task with very few gradient steps.">MAML</VIS.Term> for cold-start assumes the source and target share the same feature distribution. They usually do not. MAFCDR bolts a <VIS.Term def="A small classifier head that tries to predict which domain a feature vector came from; the main encoder is trained to fool it, producing domain-invariant features.">domain-discriminator adversary</VIS.Term> onto the source-domain encoder so the features it ships into MAML are domain-confused, then layers a multi-level attention block to weight the cross-domain signal. The adversary is what stabilizes the target adaptation.
+      Vanilla <VIS.Term def="Model-Agnostic Meta-Learning — trains an initialization that adapts to a new task with very few gradient steps.">MAML</VIS.Term> for cold-start assumes source and target tasks share the same feature distribution. Cross-domain, they don&apos;t — a movie-encoder feature axis can be book-domain noise. MAFCDR runs <VIS.Term def="A small classifier head trained to predict which domain a feature vector came from; the encoder is trained to FOOL it via gradient reversal, producing domain-invariant features.">domain-adversarial training</VIS.Term> <em>inside</em> the MAML outer loop, so the meta-initialization MAML ships to the target inner loop is already <strong>domain-confused</strong>. Three architectural commitments make this work: (1) multi-level feature attention re-weights raw features <em>before</em> any cross-domain mixing; (2) <VIS.Term def="A layer that flips the gradient sign on backward pass — so minimizing the discriminator&apos;s loss MAXIMIZES it for the encoder, forcing domain-indistinguishable features.">gradient reversal</VIS.Term> on the domain head decorrelates the shared latent from domain ID; (3) MAML&apos;s second-order inner loop adapts the domain-invariant encoder on the cold target. The adversary is what stabilizes the target adaptation — not bigger embeddings, not more meta-tasks.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        MAFCDR has three blocks composed in series. The first does feature attention, the second does adversarial domain confusion, the third does standard MAML.
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  S["Source domain features"]
-  T["Target domain features"]
+    <VIS.Section id="sec-what" title="What it is — three blocks, composed in series">
+      <VIS.Mermaid chart={`flowchart TB
+  S["Source-domain features"]
+  T["Target-domain features (cold)"]
   S --> A["Multi-level feature attention"]
   T --> A
-  A --> ADV["Adversary tries domain ID"]
   A --> ENC["Shared encoder"]
+  ENC --> ADV["Domain discriminator head"]
   ADV -.gradient reversal.-> ENC
-  ENC --> M["MAML inner loop on target tasks"]
-  M --> R["Target ranker"]
-      `} />
+  ENC --> META["MAML outer loop"]
+  META --> INIT["Domain-invariant meta-init"]
+  INIT --> INNER["MAML inner loop on cold target"]
+  INNER --> R["Adapted target ranker"]`} />
       <ul>
-        <li><strong>Multi-level feature attention</strong> — re-weights raw user and item features at several granularities (atomic, group, profile) before any cross-domain mixing.</li>
-        <li><strong>Meta-adversarial encoder</strong> — a domain classifier is trained against the encoder; <VIS.Term def="Multiplies the gradient by negative one when it flows from the adversary back into the encoder, so minimizing the adversary's loss MAXIMIZES it for the encoder — pushing features to be domain-indistinguishable.">gradient reversal</VIS.Term> makes encoder features harder to classify by domain.</li>
-        <li><strong>MAML adaptation</strong> — the now-invariant encoder feeds standard MAML inner-loop adaptation on the cold target user or item tasks.</li>
+        <li><strong>Multi-level feature attention</strong> — re-weights raw features at three granularities (atomic field, field group, user/item profile) <em>before</em> they enter the shared encoder. Pre-attention prevents one domain&apos;s feature mass from dominating the shared latent.</li>
+        <li><strong>Meta-adversarial encoder</strong> — a domain-classifier head is trained against the encoder via gradient reversal. The encoder&apos;s loss combines task loss on the source domain and <em>negative</em> domain-classification loss.</li>
+        <li><strong>MAML adaptation</strong> — the now-invariant encoder feeds the standard second-order MAML inner loop on the cold target user/item task.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from baselines">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>MAML-only cold-start</th><th style={{textAlign:"left",padding:8}}>Naive shared encoder CDR</th><th style={{textAlign:"left",padding:8}}>MAFCDR</th></tr></thead>
+    <VIS.Section id="sec-diff" title="How it differs from MAML / DANN / shared-encoder CDR">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Domain shift</th>
+          <th style={{textAlign:"left", padding:8}}>Feature reweighting</th>
+          <th style={{textAlign:"left", padding:8}}>Cold-target loop</th>
+          <th style={{textAlign:"left", padding:8}}>Adversary in meta?</th>
+        </tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Domain shift handling</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Ignored</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Hoped-away</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Actively pushed out by adversary</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Feature reweighting</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Multi-level attention</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Training stability</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Stable</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Stable</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Adversarial; needs care</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Cold-start lift</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Modest</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Modest with leakage</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Strong when source is plentiful</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>MAML-Rec</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Ignored</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Second-order</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>No</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>DANN (vanilla)</td><td style={{padding:8}}>Gradient reversal</td><td style={{padding:8}}>None</td><td style={{padding:8}}>Standard supervised</td><td style={{padding:8}}>N/A (no meta-loop)</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Naive shared-encoder CDR</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Hoped-away</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Fine-tune</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>No</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}><strong>MAFCDR</strong></td><td style={{padding:8}}><strong>Adversary INSIDE meta-loop</strong></td><td style={{padding:8}}><strong>3-level attention pre-encoder</strong></td><td style={{padding:8}}><strong>MAML on invariant init</strong></td><td style={{padding:8}}><strong>YES — load-bearing</strong></td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>Source domain has orders-of-magnitude more interactions than the target.</li>
-        <li>The source and target share user space but feature distributions visibly differ (e.g., e-commerce categories with different price ranges).</li>
-        <li>You can sustain adversarial training infrastructure (gradient reversal, two optimizers, careful LR balance).</li>
-        <li>Cold target users or items appear frequently — MAML's adaptation budget pays off.</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 24 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the question-axis it draws from. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <ul>
-        <li><strong>Adversarial training instability</strong> — the encoder-vs-adversary balance can collapse; symptoms are exploding gradients or a domain classifier stuck at 50%.</li>
-        <li><strong>Within-domain hurts</strong> — pushing features to be domain-invariant deletes useful domain-specific structure; if you only serve the source, MAFCDR underperforms a plain encoder.</li>
-        <li><strong>Second-order MAML cost</strong> — full second-order gradients are expensive; first-order MAML loses some signal.</li>
-        <li><strong>Attention block tuning</strong> — multi-level attention has three sets of weights; ablations show meaningful sensitivity.</li>
-        <li><strong>Cold items, not just users</strong> — the paper focuses on cold users; cold items need a content tower the paper doesn&apos;t fully cover.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
-
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="ma-p1" difficulty="hard"
-        title="P1 — Why does adversarial domain confusion help cross-domain but hurt within-domain?"
-        scenario={<>Your team adopts MAFCDR for a books-to-movies launch and reports a 3.1% NDCG lift on cold movie users. Encouraged, an eng turns the same model on for warm books users (source domain) and sees a 1.8% REGRESSION. Most plausible root cause?</>}
+        id="mafcdr-p1" difficulty="hard"
+        title="P1 — MAFCDR vs vanilla MAML-Rec: what is the load-bearing addition?"
+        scenario={<><em>Discriminating insight: MAML alone assumes source and target share the feature distribution. Cross-domain, that is false. MAFCDR&apos;s adversary is INSIDE the meta-loop, so the initialization MAML ships to the inner loop is already domain-invariant.</em><br/>Your CDR cold-start uses MAML-Rec and the cold-target NDCG@10 swings &plusmn;6% across seeds. What does MAFCDR add that fixes this?</>}
         options={[
-          {key:"a", text:"The adversary pushed features to be domain-invariant, deleting books-specific structure that the books ranker needed.", correct:true},
-          {key:"b", text:"The model is overfit to movies; revert and retrain."},
-          {key:"c", text:"The MAML inner loop ran too few steps for warm users."},
-          {key:"d", text:"The attention weights were tuned for the target only."},
+          {key:"a", text:"A domain-discriminator head with gradient reversal INSIDE the MAML outer loop, forcing the meta-initialization to be domain-invariant. Variance drops because the inner loop no longer chases domain-correlated axes.", correct:true},
+          {key:"b", text:"A larger inner-loop learning rate so MAML adapts faster on cold-target shots."},
+          {key:"c", text:"Second-order Hessian terms to stabilize MAML."},
+          {key:"d", text:"More source tasks per meta-batch."},
         ]}
-        trap={<>(b) is a non-diagnosis. (c) confuses warm-user vs few-shot inner loop. (d) is a possible secondary issue but does not explain the directional regression.</>}
-        lens={<>Adversarial domain confusion is a TRANSFER tool, not a universal upgrade. It explicitly removes domain-specific signal — exactly the signal a within-domain ranker leans on. Keep the un-confused source encoder for source-only serving; use the confused one only for transfer.</>}
-        stretch={<>How would you A/B-test &quot;same model both domains&quot; vs &quot;two heads&quot; cleanly?</>}
+        trap={<>(b) addresses adaptation speed, not the variance source. (c) MAML is already second-order. (d) more tasks cannot cure domain-mismatched features.</>}
+        lens={<>The variance source is the encoder shipping domain-correlated axes into the inner loop. Adversarial decorrelation INSIDE the meta-loop is the fix.</>}
+        stretch={<>Where would you start the gradient-reversal coefficient schedule?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="ma-p2" difficulty="hard" multiSelect
-        title="P2 — Stabilizing the adversary"
-        scenario={<>Your MAFCDR adversary&apos;s loss is oscillating wildly (0.69 then 0.41 then 0.72 across steps) and target NDCG is not improving. Which interventions are correct? Select all that apply.</>}
+        id="mafcdr-p2" difficulty="hard"
+        title="P2 — MAFCDR vs vanilla DANN"
+        scenario={<><em>Discriminating insight: DANN is supervised domain-adversarial — one shared encoder, one task head, one domain head, no meta-loop. MAFCDR places that DANN-style adversary INSIDE the outer loop of MAML, so the artifact decorrelated is the META-INITIALIZATION, not a single-task fit.</em><br/>Why not just slap DANN on top of your cold-start fine-tuner?</>}
         options={[
-          {key:"a", text:"Lower the gradient-reversal scaling factor (lambda) from 1.0 to 0.1 early in training and ramp up.", correct:true},
-          {key:"b", text:"Use spectral normalization or a Lipschitz constraint on the adversary.", correct:true},
-          {key:"c", text:"Increase the adversary learning rate to 10x the encoder rate."},
-          {key:"d", text:"Replace gradient reversal with a domain-confusion loss (cross-entropy with uniform target).", correct:true},
-          {key:"e", text:"Disable the adversary; meta-learning alone is sufficient."},
+          {key:"a", text:"DANN decorrelates the encoder for ONE source-target pair fitted directly; it has no few-shot adaptation step. MAFCDR keeps the adversary but puts it in the meta-loop so the artifact shipped is a domain-invariant INITIALIZATION that the MAML inner loop adapts.", correct:true},
+          {key:"b", text:"DANN does not support gradient reversal."},
+          {key:"c", text:"DANN cannot be combined with attention layers."},
+          {key:"d", text:"They are mathematically equivalent."},
         ]}
-        trap={<>(c) accelerates instability — a stronger adversary makes the encoder chase it. (e) abandons the method entirely; the question is to stabilize it.</>}
-        lens={<>The classical fixes from <VIS.Term def="Domain-Adversarial Neural Network — Ganin et al. 2015, the original gradient-reversal paper.">DANN</VIS.Term> literature apply: (a) anneal lambda, (b) constrain adversary capacity, (d) swap reversal for confusion loss which is smoother. All three reduce the GAN-style two-player race.</>}
-        stretch={<>What single metric tells you the adversary-encoder balance is healthy?</>}
+        trap={<>(b) DANN literally is gradient reversal. (c) trivially false. (d) DANN has no meta-loop, MAFCDR does.</>}
+        lens={<>DANN ships a fitted encoder; MAFCDR ships a meta-initialization. The difference matters when the target has under 10 interactions.</>}
+        stretch={<>What would MAML stacked on DANN (no adversary in meta-loop) miss?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="ma-p3" difficulty="hard"
-        title="P3 — When does the multi-level feature attention matter?"
-        scenario={<>You ablate the multi-level attention block from MAFCDR. On a books-to-movies setup, the target NDCG drops by 0.4%. On a music-to-podcasts setup, it drops by 2.1%. What is the cleanest explanation?</>}
+        id="mafcdr-p3" difficulty="medium"
+        title="P3 — Counterfactual: no MAFCDR, what do you use?"
+        scenario={<><em>Discriminating insight: without MAFCDR, the practical fallback is shared two-tower + per-domain fine-tune. That leaks domain-correlated features into the cold target until enough target interactions accumulate to wash them out — exactly the regime where you cannot wait.</em><br/>Quantify the gap.</>}
         options={[
-          {key:"a", text:"Music-and-podcasts share more feature-level structure (acoustic, duration) that benefits from explicit attention reweighting; books and movies share more abstract structure (genre, narrative) where simple pooling works.", correct:true},
-          {key:"b", text:"Movies have more data; attention is not needed."},
-          {key:"c", text:"Books-movies has a bug in the experiment."},
-          {key:"d", text:"Attention only helps when target is larger than source."},
+          {key:"a", text:"Cold-target NDCG@10 stays roughly flat for the first ~50 target interactions per user/item because the shared encoder uses source-domain-correlated axes; MAFCDR closes that gap by shipping a domain-invariant init from day zero.", correct:true},
+          {key:"b", text:"No difference; MAML-Rec and MAFCDR perform identically."},
+          {key:"c", text:"MAFCDR is strictly worse on the cold target."},
+          {key:"d", text:"The gap is in latency, not recall."},
         ]}
-        trap={<>(b) reverses the data argument. (c) is a non-answer. (d) inverts the typical regime.</>}
-        lens={<>Multi-level attention pays off when the cross-domain signal is in low-level features that need reweighting (audio length, instrument tags). When the shared signal is already at a higher level (genres, themes), the attention has less to bite into.</>}
-        stretch={<>How would you decide a priori whether multi-level attention will pay for itself?</>}
+        trap={<>(b) ignores the domain-shift premise. (c) backwards. (d) MAFCDR adds training cost, not serving latency.</>}
+        lens={<>The cold-start window is exactly when domain-correlated features hurt most.</>}
+        stretch={<>Sketch the NDCG@10-vs-#-interactions curve.</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="ma-p4" difficulty="medium"
-        title="P4 — Choosing between MAFCDR and DisCo"
-        scenario={<>You can ship MAFCDR (meta-adversarial) or DisCo (disentangled contrastive). You have a plentiful source, sparse target, ~5% overlapping users, and tight ops time. Which is the cleaner pick?</>}
+        id="mafcdr-p4" difficulty="hard"
+        title="P4 — Stacking MAFCDR with RQ-VAE Semantic IDs"
+        scenario={<><em>Discriminating insight: if the RQ-VAE codebook is trained source-only, the Semantic IDs already carry domain bias; the adversary then has to fight the IDs as well as the encoder.</em><br/>What breaks if you stack carelessly?</>}
         options={[
-          {key:"a", text:"DisCo — overlapping users are too few to support adversarial encoder training; DisCo&apos;s shared-head loss handles small overlap better."},
-          {key:"b", text:"MAFCDR — adversarial training does not require overlapping users; it works on feature distributions and meta-tasks instead.", correct:true},
-          {key:"c", text:"Both will perform identically."},
-          {key:"d", text:"Single-domain target training."},
+          {key:"a", text:"Semantic IDs trained source-only become a side-channel for domain identity. Fix: train RQ-VAE on source+target catalog union, OR add the ID embedding to the adversary&apos;s decorrelation target.", correct:true},
+          {key:"b", text:"Semantic IDs are unaffected; MAFCDR works as-is."},
+          {key:"c", text:"The MAML inner loop diverges because of codebook collisions."},
+          {key:"d", text:"RQ-VAE is incompatible with MAML."},
         ]}
-        trap={<>(a) reverses the dependency: DisCo&apos;s shared-head positive pairs come from same-user-across-domains, so small overlap STARVES it. (c) is wishful. (d) ignores the plentiful source.</>}
-        lens={<>MAFCDR is the right pick when overlap is small but the source is plentiful — adversarial alignment works at the feature-distribution level, not user-identity level. DisCo wants meaningful user overlap.</>}
-        stretch={<>What overlap fraction roughly flips the answer?</>}
+        trap={<>(b) ignores the leak. (c) unrelated mechanism. (d) false.</>}
+        lens={<>Domain leaks through any source-only-trained representation; the adversary must see them all.</>}
+        stretch={<>Where else can domain leak (item IDs, side info, tokenizers)?</>}
       />
 
+      {/* axis: A5 */}
       <VIS.TrapProblem
-        id="ma-p5" difficulty="hard" multiSelect
-        title="P5 — Diagnosing a 50% domain-classifier accuracy"
-        scenario={<>Your MAFCDR domain classifier sits at exactly 50% accuracy from epoch one through epoch fifty. Encoder features are theoretically domain-invariant. Yet target cold-start NDCG is no better than no-MAFCDR baseline. Which diagnoses are plausible? Select all that apply.</>}
+        id="mafcdr-p5" difficulty="medium"
+        title="P5 — Boundary: when does MAFCDR stop being worth it?"
+        scenario={<><em>Discriminating insight: MAFCDR pays off when source &gt;&gt; target AND domains share non-trivial feature overlap. Content-alien domains (books → grocery) leave the adversary nothing useful to make invariant; warm targets make MAML alone sufficient.</em><br/>Where is the boundary?</>}
         options={[
-          {key:"a", text:"The adversary is undertrained — its loss is flat because gradients vanish before it learns anything useful.", correct:true},
-          {key:"b", text:"The encoder collapsed to a domain-invariant but task-useless representation (mode collapse).", correct:true},
-          {key:"c", text:"Lambda is too high and the encoder discarded all signal to win the adversarial game.", correct:true},
-          {key:"d", text:"50% accuracy is always good; the issue is in the MAML head."},
-          {key:"e", text:"The feature attention is masking the domain signal before the adversary."},
+          {key:"a", text:"MAFCDR wins when (i) source >> target in interactions, (ii) domains share genuine feature overlap, and (iii) target is still cold (under ~50 interactions/user). Outside this band, prefer MAML-Rec or naive shared-encoder CDR.", correct:true},
+          {key:"b", text:"MAFCDR always wins."},
+          {key:"c", text:"MAFCDR wins when target >> source."},
+          {key:"d", text:"MAFCDR is independent of domain overlap."},
         ]}
-        trap={<>(d) confuses the surface metric with success — 50% domain accuracy is necessary but not sufficient. (e) is plausible-sounding but the attention reweighs, it does not mask.</>}
-        lens={<>50% can come from an adversary that never learned (a) OR an encoder that overshot (b, c). Both look the same on the classifier metric. Check encoder feature variance and target task loss separately to disambiguate.</>}
-        stretch={<>Design a metric that distinguishes &quot;adversary too weak&quot; from &quot;encoder collapsed.&quot;</>}
+        trap={<>(b) ignores cost. (c) backwards. (d) ignores the mechanism.</>}
+        lens={<>Adversary needs a signal; meta-loop needs few-shot.</>}
+        stretch={<>What diagnostic estimates attention-mass overlap before training?</>}
       />
 
+      {/* axis: B1 */}
       <VIS.TrapProblem
-        id="ma-p6" difficulty="hard"
-        title="P6 — Source has 100x target data: does MAFCDR still help?"
-        scenario={<>Source domain has 100M interactions; target has 200k. Both have feature distributions that visibly differ on side info. Should you reach for MAFCDR over a simple cross-domain shared encoder?</>}
+        id="mafcdr-p6" difficulty="hard"
+        title="P6 — Pick the technique for THIS scenario"
+        scenario={<><em>Discriminating insight: 50M source-domain (movies) interactions, 200k target-domain (books) interactions, only 3-8 per cold target user. Plausible feature overlap (both narrative content). Cold + plentiful source + overlap = MAFCDR&apos;s sweet spot.</em><br/>Pick the senior choice.</>}
         options={[
-          {key:"a", text:"Yes — the 100x imbalance means a shared encoder will be dominated by source features; MAFCDR&apos;s adversary explicitly fights that domination.", correct:true},
-          {key:"b", text:"No — with that much source data, naive shared-encoder transfer is fine."},
-          {key:"c", text:"No — adversarial training requires balanced classes."},
-          {key:"d", text:"Yes — but only with under 5 MAML inner steps."},
+          {key:"a", text:"MAFCDR — plentiful source, cold target with under 10 shots per user, plausible feature overlap. Domain-adversarial inside the meta-loop is exactly the regime designed for.", correct:true},
+          {key:"b", text:"Fine-tune a source-only two-tower on the target; the source data dominates."},
+          {key:"c", text:"Train a fresh book-domain DLRM from scratch; ignore the movie data."},
+          {key:"d", text:"Cross-domain CF without meta-learning."},
         ]}
-        trap={<>(b) is the most tempting decoy: &quot;more data heals everything.&quot; It heals source ranking, not target ranking. (c) confuses the adversary&apos;s binary domain classification with class imbalance. (d) is irrelevant.</>}
-        lens={<>The 100x imbalance is exactly the regime where naive shared-encoder transfer leaks source-specific structure into target. The adversary explicitly removes the source-specific bias. This is MAFCDR&apos;s sweet spot.</>}
-        stretch={<>What if the imbalance were reversed (target has 100x source)?</>}
+        trap={<>(b) leaks domain bias into cold targets. (c) wastes the 50M source rows. (d) no few-shot mechanism.</>}
+        lens={<>Cold-target + plentiful source + overlap = MAFCDR.</>}
+        stretch={<>At what target sample size would you drop the adversary?</>}
       />
 
+      {/* axis: B2 — sounds reasonable, isn't */}
       <VIS.TrapProblem
-        id="ma-p7" difficulty="medium" mode="ordered"
-        title="P7 — Order your training-stability fixes"
-        scenario={<>Training is diverging at epoch 3. Order the first interventions to try. Items not in the right path stay unranked.</>}
+        id="mafcdr-p7" difficulty="hard"
+        title="P7 — Sounds reasonable: just use a bigger source-shared embedding"
+        scenario={<><em>Discriminating insight: bigger embeddings give MORE capacity to encode domain-correlated axes — the opposite of what cold-target adaptation needs. The fix is decorrelation, not capacity.</em><br/>A teammate proposes doubling embedding dim from 64 to 128 to help cold-start. Why is this wrong for MAFCDR&apos;s problem?</>}
         options={[
-          {key:"a", text:"Add gradient clipping at norm 1.0 to both encoder and adversary.", order:1},
-          {key:"b", text:"Anneal lambda from 0 to 1 over the first 1k steps.", order:2},
-          {key:"c", text:"Rewrite the adversary from scratch."},
-          {key:"d", text:"Add spectral normalization to the adversary.", order:3},
-          {key:"e", text:"Drop adversarial training entirely."},
+          {key:"a", text:"Bigger embeddings expand capacity for domain-correlated subspaces, so the inner loop has MORE chances to latch onto source-only features. The right move is to keep dim modest and use the adversary to decorrelate.", correct:true},
+          {key:"b", text:"Bigger embeddings always help cold-start."},
+          {key:"c", text:"Embedding dim is independent of cold-start."},
+          {key:"d", text:"Halve the dim instead; smaller is always better."},
         ]}
-        trap={<>(c) is destruction-not-debugging. (e) abandons the method.</>}
-        lens={<>Clip first (cheapest), then anneal lambda (no architecture change), then spectral norm (real change). Match cost to evidence. Rewrites and abandonment come after the cheap fixes fail.</>}
-        stretch={<>If clipping plus annealing works at lambda 0.3 but you wanted lambda 1.0, what does that tell you?</>}
+        trap={<>(b) common textbook intuition that fails here. (c) ignores the mechanism. (d) overcorrects.</>}
+        lens={<>Capacity-shortage vs domain-leak require opposite fixes.</>}
+        stretch={<>What metric distinguishes capacity-bound from domain-leak failures?</>}
       />
 
+      {/* axis: B3 — customer/business framing */}
       <VIS.TrapProblem
-        id="ma-p8" difficulty="hard"
-        title="P8 — First-order vs second-order MAML inside MAFCDR"
-        scenario={<>Second-order MAML triples training time. You consider FOMAML (first-order) inside MAFCDR. Which statement is most defensible?</>}
+        id="mafcdr-p8" difficulty="medium"
+        title="P8 — One-sentence business case to a PM"
+        scenario={<><em>Discriminating insight: the business case is &quot;new books-on-our-app users get good recommendations from day 1 by borrowing structure from our movie users&quot; — NOT scaling laws or meta-learning jargon.</em><br/>Pick the right pitch.</>}
         options={[
-          {key:"a", text:"FOMAML is fine; the adversarial encoder dominates the gradient signal anyway, so the lost second-order curvature rarely changes the cold-start ranking.", correct:true},
-          {key:"b", text:"FOMAML breaks MAFCDR; the adversary depends on second-order gradients."},
-          {key:"c", text:"FOMAML is mathematically equivalent to second-order MAML."},
-          {key:"d", text:"FOMAML is fine only if you also drop the adversary."},
+          {key:"a", text:"New cold-start users in our books vertical get day-1 recommendations as good as users with months of history, by borrowing structural patterns from our mature movies vertical without contaminating book taste with movie taste.", correct:true},
+          {key:"b", text:"We train a bigger neural network for cold-start."},
+          {key:"c", text:"We apply scaling laws to recommendation."},
+          {key:"d", text:"We use second-order gradients."},
         ]}
-        trap={<>(b) is wrong — adversary lives in outer loop, not inner. (c) is the well-known myth; FOMAML is an approximation. (d) is a non-sequitur.</>}
-        lens={<>In MAFCDR specifically, the encoder is heavily shaped by the adversarial loss. The MAML inner-loop curvature is a smaller fraction of the total signal than in vanilla MAML. FOMAML loses some adaptation precision but rarely flips conclusions; the speedup usually pays for itself in iteration count.</>}
-        stretch={<>What experiment would tell you when FOMAML&apos;s approximation cost exceeds its time savings?</>}
+        trap={<>(b)(c)(d) jargon that does not name the business win.</>}
+        lens={<>Day-1 quality for new users — not the technique name.</>}
+        stretch={<>What metric does the PM watch?</>}
       />
 
+      {/* axis: B4 — when NOT to use */}
       <VIS.TrapProblem
-        id="ma-p9" difficulty="hard" multiSelect
-        title="P9 — What goes in the meta-tasks?"
-        scenario={<>You are constructing meta-tasks for MAFCDR&apos;s MAML inner loop on cold users in the target. Which task constructions belong in the recipe? Select all that apply.</>}
+        id="mafcdr-p9" difficulty="hard" multiSelect
+        title="P9 — When NOT to use MAFCDR. Select all that apply."
+        scenario={<><em>Discriminating insight: MAFCDR loses when the adversary has nothing to learn (truly disjoint domains), the meta-loop has nothing to do (warm target), or the adversary destabilizes training (very small batches, noisy domain labels).</em><br/>Pick the situations where you would NOT use MAFCDR.</>}
         options={[
-          {key:"a", text:"One cold user with K-shot interactions per task; query set is the user&apos;s held-out interactions.", correct:true},
-          {key:"b", text:"Group cold users by demographic bucket; each bucket is one task.", correct:true},
-          {key:"c", text:"One task per source-domain hit user, ignoring the target."},
-          {key:"d", text:"One task per item, with users as the query set."},
-          {key:"e", text:"Synthetic cold tasks formed by truncating warm users to K interactions.", correct:true},
+          {key:"a", text:"Source and target are content-alien (books → grocery). No invariance signal.", correct:true},
+          {key:"b", text:"Target is already warm (200+ interactions/user). MAML&apos;s few-shot premise is gone.", correct:true},
+          {key:"c", text:"Per-task batch is under 8 in the meta-loop; adversary fluctuates wildly.", correct:true},
+          {key:"d", text:"Source is plentiful and feature overlap is genuine; target is cold."},
+          {key:"e", text:"Domain labels are noisy/uncertain (mixed-domain users), making the adversary chase noise.", correct:true},
         ]}
-        trap={<>(c) trains on the wrong domain. (d) inverts user-vs-item roles for a user-cold setup.</>}
-        lens={<>The task distribution at meta-train time should match the deployment task distribution. (a) is the canonical few-shot setup; (b) groups by recoverable structure for stability; (e) is the standard synthetic augmentation when real cold users are scarce. (c) and (d) break the deployment match.</>}
-        stretch={<>How would you decide a priori whether (b) demographic grouping helps or hurts?</>}
+        trap={<>(d) is MAFCDR&apos;s sweet spot, not a do-not-use.</>}
+        lens={<>Adversary needs signal AND stability; meta-loop needs few-shot.</>}
+        stretch={<>How would you detect (e) before training?</>}
       />
 
+      {/* axis: C1 */}
       <VIS.TrapProblem
-        id="ma-p10" difficulty="hard"
-        title="P10 — A/B test design for MAFCDR launch"
-        scenario={<>You want to A/B-test MAFCDR vs a plain shared-encoder baseline on cold target users. Cold users are under 1% of daily traffic. Latency is fine. Which A/B design is cleanest?</>}
+        id="mafcdr-p10" difficulty="hard"
+        title="P10 — Why three-level attention BEFORE the adversary?"
+        scenario={<><em>Discriminating insight: if attention sits AFTER the shared encoder, the encoder has already mixed domain-correlated mass and the adversary has to undo that mixing. Pre-encoder attention lets you re-weight raw features so the encoder sees less domain-correlated mass to begin with.</em><br/>Why pre-encoder attention is load-bearing.</>}
         options={[
-          {key:"a", text:"Holdback test stratified by user-coldness bucket (defined by lifetime interaction count); report cold-bucket NDCG separately.", correct:true},
-          {key:"b", text:"Full traffic A/B and report aggregate NDCG."},
-          {key:"c", text:"Interleaving on cold users only."},
-          {key:"d", text:"Pre-post comparison."},
+          {key:"a", text:"Multi-level attention BEFORE the encoder re-weights raw features at three granularities so the encoder receives less domain-correlated mass; the adversary then only has to decorrelate the residual instead of fighting a fully-mixed latent.", correct:true},
+          {key:"b", text:"Attention is faster pre-encoder."},
+          {key:"c", text:"Post-encoder attention is mathematically equivalent."},
+          {key:"d", text:"Multi-level attention is decorative."},
         ]}
-        trap={<>(b) drowns the cold-user signal in the warm-user majority. (c) interleaving is for ranking comparisons within a single user session, not cohort comparisons. (d) has no controlled counterfactual.</>}
-        lens={<>The treatment effect is concentrated in cold buckets that are under 1% of traffic. Stratification by coldness lets you read the lift where the treatment actually does work, and lets warm users be neutral or even slightly worse without burning the launch.</>}
-        stretch={<>How long does the test need to run to detect a 1% NDCG lift on the cold bucket?</>}
+        trap={<>(b) latency, not mechanism. (c) false. (d) ignores ablations.</>}
+        lens={<>Re-weight before mixing &gt; decorrelate after mixing.</>}
+        stretch={<>Toy 2-feature case where post-encoder attention cannot undo the mixing?</>}
       />
+
+      {/* axis: C2 — loss */}
+      <VIS.TrapProblem
+        id="mafcdr-p11" difficulty="hard"
+        title="P11 — Total loss decomposition"
+        scenario={<><em>Discriminating insight: the encoder receives task-loss gradient (positive) plus NEGATIVE domain-classifier gradient (via reversal layer), weighted by lambda. The domain head receives ONLY the domain-classification gradient with normal sign.</em><br/>Which is the correct loss for the encoder?</>}
+        options={[
+          {key:"a", text:"L_encoder = L_task(source) − λ · L_domain. The reversal layer makes minimizing L_encoder MAXIMIZE L_domain — encoder learns features the discriminator cannot classify by domain.", correct:true},
+          {key:"b", text:"L_encoder = L_task(source) + λ · L_domain — encoder COOPERATES with the domain head."},
+          {key:"c", text:"L_encoder = L_task(target) − λ · L_domain — task loss on target, not source."},
+          {key:"d", text:"L_encoder = L_task + L_domain (no λ, no sign flip)."},
+        ]}
+        trap={<>(b) cooperation defeats the purpose. (c) target is cold; task loss on target is sparse. (d) misses sign and schedule.</>}
+        lens={<>Sign flip + λ schedule are the entire adversarial mechanism.</>}
+        stretch={<>How does λ evolve over training? Why start small?</>}
+      />
+
+      {/* axis: C3 — what's dropped vs baseline */}
+      <VIS.TrapProblem
+        id="mafcdr-p12" difficulty="medium"
+        title="P12 — What MAFCDR DROPS vs naive shared-encoder CDR"
+        scenario={<><em>Discriminating insight: naive shared-encoder CDR keeps a single fitted-on-source encoder and FINE-TUNES on target. MAFCDR drops the fine-tune step — it ships a meta-initialization that the MAML inner loop adapts.</em><br/>What does MAFCDR drop?</>}
+        options={[
+          {key:"a", text:"The standard target-domain FINE-TUNE step. MAFCDR ships a meta-initialization that is adapted via MAML&apos;s few-shot inner loop, not via fine-tuning. This is what makes day-1 cold-target performance possible.", correct:true},
+          {key:"b", text:"The shared encoder."},
+          {key:"c", text:"The domain discriminator (it is only used at inference)."},
+          {key:"d", text:"The attention block."},
+        ]}
+        trap={<>(b)(c)(d) all still present.</>}
+        lens={<>The replaced piece is fine-tune, not the encoder.</>}
+        stretch={<>What goes wrong if you keep fine-tune AND MAML?</>}
+      />
+
+      {/* axis: C4 — hyperparam */}
+      <VIS.TrapProblem
+        id="mafcdr-p13" difficulty="hard"
+        title="P13 — Most fragile hyperparameter"
+        scenario={<><em>Discriminating insight: λ (the gradient-reversal coefficient) is the most fragile. Too low and the adversary is decorative; too high and the encoder is starved of task signal and collapses into a near-uniform representation. The paper schedules λ to grow from 0 over training.</em><br/>Rank by production breakage if mis-set 2x.</>}
+        options={[
+          {key:"a", text:"λ (gradient-reversal coefficient) >> MAML inner LR >> embedding dim >> attention temperature. λ at 2x can collapse representation; the others degrade gracefully.", correct:true},
+          {key:"b", text:"Embedding dim is the most fragile."},
+          {key:"c", text:"Batch size is the most fragile."},
+          {key:"d", text:"All hyperparameters are equally fragile."},
+        ]}
+        trap={<>(b)(c)(d) miss the adversarial-instability mechanism.</>}
+        lens={<>The adversary&apos;s strength is the dominant fragility.</>}
+        stretch={<>Sketch the λ warmup schedule.</>}
+      />
+
+      {/* axis: C5 — data assumption */}
+      <VIS.TrapProblem
+        id="mafcdr-p14" difficulty="medium"
+        title="P14 — Data assumption violations"
+        scenario={<><em>Discriminating insight: MAFCDR assumes every example has a clean domain label and per-task batches are large enough for the discriminator. Mixed-domain users (same person reads books AND watches movies in one session) cause the adversary to chase noise.</em><br/>Which violation breaks MAFCDR most directly?</>}
+        options={[
+          {key:"a", text:"Mixed-domain users with ambiguous domain labels — the adversary cannot learn a stable boundary, so gradient reversal pushes the encoder toward random rather than invariant features.", correct:true},
+          {key:"b", text:"Slightly different feature dimensions across domains."},
+          {key:"c", text:"Slightly mismatched click rates across domains."},
+          {key:"d", text:"Different time zones."},
+        ]}
+        trap={<>(b)(c)(d) all tolerable; (a) attacks the adversary&apos;s premise.</>}
+        lens={<>The adversary needs a learnable domain boundary.</>}
+        stretch={<>What if you only have domain labels for 70% of examples?</>}
+      />
+
+      {/* axis: D1 — intuitive but wrong */}
+      <VIS.TrapProblem
+        id="mafcdr-p15" difficulty="hard"
+        title="P15 — Intuitive but wrong: adversarial training helps everywhere"
+        scenario={<><em>Discriminating insight: in WITHIN-domain recsys, the adversary has no useful target to fight — domain is constant. Forcing decorrelation against constant noise degrades the encoder.</em><br/>You add MAFCDR&apos;s adversary to a single-domain Netflix system. What happens?</>}
+        options={[
+          {key:"a", text:"Performance regresses. With a constant domain label, the adversary&apos;s loss is degenerate and the gradient-reversal term injects noise into the encoder, hurting the within-domain task.", correct:true},
+          {key:"b", text:"Performance improves uniformly."},
+          {key:"c", text:"Performance is unchanged."},
+          {key:"d", text:"Performance becomes more stable across seeds."},
+        ]}
+        trap={<>(b)(c)(d) miss that the adversary needs a real domain to fight.</>}
+        lens={<>Domain-adversarial training requires differing domains.</>}
+        stretch={<>Same logic — when is contrastive InfoNCE useless?</>}
+      />
+
+      {/* axis: D2 — wrong-assumption cascade */}
+      <VIS.TrapProblem
+        id="mafcdr-p16" difficulty="hard"
+        title="P16 — Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: &quot;MAFCDR is just MAML + DANN&quot; cascades into three downstream errors: wrong loss decomposition, wrong artifact (fine-tuned encoder vs meta-init), wrong evaluation surface (within-domain lift vs cold-target few-shot lift).</em><br/>If you assume MAFCDR = MAML+DANN naively, what breaks?</>}
+        options={[
+          {key:"a", text:"All three: loss composition, deployed artifact, and evaluation surface. The adversary&apos;s placement in the OUTER meta-loop changes what you ship and how you measure it.", correct:true},
+          {key:"b", text:"Just the loss."},
+          {key:"c", text:"Just the evaluation."},
+          {key:"d", text:"Nothing breaks; they ARE equivalent."},
+        ]}
+        trap={<>(d) the seductive misread.</>}
+        lens={<>Where the adversary lives in the loop nesting determines the deployed artifact.</>}
+        stretch={<>Where would the adversary go for a 3-domain CDR?</>}
+      />
+
+      {/* axis: D3 — senior vs junior */}
+      <VIS.TrapProblem
+        id="mafcdr-p17" difficulty="medium"
+        title="P17 — Senior vs junior framing"
+        scenario={<><em>Discriminating insight: junior reaches for &quot;more cold-target data&quot;; senior reaches for &quot;remove domain leak in the meta-init&quot;. Cold-target data is the problem to solve, not the lever.</em><br/>Cold-target NDCG@10 is +2% on weekly retrains but flat day-1. Which lever first?</>}
+        options={[
+          {key:"a", text:"Audit the meta-initialization for domain leak. If the source-trained encoder ships axes correlated with domain ID, the inner loop adapts toward them with very few target shots. Fix the adversary, not the data volume.", correct:true},
+          {key:"b", text:"Wait for more cold-target data to accumulate."},
+          {key:"c", text:"Raise the inner-loop learning rate."},
+          {key:"d", text:"Switch to first-order MAML."},
+        ]}
+        trap={<>(b) the junior lever. (c)(d) tweak symptoms.</>}
+        lens={<>Day-1 cold-start failure is a meta-init quality problem.</>}
+        stretch={<>What diagnostic exposes domain leak in a meta-init?</>}
+      />
+
+      {/* axis: D4 — plausible misattribution */}
+      <VIS.TrapProblem
+        id="mafcdr-p18" difficulty="hard"
+        title="P18 — Plausible misattribution"
+        scenario={<><em>Discriminating insight: target-domain regression LOOKS like MAML&apos;s known second-order instability, but the actual cause is λ set too aggressively — encoder collapsed and the meta-init became near-uniform.</em><br/>Cold-target NDCG falls 5% week-over-week. Three plausible causes — which is most likely?</>}
+        options={[
+          {key:"a", text:"λ schedule was bumped last week; encoder representation collapsed because the adversary overwhelmed the task loss. Roll back λ first; if NDCG recovers, you have confirmed.", correct:true},
+          {key:"b", text:"MAML inner-loop LR drift; restart with default."},
+          {key:"c", text:"Cold-target distribution shift; collect more data."},
+          {key:"d", text:"Item-side cache invalidation issue."},
+        ]}
+        trap={<>(b)(c)(d) plausible but ignore the recent change.</>}
+        lens={<>Always check what changed; for MAFCDR, λ is the dominant fragility.</>}
+        stretch={<>What logged signal would confirm representation collapse?</>}
+      />
+
+      {/* axis: E1 — production gotcha */}
+      <VIS.TrapProblem
+        id="mafcdr-p19" difficulty="hard"
+        title="P19 — Production gotcha: adversary at serving time"
+        scenario={<><em>Discriminating insight: the discriminator is a TRAINING-TIME ARTIFACT. It does not ship. Teams that accidentally keep the discriminator in the serving graph add latency for zero benefit and risk the discriminator being run on stale domain labels.</em><br/>What is the deployment discipline?</>}
+        options={[
+          {key:"a", text:"Strip the domain discriminator from the serving graph at export time. It exists only to push gradients through the reversal layer during training; at serving you ship the encoder + ranker only.", correct:true},
+          {key:"b", text:"Ship the discriminator; it is needed to choose between source/target rankers at inference."},
+          {key:"c", text:"Keep the discriminator and use it as a feature."},
+          {key:"d", text:"The discriminator&apos;s output is used for re-ranking."},
+        ]}
+        trap={<>(b)(c)(d) misunderstand the adversary&apos;s role.</>}
+        lens={<>Training-time-only components must be stripped from serving graphs.</>}
+        stretch={<>How would you assert this in CI?</>}
+      />
+
+      {/* axis: E2 — Failure on Friday */}
+      <VIS.TrapProblem
+        id="mafcdr-p20" difficulty="hard"
+        title="P20 — Failure on Friday: cold-target NDCG craters overnight"
+        scenario={<><em>Discriminating insight: a domain-label schema change (e.g., a third sub-domain was added but the discriminator head still has only 2 outputs) causes the adversary to mis-classify systematically; gradient reversal then pushes the encoder AWAY from a now-incorrect target, distorting the meta-init.</em><br/>3am page: cold-target NDCG@10 −18%, MAML inner-loop loss looks fine, item engagement diversity unchanged. Diagnosis?</>}
+        options={[
+          {key:"a", text:"A new domain category was added upstream but the discriminator&apos;s output dimension was not updated. Gradient reversal is pushing the encoder against a stale 2-class boundary, corrupting the meta-init. Fix: bump the discriminator&apos;s output dim and retrain; gate releases on a schema-version check.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"Cold-target data volume dropped."},
+          {key:"d", text:"Inner-loop LR was changed."},
+        ]}
+        trap={<>(b)(c)(d) generic — not MAFCDR-specific.</>}
+        lens={<>The adversary&apos;s output schema must track the domain label schema.</>}
+        stretch={<>What test detects label-schema drift before training?</>}
+      />
+
+      {/* axis: E3 — implementation specifics */}
+      <VIS.TrapProblem
+        id="mafcdr-p21" difficulty="medium"
+        title="P21 — Library default that bites: gradient clipping after reversal"
+        scenario={<><em>Discriminating insight: a common bug is to apply global gradient clipping to the COMBINED gradient AFTER the reversal layer; this clips the reversed gradient asymmetrically, weakening the adversary.</em><br/>Where does the silent default break MAFCDR?</>}
+        options={[
+          {key:"a", text:"Global gradient clipping applied AFTER the reversal layer clips the negated domain-gradient asymmetrically, silently weakening the adversary. Fix: clip task-grad and domain-grad separately, then combine.", correct:true},
+          {key:"b", text:"Default Adam β values are wrong for MAFCDR."},
+          {key:"c", text:"Default dropout is too low."},
+          {key:"d", text:"Default learning-rate schedule is the issue."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Reversal-layer interactions with clipping are the standard MAFCDR footgun.</>}
+        stretch={<>Where else does the reversal layer cause subtle bugs?</>}
+      />
+
+      {/* axis: E4 — rollout */}
+      <VIS.TrapProblem
+        id="mafcdr-p22" difficulty="hard" ordered
+        title="P22 — Order the rollout phases"
+        scenario={<><em>Discriminating insight: rollout for MAFCDR is (1) source-only MAML baseline, (2) ADD discriminator with λ=0 (no-op sanity), (3) ramp λ on schedule, (4) shadow-score cold-target output against source baseline, (5) traffic ramp on cold-target users.</em><br/>Put these in order.</>}
+        options={[
+          {key:"a", text:"Source-only MAML baseline → add discriminator at λ=0 → ramp λ on schedule → shadow-score cold-target → traffic ramp", correct:true},
+          {key:"b", text:"Add discriminator at full λ → train → ramp traffic."},
+          {key:"c", text:"Skip the source-only baseline; ramp λ directly on combined data."},
+          {key:"d", text:"Shadow-score first, then train."},
+        ]}
+        trap={<>(b) misses the λ=0 sanity check. (c) loses the diagnostic. (d) ordering nonsense.</>}
+        lens={<>λ=0 sanity catches adversary-induced regressions early.</>}
+        stretch={<>What does the λ=0 metric look like vs source-only MAML?</>}
+      />
+
+      {/* axis: F1 — edge case */}
+      <VIS.TrapProblem
+        id="mafcdr-p23" difficulty="hard"
+        title="P23 — Smallest input that breaks MAFCDR&apos;s claimed advantage"
+        scenario={<><em>Discriminating insight: when source and target are nearly identical (domain shift is negligible), the adversary has no useful boundary to learn, λ noise dominates, and MAFCDR underperforms MAML-Rec.</em><br/>Construct the edge case.</>}
+        options={[
+          {key:"a", text:"Source and target drawn from the SAME distribution (e.g., movies-US vs movies-EU after license filters) — the adversary&apos;s loss floors near random, gradient reversal injects noise, and MAFCDR regresses below MAML-Rec.", correct:true},
+          {key:"b", text:"Source much larger than target — MAFCDR&apos;s sweet spot, not an edge case."},
+          {key:"c", text:"Target has 100k users."},
+          {key:"d", text:"Source has 50M interactions."},
+        ]}
+        trap={<>(b) sweet spot, not edge. (c)(d) describe the standard regime.</>}
+        lens={<>MAFCDR&apos;s edge is genuine domain shift; near-IID breaks it.</>}
+        stretch={<>What measure of domain shift would you use as a gate?</>}
+      />
+
+      {/* axis: F5 — community-found / follow-up */}
+      <VIS.TrapProblem
+        id="mafcdr-p24" difficulty="hard"
+        title="P24 — Most direct follow-up to the stability gap"
+        scenario={<><em>Discriminating insight: MAFCDR&apos;s named weakness is adversarial-training instability. Likely follow-ups: replace the discriminator with a 1-Lipschitz Wasserstein critic, soften domain labels into a probabilistic mixture, or move the adversary to feature-CRITIC pairs at multiple layers.</em><br/>Which addresses the stability gap the paper itself names?</>}
+        options={[
+          {key:"a", text:"Replace the discriminator with a 1-Lipschitz Wasserstein critic and remove gradient reversal; the Wasserstein formulation gives smoother gradients and is less prone to representation collapse.", correct:true},
+          {key:"b", text:"Add more attention heads."},
+          {key:"c", text:"Increase embedding dim."},
+          {key:"d", text:"Use ReLU instead of GELU."},
+        ]}
+        trap={<>(b)(c)(d) unrelated to the stability gap.</>}
+        lens={<>Adversarial-training stability fixes are the natural follow-up direction.</>}
+        stretch={<>What does the Wasserstein critic give up in exchange?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://link.springer.com/article/10.1007/s41019-024-00245-y" target="_blank" rel="noopener">Authors of MAFCDR — <em>A Meta-Adversarial Framework for Cross-Domain Cold-Start Recommendation</em> (DSE 2024)</a> — primary source. Sections 3-4 cover the multi-level attention plus adversarial encoder.</li>
-        <li><a href="https://arxiv.org/abs/1505.07818" target="_blank" rel="noopener">Ganin et al. — <em>Domain-Adversarial Training of Neural Networks</em> (JMLR 2016)</a> — the gradient-reversal paper MAFCDR borrows from. Read this first if you have never trained a domain adversary.</li>
-        <li><a href="https://lilianweng.github.io/posts/2018-11-30-meta-learning/" target="_blank" rel="noopener">Lilian Weng — <em>Meta-Learning: Learning to Learn Fast</em> (blog)</a> — the canonical primer on MAML and its variants; the inner-vs-outer loop intuition.</li>
-        <li><a href="https://www.inference.vc/instability-in-gan-training/" target="_blank" rel="noopener">Ferenc Huszár — <em>Instability in GAN Training</em> (blog)</a> — the deep dive on adversarial training failure modes that all apply to MAFCDR&apos;s adversary.</li>
-        <li><a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener">Eugene Yan — <em>System Design for Recommendation</em> (blog)</a> — production-context framing for cold-start launches.</li>
+        <li><a href="https://link.springer.com/article/10.1007/s41019-024-00245-y" target="_blank" rel="noopener">Wang et al., <em>A Meta-Adversarial Framework for Cross-Domain Cold-Start Recommendation</em> (DSE 2024)</a> — primary source.</li>
+        <li><a href="https://arxiv.org/abs/1505.07818" target="_blank" rel="noopener">Ganin &amp; Lempitsky, <em>Domain-Adversarial Training of Neural Networks</em> (DANN, ICML 2015)</a> — the gradient-reversal mechanism MAFCDR places inside the meta-loop.</li>
+        <li><a href="https://arxiv.org/abs/1703.03400" target="_blank" rel="noopener">Finn, Abbeel, Levine, <em>Model-Agnostic Meta-Learning</em> (MAML, ICML 2017)</a> — the meta-loop MAFCDR wraps.</li>
+        <li><a href="https://lilianweng.github.io/posts/2018-11-30-meta-learning/" target="_blank" rel="noopener">Lilian Weng — <em>Meta-Learning: Learning to Learn Fast</em> (blog)</a> — practitioner intuition for MAML&apos;s inner/outer loop split.</li>
+        <li><a href="https://eugeneyan.com/writing/recsys-llm/" target="_blank" rel="noopener">Eugene Yan — <em>Cold-Start and Cross-Domain Recommendation</em> (blog)</a> — practitioner framing for when MAFCDR&apos;s assumptions hold.</li>
       </ul>
     </VIS.Section>
   </main>

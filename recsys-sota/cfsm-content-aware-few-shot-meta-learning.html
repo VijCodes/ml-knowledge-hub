@@ -1414,238 +1414,470 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// REDO v2 — RecSys-SOTA batch 11
+// CFSM — Content-aware Few-Shot Meta-learning (MDPI Sensors 2024)
+// Unique mechanism: DOUBLE-TOWER MAML where the META-LEARNER's PRIOR is built
+// from CONTENT (user attributes + item side info), NOT from interactions.
+// A MUTUAL-ATTENTION encoder on the item side filters noisy item content
+// before fusion. The point: content features ARE the prior; few-shot
+// interactions only adapt within that prior.
+// Cross-visual caution (meta-learning trio):
+//   - MAFCDR = adversarial domain head + cross-domain
+//   - CFSM   = content-feature prior + double-tower mutual attention (THIS visual)
+//   - PAM    = popularity-trajectory stratification at meta-task sampling
+// Don't let "MAML second-order cost" or "meta-task design" be CFSM's signature;
+// the signature is CONTENT-AS-PRIOR via the double-tower with mutual attention.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Cold-start"
-      title="CFSM — Content-Aware Few-Shot Meta-Learning"
-      subtitle="Two-tower MAML: a meta-encoder for user attributes and a mutual-attention encoder for item content, trained over task-based meta-batches of user cohorts."
+      pill="RecSys SOTA · Cold-start (content-as-prior)"
+      title="CFSM — Content-aware Few-Shot Meta-Learning"
+      subtitle="A double-tower MAML where the meta-learner&apos;s prior is built from user attributes and item side info; mutual-attention on the item side filters noisy content before fusion. The cold-start lift comes from CONTENT, not from interaction patterns."
       byline={[
-        {label: "Paper", value: "MDPI Sensors 2024 (PMC 11397954)"},
-        {label: "Domain", value: "Cold-start with rich heterogeneous side info"},
+        {label: "Paper", value: "MDPI Sensors 2024 — Content-aware Few-Shot Meta-learning for Recommendation"},
+        {label: "Surface", value: "Cold-start where rich heterogeneous side info exists (sensor profile, user attributes, item metadata)"},
+        {label: "Anchor that survives redaction", value: "Double-tower MAML with content-derived prior + mutual-attention denoiser"},
       ]}/>
 
     <VIS.TLDR>
-      Standard <VIS.Term def="The MAML algorithm adapted to recommendation tasks. A user&apos;s cold interactions are treated as a few-shot task; the model meta-learns a good user-init.">MAML-Rec</VIS.Term> assumes item content is clean and useful. In practice it is neither — sensor data, profile fields, and item descriptions contain noisy and contradictory signals. CFSM splits the architecture in two: one tower meta-learns user attributes; the other applies <VIS.Term def="Two encoders attend to each other&apos;s outputs; for items it lets attribute relevance weight content tokens, and vice versa.">mutual attention</VIS.Term> between item-content fields so noisy fields get downweighted. The two towers compose at the ranker.
+      Most cold-start meta-learners derive their prior from <em>interaction</em> patterns of warm users; CFSM derives it from <em>content</em> — user attributes on one tower, item side info on the other. The two towers fuse through a <VIS.Term def="A cross-attention block where user tower queries item-content keys/values and vice versa; produces a co-filtered representation that drops fields the other side cannot ground.">mutual-attention encoder</VIS.Term> that filters noisy item features (e.g., misleading sensor readings, mis-categorized tags) before they enter the MAML inner-loop adaptation. The senior claim: when interaction history is too sparse to support a meta-prior, content can substitute — IF the towers cross-filter each other. Vanilla MAML-Rec without the double-tower content prior collapses on day-1 cold users; CFSM does not.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        CFSM is a few-shot meta-learner that respects content noise. Three blocks compose:
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  U["User attributes"]
-  I["Item content fields"]
-  U --> UE["Meta-encoder user tower"]
-  I --> MA["Mutual-attention item tower"]
-  UE --> R["Ranker score"]
-  MA --> R
-  R --> META["MAML outer loop over user cohorts"]
-      `} />
+    <VIS.Section id="sec-what" title="What it is — double-tower MAML with mutual attention">
+      <VIS.Mermaid chart={`flowchart TB
+  UA["User attributes (age, region, sensor profile)"]
+  IC["Item content (metadata, side info)"]
+  UA --> UT["User attribute encoder (meta-encoder)"]
+  IC --> IT["Item content encoder (mutual-attention encoder)"]
+  UT --> MA["Mutual attention: user queries item, item queries user"]
+  IT --> MA
+  MA --> META["MAML outer loop over user cohorts"]
+  META --> INIT["Content-derived meta-init"]
+  INIT --> INNER["MAML inner loop on the cold task (few shots)"]
+  INNER --> R["Cold-start recommendation"]`} />
       <ul>
-        <li><strong>User meta-encoder</strong> — feeds a MAML inner loop adapted per user cohort; produces a fast-adapting user embedding.</li>
-        <li><strong>Mutual-attention item tower</strong> — item content fields attend to user attributes and to each other so noisy content gets downweighted dynamically.</li>
-        <li><strong>Task-based meta-batches</strong> — tasks are constructed from user cohorts (e.g., demographic clusters), not random user samples.</li>
+        <li><strong>User tower (meta-encoder)</strong> — encodes user attributes; this is the prior over user types.</li>
+        <li><strong>Item tower (mutual-attention encoder)</strong> — encodes item content with cross-attention to the user tower, so noisy item fields the user tower cannot ground are downweighted.</li>
+        <li><strong>MAML outer loop over user cohorts</strong> — each cohort is a meta-task; the prior generalizes across cohorts.</li>
+        <li><strong>MAML inner loop</strong> — a small number of interaction shots adapt the content-derived initialization to the cold user/item.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from baselines">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>MAML-Rec</th><th style={{textAlign:"left",padding:8}}>MeLU</th><th style={{textAlign:"left",padding:8}}>CFSM</th></tr></thead>
+    <VIS.Section id="sec-diff" title="How it differs from MAML-Rec, sibling meta-learners, and content-based fallback">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Prior source</th>
+          <th style={{textAlign:"left", padding:8}}>Item-noise handling</th>
+          <th style={{textAlign:"left", padding:8}}>Meta-task unit</th>
+        </tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Item content handling</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Concatenated raw</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Concatenated raw</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Mutual attention reweights fields</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Task construction</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Per user</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Per user</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Per user cohort</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Second-order cost</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Reduced via local update</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High but worth it for noisy content</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Cold-start lift on noisy data</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Modest, fragile</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Modest</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Strong</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>MAML-Rec</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Interaction patterns of warm users</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>One user = one task</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Content-based fallback (no meta)</td><td style={{padding:8}}>Content directly as features</td><td style={{padding:8}}>None — fits to noise</td><td style={{padding:8}}>N/A</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Prototypical-Nets (few-shot baseline)</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Class centroids</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Implicit averaging</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Class-balanced episodes</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}><strong>CFSM</strong></td><td style={{padding:8}}><strong>Content (both towers)</strong></td><td style={{padding:8}}><strong>Mutual-attention cross-filter</strong></td><td style={{padding:8}}><strong>User cohort = one task</strong></td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>Rich heterogeneous side info on items (sensor data, structured profile attributes, free-text descriptions).</li>
-        <li>Item content fields have variable trust quality — some clean, some noisy.</li>
-        <li>You have natural user cohorts (demographic, behavioral) to anchor meta-tasks.</li>
-        <li>You can afford second-order MAML compute or have a working first-order approximation.</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 24 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the question-axis it draws from. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <ul>
-        <li><strong>Second-order cost</strong> — full second-order MAML is 3-4x slower; many shops cannot pay it.</li>
-        <li><strong>Meta-task design is fragile</strong> — bad cohorts (too broad or too narrow) wreck adaptation.</li>
-        <li><strong>Mutual attention adds parameters</strong> — over-parameterizing the item tower on small target catalogs causes overfit.</li>
-        <li><strong>Doesn&apos;t fix label noise</strong> — content reweighting cleans inputs, not target signals.</li>
-        <li><strong>Cold items still need a content tower</strong> — CFSM helps when content exists; brand-new items with sparse content do not benefit.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
-
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="cf-p1" difficulty="hard"
-        title="P1 — Why does MAML&apos;s second-order gradient often not pay off in practical cold-start recsys?"
-        scenario={<>You implement full second-order MAML for cold-start. Training is 3.4x slower. Cold-user NDCG improves by 0.3% over FOMAML. Most defensible explanation?</>}
+        id="cfsm-p1" difficulty="hard"
+        title="P1 — CFSM vs MAML-Rec: where does the prior come from?"
+        scenario={<><em>Discriminating insight: MAML-Rec derives the meta-prior from INTERACTION patterns observed across warm users. CFSM derives it from CONTENT (user attributes + item side info). Cold users with zero interactions have nothing for MAML-Rec to lean on; they have a content profile, which is what CFSM uses.</em><br/>Pick the load-bearing difference.</>}
         options={[
-          {key:"a", text:"The second-order curvature signal is small relative to label noise on cold users; in practice it is dominated by the noise floor of few-shot evaluation.", correct:true},
-          {key:"b", text:"Second-order MAML is mathematically equivalent to FOMAML."},
-          {key:"c", text:"Cold users have so few interactions that second-order gradients vanish."},
-          {key:"d", text:"FOMAML is provably better for recommendation."},
+          {key:"a", text:"CFSM&apos;s meta-prior is built from CONTENT (user attributes + item side info via a double-tower with mutual attention). MAML-Rec&apos;s prior is built from INTERACTION patterns. CFSM wins on day-1 cold users who have a profile but no interactions.", correct:true},
+          {key:"b", text:"CFSM uses first-order MAML; MAML-Rec uses second-order."},
+          {key:"c", text:"CFSM uses contrastive loss; MAML-Rec uses cross-entropy."},
+          {key:"d", text:"They are equivalent for cold-start."},
         ]}
-        trap={<>(b) is the well-known myth — they are not equivalent, just close. (c) confuses few-shot inner loop with vanishing gradient. (d) overstates the FOMAML literature.</>}
-        lens={<>In cold-start recsys, the few-shot user has 5-20 interactions; the eval has high variance. The curvature signal that distinguishes second-order MAML is small compared to that variance. The 3x time cost rarely pays for itself unless your eval is unusually tight.</>}
-        stretch={<>What domain (not recsys) DOES reliably benefit from second-order MAML?</>}
+        trap={<>(b)(c) tweak orthogonal axes. (d) misses the prior-source split.</>}
+        lens={<>The prior&apos;s source is the architectural choice. Content-as-prior is what makes CFSM specific.</>}
+        stretch={<>When does content-as-prior fail vs interaction-as-prior?</>}
       />
 
+      {/* axis: A2 — definitional trap */}
       <VIS.TrapProblem
-        id="cf-p2" difficulty="hard" multiSelect
-        title="P2 — What does mutual attention actually buy you?"
-        scenario={<>An eng asks: why mutual attention between item content fields and user attributes? Why not concatenate everything and let an MLP learn? Which arguments support mutual attention? Select all that apply.</>}
+        id="cfsm-p2" difficulty="hard"
+        title="P2 — CFSM vs Prototypical Networks vs Matching Networks"
+        scenario={<><em>Discriminating insight: Prototypical Nets average class centroids; Matching Nets attend over support examples. CFSM adapts a MAML INITIALIZATION using content-derived priors via gradient-based inner-loop — it is gradient-based, not metric-based.</em><br/>Which is correct?</>}
         options={[
-          {key:"a", text:"It lets noisy item fields be downweighted PER USER — the same field can be informative for some users and noise for others.", correct:true},
-          {key:"b", text:"It produces interpretable attention weights for debugging.", correct:true},
-          {key:"c", text:"It eliminates the need for second-order MAML."},
-          {key:"d", text:"It is parameter-efficient compared to a wide MLP over concatenated inputs.", correct:true},
-          {key:"e", text:"It is the only architecture that supports cold-start."},
+          {key:"a", text:"CFSM is gradient-based meta-learning (MAML lineage): the inner loop performs gradient steps on the content-derived initialization. Prototypical/Matching Networks are metric-based: they classify via distance to a support set without gradient adaptation.", correct:true},
+          {key:"b", text:"CFSM is metric-based, like Prototypical Networks."},
+          {key:"c", text:"CFSM has no inner loop."},
+          {key:"d", text:"CFSM is identical to Matching Networks plus content features."},
         ]}
-        trap={<>(c) conflates two design decisions. (e) is too strong — many architectures support cold-start.</>}
-        lens={<>Mutual attention is a content-noise filter. The same product-description field can be useful for an attentive shopper and noisy for an impulse buyer; concatenation cannot express that distinction efficiently. (b) the attention weights are also a debugging surface.</>}
-        stretch={<>What single signal would tell you mutual attention is degenerating into uniform weights?</>}
+        trap={<>(b)(c)(d) confuse the meta-learning family.</>}
+        lens={<>Gradient-based vs metric-based — the family determines what you can adapt.</>}
+        stretch={<>When would you prefer metric-based meta-learning to CFSM?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="cf-p3" difficulty="hard"
-        title="P3 — Cohort-based vs per-user meta-tasks"
-        scenario={<>CFSM groups users into cohorts for meta-tasks. Vanilla MAML-Rec uses per-user tasks. You have 100k cold users with light signal. Pick the cleanest argument for cohorts.</>}
+        id="cfsm-p3" difficulty="medium"
+        title="P3 — Counterfactual: no CFSM, what would you ship?"
+        scenario={<><em>Discriminating insight: without CFSM, the practical alternatives in a content-rich cold-start setting are (i) content-based fallback (linear over attributes — no noise filtering, fits noise), (ii) MAML-Rec (interaction-based, fails on cold users with no interactions), (iii) static popularity ranker. None has the content-as-prior with mutual filtering that CFSM provides.</em><br/>Pick the realistic gap.</>}
         options={[
-          {key:"a", text:"Per-user tasks have under 10 interactions each, giving very noisy inner-loop signals. Cohorts pool similar users so the inner loop sees enough signal to actually adapt.", correct:true},
-          {key:"b", text:"Cohorts give a cleaner meta-test set."},
-          {key:"c", text:"Cohorts reduce the second-order MAML cost."},
-          {key:"d", text:"Per-user tasks are unsupported by the library."},
+          {key:"a", text:"Content-based fallback or MAML-Rec. Fallback fits noisy content directly; MAML-Rec has no prior for users with zero interactions. CFSM&apos;s mutual-attention double-tower is what closes the gap.", correct:true},
+          {key:"b", text:"You would always have content-based fallback at parity with CFSM."},
+          {key:"c", text:"You would use a pure popularity ranker."},
+          {key:"d", text:"You would skip cold-start entirely."},
         ]}
-        trap={<>(b) is true but secondary. (c) cohorts do NOT change the second-order cost meaningfully. (d) is a software pretext.</>}
-        lens={<>Per-user few-shot tasks are dominated by user-level noise. Cohorts amortize that noise across users with shared demographic or behavioral profile. The cost is that cohorts assume the users WITHIN one cohort really do share an adaptation direction.</>}
-        stretch={<>What goes wrong if your cohorts are too broad?</>}
+        trap={<>(b) ignores noise filtering. (c)(d) under-shoot.</>}
+        lens={<>Content fallback fits noise; MAML-Rec needs interactions; CFSM bridges with content-as-prior + cross-filter.</>}
+        stretch={<>Order them by recall at first interaction.</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="cf-p4" difficulty="medium"
-        title="P4 — Item with very few content fields"
-        scenario={<>A new podcast has only a title (12 tokens) and a 30-word description. Mutual attention has nothing to reweight. What is CFSM&apos;s expected behavior?</>}
+        id="cfsm-p4" difficulty="hard"
+        title="P4 — Compose CFSM with LLM-as-feature-extractor"
+        scenario={<><em>Discriminating insight: LLM-extracted item embeddings can substitute for hand-crafted item content. But LLM embeddings carry their own biases (training-distribution drift, hallucinated structure). CFSM&apos;s mutual attention helps: the user tower queries the LLM-derived item content and downweights fields the user tower cannot ground.</em><br/>What does the stack actually achieve?</>}
         options={[
-          {key:"a", text:"Mutual attention degenerates to near-uniform weights over the few fields; CFSM falls back to standard cold-start performance with no penalty.", correct:true},
-          {key:"b", text:"CFSM throws a runtime error."},
-          {key:"c", text:"CFSM systematically downweights this podcast."},
-          {key:"d", text:"CFSM performance is no different from a model with no attention."},
+          {key:"a", text:"LLM provides richer item content (free-text descriptions → dense embeddings); CFSM&apos;s mutual attention filters LLM noise (e.g., over-confident hallucinated attributes) by cross-attending to the user tower. The stack wins when item-text is rich but LLM-bias is non-trivial.", correct:true},
+          {key:"b", text:"LLM and CFSM are incompatible."},
+          {key:"c", text:"LLM replaces CFSM entirely."},
+          {key:"d", text:"Stack does nothing."},
         ]}
-        trap={<>(b) is a software pretext. (c) is wrong — attention is content-conditional, not item-level penalty. (d) misses the practical &quot;no penalty&quot; point.</>}
-        lens={<>Mutual attention scales gracefully — when there is little to reweight, it becomes near-uniform. CFSM does not break on sparse content; it simply does not benefit as much. The cost of using CFSM here is just the small computational overhead of the attention block.</>}
-        stretch={<>How would you decide when to bypass the mutual attention block at inference?</>}
+        trap={<>(b)(c)(d) ignore the composition.</>}
+        lens={<>Mutual attention is the filter for ANY noisy content source.</>}
+        stretch={<>What metric would catch LLM-bias bleeding into the cold-start ranker?</>}
       />
 
+      {/* axis: A5 */}
       <VIS.TrapProblem
-        id="cf-p5" difficulty="hard" multiSelect
-        title="P5 — Diagnosing degraded CFSM target NDCG"
-        scenario={<>CFSM target NDCG has dropped 1.5% week-over-week. Source-domain ranking is unchanged. Which checks should you run? Select all that apply.</>}
+        id="cfsm-p5" difficulty="medium"
+        title="P5 — Boundary: when does CFSM stop helping?"
+        scenario={<><em>Discriminating insight: CFSM&apos;s edge is content + few shots. With NO usable content (users are anonymous IDs, items have no metadata), the double-tower has no signal. With MANY shots (warm users), MAML-Rec or standard CF eclipses CFSM&apos;s content prior.</em><br/>Where is the boundary?</>}
         options={[
-          {key:"a", text:"Check whether the meta-task cohorts have drifted (e.g., new user signups skew demographics).", correct:true},
-          {key:"b", text:"Check inter-cohort variance of the inner-loop loss.", correct:true},
-          {key:"c", text:"Check item-content field availability stats — has the data pipeline started dropping a field?", correct:true},
-          {key:"d", text:"Roll back to FOMAML."},
-          {key:"e", text:"Switch to a different item embedding library."},
+          {key:"a", text:"CFSM wins when (i) item or user content is genuinely informative (not boilerplate), (ii) per-task shots are under ~10. Outside this, prefer CF or MAML-Rec.", correct:true},
+          {key:"b", text:"CFSM wins always."},
+          {key:"c", text:"CFSM is a pure cold-start replacement regardless of content quality."},
+          {key:"d", text:"CFSM is unrelated to content quality."},
         ]}
-        trap={<>(d) and (e) are surface fixes without diagnosis.</>}
-        lens={<>Cohort drift, inner-loop signal degradation, and upstream content-field drops are the three CFSM-specific failure modes. All are observable in metrics; none require a model rewrite. Build dashboards for all three.</>}
-        stretch={<>Which of these would also explain a slow drift over a quarter instead of a sudden week-over-week drop?</>}
+        trap={<>(b)(c) over-claim. (d) ignores the mechanism.</>}
+        lens={<>Content quality + shots regime determine CFSM&apos;s utility.</>}
+        stretch={<>What measures &quot;content informativeness&quot;?</>}
       />
 
+      {/* axis: B1 */}
       <VIS.TrapProblem
-        id="cf-p6" difficulty="hard"
-        title="P6 — When NOT to use CFSM"
-        scenario={<>Pick the regime where CFSM is most likely the wrong choice over a plain content-tower model.</>}
+        id="cfsm-p6" difficulty="hard"
+        title="P6 — Pick the technique for THIS scenario"
+        scenario={<><em>Discriminating insight: A health-app launch has 10k users with rich sensor profiles (age, steps, sleep) and 5k items (workout videos) with structured tags. Cold users do 2-3 sessions before deciding. No domain shift across users. Cold + content-rich + few shots = CFSM.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Cold items are pure text-only with no structured fields; mutual attention has only one field type to attend to, defeating the &quot;reweight fields&quot; mechanism.", correct:true},
-          {key:"b", text:"You have 100M training interactions."},
-          {key:"c", text:"You serve at p99 50ms latency."},
-          {key:"d", text:"Your model serves cold and warm users together."},
+          {key:"a", text:"CFSM — rich content on both sides, few shots, no cross-domain shift. The mutual attention will filter mis-tagged workout videos against the sensor profile.", correct:true},
+          {key:"b", text:"MAFCDR — there is no source domain to borrow from."},
+          {key:"c", text:"Content-based linear ranker — no noise filtering for mis-tagged items."},
+          {key:"d", text:"Pure popularity."},
         ]}
-        trap={<>(b) is irrelevant to architecture choice. (c) latency is solvable by quantization. (d) is a serving question, not a model choice.</>}
-        lens={<>Mutual attention specifically reweights MULTIPLE content fields against each other and against user attributes. With one field, there is nothing to attend to. A plain content tower with a strong text encoder will match CFSM at much lower complexity.</>}
-        stretch={<>How would CFSM degrade gracefully on the one-field setup?</>}
+        trap={<>(b) MAFCDR needs cross-domain. (c)(d) under-shoot.</>}
+        lens={<>Cold + rich content + few shots = CFSM&apos;s designed regime.</>}
+        stretch={<>If the sensor profile is unreliable, what changes?</>}
       />
 
+      {/* axis: B2 */}
       <VIS.TrapProblem
-        id="cf-p7" difficulty="hard" mode="ordered"
-        title="P7 — Order your meta-batch debugging steps"
-        scenario={<>Meta-train loss decreases but meta-val loss is flat. Order the first checks. Wrong steps stay unranked.</>}
+        id="cfsm-p7" difficulty="hard"
+        title="P7 — Sounds reasonable: just use second-order MAML on interactions"
+        scenario={<><em>Discriminating insight: second-order MAML on interactions has the practical second-order cost AND no content prior — for cold-start with no interactions, it is the wrong tool. CFSM&apos;s content prior is what makes day-1 cold-start work.</em><br/>Why is &quot;just use richer MAML&quot; wrong?</>}
         options={[
-          {key:"a", text:"Check that meta-val cohorts are disjoint from meta-train cohorts.", order:1},
-          {key:"b", text:"Inspect mutual-attention weights on val items.", order:2},
-          {key:"c", text:"Rewrite the meta-task sampler from scratch."},
-          {key:"d", text:"Compare inner-loop gradient norm on train vs val.", order:3},
-          {key:"e", text:"Switch to a different ranker."},
+          {key:"a", text:"MAML&apos;s second-order machinery does not create signal; it refines whatever signal the prior provides. With zero interactions, the prior has nothing to lean on. CFSM&apos;s content prior is the load-bearing addition; the meta-learning machinery is shared.", correct:true},
+          {key:"b", text:"Second-order MAML always solves cold-start."},
+          {key:"c", text:"First-order MAML works better."},
+          {key:"d", text:"MAML cost is the dominant concern."},
         ]}
-        trap={<>(c) and (e) are nuclear options. They come after diagnosis.</>}
-        lens={<>Disjoint cohorts (a) is the most common bug — train cohorts leaking into val explains a high train, flat val. Attention weights (b) tell you if reweighting is degenerate. Gradient norm comparison (d) confirms whether the inner loop on val is doing anything.</>}
-        stretch={<>What metric would alert you BEFORE this divergence shows in val loss?</>}
+        trap={<>(b) over-claim. (c) tangential. (d) shifts to cost when the problem is signal.</>}
+        lens={<>Meta-learning refines a prior; the prior&apos;s source is the architectural choice.</>}
+        stretch={<>When IS the second-order Hessian worth its cost in CFSM?</>}
       />
 
+      {/* axis: B3 — content features as the meta-learner's prior */}
       <VIS.TrapProblem
-        id="cf-p8" difficulty="medium"
-        title="P8 — Pairing CFSM with a content encoder for cold ITEMS"
-        scenario={<>You add a frozen text encoder for cold items. Should the mutual-attention block sit before or after the text encoder?</>}
+        id="cfsm-p8" difficulty="hard"
+        title="P8 — CFSM&apos;s anchor (content as prior): pitch it"
+        scenario={<><em>Discriminating insight: CFSM&apos;s anchor is &quot;content is the prior the meta-learner adapts FROM, not just a feature among many.&quot; The pitch should name the asymmetry.</em><br/>Pick the pitch that names the asymmetry.</>}
         options={[
-          {key:"a", text:"After — let the text encoder produce field-level embeddings, then mutual attention reweighs those embeddings against user attributes.", correct:true},
-          {key:"b", text:"Before — tokens get reweighted before they are encoded."},
-          {key:"c", text:"In parallel — concatenate the two paths."},
-          {key:"d", text:"Mutual attention should be removed when adding a text encoder."},
+          {key:"a", text:"For a brand-new user with a profile but zero interactions, CFSM treats the profile as the meta-prior — the model behaves as if it has already seen many users like this one — instead of treating profile attributes as just more features alongside (non-existent) interactions.", correct:true},
+          {key:"b", text:"We add a content feature column to the existing model."},
+          {key:"c", text:"We use a larger embedding table."},
+          {key:"d", text:"We retrain weekly."},
         ]}
-        trap={<>(b) does not work — tokens lack semantics until encoded. (c) loses the reweighting. (d) abandons the content-noise filter unnecessarily.</>}
-        lens={<>The pattern is encode-then-reweight. Mutual attention operates on field-level embeddings, not raw tokens. The text encoder produces those embeddings; mutual attention then weighs them against user attributes.</>}
-        stretch={<>What if the text encoder is end-to-end trainable instead of frozen?</>}
+        trap={<>(b)(c)(d) miss content-as-prior asymmetry.</>}
+        lens={<>The prior IS the content, not a feature next to interactions.</>}
+        stretch={<>What changes in the loss when the prior changes from interactions to content?</>}
       />
 
+      {/* axis: B4 */}
       <VIS.TrapProblem
-        id="cf-p9" difficulty="hard" multiSelect
-        title="P9 — Improving CFSM without rewriting the recipe"
-        scenario={<>You want to push CFSM 2% higher on cold target NDCG without changing the architecture. Which interventions are likely to help? Select all that apply.</>}
+        id="cfsm-p9" difficulty="hard" multiSelect
+        title="P9 — When NOT to use CFSM. Select all that apply."
+        scenario={<><em>Discriminating insight: CFSM needs content on both sides and few shots. It fails when content is uninformative, the noise/signal ratio of item content is extreme, or the regime is warm.</em><br/>Pick the do-not-use cases.</>}
         options={[
-          {key:"a", text:"Refine cohort definitions using behavioral clustering rather than demographic only.", correct:true},
-          {key:"b", text:"Add a small auxiliary loss predicting field-availability so the model learns which fields tend to be missing.", correct:true},
-          {key:"c", text:"Increase the user-tower hidden dim by 4x."},
-          {key:"d", text:"Add label-smoothing on the ranker target.", correct:true},
-          {key:"e", text:"Disable mutual attention and ablate."},
+          {key:"a", text:"Anonymous users with no profile and no side info — the user tower has no input.", correct:true},
+          {key:"b", text:"Items with boilerplate metadata (every item: &quot;Buy now! Best deal!&quot;) — no discriminating content.", correct:true},
+          {key:"c", text:"Warm users (200+ interactions) — CF eclipses content prior.", correct:true},
+          {key:"d", text:"Rich sensor profile + structured item tags + few shots — CFSM&apos;s sweet spot."},
+          {key:"e", text:"Item content is adversarially manipulated (SEO spam, mislabeled tags) without a fallback signal.", correct:true},
         ]}
-        trap={<>(c) is a brute-force parameter increase that wastes compute on cold-start where signal is the bottleneck. (e) is an ablation, not an improvement.</>}
-        lens={<>The leverage on a content-noise method comes from better cohorts, better content-availability priors, and smoother labels. Architecture is already paying its keep; the marginal returns come from data and task design.</>}
-        stretch={<>Which of these improvements transfers most cleanly to other meta-learning recsys methods?</>}
+        trap={<>(d) is the sweet spot, not a do-not-use.</>}
+        lens={<>Content must be informative and adversary-bounded.</>}
+        stretch={<>How would mutual attention handle (e) partially?</>}
       />
 
+      {/* axis: C1 — architectural choice */}
       <VIS.TrapProblem
-        id="cf-p10" difficulty="hard"
-        title="P10 — CFSM vs MAFCDR"
-        scenario={<>You have rich item content with noisy fields and overlapping users across a source-and-target domain pair. Pick the cleaner method.</>}
+        id="cfsm-p10" difficulty="hard"
+        title="P10 — Why double-tower instead of single-tower?"
+        scenario={<><em>Discriminating insight: a single-tower architecture concatenates user and item features early; noise on one side bleeds into the other. The double-tower with mutual attention lets each side cross-filter: the user tower&apos;s queries downweight item fields the user cannot ground, and vice versa.</em><br/>Why double-tower is load-bearing.</>}
         options={[
-          {key:"a", text:"CFSM for content-noise, plus a small cross-domain shared encoder bolted on; MAFCDR is overkill when the dominant challenge is content noise, not domain shift.", correct:true},
-          {key:"b", text:"MAFCDR — adversarial training always helps cross-domain."},
-          {key:"c", text:"Vanilla MAML — both are overkill."},
-          {key:"d", text:"Single-domain training."},
+          {key:"a", text:"Double-tower with mutual attention enables CROSS-FILTERING: the user tower can downweight noisy item content fields it cannot ground, and the item tower can downweight user attributes the item cannot ground. Single-tower concatenation cannot do this; one side&apos;s noise spreads to the other.", correct:true},
+          {key:"b", text:"Double-tower is faster at inference."},
+          {key:"c", text:"Double-tower simplifies training."},
+          {key:"d", text:"Double-tower has fewer parameters."},
         ]}
-        trap={<>(b) ignores that content noise is the dominant problem here. (c) gives up the wins both methods offer.</>}
-        lens={<>Diagnose your dominant pain. Content noise is CFSM&apos;s home turf. Domain shift is MAFCDR&apos;s home turf. When both are present, pick the method aligned with the bigger pain and bolt a small fix for the smaller. Do not stack both — adversarial-plus-mutual-attention is hard to stabilize.</>}
-        stretch={<>What experiment quantifies &quot;content noise vs domain shift&quot; as a dominant pain?</>}
+        trap={<>(b)(c)(d) miss the filtering mechanism.</>}
+        lens={<>Cross-filter is the architectural payoff of separating the towers.</>}
+        stretch={<>Sketch a 2-feature toy where single-tower bleeds noise.</>}
       />
+
+      {/* axis: C2 — loss */}
+      <VIS.TrapProblem
+        id="cfsm-p11" difficulty="hard"
+        title="P11 — Loss decomposition"
+        scenario={<><em>Discriminating insight: CFSM combines a ranking loss at the inner-loop output with a content-reconstruction (or auxiliary supervision) on the towers themselves. The auxiliary on the towers protects the content prior from being washed out by aggressive inner-loop steps.</em><br/>Pick the correct composition.</>}
+        options={[
+          {key:"a", text:"L = L_rank(inner-loop output) + α · L_aux(tower-reconstruction). The auxiliary loss prevents the content prior from collapsing during inner-loop adaptation.", correct:true},
+          {key:"b", text:"L = L_rank alone; no auxiliary."},
+          {key:"c", text:"L = L_aux alone; no ranking signal."},
+          {key:"d", text:"L = adversarial loss with gradient reversal."},
+        ]}
+        trap={<>(b) loses the prior. (c) loses the task. (d) is MAFCDR.</>}
+        lens={<>Auxiliary on towers protects the content prior under adaptation.</>}
+        stretch={<>How does α behave over training? Anneal or fixed?</>}
+      />
+
+      {/* axis: C3 — what's dropped */}
+      <VIS.TrapProblem
+        id="cfsm-p12" difficulty="medium"
+        title="P12 — What CFSM DROPS vs standard MAML-Rec"
+        scenario={<><em>Discriminating insight: CFSM drops the dependency on per-user INTERACTION history as the prior. It replaces that with content. Interaction history is still used in the inner loop adaptation, but it is NOT the prior anymore.</em><br/>What is dropped?</>}
+        options={[
+          {key:"a", text:"Reliance on per-user interaction HISTORY as the meta-prior. Interactions enter only in the inner-loop adaptation; the prior is content-derived. This is what enables day-1 cold-start.", correct:true},
+          {key:"b", text:"The MAML inner loop."},
+          {key:"c", text:"The item embedding table."},
+          {key:"d", text:"Everything."},
+        ]}
+        trap={<>(b)(c) still present.</>}
+        lens={<>The dropped piece is the interaction-history-as-prior assumption.</>}
+        stretch={<>When does dropping interaction-as-prior cost you?</>}
+      />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="cfsm-p13" difficulty="hard"
+        title="P13 — Most fragile hyperparameter"
+        scenario={<><em>Discriminating insight: the mutual-attention temperature on the item side dominates. Too sharp and the cross-filter zeros out informative item fields; too soft and noisy fields leak through. The α weight on the auxiliary loss is secondary; user-tower dim is robust.</em><br/>Rank by 2x mis-set breakage.</>}
+        options={[
+          {key:"a", text:"Mutual-attention temperature (item side) >> α (auxiliary weight) >> user-tower dim. Temperature controls how aggressively noise is filtered; mis-set destroys the cross-filter.", correct:true},
+          {key:"b", text:"User-tower dim is most fragile."},
+          {key:"c", text:"Auxiliary weight α is most fragile."},
+          {key:"d", text:"Inner-loop LR is most fragile."},
+        ]}
+        trap={<>(b)(c)(d) miss the temperature mechanism.</>}
+        lens={<>Attention temperature is the cross-filter knob.</>}
+        stretch={<>How would you set the initial temperature?</>}
+      />
+
+      {/* axis: C5 — data assumption */}
+      <VIS.TrapProblem
+        id="cfsm-p14" difficulty="medium"
+        title="P14 — Data assumption violations"
+        scenario={<><em>Discriminating insight: CFSM assumes meaningful, schema-consistent content fields. Schema drift on the item side (a new tag taxonomy is rolled out) silently rewrites the content distribution under the model and breaks the prior.</em><br/>Which violation is most direct?</>}
+        options={[
+          {key:"a", text:"Item-content schema drift (e.g., the tag taxonomy is renamed/added to upstream) rewrites the content distribution; the content prior is now wrong. Fix: schema-version-gated retraining + drift monitoring.", correct:true},
+          {key:"b", text:"Off-by-one in feature column order."},
+          {key:"c", text:"Different label encodings."},
+          {key:"d", text:"Mismatched batch sizes."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Content schema is the prior&apos;s contract.</>}
+        stretch={<>What monitor flags schema drift early?</>}
+      />
+
+      {/* axis: D1 — intuitive but wrong */}
+      <VIS.TrapProblem
+        id="cfsm-p15" difficulty="hard"
+        title="P15 — Intuitive but wrong: &quot;more content fields always help&quot;"
+        scenario={<><em>Discriminating insight: adding more low-quality content fields lowers the signal/noise ratio of the prior. The mutual-attention cross-filter helps, but only up to a point. Beyond that, the prior becomes noise-dominated.</em><br/>Why is &quot;more content = better&quot; wrong?</>}
+        options={[
+          {key:"a", text:"Adding low-quality fields dilutes the content prior. Mutual attention can downweight some of them, but if the noise/signal ratio of the prior crosses a threshold, the prior becomes uninformative and CFSM degrades to a content-based fallback. Curate fields; do not just add.", correct:true},
+          {key:"b", text:"More content fields strictly improve performance."},
+          {key:"c", text:"Content fields are independent of CFSM."},
+          {key:"d", text:"Fewer content fields are always better."},
+        ]}
+        trap={<>(b)(c)(d) miss the noise-dominance regime.</>}
+        lens={<>Curate the content prior; do not pad it.</>}
+        stretch={<>What is a per-field utility metric to use during curation?</>}
+      />
+
+      {/* axis: D2 — wrong-assumption cascade */}
+      <VIS.TrapProblem
+        id="cfsm-p16" difficulty="hard"
+        title="P16 — Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: &quot;CFSM is content-based + MAML&quot; cascades into (i) using single-tower fusion (loses cross-filter), (ii) skipping the auxiliary loss (lets the prior wash out), (iii) measuring recall on warm users (where CFSM&apos;s edge does not exist).</em><br/>What breaks?</>}
+        options={[
+          {key:"a", text:"All three: fusion architecture, auxiliary loss, evaluation surface. The double-tower with mutual attention, the auxiliary tower loss, and the cold-user evaluation are inseparable from the design.", correct:true},
+          {key:"b", text:"Just the loss."},
+          {key:"c", text:"Just the evaluation."},
+          {key:"d", text:"Nothing — &quot;content + MAML&quot; is a complete description."},
+        ]}
+        trap={<>(d) the seductive misread.</>}
+        lens={<>The double-tower and auxiliary loss are NOT optional extras.</>}
+        stretch={<>What does the auxiliary loss decay look like over inner steps?</>}
+      />
+
+      {/* axis: D3 — senior vs junior */}
+      <VIS.TrapProblem
+        id="cfsm-p17" difficulty="medium"
+        title="P17 — Senior vs junior framing"
+        scenario={<><em>Discriminating insight: junior reaches for &quot;wait for more interactions&quot;; senior reaches for &quot;audit the content prior&quot; (is the user tower&apos;s embedding for similar profiles tight? Is the item tower&apos;s cross-attention zeroing out useful fields?).</em><br/>Day-1 cold-start recall is flat; which lever first?</>}
+        options={[
+          {key:"a", text:"Audit the content prior: cluster user-tower embeddings for similar profiles; if the cluster is loose, the prior is too weak. Audit item-tower attention weights for collapsed (all-zero) fields; if so, the cross-filter is too sharp.", correct:true},
+          {key:"b", text:"Wait for more interactions."},
+          {key:"c", text:"Bigger embeddings."},
+          {key:"d", text:"Switch to first-order MAML."},
+        ]}
+        trap={<>(b)(c)(d) tweak symptoms.</>}
+        lens={<>Day-1 cold-start is a content prior problem in CFSM.</>}
+        stretch={<>What diagnostic plot shows prior tightness?</>}
+      />
+
+      {/* axis: D4 — plausible misattribution */}
+      <VIS.TrapProblem
+        id="cfsm-p18" difficulty="hard"
+        title="P18 — Plausible misattribution"
+        scenario={<><em>Discriminating insight: a 4% NDCG drop after a tag-taxonomy upgrade LOOKS like a MAML LR drift but is actually the content prior collapsing — the new taxonomy fragmented the embedding distribution.</em><br/>Most likely cause?</>}
+        options={[
+          {key:"a", text:"The tag-taxonomy change fragmented the item-content distribution; the prior built before the change no longer fits. Retrain (or fine-tune the item tower) on the new taxonomy. Fix takes hours, not days.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"MAML inner LR drift."},
+          {key:"d", text:"Cache invalidation."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Schema/taxonomy changes break content priors silently.</>}
+        stretch={<>How would canary detection catch this?</>}
+      />
+
+      {/* axis: E1 — production gotcha */}
+      <VIS.TrapProblem
+        id="cfsm-p19" difficulty="hard"
+        title="P19 — Production gotcha: which tower do you cache?"
+        scenario={<><em>Discriminating insight: the user tower output for a given profile is stable across requests; the item-side output depends on the user query via mutual attention, so it CANNOT be cached per-item without losing the cross-filter. The standard footgun is to cache item embeddings precomputed without the user-side query.</em><br/>What is the discipline?</>}
+        options={[
+          {key:"a", text:"Cache the user tower output keyed by profile fingerprint; do NOT cache item-tower output across users — mutual attention makes it user-conditional. If you must, cache by (user-cluster, item) pairs or use approximate user clustering.", correct:true},
+          {key:"b", text:"Cache item embeddings precomputed once; ignore the user-conditional mutual attention."},
+          {key:"c", text:"Cache everything; mutual attention is cheap."},
+          {key:"d", text:"Cache nothing; CFSM is incompatible with caches."},
+        ]}
+        trap={<>(b) breaks the cross-filter. (c) ignores cost. (d) over-claims.</>}
+        lens={<>Mutual attention makes item-side outputs query-conditional.</>}
+        stretch={<>How big is the user-cluster cache?</>}
+      />
+
+      {/* axis: E2 — Failure on Friday */}
+      <VIS.TrapProblem
+        id="cfsm-p20" difficulty="hard"
+        title="P20 — Failure on Friday: day-1 cold-user recall collapses"
+        scenario={<><em>Discriminating insight: a routine update bumped the item-side mutual-attention temperature from 1.0 to 0.1; cross-filter became too sharp, zeroing out almost all item content. Cold-user recall craters because the prior is now uninformative.</em><br/>3am page: cold-user recall down 12%, warm-user recall unchanged. Diagnosis?</>}
+        options={[
+          {key:"a", text:"Item-side attention temperature was changed and is now too sharp; the cross-filter is over-zeroing item content. Warm users are unaffected because the inner-loop adaptation compensates with interactions; cold users have nothing to compensate with.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"Cold-user data volume dropped."},
+          {key:"d", text:"Cache TTL changed."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Cold-users-only regression points to the prior, not the adaptation.</>}
+        stretch={<>What CI assertion would catch temperature drift?</>}
+      />
+
+      {/* axis: E3 — implementation specifics */}
+      <VIS.TrapProblem
+        id="cfsm-p21" difficulty="medium"
+        title="P21 — Library default that bites: weight-tying across towers"
+        scenario={<><em>Discriminating insight: a default that ties weights across the user and item towers (often inherited from siamese-net implementations) destroys CFSM&apos;s asymmetric design. The towers must be untied.</em><br/>Where does the default break CFSM?</>}
+        options={[
+          {key:"a", text:"Weight-tying across the two towers (a siamese-net default) forces them to share parameters, destroying the asymmetric design where one tower encodes user attributes and the other encodes item content with mutual attention. Untie weights.", correct:true},
+          {key:"b", text:"Adam β1 default is wrong."},
+          {key:"c", text:"Default dropout."},
+          {key:"d", text:"Default LR schedule."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>The towers are asymmetric on purpose.</>}
+        stretch={<>What if you tied only the bottom layers?</>}
+      />
+
+      {/* axis: E4 — rollout */}
+      <VIS.TrapProblem
+        id="cfsm-p22" difficulty="hard" ordered
+        title="P22 — Order the rollout"
+        scenario={<><em>Discriminating insight: rollout is (1) train the towers without mutual attention to verify the content prior alone has signal, (2) add mutual attention with high temperature (soft cross-filter) and verify no regression, (3) anneal temperature, (4) shadow-score cold users, (5) traffic ramp on cold cohort.</em><br/>Order.</>}
+        options={[
+          {key:"a", text:"Towers without mutual attention → add mutual attention at high temperature → anneal temperature → shadow-score cold users → traffic ramp on cold cohort", correct:true},
+          {key:"b", text:"Mutual attention at low temperature from day 1."},
+          {key:"c", text:"Skip the towers-alone step."},
+          {key:"d", text:"Ramp traffic first."},
+        ]}
+        trap={<>(b) over-aggressive. (c) loses the diagnostic. (d) backwards.</>}
+        lens={<>Anneal cross-filter intensity; verify each phase.</>}
+        stretch={<>Why high temperature first, not low?</>}
+      />
+
+      {/* axis: F1 — edge case */}
+      <VIS.TrapProblem
+        id="cfsm-p23" difficulty="hard"
+        title="P23 — Smallest input that breaks CFSM&apos;s claimed advantage"
+        scenario={<><em>Discriminating insight: zero content on the user side reduces CFSM to a content-based item ranker; zero content on the item side reduces it to a user clustering model. Either kills the cross-filter premise.</em><br/>Construct the edge case.</>}
+        options={[
+          {key:"a", text:"A user profile with only an opaque user_id and no attributes — the user tower has no input, the mutual attention has nothing to query, and CFSM reduces to a content-only item ranker.", correct:true},
+          {key:"b", text:"Rich user profile + rich item content — CFSM&apos;s sweet spot, not an edge case."},
+          {key:"c", text:"10k users."},
+          {key:"d", text:"5k items."},
+        ]}
+        trap={<>(b) sweet spot. (c)(d) describe scale.</>}
+        lens={<>CFSM needs both towers fed.</>}
+        stretch={<>What is the minimal user profile that re-enables CFSM?</>}
+      />
+
+      {/* axis: F4 — paper-named failure mode */}
+      <VIS.TrapProblem
+        id="cfsm-p24" difficulty="hard"
+        title="P24 — Paper-named failure: second-order cost vs meta-task design"
+        scenario={<><em>Discriminating insight: the paper names TWO failure modes: (i) MAML&apos;s second-order Hessian cost makes large-scale CFSM training expensive (FO-MAML is a partial fix but loses some lift), (ii) meta-task design (how to group users into cohorts) requires domain care — bad cohorts give a useless prior.</em><br/>Which is most often the LIMITING factor in practice?</>}
+        options={[
+          {key:"a", text:"Meta-task design (cohort grouping). Cost is reducible via FO-MAML; cohort quality dictates whether the content prior is informative at all. Wrong cohorts → wrong prior → CFSM degrades.", correct:true},
+          {key:"b", text:"Second-order Hessian cost is the dominant practical issue."},
+          {key:"c", text:"Embedding dim."},
+          {key:"d", text:"Inner-loop LR."},
+        ]}
+        trap={<>(b) is real but reducible; (c)(d) are not paper-named.</>}
+        lens={<>Meta-task design is the practical bottleneck the paper itself calls out.</>}
+        stretch={<>What clustering algorithm would you use for cohort design?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC11397954/" target="_blank" rel="noopener">Authors of CFSM — <em>Content-Aware Few-Shot Meta-Learning for Cold-Start Recommendation</em> (MDPI Sensors 2024)</a> — primary source. Sections 3-4 cover the two-tower MAML and mutual-attention block.</li>
-        <li><a href="https://lilianweng.github.io/posts/2018-11-30-meta-learning/" target="_blank" rel="noopener">Lilian Weng — <em>Meta-Learning: Learning to Learn Fast</em> (blog)</a> — primer on MAML and FOMAML. Read this before the paper.</li>
-        <li><a href="https://arxiv.org/abs/1908.00413" target="_blank" rel="noopener">Lee et al. — <em>MeLU: Meta-Learned User Preference Estimator for Cold-Start Recommendation</em> (KDD 2019)</a> — the baseline meta-rec method CFSM improves on.</li>
-        <li><a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">Jay Alammar — <em>The Illustrated Transformer</em> (blog)</a> — for the attention intuition that underpins CFSM&apos;s mutual-attention block.</li>
-        <li><a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener">Eugene Yan — <em>System Design for Recommendation</em> (blog)</a> — production framing for cold-start launches with rich side info.</li>
+        <li><a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC11397954/" target="_blank" rel="noopener">MDPI Sensors 2024 — <em>Content-aware Few-Shot Meta-learning for Recommendation</em></a> — primary source.</li>
+        <li><a href="https://arxiv.org/abs/1703.03400" target="_blank" rel="noopener">Finn, Abbeel, Levine, <em>Model-Agnostic Meta-Learning</em> (MAML, ICML 2017)</a> — the meta-loop CFSM specializes.</li>
+        <li><a href="https://lilianweng.github.io/posts/2018-11-30-meta-learning/" target="_blank" rel="noopener">Lilian Weng — <em>Meta-Learning: Learning to Learn Fast</em> (blog)</a> — practitioner intuition for gradient-based vs metric-based meta-learning.</li>
+        <li><a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener">Eugene Yan — <em>System Design for Discovery</em> (blog)</a> — practitioner framing for cold-start and content fallback.</li>
+        <li><a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">Jay Alammar — <em>The Illustrated Transformer</em> (blog)</a> — mutual-attention intuition (cross-attention between two streams).</li>
       </ul>
     </VIS.Section>
   </main>

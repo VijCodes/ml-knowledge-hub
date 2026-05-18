@@ -1414,241 +1414,468 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// REDO v2 — RecSys-SOTA batch 11
+// SMTPO — Simulator Multi-Turn Preference Optimization (arXiv 2604.03671, 2026)
+// Unique mechanism: A USER SIMULATOR generates synthetic multi-turn dialogues and
+// labels each turn with a preference signal; the CRS is then optimized with
+// MULTI-TURN DPO over those turn-level labels. The simulator IS the supervision —
+// no human labels per turn, no learned reward model. Multi-turn DPO incorporates
+// long-horizon credit so the model learns "ask a clarifying question now" beats
+// "recommend now" when the simulator says it does.
+// Cross-visual caution (preference-optimization pair):
+//   - ECPO  = expectation-confirmation theory operationalized as pair construction
+//   - SMTPO = multi-turn SIMULATOR generates preference data; simulator IS supervision (THIS)
+// Don't let "DPO trains preference pairs" be SMTPO's signature; the signature is
+// that the SIMULATOR is the source-of-truth across MULTIPLE TURNS, not human pairs
+// at single turns.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Conversational rec"
+      pill="RecSys SOTA · Conversational rec (simulator-supervised)"
       title="SMTPO — Simulator Multi-Turn Preference Optimization"
-      subtitle="A user simulator gives turn-level preference labels; the CRS is optimized with multi-turn DPO so it learns long-horizon dialogue strategy, not just next-turn correctness."
+      subtitle="A user simulator generates multi-turn dialogues and labels every turn with preference signal; the CRS is optimized with multi-turn DPO. The simulator is the supervision — no human per-turn labels, no learned reward model."
       byline={[
-        {label: "Paper", value: "arXiv 2604.03671 (2026)"},
-        {label: "Domain", value: "High-stakes CRS where early bad turns end sessions"},
+        {label: "Paper", value: "User Simulator-Guided Multi-Turn Preference Optimization for Reasoning LLM-based Conversational Recommendation (arXiv 2604.03671, 2026)"},
+        {label: "Surface", value: "High-stakes long-horizon CRS (travel, real estate) where eager mid-session recommendations end the session"},
+        {label: "Anchor that survives redaction", value: "Simulator generates preference data; multi-turn DPO encodes the long-horizon strategy"},
       ]}/>
 
     <VIS.TLDR>
-      Single-turn <VIS.Term def="Direct Preference Optimization — train a policy from pairwise preferences without an explicit reward model.">DPO</VIS.Term> says &quot;answer this turn well.&quot; In a long-horizon dialogue that is often wrong — asking a clarifying question now beats recommending now. SMTPO trains with a user simulator that scores ENTIRE trajectory pairs: trajectory A ends with a satisfied recommendation, trajectory B abandons. Multi-turn DPO over trajectories teaches the CRS strategy: when to clarify, when to recommend, when to back off. The simulator&apos;s quality is the dominant risk.
+      Single-turn <VIS.Term def="Direct Preference Optimization — fine-tunes an LLM on pairs of chosen vs rejected responses without a learned reward model, optimizing the policy directly via a closed-form objective.">DPO</VIS.Term> on a CRS rewards &quot;recommend now&quot; behavior whenever the next-turn reward looks plausible, even when asking a clarifying question would have unlocked a much better recommendation three turns later. The model learns to be eager and users abandon. SMTPO replaces the single-turn supervision: a <strong>user simulator</strong> plays out full multi-turn dialogues with the CRS, labels every turn with a preference signal that incorporates downstream outcomes, and feeds those turn-level pairs to a <VIS.Term def="A DPO objective where each turn&apos;s loss is weighted by the long-horizon reward observed by the simulator after that turn, so &apos;ask clarifying question&apos; can dominate &apos;recommend now&apos; when downstream payoff justifies it.">multi-turn DPO</VIS.Term> objective. The supervision is dense and synthetic; the cost is the sim-to-real gap.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        SMTPO is a recipe for training conversational recommenders on long-horizon dialogue strategy. Three blocks:
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  P["CRS policy"]
-  S["User simulator"]
-  P --> R1["Rollout trajectory A"]
-  P --> R2["Rollout trajectory B"]
-  S --> R1
-  S --> R2
-  R1 --> J["Trajectory scorer"]
-  R2 --> J
-  J --> DPO["Multi-turn DPO update"]
-  DPO --> P
-      `} />
+    <VIS.Section id="sec-what" title="What it is — simulator-generated multi-turn pairs">
+      <VIS.Mermaid chart={`flowchart TB
+  SIM["User simulator"]
+  POL["CRS policy (LLM)"]
+  SIM <--> POL
+  POL --> TURN["Turn t response"]
+  TURN --> LBL["Simulator labels turn t with multi-turn payoff"]
+  LBL --> PAIRS["Turn-level (chosen, rejected) pairs"]
+  PAIRS --> MTDPO["Multi-turn DPO objective"]
+  MTDPO --> POL2["Updated CRS policy"]`} />
       <ul>
-        <li><strong>User simulator</strong> — generates user replies grounded in a hidden goal; can score how well the dialogue progressed toward that goal.</li>
-        <li><strong>Trajectory rollouts</strong> — the CRS produces multiple multi-turn rollouts against the same simulator goal.</li>
-        <li><strong>Multi-turn DPO</strong> — preferred trajectory beats rejected trajectory at the policy level; gradients flow through every turn.</li>
+        <li><strong>User simulator</strong> — an LLM-based or rule-grounded simulator that plays a goal-directed user; the simulator knows its &quot;true&quot; preferences and can score the CRS&apos;s response against them.</li>
+        <li><strong>Multi-turn rollouts</strong> — the CRS plays full dialogues against the simulator; at each turn the simulator labels the response with a preference signal that incorporates downstream payoff.</li>
+        <li><strong>Multi-turn DPO</strong> — turn-level pairs are weighted by long-horizon payoff so that &quot;ask clarifying question now&quot; can dominate &quot;recommend now&quot; when downstream reward justifies it.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from baselines">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>Single-turn DPO</th><th style={{textAlign:"left",padding:8}}>Outcome RLHF</th><th style={{textAlign:"left",padding:8}}>ECPO</th><th style={{textAlign:"left",padding:8}}>SMTPO</th></tr></thead>
+    <VIS.Section id="sec-diff" title="How it differs from single-turn DPO / outcome RLHF / ECPO">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Label source</th>
+          <th style={{textAlign:"left", padding:8}}>Horizon</th>
+          <th style={{textAlign:"left", padding:8}}>Real or synthetic data</th>
+        </tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Horizon</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>1 turn</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Session</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Turn</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Trajectory</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Learns strategy</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>No</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Partial</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Partial</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Label source</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Human</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Human or model</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Human or LLM</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Simulator</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Sim-to-real risk</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Low</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Single-turn DPO</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Human pair</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>One turn</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Real</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Outcome RLHF</td><td style={{padding:8}}>Human at end</td><td style={{padding:8}}>Whole session</td><td style={{padding:8}}>Real</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>ECPO</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Expectation-confirmation rule</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Turn (mismatch turns only)</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Real dialogues</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}><strong>SMTPO</strong></td><td style={{padding:8}}><strong>User simulator</strong></td><td style={{padding:8}}><strong>Multi-turn weighted</strong></td><td style={{padding:8}}><strong>Synthetic rollouts</strong></td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>High-stakes CRS (travel, real estate, healthcare) where wrong early recommendations end the session.</li>
-        <li>Long-horizon dialogues (more than five turns) where strategy matters.</li>
-        <li>You can build a credible user simulator with grounded goals.</li>
-        <li>You can validate the simulator against held-out human dialogues.</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 24 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the question-axis it draws from. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <ul>
-        <li><strong>Simulator quality dominates</strong> — a bad simulator gives confidently wrong trajectory labels and the CRS optimizes the simulator&apos;s blind spots.</li>
-        <li><strong>Sim-to-real gap</strong> — real users behave differently from simulators; you need shadow-mode validation.</li>
-        <li><strong>Computational cost</strong> — multi-turn rollouts plus DPO is expensive per gradient step.</li>
-        <li><strong>Reward hacking</strong> — the CRS can find dialogue patterns the simulator scores well but real users dislike.</li>
-        <li><strong>Hard to debug</strong> — when SMTPO regresses, was it the simulator, the policy, or the scorer?</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
-
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="sm-p1" difficulty="hard"
-        title="P1 — Your CRS recommends too eagerly; users abandon. Trace this to the loss function."
-        scenario={<>Your travel CRS recommends a specific hotel on turn 2 — before establishing budget, party size, or dates. Users routinely abandon by turn 3. The model was trained with single-turn DPO on pairs of next-turn replies. Why does THIS loss produce THIS behavior, and what does SMTPO change?</>}
+        id="smtpo-p1" difficulty="hard"
+        title="P1 — SMTPO vs single-turn DPO"
+        scenario={<><em>Discriminating insight: single-turn DPO trains on (chosen, rejected) at one turn; the optimizer cannot tell that &quot;ask clarifying question now&quot; pays off three turns later. SMTPO weights each turn&apos;s preference by the multi-turn payoff observed in the simulator rollout, so deferred-reward strategies become trainable.</em><br/>What is the load-bearing addition?</>}
         options={[
-          {key:"a", text:"Single-turn DPO rewards the &quot;most helpful next reply&quot; — and an early concrete recommendation looks more helpful than a clarifying question in isolation. SMTPO scores TRAJECTORIES, so it sees that early recommendation leads to abandonment, and prefers clarify-then-recommend trajectories.", correct:true},
-          {key:"b", text:"DPO is broken; switch to RLHF."},
-          {key:"c", text:"The base model is too small."},
-          {key:"d", text:"More data will fix it."},
+          {key:"a", text:"Each turn-level preference is WEIGHTED by the multi-turn payoff observed in the simulator rollout, so behaviors that pay off downstream (clarifying questions, exploring user constraints) get a chance to win over eager-recommend behaviors.", correct:true},
+          {key:"b", text:"SMTPO uses a learned reward model; DPO does not."},
+          {key:"c", text:"SMTPO is RLHF/PPO."},
+          {key:"d", text:"They are equivalent."},
         ]}
-        trap={<>(b)(c)(d) are non-diagnoses. The structural issue is the horizon of the loss, not its name or size.</>}
-        lens={<>Loss horizon must match decision horizon. Conversational recommendation is a multi-turn planning problem; a single-turn loss has no way to encode &quot;ask clarification now to recommend better later.&quot; SMTPO&apos;s trajectory-level preference is the smallest change that supplies the missing signal.</>}
-        stretch={<>What is the simplest modification to single-turn DPO that approximates SMTPO without simulator infra?</>}
+        trap={<>(b)(c) family confusion. (d) misses credit.</>}
+        lens={<>Multi-turn weighting is the credit-assignment mechanism.</>}
+        stretch={<>When does single-turn DPO still suffice?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="sm-p2" difficulty="hard" multiSelect
-        title="P2 — Simulator quality checks before SMTPO training"
-        scenario={<>You have a user simulator. What should you verify BEFORE running SMTPO training? Select all that apply.</>}
+        id="smtpo-p2" difficulty="hard"
+        title="P2 — SMTPO vs RLHF (PPO + reward model)"
+        scenario={<><em>Discriminating insight: RLHF uses a learned reward model + PPO; SMTPO replaces the reward model with a goal-directed simulator and replaces PPO with multi-turn DPO. The simulator gives dense, deterministic labels; the reward model is a learned approximation of human preference.</em><br/>What is correct?</>}
         options={[
-          {key:"a", text:"Simulator turn distribution matches real-user turn distribution (utterance length, vocabulary, question patterns).", correct:true},
-          {key:"b", text:"Simulator&apos;s grounded goals match the distribution of real-user goals.", correct:true},
-          {key:"c", text:"Simulator&apos;s satisfaction scoring correlates with real-user satisfaction on a held-out set.", correct:true},
-          {key:"d", text:"Simulator is bigger than the CRS."},
-          {key:"e", text:"Simulator and CRS share parameters."},
+          {key:"a", text:"SMTPO replaces the learned reward model with a goal-directed user simulator (which knows the simulated user&apos;s preferences) and replaces PPO with multi-turn DPO. Simulator labels are dense and deterministic; reward models are noisy approximations.", correct:true},
+          {key:"b", text:"SMTPO and RLHF are identical."},
+          {key:"c", text:"SMTPO uses no preference data."},
+          {key:"d", text:"RLHF is multi-turn; SMTPO is single-turn."},
         ]}
-        trap={<>(d)(e) are not validation steps.</>}
-        lens={<>The three quality checks correspond to the three places the sim-to-real gap can hide: utterance distribution, goal distribution, and reward signal. If any one fails, SMTPO trains on a different problem from the one you deploy on.</>}
-        stretch={<>Which of the three is hardest to fix once detected?</>}
+        trap={<>(b)(c)(d) confuse the families.</>}
+        lens={<>Simulator replaces reward model; DPO replaces PPO.</>}
+        stretch={<>When would you still want PPO?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="sm-p3" difficulty="hard"
-        title="P3 — Reward hacking against the simulator"
-        scenario={<>After SMTPO training, your CRS opens every dialogue with the same long clarifying question. Simulator satisfaction is way up. Real users hate it and complain. Diagnose.</>}
+        id="smtpo-p3" difficulty="medium"
+        title="P3 — Counterfactual: no SMTPO, what happens in long sessions?"
+        scenario={<><em>Discriminating insight: single-turn DPO trains eagerness — &quot;recommend now&quot; almost always has a positive next-turn signal. Users abandon when the eager recs are wrong because the model never explored constraints. The gap is exactly the abandonment cost.</em><br/>What is the realistic gap?</>}
         options={[
-          {key:"a", text:"Reward hacking — the simulator was trained to reward thorough clarification, and the CRS found a pattern that maximizes that without serving real users.", correct:true},
-          {key:"b", text:"User complaints are unrelated to model behavior."},
-          {key:"c", text:"The model is overfit; reduce learning rate."},
-          {key:"d", text:"This is correct behavior; ignore the complaints."},
+          {key:"a", text:"The model recommends too eagerly. Real users abandon before constraints are explored. Abandonment rate climbs and session length plateaus.", correct:true},
+          {key:"b", text:"No difference."},
+          {key:"c", text:"Single-turn DPO solves long-horizon issues."},
+          {key:"d", text:"The gap is latency."},
         ]}
-        trap={<>(b)(c)(d) deny the structural problem.</>}
-        lens={<>The simulator&apos;s reward is a proxy. The CRS will exploit any specification gap between proxy and real preference. Defenses: regularize against the SFT baseline, monitor distributional drift in CRS turn patterns, periodic real-user audits.</>}
-        stretch={<>How would you build a simulator that resists obvious reward hacking?</>}
+        trap={<>(b)(c)(d) miss the abandonment mechanism.</>}
+        lens={<>Eager-rec failure mode is exactly what multi-turn DPO addresses.</>}
+        stretch={<>What metric tracks &quot;eagerness&quot;?</>}
       />
 
+      {/* axis: A4 — composition */}
       <VIS.TrapProblem
-        id="sm-p4" difficulty="medium"
-        title="P4 — Choose between SMTPO and ECPO"
-        scenario={<>You have a long-horizon CRS with frequent mis-interpretations. You can afford ONE: SMTPO or ECPO. Pick.</>}
+        id="smtpo-p4" difficulty="hard"
+        title="P4 — Compose SMTPO with ECPO"
+        scenario={<><em>Discriminating insight: ECPO supplies high-precision repair-loop pairs from real dialogues; SMTPO supplies dense multi-turn pairs from simulated dialogues. Mixing them gives breadth + precision: the simulator covers long-horizon strategy; ECPO anchors against real-user expectation patterns to limit sim-to-real drift.</em><br/>How do they compose?</>}
         options={[
-          {key:"a", text:"It depends on whether you can build a credible simulator. If yes, SMTPO is stronger because it learns strategy; if no, ECPO is the safer choice with human or LLM labels.", correct:true},
-          {key:"b", text:"SMTPO always wins."},
-          {key:"c", text:"ECPO always wins."},
-          {key:"d", text:"They are interchangeable."},
+          {key:"a", text:"Dataset mixing: simulator pairs (dense, broad) + ECPO real-dialogue pairs (sparse, precise). The real-dialogue anchor limits sim-to-real drift in the multi-turn policy.", correct:true},
+          {key:"b", text:"They are mutually exclusive."},
+          {key:"c", text:"SMTPO replaces ECPO."},
+          {key:"d", text:"ECPO replaces SMTPO."},
         ]}
-        trap={<>(b)(c)(d) ignore the dependence on infrastructure.</>}
-        lens={<>SMTPO&apos;s ceiling is higher (trajectory horizon) but its floor depends on simulator quality. ECPO is more bounded (per-turn) but more robust to label noise. Pick by what you can build.</>}
-        stretch={<>Could you stage ECPO first, then SMTPO?</>}
+        trap={<>(b)(c)(d) miss the complementarity.</>}
+        lens={<>Synthetic-dense + real-precise compose well.</>}
+        stretch={<>What weighting controls sim-to-real drift?</>}
       />
 
+      {/* axis: A5 — boundary */}
       <VIS.TrapProblem
-        id="sm-p5" difficulty="hard" multiSelect
-        title="P5 — Trajectory pair construction"
-        scenario={<>How should you construct trajectory pairs for multi-turn DPO? Select all that apply.</>}
+        id="smtpo-p5" difficulty="medium"
+        title="P5 — Boundary: when does SMTPO stop helping?"
+        scenario={<><em>Discriminating insight: SMTPO&apos;s lift is bounded by the simulator&apos;s realism. With a weak simulator, the multi-turn DPO chases simulator artifacts, not real-user preferences. Short-horizon tasks also remove the long-horizon credit story.</em><br/>Boundary?</>}
         options={[
-          {key:"a", text:"Sample two trajectories from the same simulator-goal seed using different CRS temperatures.", correct:true},
-          {key:"b", text:"Sample two trajectories from the same simulator-goal seed using slight policy perturbations.", correct:true},
-          {key:"c", text:"Sample two trajectories from DIFFERENT simulator-goal seeds and pair them."},
-          {key:"d", text:"Use one human-written gold trajectory vs one policy-generated trajectory.", correct:true},
-          {key:"e", text:"Pair every trajectory with itself."},
+          {key:"a", text:"SMTPO wins when (i) sessions are long (3+ turns), (ii) the simulator captures real-user preferences faithfully enough for transfer. Weak simulator → policy overfits to simulator quirks.", correct:true},
+          {key:"b", text:"SMTPO wins always."},
+          {key:"c", text:"SMTPO wins for single-turn tasks."},
+          {key:"d", text:"SMTPO is independent of simulator quality."},
         ]}
-        trap={<>(c) breaks the &quot;same goal&quot; assumption that makes the preference meaningful. (e) is a no-op.</>}
-        lens={<>Pairs must share the underlying user goal so the preference signal is &quot;which trajectory served THIS goal better,&quot; not &quot;which goal was easier.&quot; (a)(b) give policy-induced contrast; (d) gives a gold target.</>}
-        stretch={<>What is the right ratio of (a)/(b)/(d) in the training batch?</>}
+        trap={<>(b)(c)(d) miss the conditions.</>}
+        lens={<>Simulator quality + horizon length are the conditions.</>}
+        stretch={<>How would you measure simulator realism?</>}
       />
 
+      {/* axis: B1 */}
       <VIS.TrapProblem
-        id="sm-p6" difficulty="hard"
-        title="P6 — Shadow-mode validation of SMTPO"
-        scenario={<>SMTPO training shows 8% trajectory-level reward improvement on simulator goals. Pick the cleanest before-launch validation.</>}
+        id="smtpo-p6" difficulty="hard"
+        title="P6 — Pick the technique for THIS scenario"
+        scenario={<><em>Discriminating insight: a travel CRS with 6-8 turns/session, expensive bookings ($1k+), and real-user dialogues too expensive to label per turn. Synthetic rollouts with a calibrated simulator are the only scalable option.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Shadow-mode deploy: send a fraction of real user dialogues to the SMTPO model in parallel with the production model; compare real-user satisfaction signals (session completion, explicit feedback).", correct:true},
-          {key:"b", text:"Trust the 8% and launch."},
-          {key:"c", text:"Run more simulator rollouts."},
-          {key:"d", text:"Ask the simulator to rate the SMTPO model directly."},
+          {key:"a", text:"SMTPO — long horizon, real per-turn labels too expensive to collect, simulator can be calibrated against a smaller real-dialogue eval set. Multi-turn DPO is exactly what the eager-rec problem requires.", correct:true},
+          {key:"b", text:"Single-turn DPO."},
+          {key:"c", text:"Outcome RLHF only."},
+          {key:"d", text:"Rule-based slot-filling."},
         ]}
-        trap={<>(b)(c)(d) all stay inside the simulator&apos;s world.</>}
-        lens={<>Sim-to-real gap is invisible to simulator metrics. The only way to size it is real traffic. Shadow mode is cheap and preserves user safety while letting you measure the gap.</>}
-        stretch={<>How much shadow-mode traffic is enough?</>}
+        trap={<>(b)(c) miss horizon. (d) under-shoots.</>}
+        lens={<>High-stakes + long horizon + expensive labels = SMTPO.</>}
+        stretch={<>How would you calibrate the simulator?</>}
       />
 
+      {/* axis: B2 — sounds reasonable, isn't */}
       <VIS.TrapProblem
-        id="sm-p7" difficulty="medium" mode="ordered"
-        title="P7 — Order your SMTPO debugging steps"
-        scenario={<>SMTPO model regresses 1.5% on real-user satisfaction post-launch. Order your first three checks.</>}
+        id="smtpo-p7" difficulty="hard"
+        title="P7 — Sounds reasonable: &quot;use GPT-4 as the simulator and we&apos;re done&quot;"
+        scenario={<><em>Discriminating insight: an off-the-shelf LLM simulator captures linguistic plausibility but not goal-directed user preferences. The CRS then optimizes for &quot;a believable GPT-4 user&quot;, not real users. The simulator must be GROUNDED in real-user behavior data.</em><br/>Why is &quot;just use GPT-4&quot; wrong?</>}
         options={[
-          {key:"a", text:"Compare simulator trajectory rewards on the new policy vs the previous policy.", order:1},
-          {key:"b", text:"Compare distribution of CRS turn patterns (e.g., clarify-vs-recommend ratio) on shadow traffic.", order:2},
-          {key:"c", text:"Roll back immediately."},
-          {key:"d", text:"Audit a sample of failed real-user sessions for new failure patterns.", order:3},
-          {key:"e", text:"Retrain from scratch."},
+          {key:"a", text:"An off-the-shelf LLM simulator is linguistically plausible but not goal-grounded; the CRS optimizes to please the LLM, not real users. The simulator needs grounding in real-user behavior data (preferences, abandonment patterns) to be useful as supervision.", correct:true},
+          {key:"b", text:"GPT-4 is too small."},
+          {key:"c", text:"GPT-4 is incompatible with DPO."},
+          {key:"d", text:"GPT-4 is too cheap."},
         ]}
-        trap={<>(c) destroys evidence. (e) is panic.</>}
-        lens={<>Diagnosis flows from simulator-side to real-side: is the policy moving in the simulator metric (a)? is the policy behavior distribution changing (b)? what are the real failures (d)? Rollback is what you do AFTER diagnosis.</>}
-        stretch={<>What if simulator reward IMPROVED but real-user satisfaction dropped?</>}
+        trap={<>(b)(c)(d) miss the grounding argument.</>}
+        lens={<>Simulator must be goal-grounded, not just plausible.</>}
+        stretch={<>How would you ground a simulator?</>}
       />
 
+      {/* axis: B3 — simulator IS the supervision */}
       <VIS.TrapProblem
-        id="sm-p8" difficulty="hard"
-        title="P8 — Simulator drift over time"
-        scenario={<>Your simulator is built on user dialogues from 2025. The CRS is now serving 2026 traffic with different user behaviors. SMTPO retraining still uses the 2025-trained simulator. Risk?</>}
+        id="smtpo-p8" difficulty="hard"
+        title="P8 — SMTPO&apos;s anchor (simulator IS the supervision): pitch it"
+        scenario={<><em>Discriminating insight: SMTPO&apos;s anchor is that the SIMULATOR provides ALL the per-turn supervision; there is no learned reward model and no human label per turn. The simulator&apos;s preferences are the source of truth.</em><br/>Pick the pitch.</>}
         options={[
-          {key:"a", text:"Simulator distribution drift — the simulator no longer reflects real user behavior, so SMTPO is optimizing toward a stale target. Refresh the simulator from recent real dialogues.", correct:true},
-          {key:"b", text:"No risk; simulators are time-invariant."},
-          {key:"c", text:"Retrain the policy harder."},
-          {key:"d", text:"Add more rollouts."},
+          {key:"a", text:"We train the recommender against a goal-directed user simulator that plays full multi-turn dialogues and scores every system response by long-horizon payoff. No per-turn human labels; the simulator IS the supervision.", correct:true},
+          {key:"b", text:"We collect more user feedback."},
+          {key:"c", text:"We use a bigger model."},
+          {key:"d", text:"We use a learned reward model."},
         ]}
-        trap={<>(b) is wishful. (c)(d) make a wrong target more confident.</>}
-        lens={<>Simulator drift is the silent killer of SMTPO over time. Build a simulator-refresh cadence (monthly?) and validate against fresh held-out dialogues. Treat the simulator as a model that itself needs retraining.</>}
-        stretch={<>How would you detect simulator drift before SMTPO regresses?</>}
+        trap={<>(b)(c)(d) miss the anchor.</>}
+        lens={<>Simulator-as-supervision is the architectural choice.</>}
+        stretch={<>What guarantees does the simulator give that humans do not?</>}
       />
 
+      {/* axis: B4 — when NOT */}
       <VIS.TrapProblem
-        id="sm-p9" difficulty="hard" multiSelect
-        title="P9 — Cost-saving variants of SMTPO"
-        scenario={<>Multi-turn rollouts are expensive. Which cost-saving variants are reasonable? Select all that apply.</>}
+        id="smtpo-p9" difficulty="hard" multiSelect
+        title="P9 — When NOT to use SMTPO. Select all that apply."
+        scenario={<><em>Discriminating insight: SMTPO fails with a poor simulator, short horizons, or low-stakes tasks where sim-to-real drift dominates the small lift.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Truncated horizon — train on 4-turn trajectories instead of 8-turn.", correct:true},
-          {key:"b", text:"Importance-sampled DPO so you can reuse trajectories across gradient steps.", correct:true},
-          {key:"c", text:"Curriculum that starts at horizon 2 and grows.", correct:true},
-          {key:"d", text:"Replace the simulator with a one-liner heuristic."},
-          {key:"e", text:"Drop DPO and use single-turn."},
+          {key:"a", text:"Weak simulator (linguistic only, no grounded preferences).", correct:true},
+          {key:"b", text:"Single-turn product rec — no multi-turn signal.", correct:true},
+          {key:"c", text:"Low-stakes domain where sim-to-real drift cost &gt; expected lift.", correct:true},
+          {key:"d", text:"High-stakes long-horizon CRS with a calibrated simulator — SMTPO&apos;s sweet spot."},
+          {key:"e", text:"Adversarial users not captured by the simulator distribution (no out-of-distribution test).", correct:true},
         ]}
-        trap={<>(d) wrecks the signal. (e) defeats SMTPO.</>}
-        lens={<>The three viable cost cuts are horizon truncation, sample reuse, and curriculum. Each loses some signal but preserves the trajectory-preference structure. The two bad ones throw away the structure entirely.</>}
-        stretch={<>Which of these cuts works least well when the dialogues are inherently long-horizon?</>}
+        trap={<>(d) is sweet spot.</>}
+        lens={<>Simulator realism + horizon + stakes are the conditions.</>}
+        stretch={<>How would you mitigate (e)?</>}
       />
 
+      {/* axis: C1 — why multi-turn DPO */}
       <VIS.TrapProblem
-        id="sm-p10" difficulty="hard"
-        title="P10 — Combining SMTPO with offline data"
-        scenario={<>You have logged real-user dialogues. Can you use them WITH SMTPO instead of relying solely on simulator rollouts?</>}
+        id="smtpo-p10" difficulty="hard"
+        title="P10 — Why multi-turn DPO vs accumulating single-turn pairs"
+        scenario={<><em>Discriminating insight: stacking single-turn DPO pairs does not add credit-assignment weight; each pair contributes the same gradient regardless of downstream payoff. Multi-turn DPO weighs each turn&apos;s loss by simulator-observed downstream reward.</em><br/>Why multi-turn DPO is load-bearing.</>}
         options={[
-          {key:"a", text:"Yes — treat real logged dialogues as one trajectory in the pair, simulator rollouts as the other, and let DPO learn from real-vs-simulated preferences. This grounds the policy in real behavior.", correct:true},
-          {key:"b", text:"No — DPO requires matched goal seeds."},
-          {key:"c", text:"No — real data is too noisy."},
-          {key:"d", text:"Yes — but only if the simulator is removed."},
+          {key:"a", text:"Multi-turn DPO weights each turn-level loss by simulator-observed downstream payoff, so deferred-reward behaviors (clarifying question now → strong recommendation later) get gradient signal proportional to their long-horizon value.", correct:true},
+          {key:"b", text:"Multi-turn DPO is faster."},
+          {key:"c", text:"Equivalent to single-turn DPO."},
+          {key:"d", text:"Decorative."},
         ]}
-        trap={<>(b)(c) are over-strong. (d) defeats SMTPO.</>}
-        lens={<>Hybrid offline-plus-simulator training is a strong move. Real trajectories anchor against sim-to-real gap; simulator trajectories give the contrast. Be careful with the goal-matching — for logged data, you may need to infer the goal post-hoc.</>}
-        stretch={<>How would you infer the goal of a logged dialogue?</>}
+        trap={<>(b)(c)(d) miss the weighting.</>}
+        lens={<>Per-turn weighting by downstream payoff is the mechanism.</>}
+        stretch={<>What is the analog in policy-gradient methods?</>}
       />
+
+      {/* axis: C2 — loss */}
+      <VIS.TrapProblem
+        id="smtpo-p11" difficulty="hard"
+        title="P11 — Loss decomposition"
+        scenario={<><em>Discriminating insight: SMTPO&apos;s loss is a per-turn DPO term scaled by a discounted-future-reward weight from the simulator rollout. Without the weight, it is single-turn DPO; without DPO, it is a reward-weighted regression.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"L = Σ_t (γ^Δ R_simulator(τ ≥ t)) · L_DPO(turn_t). Per-turn DPO loss weighted by discounted downstream simulator reward. Both pieces are essential.", correct:true},
+          {key:"b", text:"L = L_DPO(turn_t) (no weighting)."},
+          {key:"c", text:"L = -E[R_simulator]."},
+          {key:"d", text:"L = adversarial loss with gradient reversal."},
+        ]}
+        trap={<>(b) drops weighting. (c) drops DPO. (d) wrong family.</>}
+        lens={<>DPO loss × discounted simulator reward.</>}
+        stretch={<>How does γ trade myopic vs farsighted behavior?</>}
+      />
+
+      {/* axis: C3 — what's dropped */}
+      <VIS.TrapProblem
+        id="smtpo-p12" difficulty="medium"
+        title="P12 — What SMTPO DROPS vs RLHF"
+        scenario={<><em>Discriminating insight: SMTPO drops the LEARNED reward model and the PPO trajectory optimization, replacing them with a hand-grounded simulator and multi-turn DPO.</em><br/>What is dropped?</>}
+        options={[
+          {key:"a", text:"The learned reward model and PPO. Replaced by a goal-grounded user simulator (deterministic preferences) and multi-turn DPO (closed-form policy update).", correct:true},
+          {key:"b", text:"The base LLM."},
+          {key:"c", text:"Dialogue history."},
+          {key:"d", text:"Tokenizer."},
+        ]}
+        trap={<>(b)(c)(d) still present.</>}
+        lens={<>Reward model + PPO are the dropped pieces.</>}
+        stretch={<>When is the dropped reward model worth keeping?</>}
+      />
+
+      {/* axis: C4 — hyperparam */}
+      <VIS.TrapProblem
+        id="smtpo-p13" difficulty="hard"
+        title="P13 — Most fragile hyperparameter"
+        scenario={<><em>Discriminating insight: simulator quality (its preference calibration) dominates. γ (discount factor) is secondary; DPO β is tertiary. A poorly calibrated simulator at 2x noisier preferences corrupts the entire training signal.</em><br/>Rank.</>}
+        options={[
+          {key:"a", text:"Simulator preference calibration >> γ (discount factor) >> DPO β. Simulator quality determines whether the signal is real; the others are knobs on a valid signal.", correct:true},
+          {key:"b", text:"γ is most fragile."},
+          {key:"c", text:"β is most fragile."},
+          {key:"d", text:"All equal."},
+        ]}
+        trap={<>(b)(c)(d) miss the simulator.</>}
+        lens={<>The simulator is the dominant fragility.</>}
+        stretch={<>How would you calibrate the simulator monthly?</>}
+      />
+
+      {/* axis: C5 — data assumption */}
+      <VIS.TrapProblem
+        id="smtpo-p14" difficulty="medium"
+        title="P14 — Data assumption violations"
+        scenario={<><em>Discriminating insight: SMTPO assumes simulator preferences mirror real-user preferences. When real-user behavior shifts (new product, seasonal change), the simulator must be re-calibrated or sim-to-real drift opens.</em><br/>Which violation breaks SMTPO most directly?</>}
+        options={[
+          {key:"a", text:"Real-user preference shift (new domain, seasonality) that the simulator did not see. Mitigation: monthly simulator recalibration on recent real-dialogue eval set.", correct:true},
+          {key:"b", text:"Different time zones."},
+          {key:"c", text:"Different LLM token counts."},
+          {key:"d", text:"Different batch sizes."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>The simulator&apos;s calibration is the data contract.</>}
+        stretch={<>What real-dialogue eval set would you maintain?</>}
+      />
+
+      {/* axis: D1 — intuitive but wrong */}
+      <VIS.TrapProblem
+        id="smtpo-p15" difficulty="hard"
+        title="P15 — Intuitive but wrong: &quot;simulators are unrealistic, so trust real data only&quot;"
+        scenario={<><em>Discriminating insight: real per-turn data is rare and expensive; the simulator covers long-horizon dynamics that real datasets cannot at scale. The right framing is &quot;simulator + real anchor&quot;, not &quot;reject simulators.&quot;</em><br/>Why is the &quot;reject simulators&quot; intuition wrong?</>}
+        options={[
+          {key:"a", text:"Real per-turn data is scarce; the simulator covers dynamics real data cannot at scale. The senior framing is &quot;simulator + real anchor&quot;: use simulator-dense pairs for breadth and a real-dialogue eval set as the calibration anchor.", correct:true},
+          {key:"b", text:"Simulators are always better than real data."},
+          {key:"c", text:"Simulators are unrelated to real data."},
+          {key:"d", text:"Real data alone always wins."},
+        ]}
+        trap={<>(b)(c)(d) overshoot or undershoot.</>}
+        lens={<>Simulator + real-anchor calibration is the practical pattern.</>}
+        stretch={<>What real-anchor eval would you build?</>}
+      />
+
+      {/* axis: D2 — cascade */}
+      <VIS.TrapProblem
+        id="smtpo-p16" difficulty="hard"
+        title="P16 — Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: assuming &quot;the simulator is fixed&quot; cascades into: (i) sim-to-real drift over time, (ii) policy that fits simulator quirks, (iii) outcome regressions in production without offline warning.</em><br/>What breaks?</>}
+        options={[
+          {key:"a", text:"All three: sim-to-real drift, overfit to simulator quirks, undetected production regression. Mitigation: scheduled simulator recalibration + real-anchor offline eval gating every rollout.", correct:true},
+          {key:"b", text:"Just simulator drift."},
+          {key:"c", text:"Just production regression."},
+          {key:"d", text:"Nothing — the simulator is stable."},
+        ]}
+        trap={<>(d) over-trust.</>}
+        lens={<>The simulator is a calibration target, not a fixture.</>}
+        stretch={<>How often would you recalibrate?</>}
+      />
+
+      {/* axis: D3 — senior vs junior */}
+      <VIS.TrapProblem
+        id="smtpo-p17" difficulty="medium"
+        title="P17 — Senior vs junior framing"
+        scenario={<><em>Discriminating insight: junior reaches for &quot;train DPO longer&quot;; senior reaches for &quot;is the simulator still calibrated to real users?&quot; The upstream simulator is the most common silent failure.</em><br/>Online accept-rate falls 3%; first lever?</>}
+        options={[
+          {key:"a", text:"Recalibrate the simulator on a recent real-dialogue eval set. If real users have shifted preferences and the simulator has not, the policy is now optimized for the wrong target.", correct:true},
+          {key:"b", text:"Train DPO longer."},
+          {key:"c", text:"Bigger base model."},
+          {key:"d", text:"Lower DPO β."},
+        ]}
+        trap={<>(b)(c)(d) wrong moving part.</>}
+        lens={<>Simulator drift is the dominant silent failure.</>}
+        stretch={<>What does the recent real-dialogue eval set look like?</>}
+      />
+
+      {/* axis: D4 — plausible misattribution */}
+      <VIS.TrapProblem
+        id="smtpo-p18" difficulty="hard"
+        title="P18 — Plausible misattribution"
+        scenario={<><em>Discriminating insight: an accept-rate drop LOOKS like a DPO β regression but is actually simulator drift after a product launch added new categories the simulator does not know.</em><br/>Most likely cause?</>}
+        options={[
+          {key:"a", text:"New product categories were added; the simulator&apos;s preference vocabulary does not cover them. Recalibrate the simulator on the new categories before retraining.", correct:true},
+          {key:"b", text:"DPO β regression."},
+          {key:"c", text:"GPU thermal throttling."},
+          {key:"d", text:"Cache invalidation."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Catalog or category shifts expose simulator coverage gaps.</>}
+        stretch={<>How would you canary new categories?</>}
+      />
+
+      {/* axis: E1 — production gotcha */}
+      <VIS.TrapProblem
+        id="smtpo-p19" difficulty="hard"
+        title="P19 — Production gotcha: do you ship the simulator?"
+        scenario={<><em>Discriminating insight: the simulator is a TRAINING-TIME ARTIFACT. It does not serve. Teams sometimes attempt to use the simulator as an online quality monitor; this leaks training assumptions into online evaluation.</em><br/>What is the discipline?</>}
+        options={[
+          {key:"a", text:"Strip the simulator from serving. It is training-time only. Use a separate real-dialogue eval set for online quality monitoring; do not let the simulator double as online judge.", correct:true},
+          {key:"b", text:"Ship the simulator as a serving judge."},
+          {key:"c", text:"The simulator must run on every request."},
+          {key:"d", text:"The simulator is the policy."},
+        ]}
+        trap={<>(b)(c)(d) misunderstand the role.</>}
+        lens={<>Simulator does not judge production.</>}
+        stretch={<>How do you assert this separation?</>}
+      />
+
+      {/* axis: E2 — Failure on Friday */}
+      <VIS.TrapProblem
+        id="smtpo-p20" difficulty="hard"
+        title="P20 — Failure on Friday: simulator updated upstream, accept-rate craters"
+        scenario={<><em>Discriminating insight: a routine simulator-model update changed its preference distribution; the next SMTPO training round inherited that shift and the policy optimized for a different user model than production users.</em><br/>3am page: accept-rate −7%, multi-turn engagement metrics unchanged offline. Diagnosis?</>}
+        options={[
+          {key:"a", text:"Simulator update silently shifted preferences; the offline multi-turn metric (computed against the new simulator) still looked fine, but real users now see a policy optimized for the wrong target. Roll back simulator and gate updates on real-anchor calibration tests.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"DPO LR drift."},
+          {key:"d", text:"Cache TTL changed."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Offline metric is simulator-defined; only real-anchor catches drift.</>}
+        stretch={<>What real-anchor metric would you gate on?</>}
+      />
+
+      {/* axis: E3 — implementation specifics */}
+      <VIS.TrapProblem
+        id="smtpo-p21" difficulty="medium"
+        title="P21 — Library default that bites: rollout truncation"
+        scenario={<><em>Discriminating insight: many DPO libraries truncate sequences at a fixed length; for multi-turn DPO this truncates dialogue history and erases the long-horizon weighting signal. Disable truncation or extend the window.</em><br/>What bites?</>}
+        options={[
+          {key:"a", text:"Default sequence-length truncation cuts off dialogue history needed for multi-turn weighting; the policy sees only recent turns and loses long-horizon credit. Extend the context window or use turn-segmented training.", correct:true},
+          {key:"b", text:"Default Adam β values."},
+          {key:"c", text:"Default dropout."},
+          {key:"d", text:"Default LR schedule."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Context length protects multi-turn credit.</>}
+        stretch={<>What context length do you need for 8-turn sessions?</>}
+      />
+
+      {/* axis: E4 — rollout */}
+      <VIS.TrapProblem
+        id="smtpo-p22" difficulty="hard" ordered
+        title="P22 — Order the rollout"
+        scenario={<><em>Discriminating insight: rollout is (1) calibrate simulator on real-dialogue eval set, (2) sanity-check single-turn DPO on simulator data first, (3) enable multi-turn weighting, (4) shadow-score real-anchor metrics, (5) traffic ramp.</em><br/>Order.</>}
+        options={[
+          {key:"a", text:"Calibrate simulator → single-turn DPO sanity → enable multi-turn weighting → shadow-score real-anchor → traffic ramp", correct:true},
+          {key:"b", text:"Multi-turn weighting from day 1."},
+          {key:"c", text:"Skip simulator calibration."},
+          {key:"d", text:"Ramp traffic before shadow-scoring."},
+        ]}
+        trap={<>(b)(c)(d) skip gates.</>}
+        lens={<>Calibration is the gate; single-turn sanity catches wiring bugs.</>}
+        stretch={<>What is the single-turn sanity metric?</>}
+      />
+
+      {/* axis: F1 — edge case */}
+      <VIS.TrapProblem
+        id="smtpo-p23" difficulty="hard"
+        title="P23 — Smallest input that breaks SMTPO&apos;s claimed advantage"
+        scenario={<><em>Discriminating insight: a 1-turn session (user asks, system answers, session ends) has no multi-turn weighting to apply. SMTPO degenerates to single-turn DPO.</em><br/>Construct.</>}
+        options={[
+          {key:"a", text:"Sessions of length 1 — the multi-turn weighting collapses, SMTPO reduces to single-turn DPO on simulator pairs and the entire multi-turn premise is lost.", correct:true},
+          {key:"b", text:"Sessions of length 8 — SMTPO&apos;s sweet spot."},
+          {key:"c", text:"10k sessions."},
+          {key:"d", text:"5 simulators."},
+        ]}
+        trap={<>(b) sweet spot. (c)(d) describe scale.</>}
+        lens={<>SMTPO needs &gt;1 turn.</>}
+        stretch={<>What is the minimum session length where multi-turn helps measurably?</>}
+      />
+
+      {/* axis: F4 — paper-named failure */}
+      <VIS.TrapProblem
+        id="smtpo-p24" difficulty="hard"
+        title="P24 — Paper-named failure: simulator quality dominates"
+        scenario={<><em>Discriminating insight: the paper itself names &quot;simulator quality dominates; sim-to-real gap&quot; as the principal limitation. No SMTPO technique can outpace the simulator&apos;s calibration ceiling.</em><br/>What is the paper-named limitation?</>}
+        options={[
+          {key:"a", text:"Simulator quality dominates lift; sim-to-real gap is the practical ceiling. The paper names this and recommends continuous simulator recalibration against real-dialogue evaluation.", correct:true},
+          {key:"b", text:"DPO β sensitivity."},
+          {key:"c", text:"γ sensitivity."},
+          {key:"d", text:"Base LLM size."},
+        ]}
+        trap={<>(b)(c)(d) not paper-named.</>}
+        lens={<>The simulator is SMTPO&apos;s ceiling.</>}
+        stretch={<>How would you set the simulator&apos;s calibration SLO?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://arxiv.org/html/2604.03671" target="_blank" rel="noopener">Authors of SMTPO — <em>User Simulator-Guided Multi-Turn Preference Optimization for Reasoning LLM-based Conversational Recommendation</em> (arXiv 2026)</a> — primary source. Sections 3-5 cover the multi-turn DPO and simulator design.</li>
-        <li><a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">Rafailov et al. — <em>Direct Preference Optimization</em> (NeurIPS 2023)</a> — the DPO foundation; SMTPO is its multi-turn generalization.</li>
-        <li><a href="https://huyenchip.com/2023/05/02/rlhf.html" target="_blank" rel="noopener">Chip Huyen — <em>RLHF: Reinforcement Learning from Human Feedback</em> (blog)</a> — the practitioner primer that frames why outcome-only rewards struggle with credit assignment.</li>
-        <li><a href="https://lilianweng.github.io/posts/2018-06-24-attention/" target="_blank" rel="noopener">Lilian Weng — <em>Attention and the Transformer</em> (blog)</a> — needed for the LLM-base context most SMTPO implementations use.</li>
-        <li><a href="https://eugeneyan.com/writing/llm-evaluation/" target="_blank" rel="noopener">Eugene Yan — <em>LLM Evaluation</em> (blog)</a> — for sim-to-real validation patterns that SMTPO must layer on top.</li>
+        <li><a href="https://arxiv.org/html/2604.03671" target="_blank" rel="noopener">arXiv 2604.03671 — <em>User Simulator-Guided Multi-Turn Preference Optimization for Reasoning LLM-based Conversational Recommendation</em> (2026)</a> — primary source.</li>
+        <li><a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">Rafailov et al., <em>Direct Preference Optimization</em> (DPO, NeurIPS 2023)</a> — the underlying preference-optimization recipe SMTPO extends to multi-turn.</li>
+        <li><a href="https://huyenchip.com/2023/05/02/rlhf.html" target="_blank" rel="noopener">Chip Huyen — <em>RLHF: Reinforcement Learning from Human Feedback</em> (blog)</a> — practitioner overview of the family SMTPO sits in.</li>
+        <li><a href="https://lilianweng.github.io/posts/2023-06-23-agent/" target="_blank" rel="noopener">Lilian Weng — <em>LLM-Powered Autonomous Agents</em> (blog)</a> — long-horizon credit-assignment context for multi-turn LLM systems.</li>
+        <li><a href="https://eugeneyan.com/writing/llm-evaluation/" target="_blank" rel="noopener">Eugene Yan — <em>LLM Evaluation</em> (blog)</a> — practitioner discipline for sim-to-real anchoring and offline evaluation gaps.</li>
       </ul>
     </VIS.Section>
   </main>

@@ -1414,242 +1414,472 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// REDO v2 — RecSys-SOTA batch 11
+// PAM — Popularity-Aware Meta-Learning (arXiv 2411.11225, 2024)
+// Unique mechanism: STRATIFY THE META-TASK SAMPLING BY ITEM POPULARITY (or
+// predicted popularity TRAJECTORY). Cold-but-trending items, cold-forever items,
+// and head items each get DIFFERENT meta-priors. The meta-learner therefore
+// generalizes fairly across head/tail rather than over-exploring tail items
+// that will never warm.
+// Cross-visual caution (meta-learning trio):
+//   - MAFCDR = adversarial domain head + cross-domain
+//   - CFSM   = content-feature prior + double-tower mutual attention
+//   - PAM    = popularity-trajectory stratification at meta-task sampling (THIS)
+// Don't let "few-shot variance" / "MAML inner-loop sensitivity" be PAM's
+// signature. PAM's signature is task-distribution skew handled at the
+// META-SAMPLER level, gated by a popularity-trajectory predictor.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Cold-start"
+      pill="RecSys SOTA · Cold-start (streaming)"
       title="PAM — Popularity-Aware Meta-Learning"
-      subtitle="A model-agnostic meta-learner that conditions on item popularity bucket — different priors for items predicted to go viral vs items predicted to stay cold forever."
+      subtitle="The meta-learner conditions on item-popularity bucket at meta-task sampling time — a cold-but-trending item gets one prior, a cold-forever item gets another. Exploration is gated by predicted trajectory, not by interaction count."
       byline={[
-        {label: "Paper", value: "arXiv 2411.11225 (2024)"},
-        {label: "Domain", value: "Streaming / short-lifecycle items (TikTok, news)"},
+        {label: "Paper", value: "Online Item Cold-Start Recommendation with Popularity-Aware Meta-Learning (arXiv 2411.11225, 2024)"},
+        {label: "Surface", value: "Streaming-data settings with short item lifecycles (TikTok, news, e-commerce flash inventory)"},
+        {label: "Anchor that survives redaction", value: "Popularity-trajectory stratification at meta-task sampling"},
       ]}/>
 
     <VIS.TLDR>
-      Uniform meta-priors over-explore items that will never warm. PAM gates the meta-init by a predicted popularity TRAJECTORY (about to go viral, slow-burn, never-warming). Cold-but-going-viral items get an aggressive adaptation prior; persistently-cold items get a conservative one. The trick is the trajectory predictor itself — it has to work from very few interactions and item content alone.
+      Streaming recommenders mint thousands of cold items per hour; most will stay cold, a handful will go viral. Uniform meta-priors over-explore every cold item identically, wasting budget on items that will never warm. PAM&apos;s move: <strong>condition the meta-learner on a popularity bucket</strong> determined by a <VIS.Term def="A model that predicts whether a brand-new item will trend, plateau, or stay cold based on early-stage signals (creator reputation, content category, seed engagement).">popularity-trajectory predictor</VIS.Term>, stratify meta-task sampling so each bucket gets its own prior, and let MAML adapt FROM that bucket&apos;s prior. The bet is that &quot;cold-but-going-viral&quot; and &quot;always-cold&quot; need fundamentally different exploration policies — and meta-task stratification at sampling time is the cleanest place to encode that.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        PAM is two models in a trench coat. First, predict a popularity trajectory bucket from item content and early signals. Second, condition a MAML-style meta-init on that bucket.
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  I["New item arrives"]
-  I --> TP["Popularity trajectory predictor"]
-  TP --> B1["Going viral bucket"]
-  TP --> B2["Slow-burn bucket"]
-  TP --> B3["Never-warm bucket"]
-  B1 --> MA["Aggressive meta-init"]
-  B2 --> MB["Balanced meta-init"]
-  B3 --> MC["Conservative meta-init"]
-  MA --> R["Online adaptation"]
-  MB --> R
-  MC --> R
-      `} />
+    <VIS.Section id="sec-what" title="What it is — popularity-stratified meta-task sampling">
+      <VIS.Mermaid chart={`flowchart TB
+  ITEMS["New items (per hour)"]
+  ITEMS --> PRED["Popularity-trajectory predictor"]
+  PRED --> HOT["Bucket: cold-trending"]
+  PRED --> MID["Bucket: cold-plateau"]
+  PRED --> COLD["Bucket: cold-forever"]
+  HOT --> S1["Meta-tasks sampled within bucket"]
+  MID --> S2["Meta-tasks sampled within bucket"]
+  COLD --> S3["Meta-tasks sampled within bucket"]
+  S1 --> META["MAML outer loop (bucket-conditioned)"]
+  S2 --> META
+  S3 --> META
+  META --> R["Bucket-aware prior; inner loop adapts"]`} />
       <ul>
-        <li><strong>Trajectory predictor</strong> — a small model that consumes item content + first-few-hours signals to bucket the item.</li>
-        <li><strong>Bucket-conditioned meta-init</strong> — a separate set of <VIS.Term def="The starting parameters that meta-learning produces; the inner loop fine-tunes them per task.">meta-initializations</VIS.Term> per bucket.</li>
-        <li><strong>Online updates</strong> — as interactions accrue, the item migrates between buckets and is re-conditioned.</li>
+        <li><strong>Popularity-trajectory predictor</strong> — small upstream model that buckets each new item by predicted lifecycle (cold-trending, cold-plateau, cold-forever) using early signals: creator history, content category, seed engagement.</li>
+        <li><strong>Stratified meta-task sampling</strong> — meta-tasks are drawn WITHIN buckets so the meta-learner sees representative tasks per bucket, not random tasks dominated by head items.</li>
+        <li><strong>Bucket-conditioned MAML</strong> — the inner loop adapts from a prior chosen by the predicted bucket; exploration budget is allocated by bucket, not uniformly.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from baselines">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>Uniform MAML cold-start</th><th style={{textAlign:"left",padding:8}}>Content-only ranking</th><th style={{textAlign:"left",padding:8}}>PAM</th></tr></thead>
+    <VIS.Section id="sec-diff" title="How it differs from MAML-Rec / uniform-prior meta-learning / popularity reranking">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Prior over items</th>
+          <th style={{textAlign:"left", padding:8}}>Exploration policy</th>
+          <th style={{textAlign:"left", padding:8}}>Lifecycle-aware?</th>
+        </tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Exploration budget</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Equal per item</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Bucket-gated</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Adaptation speed for viral items</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Slow</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Slow</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Fast</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Wasted impressions on dead items</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Low</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Low</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Extra dependency</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Trajectory predictor</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>MAML-Rec</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Uniform over tasks</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Uniform per cold item</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>No</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Popularity reranking (post hoc)</td><td style={{padding:8}}>Implicit head bias</td><td style={{padding:8}}>None at meta-level</td><td style={{padding:8}}>Reactive only</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Bandit (LinUCB)</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Per-arm posterior</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>UCB confidence interval</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>No</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}><strong>PAM</strong></td><td style={{padding:8}}><strong>Bucket-conditioned</strong></td><td style={{padding:8}}><strong>Trajectory-gated</strong></td><td style={{padding:8}}><strong>YES — load-bearing</strong></td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>Item lifecycles are short (under a week) so warming the wrong items is costly.</li>
-        <li>Catalogs grow fast (TikTok-style hourly ingestion, breaking news).</li>
-        <li>You already have a reliable popularity predictor or are willing to build one.</li>
-        <li>Slate diversity matters; PAM&apos;s bucket gating gives a natural diversity dial.</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 24 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the question-axis it draws from. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <ul>
-        <li><strong>The trajectory predictor IS the system</strong> — bad predictor &rarr; bad bucket assignments &rarr; PAM is worse than uniform.</li>
-        <li><strong>Bucket boundaries are arbitrary</strong> — three vs five buckets, soft vs hard assignment, all matter.</li>
-        <li><strong>Cold-start within cold-start</strong> — items with under 10 interactions have noisy predictor inputs.</li>
-        <li><strong>Self-fulfilling prophecy</strong> — bucketing items as &quot;never warm&quot; and starving exposure makes them never warm.</li>
-        <li><strong>Re-bucketing latency</strong> — if items migrate buckets only nightly, fast-moving virality is missed.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
-
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="pa-p1" difficulty="hard"
-        title="P1 — Design the popularity-trajectory predictor: which features matter most?"
-        scenario={<>You are designing the trajectory predictor inside PAM. The item has been live for 30 minutes with 200 impressions. Which feature is the SINGLE BIGGEST signal for the going-viral bucket?</>}
+        id="pam-p1" difficulty="hard"
+        title="P1 — PAM vs uniform MAML-Rec: what is the load-bearing addition?"
+        scenario={<><em>Discriminating insight: MAML-Rec samples meta-tasks uniformly over cold items, giving every new item the same prior and the same exploration budget. PAM stratifies sampling by predicted popularity trajectory; cold-trending items get a head-leaning prior, cold-forever items get a different (likely sparser) prior. The lever is at the META-SAMPLER level, not the inner loop.</em><br/>What is the load-bearing addition?</>}
         options={[
-          {key:"a", text:"Early share-and-comment rate per impression in the first 30 minutes (engagement velocity, not absolute count).", correct:true},
-          {key:"b", text:"Item content category."},
-          {key:"c", text:"Creator follower count."},
-          {key:"d", text:"Time of day."},
+          {key:"a", text:"Popularity-trajectory stratification at meta-task SAMPLING time. Each item bucket gets its own meta-prior, so the inner loop adapts FROM a bucket-appropriate initialization rather than a uniform one.", correct:true},
+          {key:"b", text:"A larger inner-loop learning rate."},
+          {key:"c", text:"A bigger embedding table."},
+          {key:"d", text:"Removing the inner loop entirely."},
         ]}
-        trap={<>(b)(c)(d) are useful but lagging. Engagement VELOCITY catches the inflection point; raw counts after 30 minutes are too noisy on under 200 impressions.</>}
-        lens={<>Going-viral has a characteristic curvature in early engagement velocity that absolute volume does not. The right feature is per-impression engagement RATE, smoothed over a short window. Category and creator features are baseline conditioning; they shift priors but do not catch surprise virality.</>}
-        stretch={<>What feature would you add to detect &quot;viral but in a small niche&quot; (high engagement rate, low absolute count)?</>}
+        trap={<>(b)(c) tweak orthogonal axes. (d) removes the mechanism.</>}
+        lens={<>The lever is at the meta-sampler, not the inner loop.</>}
+        stretch={<>Why is sampler-level intervention superior to per-item reweighting in the loss?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="pa-p2" difficulty="hard" multiSelect
-        title="P2 — Choose bucket boundaries"
-        scenario={<>You need to set the bucket boundaries for PAM. Daily catalog: 1M new items, 0.1% reach a million views, 5% reach 100k views, the rest stay under 10k. Which bucket designs are reasonable? Select all that apply.</>}
+        id="pam-p2" difficulty="hard"
+        title="P2 — PAM vs LinUCB (contextual bandit)"
+        scenario={<><em>Discriminating insight: bandits maintain per-arm uncertainty estimates and pull arms by upper-confidence. PAM uses a separate trajectory predictor to bucket items BEFORE any interactions arrive; exploration is then meta-prior-driven within bucket, not bandit-driven across all items. PAM is a meta-learning solution; LinUCB is a bandit.</em><br/>Which is correct?</>}
         options={[
-          {key:"a", text:"Three buckets {viral, slow-burn, never-warm} with quantile boundaries calibrated against the daily catalog distribution.", correct:true},
-          {key:"b", text:"Soft-bucket assignment via Dirichlet over three categories — items get a soft posterior over buckets.", correct:true},
-          {key:"c", text:"Five buckets to capture finer gradients.", correct:true},
-          {key:"d", text:"Two buckets {viral, not-viral}."},
-          {key:"e", text:"Continuous popularity score with no bucketing."},
+          {key:"a", text:"PAM is a meta-learning approach that buckets items by predicted trajectory before any interactions; LinUCB is a contextual bandit that explores by per-arm confidence. PAM front-loads the prior; LinUCB front-loads exploration. They compose: PAM&apos;s bucket can determine LinUCB&apos;s exploration coefficient.", correct:true},
+          {key:"b", text:"PAM and LinUCB are equivalent."},
+          {key:"c", text:"PAM has no exploration."},
+          {key:"d", text:"LinUCB does the same trajectory prediction."},
         ]}
-        trap={<>(d) collapses too much; the never-warm cohort needs its own conservative prior. (e) loses the meta-init switching at the heart of PAM.</>}
-        lens={<>Three or five quantile-anchored buckets is the sweet spot. Soft assignment via posterior helps the gray-zone items. Two buckets is too coarse; continuous loses the discrete meta-init switching. PAM is fundamentally a discrete-prior method.</>}
-        stretch={<>How would you decide three vs five buckets empirically?</>}
+        trap={<>(b)(c)(d) confuse the families.</>}
+        lens={<>Meta-learning vs bandit families; they compose.</>}
+        stretch={<>How would PAM&apos;s buckets seed LinUCB&apos;s prior covariance?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="pa-p3" difficulty="hard"
-        title="P3 — Self-fulfilling prophecy in the never-warm bucket"
-        scenario={<>Items bucketed as &quot;never-warm&quot; get under 100 impressions in their first day. After a week, they have never accumulated enough signal to migrate buckets. Your never-warm cohort is now permanently never-warm. What does this look like, and what fixes it?</>}
+        id="pam-p3" difficulty="medium"
+        title="P3 — Counterfactual: no PAM, what happens to cold-but-trending items?"
+        scenario={<><em>Discriminating insight: without trajectory awareness, cold-trending items get the same exploration budget as cold-forever items; viral items therefore take hours longer to surface, missing their peak. The opportunity cost is huge in short-lifecycle settings (TikTok-style).</em><br/>What is the realistic gap?</>}
         options={[
-          {key:"a", text:"This is a self-fulfilling prophecy; add a small exploration budget (e.g., epsilon-fraction random promotion) to never-warm items so a sample can escape.", correct:true},
-          {key:"b", text:"This is correct behavior; bad items SHOULD stay buried."},
-          {key:"c", text:"Bug in the trajectory predictor."},
-          {key:"d", text:"Bug in the meta-init."},
+          {key:"a", text:"Cold-trending items surface ~5-15x slower because exploration budget is split across the entire cold pool. In short-lifecycle inventory (TikTok), the item is already past peak before warming.", correct:true},
+          {key:"b", text:"No difference; uniform exploration is fine."},
+          {key:"c", text:"Cold-forever items dominate uniformly."},
+          {key:"d", text:"The gap is in latency, not surfacing time."},
         ]}
-        trap={<>(b) accepts the system&apos;s false negative confidence as ground truth. (c) and (d) jump to bug fixes before recognizing the structural feedback loop.</>}
-        lens={<>Bucketing systems without exploration create feedback loops. Items can be misclassified, never given a chance, and the trajectory predictor never learns to correct itself because it never sees the counterfactual. Bandit-style exploration (Thompson sampling, epsilon-greedy) breaks the loop.</>}
-        stretch={<>How big should the exploration epsilon be, and how would you tune it?</>}
+        trap={<>(b)(c)(d) miss the lifecycle cost.</>}
+        lens={<>Opportunity cost on short-lifecycle items is the dominant business case.</>}
+        stretch={<>Sketch the time-to-surface distribution with vs without PAM.</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="pa-p4" difficulty="medium"
-        title="P4 — Migration latency between buckets"
-        scenario={<>Items currently re-bucket nightly. A viral spike happens at 3 PM and the model treats the item as slow-burn until 2 AM the next morning. Pick the cleanest fix.</>}
+        id="pam-p4" difficulty="hard"
+        title="P4 — Compose PAM with TIGER / HSTU"
+        scenario={<><em>Discriminating insight: TIGER/HSTU score items via generative retrieval over a learned vocabulary; the vocabulary itself has implicit popularity bias (frequent items get tighter codebook codes). PAM&apos;s buckets can override this at the candidate-set sampling stage, ensuring cold-trending items appear in the candidate pool the generative model scores.</em><br/>What does the stack achieve?</>}
         options={[
-          {key:"a", text:"Re-bucket on a streaming basis (every few minutes) using a lightweight predictor that only consumes recent engagement counters.", correct:true},
-          {key:"b", text:"Re-bucket hourly."},
-          {key:"c", text:"Increase the inner-loop learning rate."},
-          {key:"d", text:"Switch to a uniform-prior MAML and abandon PAM."},
+          {key:"a", text:"PAM&apos;s buckets feed candidate-pool sampling, ensuring cold-trending items appear in the pool TIGER/HSTU scores. Without PAM, the generative model never sees them and they cannot win.", correct:true},
+          {key:"b", text:"TIGER replaces PAM."},
+          {key:"c", text:"They cannot compose."},
+          {key:"d", text:"PAM is post-hoc only."},
         ]}
-        trap={<>(b) is a half-fix; viral spikes happen on under-hour scales. (c) papers over the bucket issue. (d) abandons the method instead of fixing the operational gap.</>}
-        lens={<>The whole value proposition of PAM is fast adaptation to virality. If the re-bucketing pipeline runs slower than virality propagates, PAM is a brand mismatch with its own pipeline. Stream the predictor.</>}
-        stretch={<>What if streaming re-bucketing is impossible operationally?</>}
+        trap={<>(b)(c)(d) miss the pool-sampling integration.</>}
+        lens={<>Cold items must appear in the candidate pool to win.</>}
+        stretch={<>Where in the funnel does PAM&apos;s bucket signal live?</>}
       />
 
+      {/* axis: A5 */}
       <VIS.TrapProblem
-        id="pa-p5" difficulty="hard" multiSelect
-        title="P5 — Diagnosing degraded PAM"
-        scenario={<>PAM&apos;s lift over uniform MAML has dropped from 4% to 1.2% over two months. Which checks should you run? Select all that apply.</>}
+        id="pam-p5" difficulty="medium"
+        title="P5 — Boundary: when does PAM stop helping?"
+        scenario={<><em>Discriminating insight: PAM&apos;s edge requires (i) short item lifecycles (uniform exploration is too slow), (ii) a usable trajectory predictor. With long-lifecycle catalogs (movies, books) or a trajectory predictor with AUC near 0.5, PAM degenerates.</em><br/>Where is the boundary?</>}
         options={[
-          {key:"a", text:"Evaluate trajectory-predictor calibration — does the predicted bucket match the realized trajectory after 24 hours?", correct:true},
-          {key:"b", text:"Check if catalog composition has shifted (e.g., more long-form content with longer lifecycles, breaking the bucket assumptions).", correct:true},
-          {key:"c", text:"Check exposure feedback loop — has the never-warm bucket starved?", correct:true},
-          {key:"d", text:"Increase the MAML inner-loop steps."},
-          {key:"e", text:"Drop PAM entirely."},
+          {key:"a", text:"PAM wins when (i) item lifecycle is short (hours-to-days) AND (ii) the trajectory predictor has meaningful AUC (≥ 0.7) on early signals. Long lifecycles or weak predictor → PAM degenerates toward uniform sampling.", correct:true},
+          {key:"b", text:"PAM always wins."},
+          {key:"c", text:"PAM wins for long-lifecycle catalogs."},
+          {key:"d", text:"PAM is independent of predictor quality."},
         ]}
-        trap={<>(d) is a surface knob. (e) abandons the method without diagnosis.</>}
-        lens={<>Three diagnostics: predictor calibration, catalog drift, exposure feedback. All three are PAM-specific failure modes and all three are measurable. None require a model rewrite.</>}
-        stretch={<>Which of these would have shown up first in metrics?</>}
+        trap={<>(b)(c)(d) miss the conditions.</>}
+        lens={<>Short lifecycle + decent predictor are the necessary conditions.</>}
+        stretch={<>How would you measure the predictor&apos;s AUC under selection bias?</>}
       />
 
+      {/* axis: B1 */}
       <VIS.TrapProblem
-        id="pa-p6" difficulty="hard"
-        title="P6 — Adversarial actors gaming the bucket"
-        scenario={<>Creators discover that engagement velocity in the first 30 minutes lifts an item to the viral bucket. They bot-engage their own items to enter the viral bucket and get free exposure. What is the cleanest mitigation INSIDE the PAM trajectory predictor?</>}
+        id="pam-p6" difficulty="hard"
+        title="P6 — Pick the technique for THIS scenario"
+        scenario={<><em>Discriminating insight: TikTok-like surface, 50k new videos/hour, item lifecycle ~6 hours, rich creator and content signals available for trajectory prediction.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Add an authentication-strength weighting to engagement events so bot-like signals (no verified device, no session history) count less in the velocity feature.", correct:true},
-          {key:"b", text:"Ban high-velocity items as a class."},
-          {key:"c", text:"Remove velocity from the feature set."},
-          {key:"d", text:"Add a captcha to engagement actions."},
+          {key:"a", text:"PAM — short lifecycle (cannot wait for uniform exploration to warm items), strong early signals (creator history + content), trajectory predictor will work. Buckets feed candidate pool + meta-prior.", correct:true},
+          {key:"b", text:"Pure popularity ranker."},
+          {key:"c", text:"Vanilla MAML-Rec."},
+          {key:"d", text:"Static content-based ranker."},
         ]}
-        trap={<>(b) kills the real viral signal. (c) blinds the predictor. (d) lives in product policy, not model.</>}
-        lens={<>The bucket gating is a target for adversarial behavior. The model fix is to weight events by quality-of-signal, not to discard the feature. Bot-fingerprinted engagement contributes less to the velocity feature, real engagement contributes more.</>}
-        stretch={<>How would you tune the authentication-strength weighting without leaking it to attackers?</>}
+        trap={<>(b) reinforces head bias. (c) wastes exploration. (d) static.</>}
+        lens={<>Short lifecycle + early signal availability = PAM.</>}
+        stretch={<>What if creator signals were absent?</>}
       />
 
+      {/* axis: B2 — sounds reasonable, isn't */}
       <VIS.TrapProblem
-        id="pa-p7" difficulty="medium" mode="ordered"
-        title="P7 — Order the first three things to ship for a new PAM launch"
-        scenario={<>You are launching PAM next month. Order the first three deliverables.</>}
+        id="pam-p7" difficulty="hard"
+        title="P7 — Sounds reasonable: &quot;just boost cold items in the ranker&quot;"
+        scenario={<><em>Discriminating insight: a ranker-side boost gives every cold item the same uplift, wasting exposure on cold-forever items. PAM&apos;s buckets allocate exposure where the trajectory predictor says it pays off.</em><br/>Why is a flat cold boost wrong?</>}
         options={[
-          {key:"a", text:"A passable trajectory predictor evaluated by 24-hour-ahead bucket accuracy.", order:1},
-          {key:"b", text:"Bucket-conditioned meta-init trained against the predictor.", order:2},
-          {key:"c", text:"Re-bucketing pipeline with under 5-minute latency.", order:3},
-          {key:"d", text:"A blog post."},
-          {key:"e", text:"Adversarial-bot-detection feature engineering."},
+          {key:"a", text:"A flat cold boost over-exposes cold-forever items and under-exposes cold-trending items — the very items you most want to find. PAM&apos;s trajectory predictor allocates the exposure by predicted payoff.", correct:true},
+          {key:"b", text:"Flat boosts always solve cold-start."},
+          {key:"c", text:"Cold boosts are mathematically equivalent to PAM."},
+          {key:"d", text:"Cold boosts are unrelated to PAM."},
         ]}
-        trap={<>(d) is not a deliverable. (e) is important but post-launch.</>}
-        lens={<>Build the predictor first because PAM depends on it; build the meta-init that consumes it; then build the streaming pipeline that makes it operational. Diagnosis-driven, dependency-ordered.</>}
-        stretch={<>What is the minimum acceptable predictor accuracy at which it is worth shipping PAM?</>}
+        trap={<>(b)(c)(d) miss the allocation argument.</>}
+        lens={<>Exposure should be allocated by expected payoff, not uniformly.</>}
+        stretch={<>How would you A/B test &quot;flat boost vs PAM&quot;?</>}
       />
 
+      {/* axis: B3 — popularity stratification at sampling */}
       <VIS.TrapProblem
-        id="pa-p8" difficulty="hard"
-        title="P8 — PAM vs a bandit-based explore-exploit"
-        scenario={<>A teammate proposes a contextual bandit instead of PAM: explore each cold item proportionally to its content-based prior. Pick the cleanest argument FOR PAM.</>}
+        id="pam-p8" difficulty="hard"
+        title="P8 — PAM&apos;s anchor (popularity stratification at sampling): pitch it"
+        scenario={<><em>Discriminating insight: PAM&apos;s anchor is &quot;different cold items deserve different priors and different exploration budgets, decided at sampling time.&quot; That is the asymmetry to name.</em><br/>Pick the right pitch.</>}
         options={[
-          {key:"a", text:"PAM&apos;s meta-init has fast few-shot adaptation built in — the model learns from K interactions and then makes confident predictions. A bandit explores until it has enough confidence, which is slower per item.", correct:true},
-          {key:"b", text:"Bandits cannot handle cold-start at all."},
-          {key:"c", text:"PAM is provably better than bandits."},
-          {key:"d", text:"Bandits are deprecated."},
+          {key:"a", text:"We spend cold-start exposure on the items most likely to take off — predicted by a small trajectory model on creator and content signals — instead of giving every new item the same budget regardless of its odds.", correct:true},
+          {key:"b", text:"We add a popularity feature column."},
+          {key:"c", text:"We retrain weekly with more data."},
+          {key:"d", text:"We use bigger embeddings."},
         ]}
-        trap={<>(b)(c)(d) are over-strong. Bandits handle cold-start fine; they are just slower per item.</>}
-        lens={<>The two methods aim at different goals. PAM amortizes cold-start across MANY items by learning a meta-prior. A bandit handles each item independently and explores from scratch. PAM wins when you launch thousands of items per day; a bandit wins when you have a few items that need careful exploration.</>}
-        stretch={<>Could you combine PAM with a bandit on top of the never-warm bucket?</>}
+        trap={<>(b)(c)(d) miss the asymmetry.</>}
+        lens={<>Different items deserve different budgets — sampler-level.</>}
+        stretch={<>What metric does the PM watch?</>}
       />
 
+      {/* axis: B4 */}
       <VIS.TrapProblem
-        id="pa-p9" difficulty="hard" multiSelect
-        title="P9 — Side-effects of conditioning on popularity"
-        scenario={<>By conditioning ranker behavior on predicted popularity, what risks are you introducing? Select all that apply.</>}
+        id="pam-p9" difficulty="hard" multiSelect
+        title="P9 — When NOT to use PAM. Select all that apply."
+        scenario={<><em>Discriminating insight: PAM fails when the trajectory predictor is uninformative, when item lifecycles are very long (the cost of uniform exploration is absorbed), or when the catalog is small enough to exhaustively explore.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Popularity bias — already-popular items get more aggressive priors, compounding the rich-get-richer effect.", correct:true},
-          {key:"b", text:"Filter bubbles — niche items that would never enter the viral bucket are systematically starved.", correct:true},
-          {key:"c", text:"Reduced creator diversity at the top of the platform.", correct:true},
-          {key:"d", text:"Increased eval-set leakage."},
-          {key:"e", text:"Worse cold-start specifically."},
+          {key:"a", text:"Trajectory predictor near AUC 0.5 (no early signal).", correct:true},
+          {key:"b", text:"Long-lifecycle catalog (movies, books) where the head/tail churn is slow.", correct:true},
+          {key:"c", text:"Small catalog you can exhaustively explore in a few hours.", correct:true},
+          {key:"d", text:"Short lifecycle + strong early signals — PAM&apos;s sweet spot."},
+          {key:"e", text:"Adversarial supply (creator gaming) that fools the trajectory predictor without monitoring.", correct:true},
         ]}
-        trap={<>(d) is unrelated. (e) reverses what PAM is for.</>}
-        lens={<>Popularity-conditional priors create ranking-side externalities. PAM amplifies signal AND amplifies the rich-get-richer feedback. The mitigation is exploration on the never-warm bucket plus monitoring creator-side diversity metrics.</>}
-        stretch={<>How would you measure &quot;niche items being starved&quot; as a single metric?</>}
+        trap={<>(d) is the sweet spot.</>}
+        lens={<>Need short lifecycle + informative predictor + non-trivial catalog.</>}
+        stretch={<>How would you mitigate (e)?</>}
       />
 
+      {/* axis: C1 */}
       <VIS.TrapProblem
-        id="pa-p10" difficulty="hard"
-        title="P10 — Choose between PAM and CFSM"
-        scenario={<>You have a short-lifecycle catalog (TikTok-like) with rich item content (audio, video, metadata). You can afford one of PAM or CFSM. Which is the better fit?</>}
+        id="pam-p10" difficulty="hard"
+        title="P10 — Why stratify at SAMPLING vs at the loss?"
+        scenario={<><em>Discriminating insight: per-example loss reweighting in the inner loop only adjusts the gradient magnitude for items already drawn into the batch. Stratified SAMPLING controls WHICH items appear in the batch at all, which is a stronger lever for representativeness.</em><br/>Why sampler-level is right?</>}
         options={[
-          {key:"a", text:"PAM — short lifecycles make popularity trajectory the dominant signal; content-noise reweighting is secondary when items live for under a week.", correct:true},
-          {key:"b", text:"CFSM — rich content always wins."},
-          {key:"c", text:"Both perform identically."},
-          {key:"d", text:"Vanilla MAML."},
+          {key:"a", text:"Sampling controls representation in the batch; loss reweighting only adjusts gradient magnitude for items already in the batch. For tail items that almost never appear, only sampling can fix the imbalance.", correct:true},
+          {key:"b", text:"Loss reweighting and sampling are equivalent."},
+          {key:"c", text:"Sampling is faster."},
+          {key:"d", text:"Sampling is decorative."},
         ]}
-        trap={<>(b) prioritizes the wrong axis. (c) is wishful. (d) gives up the wins of both.</>}
-        lens={<>Diagnose the dominant scarcity. If item lifecycles are short, you cannot WAIT to gather enough content signal — popularity trajectory is what beats the clock. If lifecycles are long and content is noisy, CFSM&apos;s reweighting pays off.</>}
-        stretch={<>What hybrid would combine the two without doubling the cost?</>}
+        trap={<>(b)(c)(d) miss the representation argument.</>}
+        lens={<>Sampler controls representation; loss only adjusts seen items.</>}
+        stretch={<>What would IPW have to do to recover PAM&apos;s effect?</>}
       />
+
+      {/* axis: C2 — loss/objective */}
+      <VIS.TrapProblem
+        id="pam-p11" difficulty="hard"
+        title="P11 — Loss: bucket-conditioned vs joint"
+        scenario={<><em>Discriminating insight: PAM&apos;s outer loss aggregates per-bucket meta-objectives. Joint loss without bucket conditioning lets head-bucket gradients dominate; the tail buckets never get representative gradient flow. The bucket-conditioned formulation gives each bucket its own averaged gradient.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"L_outer = Σ_bucket w_bucket · E_tasks-in-bucket[L_inner]. Each bucket contributes an averaged gradient; w_bucket controls how much each bucket is weighted overall. Joint without bucketing lets head items dominate.", correct:true},
+          {key:"b", text:"L_outer = E_all-tasks[L_inner] (no bucketing)."},
+          {key:"c", text:"L_outer = max_bucket E_tasks-in-bucket[L_inner]."},
+          {key:"d", text:"L_outer = adversarial loss with gradient reversal."},
+        ]}
+        trap={<>(b) collapses to uniform. (c) min-max not aligned. (d) is MAFCDR.</>}
+        lens={<>Bucket-conditioned averaging is the explicit fairness mechanism.</>}
+        stretch={<>How do you set w_bucket — uniform or trajectory-prior-weighted?</>}
+      />
+
+      {/* axis: C3 — what's dropped */}
+      <VIS.TrapProblem
+        id="pam-p12" difficulty="medium"
+        title="P12 — What PAM DROPS vs uniform meta-learning"
+        scenario={<><em>Discriminating insight: PAM drops the uniform-prior assumption. It adds the trajectory predictor (an extra moving part with its own training data and drift) but drops a brittle invariant.</em><br/>What is dropped?</>}
+        options={[
+          {key:"a", text:"The uniform-prior assumption across all cold items. Replaced with bucket-conditioned priors driven by a popularity-trajectory predictor.", correct:true},
+          {key:"b", text:"The MAML inner loop."},
+          {key:"c", text:"The item embedding table."},
+          {key:"d", text:"Everything."},
+        ]}
+        trap={<>(b)(c) still present.</>}
+        lens={<>Uniform prior is the dropped invariant.</>}
+        stretch={<>What does the trajectory predictor cost in training data?</>}
+      />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="pam-p13" difficulty="hard"
+        title="P13 — Most fragile hyperparameter"
+        scenario={<><em>Discriminating insight: the bucket-boundary thresholds (where you split cold-trending vs cold-plateau vs cold-forever) dominate. Wrong boundaries put trending items in the cold bucket (or vice versa), corrupting the priors. The bucket count itself is secondary.</em><br/>Rank by 2x mis-set breakage.</>}
+        options={[
+          {key:"a", text:"Bucket-boundary thresholds (where you split cold-trending vs cold-plateau vs cold-forever) >> bucket count >> MAML inner LR. Wrong boundaries put items in the wrong prior, corrupting the meta-learner.", correct:true},
+          {key:"b", text:"Embedding dim is most fragile."},
+          {key:"c", text:"Batch size is most fragile."},
+          {key:"d", text:"All equal."},
+        ]}
+        trap={<>(b)(c)(d) miss the boundary mechanism.</>}
+        lens={<>The boundaries decide which prior an item adapts from.</>}
+        stretch={<>How would you tune boundaries — quantiles or held-out NDCG?</>}
+      />
+
+      {/* axis: C5 — data assumption violations */}
+      <VIS.TrapProblem
+        id="pam-p14" difficulty="medium"
+        title="P14 — Data assumption violations"
+        scenario={<><em>Discriminating insight: PAM assumes the trajectory predictor was trained on a label distribution similar to today&apos;s. A seasonal shift (holidays, world events) shifts the trajectory label distribution and the predictor mis-buckets; PAM then routes new items to wrong priors.</em><br/>Which violation is most direct?</>}
+        options={[
+          {key:"a", text:"Seasonality shifts the trajectory label distribution; the predictor mis-buckets. Mitigation: short retraining window for the predictor + drift monitoring on bucket assignments.", correct:true},
+          {key:"b", text:"Different label encodings."},
+          {key:"c", text:"Slight feature-order changes."},
+          {key:"d", text:"Different batch sizes."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>The predictor&apos;s label distribution is the contract.</>}
+        stretch={<>What monitor catches predictor drift?</>}
+      />
+
+      {/* axis: D1 — intuitive but wrong */}
+      <VIS.TrapProblem
+        id="pam-p15" difficulty="hard"
+        title="P15 — Intuitive but wrong: &quot;just over-sample tail items&quot;"
+        scenario={<><em>Discriminating insight: blanket tail oversampling lifts cold-forever items into the batch, wasting capacity. PAM oversamples ONLY items the trajectory predictor flags as likely-to-trend.</em><br/>Why is blanket tail oversampling wrong here?</>}
+        options={[
+          {key:"a", text:"Blanket tail oversampling treats all tail items as deserving the same exposure. PAM oversamples conditionally on predicted trajectory; budget goes to items likely to warm.", correct:true},
+          {key:"b", text:"Tail oversampling and PAM are equivalent."},
+          {key:"c", text:"Tail oversampling always wins."},
+          {key:"d", text:"Tail oversampling is unrelated."},
+        ]}
+        trap={<>(b)(c)(d) miss the conditional argument.</>}
+        lens={<>Allocate by predicted payoff, not by tail membership.</>}
+        stretch={<>How does PAM&apos;s sampler compare to inverse-popularity oversampling?</>}
+      />
+
+      {/* axis: D2 — cascade */}
+      <VIS.TrapProblem
+        id="pam-p16" difficulty="hard"
+        title="P16 — Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: assuming &quot;the trajectory predictor is reliable&quot; without monitoring cascades into: (i) trusting bucket assignments forever, (ii) failing to detect predictor drift, (iii) misallocating exploration during seasonal shifts.</em><br/>What breaks?</>}
+        options={[
+          {key:"a", text:"All three: stale bucket assignments, undetected drift, misallocated exploration during seasonality. Mitigation: monitor predictor calibration on a recent rolling window and gate releases on calibration tests.", correct:true},
+          {key:"b", text:"Just the bucket assignments."},
+          {key:"c", text:"Just the exploration allocation."},
+          {key:"d", text:"Nothing — the predictor is reliable."},
+        ]}
+        trap={<>(d) over-trust.</>}
+        lens={<>The predictor is a moving part with its own drift surface.</>}
+        stretch={<>What is the calibration metric on bucket assignments?</>}
+      />
+
+      {/* axis: D3 — senior vs junior */}
+      <VIS.TrapProblem
+        id="pam-p17" difficulty="medium"
+        title="P17 — Senior vs junior framing"
+        scenario={<><em>Discriminating insight: junior reaches for more data; senior reaches for &quot;is the trajectory predictor still calibrated?&quot; — the upstream moving part is the most common silent failure.</em><br/>Cold-trending recall sags 8%; first lever?</>}
+        options={[
+          {key:"a", text:"Check the trajectory predictor&apos;s calibration on a recent window. If it has drifted, fix it before debugging the meta-learner.", correct:true},
+          {key:"b", text:"Wait for more interaction data."},
+          {key:"c", text:"Increase inner-loop LR."},
+          {key:"d", text:"Bigger embeddings."},
+        ]}
+        trap={<>(b)(c)(d) tweak the wrong moving part.</>}
+        lens={<>The upstream predictor is the cheap-to-check, often-failing component.</>}
+        stretch={<>What recent-window calibration metric would you use?</>}
+      />
+
+      {/* axis: D4 — plausible misattribution */}
+      <VIS.TrapProblem
+        id="pam-p18" difficulty="hard"
+        title="P18 — Plausible misattribution"
+        scenario={<><em>Discriminating insight: a sudden drop in cold-trending NDCG looks like MAML LR drift but is actually predictor staleness; the predictor was trained on a pre-holiday window and is now misbucketing holiday items.</em><br/>Most likely cause?</>}
+        options={[
+          {key:"a", text:"Trajectory predictor was trained on a pre-holiday window; it is now misbucketing holiday-themed items as cold-forever when they are actually cold-trending. Retrain the predictor on the recent window; PAM will route correctly again.", correct:true},
+          {key:"b", text:"MAML inner LR drift."},
+          {key:"c", text:"GPU thermal throttling."},
+          {key:"d", text:"Cache invalidation."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Upstream label drift is the typical PAM-specific cause.</>}
+        stretch={<>How would you canary the predictor weekly?</>}
+      />
+
+      {/* axis: E1 — production gotcha */}
+      <VIS.TrapProblem
+        id="pam-p19" difficulty="hard"
+        title="P19 — Production gotcha: the trajectory predictor as a hidden dependency"
+        scenario={<><em>Discriminating insight: the trajectory predictor has its own training data, its own retraining cadence, its own drift surface. Teams forget it exists and only debug the meta-learner. Operational hygiene: treat the predictor as a first-class model with monitoring.</em><br/>What is the discipline?</>}
+        options={[
+          {key:"a", text:"Treat the trajectory predictor as a first-class model: training pipeline, calibration monitoring, drift alerts, retraining cadence. PAM&apos;s output is only as good as the predictor&apos;s buckets.", correct:true},
+          {key:"b", text:"The predictor is a static module."},
+          {key:"c", text:"The predictor is irrelevant to PAM&apos;s performance."},
+          {key:"d", text:"Predictor monitoring is overkill."},
+        ]}
+        trap={<>(b)(c)(d) under-rate the dependency.</>}
+        lens={<>The predictor is a first-class dependency, not a static feature.</>}
+        stretch={<>What is the minimal monitoring set for the predictor?</>}
+      />
+
+      {/* axis: E2 — Failure on Friday */}
+      <VIS.TrapProblem
+        id="pam-p20" difficulty="hard"
+        title="P20 — Failure on Friday: cold-trending bucket empties"
+        scenario={<><em>Discriminating insight: an upstream creator-feature pipeline broke; the trajectory predictor lost its strongest signal (creator history) and now classifies almost every new item as cold-forever. The cold-trending bucket empties; viral items never surface.</em><br/>3am page: cold-trending bucket population fell 90%, overall NDCG down 6%. Diagnosis?</>}
+        options={[
+          {key:"a", text:"Creator-feature pipeline upstream lost a column; the trajectory predictor&apos;s strongest signal vanished and it now classifies everything as cold-forever. Restore the upstream feature; gate releases on bucket-population diversity.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"MAML LR drift."},
+          {key:"d", text:"Cache TTL changed."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Bucket-population diversity is the canary.</>}
+        stretch={<>What would the bucket-population SLO look like?</>}
+      />
+
+      {/* axis: E3 — implementation specifics */}
+      <VIS.TrapProblem
+        id="pam-p21" difficulty="medium"
+        title="P21 — Library default that bites: balanced sampler"
+        scenario={<><em>Discriminating insight: a generic &quot;balanced sampler&quot; in a meta-learning library will sample uniformly per CLASS (e.g., per user), not per BUCKET. Out of the box, PAM&apos;s bucketing is ignored unless you explicitly plug in a bucket-stratified sampler.</em><br/>What default bites?</>}
+        options={[
+          {key:"a", text:"The default balanced sampler is class-balanced (per user/per item), not bucket-stratified. You must explicitly plug in a bucket sampler keyed on the trajectory predictor.", correct:true},
+          {key:"b", text:"Adam β2 default."},
+          {key:"c", text:"Default dropout."},
+          {key:"d", text:"Default LR schedule."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Sampler integration is the load-bearing plumbing.</>}
+        stretch={<>How do you unit-test the bucket sampler?</>}
+      />
+
+      {/* axis: E4 — rollout */}
+      <VIS.TrapProblem
+        id="pam-p22" difficulty="hard" ordered
+        title="P22 — Order the rollout"
+        scenario={<><em>Discriminating insight: rollout is (1) train and validate the trajectory predictor stand-alone, (2) wire it into the sampler with monitoring but uniform weights, (3) shift weights toward bucket-specific priors, (4) shadow-score, (5) traffic ramp.</em><br/>Order.</>}
+        options={[
+          {key:"a", text:"Train predictor stand-alone → wire into sampler with uniform weights (sanity) → shift to bucket-specific weights → shadow-score → traffic ramp", correct:true},
+          {key:"b", text:"Wire in bucket-specific weights from day 1."},
+          {key:"c", text:"Skip predictor validation."},
+          {key:"d", text:"Ramp traffic before shadow-scoring."},
+        ]}
+        trap={<>(b) over-aggressive. (c) skips a critical step. (d) backwards.</>}
+        lens={<>Predictor validation is the gate; uniform weights catch wiring bugs.</>}
+        stretch={<>What predictor metric is your gate?</>}
+      />
+
+      {/* axis: F1 — edge case */}
+      <VIS.TrapProblem
+        id="pam-p23" difficulty="hard"
+        title="P23 — Smallest input that breaks PAM&apos;s claimed advantage"
+        scenario={<><em>Discriminating insight: a trajectory predictor at AUC 0.5 is equivalent to random bucketing; PAM degenerates to uniform meta-learning + the overhead of running a useless model.</em><br/>Construct the edge case.</>}
+        options={[
+          {key:"a", text:"A trajectory predictor at chance-level AUC (≈0.5) — the buckets become random, the bucket-conditioned priors collapse to a noisy uniform, and PAM regresses below MAML-Rec because of the added overhead.", correct:true},
+          {key:"b", text:"Predictor at AUC 0.9 — PAM&apos;s sweet spot, not an edge case."},
+          {key:"c", text:"10k items."},
+          {key:"d", text:"5 buckets."},
+        ]}
+        trap={<>(b) sweet spot. (c)(d) describe scale.</>}
+        lens={<>Predictor quality is the gating factor.</>}
+        stretch={<>What AUC threshold would you set as a gate?</>}
+      />
+
+      {/* axis: F4 — paper-named failure mode */}
+      <VIS.TrapProblem
+        id="pam-p24" difficulty="hard"
+        title="P24 — Paper-named failure: predictor is itself a hard problem"
+        scenario={<><em>Discriminating insight: the paper itself names &quot;trajectory prediction is hard&quot; as the dominant limitation: early-stage signals are noisy, virality has heavy-tailed structure, and creator gaming attacks the predictor.</em><br/>What is the paper&apos;s named limitation?</>}
+        options={[
+          {key:"a", text:"Predicting which cold items will trend is itself a hard problem; PAM&apos;s lift is bounded by the predictor&apos;s quality, which the paper acknowledges as the dominant practical limitation.", correct:true},
+          {key:"b", text:"MAML&apos;s second-order cost."},
+          {key:"c", text:"Embedding-dim sensitivity."},
+          {key:"d", text:"Inner-loop LR sensitivity."},
+        ]}
+        trap={<>(b)(c)(d) not paper-named.</>}
+        lens={<>PAM&apos;s upper bound is the predictor.</>}
+        stretch={<>How would you make the predictor self-correcting via online feedback?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://arxiv.org/html/2411.11225v1" target="_blank" rel="noopener">Authors of PAM — <em>Online Item Cold-Start Recommendation with Popularity-Aware Meta-Learning</em> (arXiv 2024)</a> — primary source. Sections 3-5 cover the trajectory predictor and bucket-conditioned meta-init.</li>
-        <li><a href="https://lilianweng.github.io/posts/2018-11-30-meta-learning/" target="_blank" rel="noopener">Lilian Weng — <em>Meta-Learning: Learning to Learn Fast</em> (blog)</a> — MAML primer; you need this to understand how the bucket conditions the meta-init.</li>
-        <li><a href="https://netflixtechblog.com/artwork-personalization-c589f074ad76" target="_blank" rel="noopener">Netflix Tech Blog — <em>Artwork Personalization at Netflix</em></a> — production exploration-vs-exploitation framing that complements PAM&apos;s bucket gating.</li>
-        <li><a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener">Eugene Yan — <em>System Design for Recommendation</em> (blog)</a> — for the broader two-stage architecture that PAM slots into.</li>
-        <li><a href="https://arxiv.org/abs/2310.04966" target="_blank" rel="noopener">Wei et al. — <em>Survey of Cold-Start Recommendation</em> (2024)</a> — the recent survey that places PAM in the wider cold-start landscape.</li>
+        <li><a href="https://arxiv.org/html/2411.11225v1" target="_blank" rel="noopener">Wei et al., <em>Online Item Cold-Start Recommendation with Popularity-Aware Meta-Learning</em> (arXiv 2411.11225, 2024)</a> — primary source.</li>
+        <li><a href="https://arxiv.org/abs/1703.03400" target="_blank" rel="noopener">Finn, Abbeel, Levine, <em>Model-Agnostic Meta-Learning</em> (MAML, ICML 2017)</a> — the meta-loop PAM specializes.</li>
+        <li><a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener">Eugene Yan — <em>System Design for Discovery</em> (blog)</a> — exploration vs exploitation in short-lifecycle catalogs.</li>
+        <li><a href="https://lilianweng.github.io/posts/2018-01-23-multi-armed-bandit/" target="_blank" rel="noopener">Lilian Weng — <em>The Multi-Armed Bandit</em> (blog)</a> — exploration framing PAM departs from.</li>
+        <li><a href="https://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">Andrej Karpathy — <em>A Recipe for Training Neural Networks</em> (blog)</a> — practitioner discipline for monitoring upstream model dependencies.</li>
       </ul>
     </VIS.Section>
   </main>
