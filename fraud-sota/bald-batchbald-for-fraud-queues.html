@@ -1414,292 +1414,655 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// BALD / BatchBALD for fraud queues — Bayesian active learning that diversifies queries.
+// BALD / BatchBALD for fraud queues — Bayesian active learning, joint-MI batch correction.
+// Concept-specific anchor: every trap must hinge on BALD's MI decomposition (not margin/entropy),
+// BatchBALD's joint-MI (not greedy top-K), or a posterior-approximation gotcha.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Active learning for fraud labeling"
       title="BALD / BatchBALD for fraud queues"
-      subtitle="Bayesian acquisition that asks analysts to label cases whose label would most reduce uncertainty about the model parameters — and BatchBALD that diversifies the batch instead of asking near-duplicates."
+      subtitle="Bayesian acquisition by mutual information with model parameters — and the joint-MI batch correction that stops K labels from being K copies of the same fraud ring."
       byline={[
-        {label: "Paper", value: "Houlsby 2011 (BALD); Kirsch NeurIPS 2019 (BatchBALD)"},
-        {label: "Year", value: "2019 / 2024 (ADS revisit)"},
-        {label: "L3", value: "Active learning"},
+        {label: "Papers", value: "Houlsby 2011 (BALD); Kirsch NeurIPS 2019 (BatchBALD)"},
+        {label: "Year", value: "2011 / 2019 (KDD 2024 ADS revisit)"},
+        {label: "L3", value: "Active learning for fraud labeling"},
       ]}/>
 
     <VIS.TLDR>
-      Margin sampling — "ask the analyst about the cases I'm least sure of" — oversamples redundant fraud rings: ten near-identical cases from one ring all sit near the decision boundary.{" "}
-      <VIS.Term def="Bayesian Active Learning by Disagreement. Score each unlabeled case by how much labeling it would reduce uncertainty in the MODEL'S PARAMETERS, not in this single prediction.">BALD</VIS.Term>{" "}
-      scores by parameter-information gain instead.{" "}
-      <VIS.Term def="The batch-aware extension of BALD. Greedy BALD picks K independently and lands on near-duplicates; BatchBALD penalizes mutual information BETWEEN queries inside the batch.">BatchBALD</VIS.Term>{" "}
-      then makes the batch DIVERSE so you don't waste 10 analyst slots on the same fraud ring.
+      <VIS.Term def="Bayesian Active Learning by Disagreement. Per-case score = mutual information between the unknown label and the model parameters, NOT predictive entropy.">BALD</VIS.Term>{" "}
+      scores cases by `H[y|x,D] &minus; E&#x3B8; H[y|x,&#x3B8;]` — the part of predictive entropy that labeling will actually reduce (epistemic), with aleatoric noise subtracted out.{" "}
+      <VIS.Term def="The batch-aware extension. Replaces sum of per-case MI with the JOINT MI over the K-tuple, which subtracts label-overlap between queries. Greedy top-K BALD does not.">BatchBALD</VIS.Term>{" "}
+      then corrects greedy top-K's redundancy on ringed fraud by computing joint MI over the K chosen cases, not sum of marginals.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — MI between label and parameters, then joint MI for batches">
       <p>
-        <VIS.Term def="A loop where the model proposes the next cases to label, an analyst labels them, and the model retrains. Used when labels are expensive (~$5-50 per fraud case) and you can only afford to label a small slice.">Active learning</VIS.Term>{" "}
-        scores each unlabeled case and asks the analyst to label the top-K. BALD scores by{" "}
-        <VIS.Term def="The information gained about variable X by observing variable Y. For BALD: how much does observing this label tell us about the model's posterior over parameters.">mutual information</VIS.Term>{" "}
-        between the label and the model parameters:
+        <VIS.Term def="A loop where the model proposes the next cases to label, an analyst labels them, the model retrains. Used when labels are expensive — typically $5-50/case in fraud.">Active learning</VIS.Term>{" "}
+        scores each unlabeled case and asks the analyst to label the top-K. The default acquisition function is{" "}
+        <VIS.Term def="Score each case by 1 minus the gap between the top-1 and top-2 predicted class probabilities. The case nearest the decision boundary gets the highest score.">margin sampling</VIS.Term>.
+        For fraud, margin oversamples members of the same fraud ring (they all sit near the boundary together) — the K queries are near-duplicates.
+      </p>
+      <p>
+        BALD reframes the score as mutual information between the unknown label `y` and the posterior on model parameters &#x3B8;:
       </p>
       <VIS.Equation display
-        tex="\mathrm{BALD}(x) = H[y \mid x, \mathcal{D}] - \mathbb{E}_{\theta \sim p(\theta \mid \mathcal{D})}\!\big[H[y \mid x, \theta]\big]" />
+        tex="\mathrm{BALD}(x) \;=\; \underbrace{H[y \mid x,\mathcal{D}]}_{\text{total predictive entropy}} \;-\; \underbrace{\mathbb{E}_{\theta \sim p(\theta\mid\mathcal{D})}\!\big[H[y \mid x,\theta]\big]}_{\text{average aleatoric (label noise)}}"/>
       <p>
-        First term: entropy of the predictive distribution after marginalizing over the posterior on parameters (total uncertainty). Second term: average entropy at fixed parameters (aleatoric noise the labels can't reduce). The DIFFERENCE is the part labeling actually helps —{" "}
-        <VIS.Term def="Uncertainty due to limited training data; shrinks as you collect more labels. Contrast with aleatoric uncertainty (label noise) which stays fixed.">epistemic uncertainty</VIS.Term>.
+        The difference is the part of predictive entropy that comes from{" "}
+        <VIS.Term def="Uncertainty due to limited training data. Shrinks as you collect more labels — this is what active learning can reduce.">epistemic uncertainty</VIS.Term>{" "}
+        — exactly the part labeling will reduce.{" "}
+        <VIS.Term def="Uncertainty inherent to the data itself — two transactions with identical features can have different labels. Labeling does NOT reduce it.">Aleatoric uncertainty</VIS.Term>{" "}
+        gets subtracted out.
+      </p>
+
+      <p style={{marginTop: 16}}>
+        BatchBALD scores a SET of K queries jointly:
+      </p>
+      <VIS.Equation display
+        tex="\mathrm{BatchBALD}(\{x_1,\dots,x_K\}) \;=\; H[y_1,\dots,y_K \mid x_{1:K},\mathcal{D}] \;-\; \mathbb{E}_{\theta}\!\Big[\sum_i H[y_i \mid x_i,\theta]\Big]"/>
+      <p>
+        The joint entropy `H[y_1,…,y_K | x_{1:K}, D]` is SMALLER than the sum of marginals when labels are correlated (e.g., same fraud ring), so picking a near-duplicate as the 2nd query buys near-zero additional joint MI.
+        Greedy top-K BALD doesn't see this; BatchBALD does.
       </p>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  POOL["Unlabeled fraud cases"]
-  POOL --> BAYES["Bayesian model (MC dropout / ensemble)"]
-  BAYES --> SCORE["Score each case by BALD or BatchBALD"]
-  SCORE --> TOPK["Top-K diverse batch"]
-  TOPK --> ANALYST["Analyst labels K cases"]
-  ANALYST --> TRAIN["Retrain"]
-  TRAIN --> BAYES
-  style SCORE fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style TOPK fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  POOL["Unlabeled fraud pool"]
+  POOL --> BAYES["Posterior approx (MC-dropout / ensemble / bagged GBDT)"]
+  BAYES --> PERCASE["Per-case BALD: MI(y; theta)"]
+  PERCASE --> NAIVE["Greedy top-K: picks duplicates"]
+  PERCASE --> JOINT["BatchBALD: joint MI over K-tuple"]
+  JOINT --> DIVERSE["Diverse batch of K queries"]
+  DIVERSE --> ANALYST["Analyst labels K cases"]
+  ANALYST --> RETRAIN["Retrain, update posterior"]
+  RETRAIN --> BAYES
+  style PERCASE fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style JOINT fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style NAIVE fill:#fee2e2,stroke:#dc2626,stroke-width:2px
       `} />
-      <p>The blue nodes are the BALD/BatchBALD-specific pieces. Everything else is standard active-learning plumbing.</p>
+      <p>Blue = per-case BALD. Yellow = the joint-MI step that makes BatchBALD different from greedy top-K. Red = the failure path most teams trip on.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <p>
-        The default acquisition function is{" "}
-        <VIS.Term def="Score each case by 1 minus the gap between the top two predicted class probabilities. The case nearest the decision boundary gets the highest score.">margin sampling</VIS.Term>{" "}
-        (or its cousin, max-entropy). For fraud, that picks cases sitting on the decision boundary — which tend to come from the SAME fraud ring or merchant cluster, so the K queries are near-duplicates.
-      </p>
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="How it differs from margin sampling and greedy top-K BALD">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Knob</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Property</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Margin sampling</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>BALD</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Greedy top-K BALD</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>BatchBALD</th>
           </tr>
         </thead>
         <tbody>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>What it scores</td>
+            <td style={{padding:"8px 10px"}}>What's scored</td>
             <td style={{padding:"8px 10px"}}>Predictive confidence</td>
-            <td style={{padding:"8px 10px"}}>Info gain on parameters</td>
-            <td style={{padding:"8px 10px"}}>Joint info gain on a SET</td>
+            <td style={{padding:"8px 10px"}}>Per-case MI(y; &#x3B8;)</td>
+            <td style={{padding:"8px 10px"}}>Joint MI over K-tuple</td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Needs Bayesian model?</td>
+            <td style={{padding:"8px 10px"}}>Needs posterior on &#x3B8;?</td>
             <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Yes (MC dropout / ensemble)</td>
+            <td style={{padding:"8px 10px"}}>Yes</td>
             <td style={{padding:"8px 10px"}}>Yes</td>
           </tr>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Batch behavior</td>
-            <td style={{padding:"8px 10px"}}>Picks K near-duplicates</td>
-            <td style={{padding:"8px 10px"}}>Still picks duplicates if greedy top-K</td>
-            <td style={{padding:"8px 10px"}}>Diversifies the batch</td>
+            <td style={{padding:"8px 10px"}}>Separates aleatoric vs epistemic?</td>
+            <td style={{padding:"8px 10px"}}>No</td>
+            <td style={{padding:"8px 10px"}}>Yes (2nd term subtracts aleatoric)</td>
+            <td style={{padding:"8px 10px"}}>Yes</td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Separates noise from ignorance?</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Yes — second term is aleatoric</td>
-            <td style={{padding:"8px 10px"}}>Yes</td>
+            <td style={{padding:"8px 10px"}}>Ringed-fraud behavior</td>
+            <td style={{padding:"8px 10px"}}>K duplicates</td>
+            <td style={{padding:"8px 10px"}}>K duplicates (still!)</td>
+            <td style={{padding:"8px 10px"}}>Diverse</td>
+          </tr>
+          <tr style={{background:"#e8f0fa"}}>
+            <td style={{padding:"8px 10px"}}>Naive joint cost</td>
+            <td style={{padding:"8px 10px"}}>O(N)</td>
+            <td style={{padding:"8px 10px"}}>O(N&middot;M)</td>
+            <td style={{padding:"8px 10px"}}>O(2^K) → MC O(K&middot;M&middot;N)</td>
           </tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Limited analyst capacity.</strong> Fraud labels cost $5-50 each; you can label only ~100-1000 cases per cycle.</li>
-        <li><strong>Pool has obvious clusters / rings.</strong> Margin sampling wastes the batch on near-duplicates; BatchBALD pays for itself.</li>
-        <li><strong>You can afford MC dropout or a small ensemble.</strong> Need a posterior over parameters — point-estimate models can't compute BALD.</li>
-        <li><strong>Aleatoric noise is non-trivial.</strong> BALD separates it from epistemic; margin sampling conflates them.</li>
-      </ul>
-    </VIS.Section>
-
     <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="MC dropout is a weak posterior approximation">
-        BALD assumes you can sample from p(theta | D). MC dropout treats dropout masks as posterior samples — it's an approximation that often UNDER-estimates uncertainty on out-of-distribution data. For high-stakes fraud, prefer a 5-10 model deep ensemble.
+      <VIS.Callout kind="gotcha" title="MC-dropout under-estimates aleatoric on OOD inputs">
+        BALD's second term is `E&#x3B8; H[y|x,&#x3B8;]` averaged over posterior samples. MC-dropout's posterior is biased — on out-of-distribution inputs, dropped masks give nearly the same prediction (network is locally flat), so the second term is too small and BALD over-rates noisy cases. Use a deep ensemble for high-stakes fraud.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="BatchBALD is O(2^K) naively">
-        Exact BatchBALD requires joint entropy over K labels — exponential in batch size. Use the paper's MC-approximation; even then, K under 100 is the practical sweet spot.
+      <VIS.Callout kind="warn" title="BatchBALD naive joint entropy is O(2^K)">
+        Joint entropy over K binary labels enumerates 2^K assignments. Use the Kirsch MC estimator (paper Sec 5) for K under ~100, or sequential-greedy BatchBALD (pick best, condition, pick next) for larger K.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Doesn't fix the eval set">
-        AL biases the LABELED set toward informative cases. Your eval set must still come from a stratified random reserve, or your AUC numbers are not population-representative. See the companion visual on stratified reserves.
+      <VIS.Callout kind="warn" title="AL contaminates eval — needs a stratified random reserve">
+        BALD-acquired labels are systematically harder than random. If they leak into eval, AUC drifts as a function of acquisition, not model quality. See the companion visual on stratified random reserves.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on BALD, BatchBALD, fraud-queue design, and active-learning pitfalls.
+        Every problem hinges on something BALD or BatchBALD-specific: MI decomposition, joint-MI batch correction, posterior approximation choice, or the aleatoric/epistemic split. Strip the name → option no longer wins.
       </p>
 
+      {/* axis: B2 — sounds reasonable, isn't */}
       <VIS.TrapProblem
         id="bald-p1"
         difficulty="hard"
-        title="P1 — Margin sampling wastes the analyst batch. Why?"
-        scenario={<>Your fraud team labels 50 cases per day. You score the unlabeled pool by margin sampling (top-50 by 1 minus margin to threshold). After two weeks, analyst feedback says "we're seeing the same merchant over and over." The model gain has plateaued. What's the mechanism?</>}
+        title="P1 — Margin sampling wastes the analyst batch on rings. Why specifically?"
+        scenario={<><em>Discriminating insight: margin scores each case independently from its own predictive entropy; nothing penalizes label overlap.</em><br/><br/>Your fraud team labels 50/day via margin sampling. After two weeks, analysts say "same merchant over and over"; model gain plateaus. Pick the most precise mechanism.</>}
         options={[
-          {key:"a", text:"Margin sampling scores each case independently; cases from the same fraud ring share features, so they cluster near the boundary together. The top-50 are near-duplicates. Information per labeled case collapses.", correct:true},
-          {key:"b", text:"Margin sampling is biased toward the majority class — fix by re-weighting positives."},
-          {key:"c", text:"Two weeks is not enough for AL to show gains."},
-          {key:"d", text:"Analysts are mislabeling; margin sampling needs cleaner labels."},
+          {key:"a", text:"Margin scores predictive confidence per case independently; ring members share features and cluster near the boundary, so K queries are near-duplicates with overlapping label information.", correct:true},
+          {key:"b", text:"Margin sampling is biased toward the majority class; reweight positives 10x to fix."},
+          {key:"c", text:"Two weeks is below the warm-up horizon for any AL acquisition function."},
+          {key:"d", text:"Analyst label noise is high; margin sampling is sensitive to noise so it picks similar cases."},
         ]}
-        trap={<>(b)-(d) miss the point. The failure is INFORMATION REDUNDANCY in the batch, not class balance or label quality. Margin sampling is myopic — it picks the K highest-scoring points without considering whether those points tell you the same thing.</>}
-        lens={<>(a) is the diagnosis. The fix is BatchBALD (or any batch-aware acquisition: k-means++ on uncertainty embeddings, BADGE, etc.) — score the BATCH jointly so the model penalizes redundancy.</>}
-        stretch={<>Could you fix margin sampling cheaply without going full Bayesian? What approximation works?</>}
+        trap={<>(b)-(d) name unrelated phenomena. The trap is "label overlap inside the batch," which is invisible to margin's per-case score — it's the property BatchBALD's joint-MI directly addresses.</>}
+        lens={<>The fix is batch-aware acquisition. BALD per-case won't help (it's also independent). Only joint-MI methods (BatchBALD, BADGE, core-set) penalize within-batch overlap.</>}
+        stretch={<>If your pool has no clustering, would BatchBALD's gain over greedy top-K shrink to zero?</>}
       />
 
+      {/* axis: C2 — loss/objective math */}
       <VIS.TrapProblem
         id="bald-p2"
         difficulty="hard"
-        title="P2 — BALD score is high but the label adds nothing to the model. What happened?"
-        scenario={<>You score a case at BALD = 0.65 (very high). The analyst labels it as fraud. You retrain. The model barely shifts. The case looked confident-fraud to the analyst (no ambiguity). Diagnose.</>}
+        title="P2 — Which term subtracts label noise from BALD?"
+        scenario={<><em>Discriminating insight: the SECOND BALD term, the expected per-parameter entropy, captures aleatoric noise that labeling cannot reduce.</em><br/><br/>BALD score on a case is `BALD(x) = A − B`. A label is mostly uninformative because of inherent transaction-data ambiguity. Which term of BALD is supposed to subtract that?</>}
         options={[
-          {key:"a", text:"The case had high TOTAL entropy (first BALD term) but the model already had high epistemic uncertainty on cases like this — labeling it confirms what the posterior already weakly believed; the parameter posterior barely tightens."},
-          {key:"b", text:"BALD's first term was driven by aleatoric noise that the second term failed to subtract because MC dropout under-estimates aleatoric on this kind of case.", correct:true},
-          {key:"c", text:"BALD never works for high-confidence labels."},
-          {key:"d", text:"The model is overfit and ignores new labels."},
+          {key:"a", text:"The first term A = H[y|x,D] — total predictive entropy that includes aleatoric."},
+          {key:"b", text:"The second term B = E&#x3B8;[H[y|x,&#x3B8;]] — average entropy at fixed parameters, which is aleatoric only.", correct:true},
+          {key:"c", text:"Neither — BALD subtracts model uncertainty, not aleatoric."},
+          {key:"d", text:"The product A&middot;B — BALD is multiplicative on uncertainty terms."},
         ]}
-        trap={<>(a) sounds technical but is incoherent (BALD already subtracts the average single-model entropy). (c) is wrong: high-confidence labels CAN still tighten the parameter posterior. (d) is unsupported speculation.</>}
-        lens={<>(b) is the realistic failure mode: MC dropout / small ensembles often under-estimate aleatoric uncertainty (the second BALD term), so cases dominated by label noise score artificially high. The fix is a bigger ensemble or calibration on the second term.</>}
-        stretch={<>How would you SANITY-CHECK whether your BALD scores are dominated by aleatoric leakage?</>}
+        trap={<>(a) confuses total with aleatoric. (c) inverts the decomposition: BALD subtracts ALEATORIC (B), so what remains is epistemic. (d) is fabricated.</>}
+        lens={<>The decomposition is: total predictive uncertainty = epistemic + aleatoric. BALD = total − aleatoric = epistemic. Margin sampling has only the total — that's why it's fooled by inherently ambiguous cases.</>}
+        stretch={<>If your posterior approximation under-estimates B (the aleatoric term), what direction does BALD bias?</>}
       />
 
+      {/* axis: C1 — architectural choice */}
       <VIS.TrapProblem
         id="bald-p3"
-        difficulty="hard"
-        multiSelect
-        title="P3 — Pure greedy top-K BALD also picks near-duplicates. Which fixes apply?"
-        scenario={<>You're surprised: greedy top-K BALD gives nearly the same diversity problem as margin sampling. Two cases from the same ring both have BALD = 0.6. Which fixes legitimately address this? Select all that apply.</>}
+        difficulty="medium"
+        title="P3 — Can a point-estimate XGBoost compute BALD?"
+        scenario={<><em>Discriminating insight: BALD's second term is an expectation over the parameter posterior — a point estimate has no posterior.</em><br/><br/>A junior asks: "Why can't I just use BALD with a regular XGBoost classifier?"</>}
         options={[
-          {key:"a", text:"BatchBALD — replace the sum of per-case BALD with the joint mutual information over the K labels, which penalizes overlap.", correct:true},
-          {key:"b", text:"BADGE — k-means++ on the model's gradient embeddings to diversify queries.", correct:true},
-          {key:"c", text:"Cluster the unlabeled pool first (e.g., HDBSCAN on embeddings) and cap labels per cluster.", correct:true},
-          {key:"d", text:"Increase MC dropout rate to make BALD scores more random."},
-          {key:"e", text:"Switch from BALD to margin sampling."},
+          {key:"a", text:"You can — BALD is a property of predictive distributions, not the model. Just use the XGBoost probabilities.",},
+          {key:"b", text:"BALD's second term is `E&#x3B8;[H[y|x,&#x3B8;]]` — an expectation over the parameter posterior. A point-estimate XGBoost has no posterior. You need MC-dropout, a deep ensemble, or bagged XGBoost to approximate one.", correct:true},
+          {key:"c", text:"BALD is only defined for binary classification with calibrated probabilities, so XGBoost's raw scores would need Platt scaling first."},
+          {key:"d", text:"XGBoost is regression-only; BALD is for classification."},
         ]}
-        trap={<>(d) injects noise, not diversity — random tie-breaking doesn't fix structural redundancy. (e) is going backwards.</>}
-        lens={<>(a), (b), (c) all address the same problem at different layers: BatchBALD is the principled approach; BADGE is a cheaper approximation; cluster-capping is a hack that works surprisingly well in practice and is what most teams ship.</>}
-        stretch={<>Of (a)-(c), which would you ship FIRST in a real fraud team with three weeks before next eval?</>}
+        trap={<>(a) collapses BALD to confidence-based AL, which IS margin sampling — and loses the aleatoric/epistemic split. (c) and (d) are non sequiturs.</>}
+        lens={<>BALD needs a *posterior* over parameters, not a *better* model. Cheapest in practice: MC-dropout (one network, K forward passes with dropout on). For tabular: bagged XGBoost serves as posterior approximation.</>}
+        stretch={<>Bagged XGBoost vs MC-dropout NN as posterior approximation — when does each win for fraud?</>}
       />
 
+      {/* axis: F3 — reverse engineering */}
       <VIS.TrapProblem
         id="bald-p4"
         difficulty="hard"
-        title="P4 — BatchBALD with K=100 takes 6 hours per round. What's wrong?"
-        scenario={<>You implement BatchBALD with K=100 over an unlabeled pool of 1M cases. Each round takes 6 hours just for scoring (training is 20 min). Diagnose the bottleneck.</>}
+        title="P4 — BALD=0.65, label adds nothing. Which BALD-specific failure?"
+        scenario={<><em>Discriminating insight: under-estimated aleatoric term inflates BALD on label-noisy cases — a specific MC-dropout pathology.</em><br/><br/>You score a case at BALD = 0.65 (high). The analyst labels it as fraud. You retrain. The model barely shifts. The case looked obviously fraud to the analyst (no ambiguity for them, but the underlying transaction feature set is known to have label-noise issues). Diagnose.</>}
         options={[
-          {key:"a", text:"BatchBALD's joint entropy is exponential in K; naive implementation is intractable past K around 20. You need the paper's MC sampling approximation OR a sequential greedy variant.", correct:true},
-          {key:"b", text:"MC dropout sampling is slow; reduce dropout samples from 50 to 5."},
-          {key:"c", text:"Pool size is too large; sub-sample to 10k cases before scoring."},
-          {key:"d", text:"Training, not scoring, is the bottleneck."},
+          {key:"a", text:"BALD always over-rates fraud cases because positives have higher entropy in imbalanced classification."},
+          {key:"b", text:"MC-dropout under-estimates the second BALD term (aleatoric) on this region of feature space — so the first term inflates the score, but the label can't tighten the parameter posterior because the underlying noise wasn't truly epistemic.", correct:true},
+          {key:"c", text:"BALD doesn't apply to cases the analyst is confident about — it needs ambiguous labels."},
+          {key:"d", text:"The model already converged; retraining can't change it regardless of BALD score."},
         ]}
-        trap={<>(b) reduces posterior fidelity — not free. (c) is a pragmatic hack but doesn't address the K-exponential cost; even K=100 on a 10k pool is intractable without MC approx. (d) misreads the scenario.</>}
-        lens={<>(a) is the core gotcha. The Kirsch paper's MC estimator drops the cost to roughly O(K x M x pool_size) where M is MC samples — tractable for K up to a few hundred. Many production teams use sequential-greedy BatchBALD (pick best, condition, pick next) which is cheaper still.</>}
-        stretch={<>What's the practical maximum K where BatchBALD's diversity gain over greedy BALD is worth the compute?</>}
+        trap={<>(a) misreads imbalance. (c) confuses analyst confidence (high) with model parameter uncertainty (the BALD score). (d) ignores AL's premise.</>}
+        lens={<>The failure is *aleatoric leakage into the first term*: MC-dropout's posterior is too narrow on certain feature regions, so B is under-estimated, A is inflated by noise, and the score reflects noise not info gain. Fix: deep ensemble with 5–10 models.</>}
+        stretch={<>How would you DIAGNOSE this in production without labeling more cases?</>}
       />
 
+      {/* axis: B1 — picking the right tool */}
       <VIS.TrapProblem
         id="bald-p5"
         difficulty="hard"
         multiSelect
-        title="P5 — BALD chooses cases that are noisy not informative. What's the diagnostic?"
-        scenario={<>You suspect BALD is being fooled by aleatoric noise (high-entropy cases that no model could classify well). Which diagnostics would help you confirm? Select all that apply.</>}
+        title="P5 — Which AL methods actually diversify the batch?"
+        scenario={<><em>Discriminating insight: per-case scoring (BALD, margin, entropy) never penalizes within-batch overlap; only joint or representation-diversity methods do.</em><br/><br/>You're documenting AL options. Which explicitly diversify the batch (vs scoring per-case independently)? Select all that apply.</>}
         options={[
-          {key:"a", text:"Plot BALD's first term (total entropy) vs second term (expected entropy across posterior samples). If second term is large relative to first, aleatoric noise dominates.", correct:true},
-          {key:"b", text:"Have two analysts double-label the high-BALD cases; if their agreement is low, those cases are inherently ambiguous (aleatoric).", correct:true},
-          {key:"c", text:"Compare BALD-selected cases to a stratified-random batch; if BALD's labeled-case agreement-rate is much lower, aleatoric leakage is real.", correct:true},
-          {key:"d", text:"Increase the model size — bigger models eliminate aleatoric noise."},
-          {key:"e", text:"Reduce dropout rate — less dropout means less aleatoric noise."},
+          {key:"a", text:"BatchBALD — joint mutual information over the K-tuple.", correct:true},
+          {key:"b", text:"BADGE — k-means++ on the model's gradient embeddings.", correct:true},
+          {key:"c", text:"Core-set selection — k-center on representation embeddings.", correct:true},
+          {key:"d", text:"Greedy top-K BALD (independent per-case scoring)."},
+          {key:"e", text:"Greedy top-K margin sampling."},
+          {key:"f", text:"Random sampling (diverse by construction, but not actively diversifying)."},
         ]}
-        trap={<>(d) and (e) confuse aleatoric (data noise) with epistemic (model uncertainty). Bigger models / less dropout reduce epistemic, never aleatoric. Aleatoric is a property of the LABELS, not the model.</>}
-        lens={<>(a), (b), (c) are the three diagnostics. (a) is internal to the model; (b) and (c) require analyst time but give the most defensible answer.</>}
-        stretch={<>If aleatoric noise is real and high, what's the active-learning move — abandon BALD, or modify it?</>}
+        trap={<>(d) is the seductive miss — BALD is information-theoretic, so people assume it diversifies. It does not unless you take the JOINT MI (that's BatchBALD). (f) is uniform-diversity by sampling, not active diversification.</>}
+        lens={<>BatchBALD diversifies via JOINT MI (label info). BADGE diversifies via gradient direction. Core-set diversifies via representation coverage. All three address the within-batch overlap problem at different layers.</>}
+        stretch={<>For ringed fraud where labels are highly correlated within a ring, which of (a/b/c) is theoretically best, and why?</>}
       />
 
+      {/* axis: C4 — hyperparameter / computational sensitivity */}
       <VIS.TrapProblem
         id="bald-p6"
-        difficulty="medium"
-        title="P6 — Why does BALD need a Bayesian model?"
-        scenario={<>A junior teammate asks: "Why can't I just use BALD with a regular XGBoost or a point-estimate neural net?"</>}
+        difficulty="hard"
+        title="P6 — BatchBALD scoring takes 6h at K=100. Which BatchBALD-specific term is exploding?"
+        scenario={<><em>Discriminating insight: the joint-entropy term `H[y_1,…,y_K | x_{1:K},D]` is exponential in K under naive enumeration; the MC estimator drops it to polynomial.</em><br/><br/>Pool=1M cases, K=100. Each round: scoring 6h, training 20 min. Pick the dominant cost.</>}
         options={[
-          {key:"a", text:"BALD's second term is an expectation over the parameter posterior. A point-estimate model has NO posterior — there's nothing to take an expectation over. MC dropout, deep ensembles, or proper Bayesian NNs give you the posterior samples BALD needs.", correct:true},
-          {key:"b", text:"Bayesian models are more accurate, so BALD picks better cases."},
-          {key:"c", text:"BALD only works for classification, and XGBoost is regression."},
-          {key:"d", text:"You can — just use any uncertainty score."},
+          {key:"a", text:"MC-dropout inference is the bottleneck; reduce dropout samples from 100 to 10."},
+          {key:"b", text:"Pool size dominates; sub-sample to 10k cases before scoring."},
+          {key:"c", text:"BatchBALD's joint entropy enumerates 2^K assignments naively. Use Kirsch's MC estimator (paper Sec 5) which gives O(K&middot;M&middot;|pool|), tractable for K up to a few hundred.", correct:true},
+          {key:"d", text:"Training time is hidden inside scoring; profile to confirm."},
         ]}
-        trap={<>(b) is wrong: BALD doesn't need a more accurate model, it needs a model that exposes parameter uncertainty. (d) collapses BALD to confidence-based AL, which is exactly margin sampling.</>}
-        lens={<>(a) is the architectural fact. The cheapest way is MC dropout (one network, K forward passes with dropout on). Deep ensembles are slower but more reliable. XGBoost ensembles via bagging also work if you bootstrap.</>}
-        stretch={<>Could you do BALD with bagged XGBoost as the posterior approximator? What's the tradeoff vs a Bayesian NN?</>}
+        trap={<>(a) reduces posterior fidelity to fix a different problem. (b) is a pragmatic hack but doesn't address the K-exponential cost (even K=100 on 10k pool is intractable naively). (d) misreads the budget.</>}
+        lens={<>The 2^K is BatchBALD-specific. Greedy top-K BALD scales linearly in K. The MC estimator samples joint label assignments, reducing exponential to polynomial.</>}
+        stretch={<>At what K does sequential-greedy BatchBALD (pick best, condition, pick next) beat the MC joint estimator?</>}
       />
 
+      {/* axis: E6 — eval contamination */}
       <VIS.TrapProblem
         id="bald-p7"
         difficulty="hard"
-        title="P7 — Eval set bias under AL"
-        scenario={<>You ran 6 cycles of BatchBALD. Held-out AUC went from 0.78 to 0.91. Your CFO wants to ship. The held-out set was a random 20% of cases sampled BEFORE AL started, but you've been updating it by adding the BatchBALD-labeled cases to BOTH train and eval. Diagnose.</>}
+        title="P7 — AUC 0.78 → 0.91 across 6 BALD rounds. Real or contamination?"
+        scenario={<><em>Discriminating insight: AL-acquired cases are systematically harder; merging them into eval upward-shifts the eval distribution's difficulty in a way real-population AUC won't reproduce.</em><br/><br/>BatchBALD for 6 cycles. Held-out AUC went 0.78 → 0.91. Held-out set was a random 20% pre-AL, but the team has been adding BatchBALD-labeled cases to BOTH train and eval over the rounds. Diagnose.</>}
         options={[
-          {key:"a", text:"You contaminated the eval set with selectively-labeled cases. BatchBALD over-samples cases where the model was uncertain; those cases are systematically harder than random. Eval AUC is upward-biased.", correct:true},
-          {key:"b", text:"AUC of 0.91 is realistic; ship it."},
-          {key:"c", text:"Random 20% is too small for a stable AUC estimate."},
-          {key:"d", text:"Held-out is fine — AL only changes train."},
+          {key:"a", text:"AUC=0.91 is realistic; ship."},
+          {key:"b", text:"The held-out set is fine; AL only adds to train, not eval."},
+          {key:"c", text:"Eval was contaminated by AL labels. BatchBALD selects cases with high model uncertainty (systematically harder than random); merging them into eval shifts the eval distribution to harder-than-population, AND introduces train/eval correlation. AUC is unreliable both ways.", correct:true},
+          {key:"d", text:"AUC sample size is too small to be reliable at 20% holdout."},
         ]}
-        trap={<>(b) and (d) miss the contamination. (c) is a different concern not relevant here. The trap is that the team did NOT keep the eval set frozen — they expanded it with AL-labeled cases.</>}
-        lens={<>(a) is the failure mode. Keep eval frozen, OR use a stratified random reserve labeled in parallel that AL never touches. See the companion visual on stratified random reserves vs AL.</>}
-        stretch={<>How would you measure the bias if you've already contaminated eval?</>}
+        trap={<>(a) and (b) miss the contamination. (d) is a different (smaller) concern.</>}
+        lens={<>The eval set must be frozen, OR sourced from a stratified random reserve labeled in parallel that AL never touches. The companion visual covers the reserve protocol.</>}
+        stretch={<>If you've already contaminated, how would you BOUND the eval bias without re-labeling?</>}
       />
 
+      {/* axis: E3 — cold-start operational gotcha */}
       <VIS.TrapProblem
         id="bald-p8"
         difficulty="hard"
-        title="P8 — Cold-start: BALD on epoch 0"
-        scenario={<>Day 1 of a new fraud product. You have 1k labeled cases (50 fraud) and 5M unlabeled. You train an initial Bayesian model (high posterior variance everywhere) and score with BALD. Most BALD scores are near-identical. Why, and what do you do?</>}
+        title="P8 — Day 1 of a new product. BALD scores nearly uniform. Why?"
+        scenario={<><em>Discriminating insight: BALD's `H[y|x,D] − E&#x3B8; H[y|x,&#x3B8;]` requires a meaningful posterior; at cold-start the posterior is wide everywhere, so MI is uniformly small.</em><br/><br/>1k labels (50 fraud), 5M unlabeled. Train a Bayesian model — posterior variance high everywhere. BALD scores are nearly identical across the pool. What's the cold-start fix?</>}
         options={[
-          {key:"a", text:"With a weakly-trained model, the posterior is wide everywhere — BALD scores are uniformly high and uninformative. Bootstrap with a random or stratified-by-feature batch for the first 2-3 cycles, then switch to BALD once the posterior tightens.", correct:true},
-          {key:"b", text:"Increase MC dropout samples — that will spread out BALD scores."},
-          {key:"c", text:"BALD doesn't work for small datasets; switch to margin sampling."},
-          {key:"d", text:"Train a much larger model to differentiate cases."},
+          {key:"a", text:"Increase MC-dropout samples — more samples will spread BALD scores."},
+          {key:"b", text:"With a weakly-trained model the posterior is wide everywhere, so per-case MI between label and parameters is small and roughly equal. Bootstrap with random or stratified-by-feature batches for 2-3 cycles, then turn on BALD once the posterior tightens enough to give meaningful disagreement.", correct:true},
+          {key:"c", text:"BALD doesn't work below 10k labels; switch permanently to margin sampling."},
+          {key:"d", text:"Train a larger model — more capacity will create score differentiation."},
         ]}
-        trap={<>(b) doesn't fix the cold-start issue — more samples of a wide posterior still give a wide posterior. (c) and (d) are too extreme.</>}
-        lens={<>(a) is the cold-start playbook. AL needs SOMETHING to score against. Random or feature-stratified seeding for cycles 1-3 builds the initial posterior; BALD takes over once the model has a meaningful disagreement structure.</>}
-        stretch={<>Roughly how many labeled examples does the model need before BALD beats random sampling?</>}
+        trap={<>(a) more posterior samples of a wide posterior is still a wide posterior. (c) and (d) are overcorrections.</>}
+        lens={<>BALD needs disagreement structure. A model that can't disagree about anything has uniform BALD. Cold-start playbook: random/stratified seeding for 2-3 cycles, then BALD.</>}
+        stretch={<>What's the diagnostic for "posterior is now informative enough for BALD"?</>}
       />
 
+      {/* axis: A1 — distinguish from sibling */}
       <VIS.TrapProblem
         id="bald-p9"
-        difficulty="hard"
-        multiSelect
-        title="P9 — Comparable techniques: which DIVERSIFY the AL batch?"
-        scenario={<>You're documenting AL techniques. Which of these explicitly diversify the batch (not just score per-case)? Select all that apply.</>}
+        difficulty="medium"
+        title="P9 — BALD vs max-entropy acquisition: what's the actual difference?"
+        scenario={<><em>Discriminating insight: max-entropy uses only the first BALD term; BALD subtracts the second.</em><br/><br/>A colleague claims "BALD and max-entropy AL are the same thing — both pick high-uncertainty cases." True?</>}
         options={[
-          {key:"a", text:"BatchBALD.", correct:true},
-          {key:"b", text:"BADGE (k-means++ on gradient embeddings).", correct:true},
-          {key:"c", text:"Core-set selection (k-center on representation space).", correct:true},
-          {key:"d", text:"Greedy top-K margin sampling."},
-          {key:"e", text:"Greedy top-K BALD (without BatchBALD)."},
-          {key:"f", text:"Random sampling."},
+          {key:"a", text:"True — both reduce to `H[y|x,D]` in practice; the difference is academic."},
+          {key:"b", text:"True for binary classification, false for multi-class."},
+          {key:"c", text:"False. Max-entropy = `H[y|x,D]` (first BALD term only). BALD = `H[y|x,D] − E&#x3B8;[H[y|x,&#x3B8;]]`. Max-entropy can't tell a confidently-fraud-with-noisy-labels case from a genuinely-uncertain case; BALD subtracts the noise.", correct:true},
+          {key:"d", text:"False — BALD is regression-only, max-entropy is classification-only."},
         ]}
-        trap={<>(d) and (e) are greedy independent-scoring; they pick the K HIGHEST without considering overlap. (f) gives diversity by accident, but it doesn't actively diversify — it just doesn't concentrate.</>}
-        lens={<>(a), (b), (c) are the canonical batch-diversifying techniques. BatchBALD: joint mutual information. BADGE: gradient diversity. Core-set: input/embedding diversity. They differ on WHAT they diversify (label info, gradient direction, representation coverage).</>}
-        stretch={<>For fraud with strong ring-clustering, which of these three would you expect to perform best, and why?</>}
+        trap={<>(a) misses the decomposition. (b) and (d) introduce dimensions that aren't operative.</>}
+        lens={<>This is the canonical confusion. Max-entropy = total uncertainty. BALD = epistemic only. Aleatoric-rich datasets (fraud labels with ambiguity!) reveal the gap.</>}
+        stretch={<>Construct a case where max-entropy and BALD pick completely different top-K queries.</>}
       />
 
+      {/* axis: D4 — plausible misattribution */}
       <VIS.TrapProblem
         id="bald-p10"
         difficulty="hard"
-        title="P10 — Production design: AL only, AL + reserve, or reserve only?"
-        scenario={<>You design the labeling protocol for a payments-fraud team. Budget: 1000 labels per week. Constraint: you need both a strong model AND an unbiased AUC eval that the risk committee will accept. Pick the design.</>}
+        title="P10 — BatchBALD-labeled fraud catch rate didn't improve. Three plausible causes."
+        scenario={<><em>Discriminating insight: BatchBALD optimizes parameter-info gain, NOT fraud catch rate; the two correlate only when the model's epistemic uncertainty is on the fraud-decision boundary.</em><br/><br/>You shipped BatchBALD. Analyst label spend is unchanged, model log-likelihood improved 8%, but fraud catch rate is flat. Which cause is most likely?</>}
         options={[
-          {key:"a", text:"950/week via BatchBALD on the uncertainty pool; 50/week via stratified random reserve held out from AL entirely. Model trains on AL labels; eval AUC reported only on the reserve. Best of both worlds.", correct:true},
-          {key:"b", text:"1000/week via BatchBALD; eval on a 20% holdout from the AL-labeled set."},
-          {key:"c", text:"1000/week via stratified random reserve; train on the same labels you eval on (with k-fold to avoid contamination)."},
-          {key:"d", text:"500/week BatchBALD + 500/week margin sampling, then combine."},
+          {key:"a", text:"BatchBALD is broken; the joint MI estimate is converging to greedy BALD."},
+          {key:"b", text:"BatchBALD optimizes posterior tightness, not the metric your business cares about. The labels reduced parameter uncertainty in a region OFF the fraud-decision boundary, so the operating-point performance (catch rate at the threshold) didn't move even though log-likelihood did.", correct:true},
+          {key:"c", text:"Fraud catch rate is noisy; rerun for 3 more months."},
+          {key:"d", text:"BatchBALD requires labeled positives to work; the team labeled too many negatives."},
         ]}
-        trap={<>(b) contaminates eval — AL-labeled cases are systematically harder, so AUC on them is downward-biased and not comparable across cycles. (c) wastes 95% of labels on cases the model already knows. (d) doesn't address the eval-bias problem.</>}
-        lens={<>(a) is the standard production answer (Stripe, Sift, payment processors all use a variant). The 5% reserve cost is fixed; you get unbiased eval AND high-signal training. The companion visual on stratified random reserves goes deeper.</>}
-        stretch={<>What's the minimum reserve fraction that gives statistically reliable AUC at 1% positives?</>}
+        trap={<>(a) and (d) are technical-but-wrong. (c) hand-waves.</>}
+        lens={<>BALD/BatchBALD are *information-theoretic* objectives; the *business metric* (catch rate at threshold) is a *decision-theoretic* objective. Mismatch is common. Fix: use a decision-aware acquisition (expected error reduction, Bayesian active risk minimization).</>}
+        stretch={<>What's the cheapest modification to BALD that makes it decision-aware?</>}
+      />
+
+      {/* axis: C5 — data assumption */}
+      <VIS.TrapProblem
+        id="bald-p11"
+        difficulty="hard"
+        title="P11 — When does BatchBALD's joint-MI gain over greedy BALD shrink to zero?"
+        scenario={<><em>Discriminating insight: joint MI = sum of marginals when labels are conditionally independent given posterior; that condition holds on i.i.d. pools without ring structure.</em><br/><br/>A theorist insists "BatchBALD always beats greedy BALD." Build a counterexample.</>}
+        options={[
+          {key:"a", text:"A pool where every example is identical — both methods pick the same single point K times."},
+          {key:"b", text:"A pool of i.i.d. samples with no within-batch label correlation given the parameters: joint MI = sum of marginals exactly, so greedy BALD == BatchBALD. The gain is structural, not free.", correct:true},
+          {key:"c", text:"A pool where all cases are very high entropy."},
+          {key:"d", text:"A pool labeled by a perfect oracle — no AL method matters."},
+        ]}
+        trap={<>(a) is technically true but degenerate. (c) and (d) describe regimes where AL is hard but BatchBALD doesn't lose its advantage from those alone.</>}
+        lens={<>BatchBALD's benefit is the joint-entropy CORRECTION for label overlap. Without overlap (i.i.d. pool), there's nothing to correct. This is why BatchBALD shines on ringed fraud and flatlines on clean i.i.d. data.</>}
+        stretch={<>How would you measure within-batch label overlap empirically before deciding BALD vs BatchBALD?</>}
+      />
+
+      {/* axis: D1 — intuitive but wrong */}
+      <VIS.TrapProblem
+        id="bald-p12"
+        difficulty="medium"
+        title="P12 — "BALD picks the cases the model is least confident on." True?"
+        scenario={<><em>Discriminating insight: BALD picks cases where the parameter posterior most DISAGREES — not where the marginal predictive distribution has highest entropy.</em><br/><br/>Quick check. A teammate says: "BALD is just picking the cases the model is least confident on." Is this an accurate summary?</>}
+        options={[
+          {key:"a", text:"Yes — BALD is a confidence-based AL method."},
+          {key:"b", text:"Yes for the first term, but the full BALD score adds a bonus for high-confidence cases that posterior samples disagree about."},
+          {key:"c", text:"No. The marginal predictive distribution can have high entropy from aleatoric label noise — those cases LOOK uncertain but labeling them won't tighten the posterior. BALD scores cases where the POSTERIOR SAMPLES disagree (epistemic), not where the marginal is uncertain.", correct:true},
+          {key:"d", text:"No — BALD is a regression method."},
+        ]}
+        trap={<>(a) is the common simplification you'll hear from juniors. (b) is plausible but wrong directionally — BALD subtracts the aleatoric contribution, doesn't add. (d) is silly.</>}
+        lens={<>The simplification "least confident" is wrong because it doesn't distinguish two sources of low confidence: noisy labels (aleatoric) vs not-enough-data (epistemic). BALD targets the second.</>}
+        stretch={<>For tabular fraud, is aleatoric high or low? What does that mean for BALD vs margin?</>}
+      />
+
+      {/* axis: F4 — paper-named failure */}
+      <VIS.TrapProblem
+        id="bald-p13"
+        difficulty="hard"
+        title="P13 — Kirsch et al. flag a specific weakness of their joint-MI estimator. Which?"
+        scenario={<><em>Discriminating insight: the MC estimator's variance grows with the number of posterior samples M; small M makes BatchBALD ≈ BALD.</em><br/><br/>The BatchBALD paper itself calls out one practical bottleneck in the joint-MI MC estimator. Which?</>}
+        options={[
+          {key:"a", text:"The estimator is biased low — joint MI is systematically under-estimated, so BatchBALD underestimates batch redundancy."},
+          {key:"b", text:"The estimator has high variance when M (posterior samples) is small; in the small-M regime BatchBALD reduces to greedy BALD in practice.", correct:true},
+          {key:"c", text:"The estimator only works for binary classification."},
+          {key:"d", text:"The estimator requires the pool size to be exponential in K."},
+        ]}
+        trap={<>(a) is a plausible-sounding miss (the bias isn't the named issue; variance is). (c) and (d) are fabricated.</>}
+        lens={<>Calibration of the second-term aleatoric estimate is the practical bottleneck. Production: use M >= 100. With M=10 BatchBALD's joint correction is noisy.</>}
+        stretch={<>Could you reduce M by changing the prior, the architecture, or the loss?</>}
+      />
+
+      {/* axis: E1 — production gotcha */}
+      <VIS.TrapProblem
+        id="bald-p14"
+        difficulty="medium"
+        title="P14 — Posterior approximation choice for production BALD"
+        scenario={<><em>Discriminating insight: MC-dropout is cheap but biased on OOD; deep ensembles are slower but more reliable; bagged GBDT works for tabular.</em><br/><br/>Pick the posterior approximation for a payments fraud team scoring 1M cases/day.</>}
+        options={[
+          {key:"a", text:"MC-dropout with 10 forward passes — cheapest, sufficient for production."},
+          {key:"b", text:"Single point-estimate model — use predicted probability as posterior approximation."},
+          {key:"c", text:"Deep ensemble of 5-10 models — slower at inference but the most reliable posterior; payment fraud has plenty of OOD cases where MC-dropout under-estimates uncertainty. Bagged XGBoost is the GBDT-side equivalent.", correct:true},
+          {key:"d", text:"Variational Bayesian NN with mean-field approximation — strictly better than ensembles."},
+        ]}
+        trap={<>(a) MC-dropout is biased on OOD and high-stakes fraud has OOD. (b) collapses to margin. (d) mean-field VI under-estimates correlations and gives wrong BALD on multi-modal posteriors.</>}
+        lens={<>Ensembles vs MC-dropout is a calibration vs cost tradeoff. The empirically defensible default for fraud is 5–10 model deep ensemble (Lakshminarayanan et al. 2017).</>}
+        stretch={<>How would you BENCHMARK whether your posterior is well-calibrated enough for BALD?</>}
+      />
+
+      {/* axis: A4 — composition with sibling */}
+      <VIS.TrapProblem
+        id="bald-p15"
+        difficulty="hard"
+        title="P15 — Compose BatchBALD with a stratified random reserve. Where does the reserve sit?"
+        scenario={<><em>Discriminating insight: the reserve must be DISJOINT from the AL pool — otherwise BatchBALD's acquisition can include reserve cases and contaminate both.</em><br/><br/>You're shipping BatchBALD (95% of labels) + a stratified random reserve (5% for unbiased eval). Pick the protocol.</>}
+        options={[
+          {key:"a", text:"Reserve and AL pool overlap is fine — reserve labels are gold-standard either way."},
+          {key:"b", text:"Reserve is sampled from the AL-acquired labels, post hoc."},
+          {key:"c", text:"Reserve is a DISJOINT random stratified sample from the unlabeled pool, removed BEFORE BatchBALD acquisition. BatchBALD never sees it. Reserve labels enter EVAL only; AL labels enter TRAIN only.", correct:true},
+          {key:"d", text:"Reserve is sampled from the cases BatchBALD did NOT select — that's the natural complement."},
+        ]}
+        trap={<>(a) lets BatchBALD's acquisition bias correlate with the reserve. (b) is contamination by construction. (d) samples from the EASY half of the pool — biased toward low-uncertainty cases, defeats the unbiased-prevalence point.</>}
+        lens={<>The reserve and AL pool MUST be disjoint and independent. Reserve sampling is uniform-stratified over the full pool, done first; AL operates on what remains.</>}
+        stretch={<>How small can the reserve be before its AUC CI is wider than the AL improvement signal?</>}
+      />
+
+      {/* axis: F2 — adversarial */}
+      <VIS.TrapProblem
+        id="bald-p16"
+        difficulty="hard"
+        title="P16 — An attacker floods the pool with 10,000 near-duplicate transactions. What does BatchBALD do?"
+        scenario={<><em>Discriminating insight: BatchBALD's joint-MI correctly recognizes the 10,000 cases as redundant — labels only 1 — which is the WRONG operational answer if the attacker is using the diversity penalty as evasion.</em><br/><br/>Adversarial pool: an attacker submits 10,000 near-identical transactions to evade detection. What happens with BatchBALD on this pool?</>}
+        options={[
+          {key:"a", text:"BatchBALD labels all 10,000 because they're all near the boundary."},
+          {key:"b", text:"BatchBALD labels 1 (joint-MI correctly identifies the 9,999 as redundant) — analyst sees one card-not-present and the model trains; but the attacker successfully evaded scrutiny on 9,999. Joint-MI diversity penalty is also an attack surface.", correct:true},
+          {key:"c", text:"BatchBALD ignores the duplicates because they have low individual BALD score."},
+          {key:"d", text:"BatchBALD requires labels to disambiguate; no behavior change."},
+        ]}
+        trap={<>(a) describes margin sampling, not BatchBALD. (c) and (d) are wrong about the mechanism.</>}
+        lens={<>BatchBALD's joint-MI correction is *exactly* the property an attacker exploits. Defense: combine with risk-weighted acquisition (label by amount-at-risk) or cluster-cap (label N per cluster regardless of BALD).</>}
+        stretch={<>Could you modify BatchBALD to be ATTACK-AWARE without losing the joint-MI benefit?</>}
+      />
+
+      {/* axis: D3 — senior vs junior signal */}
+      <VIS.TrapProblem
+        id="bald-p17"
+        difficulty="hard"
+        multiSelect
+        title="P17 — Junior says "we use BALD." What does a senior follow up with?"
+        scenario={<><em>Discriminating insight: BALD vs BatchBALD, posterior approximation, aleatoric handling, and eval design are four orthogonal decisions each hiding a system-design choice.</em><br/><br/>Select all questions a senior would ask next.</>}
+        options={[
+          {key:"a", text:"Greedy top-K or BatchBALD with joint MI?", correct:true},
+          {key:"b", text:"What's your posterior approximation — MC-dropout, ensemble, or bagged GBDT?", correct:true},
+          {key:"c", text:"How are you handling aleatoric leakage — is the second BALD term reliable?", correct:true},
+          {key:"d", text:"How does your eval set stay unbiased — frozen holdout or stratified random reserve?", correct:true},
+          {key:"e", text:"What's the depth of your Bayesian NN?"},
+          {key:"f", text:"Did you use Adam or AdamW?"},
+        ]}
+        trap={<>(e) and (f) are noise — neither hinges on a BALD-design decision.</>}
+        lens={<>Each of (a)-(d) is a different shipped system. Saying "we use BALD" without specifying any of them is exactly the under-specified answer that fails senior interviews.</>}
+        stretch={<>Which of (a)-(d) does the team most often skip in practice?</>}
+      />
+
+      {/* axis: C2 — sequential greedy alternative */}
+      <VIS.TrapProblem
+        id="bald-p18"
+        difficulty="hard"
+        title="P18 — Sequential-greedy BatchBALD: what does each step add?"
+        scenario={<><em>Discriminating insight: sequential greedy conditions on already-picked queries, so each subsequent pick maximizes MARGINAL joint MI given the prefix — cheaper than full joint MC.</em><br/><br/>Sequential-greedy BatchBALD picks one query, then picks the next conditioned on the first being in the batch, then the third conditioned on the first two. Why does this approximate the full joint?</>}
+        options={[
+          {key:"a", text:"It's exactly equal to greedy top-K BALD because of the chain rule of entropy."},
+          {key:"b", text:"Each conditional pick adds the marginal joint MI given the prefix: `MI(y_k; θ | x_k, D, y_{1:k-1}, x_{1:k-1})`. This naturally subtracts overlap with already-chosen queries; it's a submodular approximation to the joint that costs O(K) per round, not O(2^K).", correct:true},
+          {key:"c", text:"It under-approximates the joint MI by a constant factor that you can bias-correct."},
+          {key:"d", text:"It's a heuristic with no information-theoretic guarantee."},
+        ]}
+        trap={<>(a) confuses conditioning with marginalization. (c) over-claims. (d) under-claims — there IS a submodularity argument.</>}
+        lens={<>Sequential-greedy is the production-friendly variant. Submodularity of joint MI (Krause & Guestrin 2007) gives a (1 − 1/e) approximation guarantee. Most teams ship this rather than the full MC joint estimator.</>}
+        stretch={<>For what K is sequential-greedy provably bad?</>}
+      />
+
+      {/* axis: B2 — sounds reasonable, isn't */}
+      <VIS.TrapProblem
+        id="bald-p19"
+        difficulty="medium"
+        title="P19 — "Increase dropout rate to make BALD scores more dispersed." Right or wrong?"
+        scenario={<><em>Discriminating insight: dropout rate trades off posterior fidelity vs collapse; tuning it to maximize BALD-score dispersion optimizes the wrong objective.</em><br/><br/>BALD scores are clustered too tightly. A teammate suggests cranking MC-dropout rate up to 0.5 to spread them out.</>}
+        options={[
+          {key:"a", text:"Wrong — but for the right reason: higher dropout means a worse base model, so BALD scores are dispersed but uninformative."},
+          {key:"b", text:"Wrong: dropout rate controls posterior WIDTH, not BALD score dispersion. Cranking it up makes the posterior too wide → both BALD terms inflate together → score differences (epistemic vs aleatoric) collapse. The fix for clustered scores is more posterior samples or a deep ensemble.", correct:true},
+          {key:"c", text:"Right — higher dropout = more posterior samples behavior = better BALD."},
+          {key:"d", text:"Right — dropout rate is the only knob for BALD score scale."},
+        ]}
+        trap={<>(a) is *correct-ish* but the mechanism it names (model quality) isn't the dominant one. (c) and (d) misread dropout's role.</>}
+        lens={<>Dropout rate determines the implicit prior on parameter variance — not directly the BALD score. To genuinely spread BALD scores you need a posterior that has more between-sample disagreement on hard cases vs easy ones, which is what ensembles give.</>}
+        stretch={<>Could you choose dropout rate by CALIBRATING the second BALD term against a held-out aleatoric estimate?</>}
+      />
+
+      {/* axis: A3 — counterfactual */}
+      <VIS.TrapProblem
+        id="bald-p20"
+        difficulty="hard"
+        title="P20 — Counterfactual: no BatchBALD, only margin sampling. Quantify the cost."
+        scenario={<><em>Discriminating insight: the cost is dominated by labeled-batch redundancy at fixed K, scaling with intra-batch label correlation — NOT generic AL inefficiency.</em><br/><br/>Suppose BatchBALD vanished tomorrow and your only option is margin sampling. Quantify the concrete cost in three dimensions.</>}
+        options={[
+          {key:"a", text:"(1) Labels per real signal: 3-10x worse on ringed fraud pools — the margin batch has K duplicates, so unique fraud rings labeled per cycle drops K/cluster_size. (2) Time to model improvement: scales with redundancy factor. (3) Aleatoric leakage into AL choice: margin can't subtract it.", correct:true},
+          {key:"b", text:"(1) GPU memory: 10x more. (2) Inference latency: 5x slower. (3) Storage: 2x more."},
+          {key:"c", text:"(1) Recall: drops 20pp. (2) Precision: drops 15pp. (3) F1: drops 18pp — irrespective of pool structure."},
+          {key:"d", text:"No cost — margin sampling is empirically equivalent on fraud."},
+        ]}
+        trap={<>(b) is wrong-axis. (c) gives a specific delta that doesn't depend on pool structure (suspect). (d) is the cope.</>}
+        lens={<>The counterfactual cost is structural: redundancy. On i.i.d. pools margin and BatchBALD converge; on clustered fraud BatchBALD's gain is multiplicative in the ring size.</>}
+        stretch={<>Above what cluster size does BatchBALD's gain over margin exceed the engineering cost?</>}
+      />
+
+      {/* axis: F1 — edge case */}
+      <VIS.TrapProblem
+        id="bald-p21"
+        difficulty="medium"
+        title="P21 — K=1 BatchBALD vs K=1 BALD."
+        scenario={<><em>Discriminating insight: at K=1 there's no joint MI to compute — BatchBALD reduces mathematically to BALD.</em><br/><br/>Your batch size is K=1 (one label per round). Which is provably true?</>}
+        options={[
+          {key:"a", text:"BatchBALD with K=1 is identical to BALD with K=1. Joint MI over a singleton is just the marginal MI.", correct:true},
+          {key:"b", text:"BatchBALD with K=1 still has a regularization benefit over BALD."},
+          {key:"c", text:"BatchBALD with K=1 is faster than BALD because it skips the joint computation."},
+          {key:"d", text:"BatchBALD doesn't define a K=1 case."},
+        ]}
+        trap={<>(b) makes up regularization that isn't in the paper. (c) is true compute-wise but not the asked property. (d) is wrong.</>}
+        lens={<>BatchBALD's gain over BALD vanishes at K=1. The diversity benefit grows with K (up to where MC estimator variance dominates).</>}
+        stretch={<>What's the smallest K where you'd actually choose BatchBALD over BALD in practice?</>}
+      />
+
+      {/* axis: A2 — definitional trap */}
+      <VIS.TrapProblem
+        id="bald-p22"
+        difficulty="hard"
+        title="P22 — BALD vs Expected Error Reduction (EER): are they the same?"
+        scenario={<><em>Discriminating insight: BALD optimizes parameter info gain; EER optimizes expected reduction in a task-specific loss. They diverge when the boundary doesn't align with the posterior's most-uncertain region.</em><br/><br/>A colleague claims "BALD is the same as Expected Error Reduction." Diagnose.</>}
+        options={[
+          {key:"a", text:"True — both reduce uncertainty."},
+          {key:"b", text:"False. BALD = MI(y; θ): how much labeling reduces parameter uncertainty. EER = expected reduction in model's task error (e.g., 0/1 loss). The two diverge when the task threshold is away from the posterior's high-disagreement region — common in imbalanced fraud where the operating point is in a tail.", correct:true},
+          {key:"c", text:"False — EER is theoretical, BALD is empirical."},
+          {key:"d", text:"True for binary classification, false for multi-class."},
+        ]}
+        trap={<>(a) elides the objective. (c) and (d) are wrong dimensions.</>}
+        lens={<>BALD ≠ EER. For decision-aware AL, prefer EER variants (Bayesian Active Risk Minimization) at the cost of harder estimation.</>}
+        stretch={<>Could you APPROXIMATE EER using BALD with a posterior-weighted threshold integration?</>}
+      />
+
+      {/* axis: E4 — rollout / migration */}
+      <VIS.TrapProblem
+        id="bald-p23"
+        difficulty="hard"
+        title="P23 — Migrate from margin sampling to BatchBALD. Order the rollout phases."
+        scenario={<><em>Discriminating insight: rollout must establish the posterior approximation and the stratified reserve BEFORE turning on joint-MI acquisition, or you can't measure the lift.</em><br/><br/>Phases: (1) Add posterior approximation (ensemble), (2) Add stratified random reserve to eval, (3) Switch from margin to greedy-BALD, (4) Switch from greedy-BALD to BatchBALD. Pick the rollout order.</>}
+        options={[
+          {key:"a", text:"(4) → (3) → (2) → (1): start with the most-impactful change."},
+          {key:"b", text:"(1) → (3) → (4) → (2): build the model side first, then add eval."},
+          {key:"c", text:"(2) → (1) → (3) → (4): freeze unbiased eval (2) FIRST; then add posterior (1); then turn on greedy-BALD (3) and validate the lift on the frozen reserve; finally switch to BatchBALD (4) and again measure lift.", correct:true},
+          {key:"d", text:"Roll them all out simultaneously; one round of A/B."},
+        ]}
+        trap={<>(a) lacks measurement scaffolding. (b) delays eval — can't measure lift. (d) is multi-variable, can't attribute.</>}
+        lens={<>The rollout order is determined by what's MEASURABLE at each step. Without (2) you can't measure (3) or (4). Without (1) you can't compute BALD at all.</>}
+        stretch={<>What metric specifically tells you greedy-BALD → BatchBALD added value beyond margin → greedy-BALD?</>}
+      />
+
+      {/* axis: F5 — community follow-up */}
+      <VIS.TrapProblem
+        id="bald-p24"
+        difficulty="hard"
+        title="P24 — Kirsch et al. (NeurIPS 2019) reported BatchBALD gains on MNIST. Why are fraud-team gains often smaller?"
+        scenario={<><em>Discriminating insight: MNIST has independent class-balanced batches; fraud has correlated within-batch (rings) AND class imbalance — both shift the operating regime where BatchBALD's joint correction matters.</em><br/><br/>Pick the dominant reason fraud-team BatchBALD gains shrink vs MNIST.</>}
+        options={[
+          {key:"a", text:"Fraud has lower aleatoric noise."},
+          {key:"b", text:"MNIST experiments use small K; production fraud uses K=100+ where the MC estimator dominates the gain."},
+          {key:"c", text:"Operating-point mismatch: BatchBALD optimizes joint info gain over labels, but fraud KPIs are at a tail of the score distribution (catch-rate at 0.1% FPR); BatchBALD's gains in the bulk of the posterior may not move the tail-operating-point metric.", correct:true},
+          {key:"d", text:"Fraud data is tabular and BatchBALD is image-only."},
+        ]}
+        trap={<>(a) misreads aleatoric direction. (b) describes a different effect (MC variance), not the main one. (d) is fabricated.</>}
+        lens={<>The fraud-vs-MNIST gap is largely about *what metric you're maximizing*. BatchBALD shines on log-likelihood gains and faceplants on tail-operating-point gains.</>}
+        stretch={<>How would you re-formulate BatchBALD to target tail-operating-point fraud KPIs?</>}
+      />
+
+      {/* axis: D2 — wrong-assumption cascade */}
+      <VIS.TrapProblem
+        id="bald-p25"
+        difficulty="hard"
+        multiSelect
+        title="P25 — "BatchBALD just means train more models." Trace the wrong assumptions."
+        scenario={<><em>Discriminating insight: BatchBALD is not "more models" — it's a JOINT acquisition function, orthogonal to posterior approximation. The "more models" intuition causes 3 cascading errors.</em><br/><br/>A teammate says "BatchBALD basically means train a deep ensemble — that's the part that helps." Which downstream consequences follow from this misreading? Select all that apply.</>}
+        options={[
+          {key:"a", text:"They'll buy a bigger ensemble (say M=20) and skip the joint-MI computation, expecting the gain.", correct:true},
+          {key:"b", text:"They'll over-allocate eng time to posterior approximation and under-allocate to the joint-MI MC estimator.", correct:true},
+          {key:"c", text:"When BatchBALD performance flatlines, they'll blame the posterior, not the acquisition function.", correct:true},
+          {key:"d", text:"They'll switch from MC-dropout to MCMC-NN as a fix."},
+          {key:"e", text:"They'll re-derive the chain rule of entropy."},
+        ]}
+        trap={<>(d) is plausible but downstream from the same misreading; not a CASCADE error per se. (e) is unrelated.</>}
+        lens={<>The misreading "BatchBALD = more models" causes (a)(b)(c). The fix is to clarify: posterior approximation is ONE input; joint MI over the K-tuple is the SECOND, independent input. Both are necessary.</>}
+        stretch={<>What single experiment isolates the joint-MI contribution from the posterior contribution?</>}
+      />
+
+      {/* axis: A5 — boundary with sibling */}
+      <VIS.TrapProblem
+        id="bald-p26"
+        difficulty="hard"
+        title="P26 — At what cluster size does BatchBALD beat BADGE?"
+        scenario={<><em>Discriminating insight: BADGE diversifies in gradient space; BatchBALD diversifies in label-info space. They diverge when gradients are similar across the cluster but labels are NOT (or vice versa).</em><br/><br/>BatchBALD and BADGE both diversify the batch. Pick the regime where BatchBALD beats BADGE.</>}
+        options={[
+          {key:"a", text:"BatchBALD always wins because joint MI is information-theoretically optimal."},
+          {key:"b", text:"BADGE always wins because gradient diversity is cheaper to compute."},
+          {key:"c", text:"BatchBALD wins when cluster members have *similar gradients* (BADGE thinks they're already diverse and picks them anyway) but *correlated labels under the posterior* (BatchBALD penalizes them). Common when the model is in a flat-loss region.", correct:true},
+          {key:"d", text:"They are mathematically equivalent."},
+        ]}
+        trap={<>(a)(b)(d) all assume one universally dominates. The interesting answer is *when do they disagree*.</>}
+        lens={<>BADGE and BatchBALD diversify on different axes. Local-loss flat regions cause gradient collapse → BADGE under-diversifies → BatchBALD's label-info diversification wins. Use BADGE when posteriors are unreliable; BatchBALD when gradients are unreliable.</>}
+        stretch={<>How would you HYBRIDIZE BatchBALD and BADGE in one acquisition function?</>}
+      />
+
+      {/* axis: E5 — reproducibility */}
+      <VIS.TrapProblem
+        id="bald-p27"
+        difficulty="medium"
+        title="P27 — Reproducing Kirsch et al.'s BatchBALD numbers — which detail must match?"
+        scenario={<><em>Discriminating insight: the paper's gains require M ≥ 100 posterior samples AND the specific joint-MI MC estimator; smaller M collapses BatchBALD to BALD.</em><br/><br/>Pick the detail you MUST match to reproduce the BatchBALD paper's reported gains.</>}
+        options={[
+          {key:"a", text:"Same model architecture (LeNet for MNIST)."},
+          {key:"b", text:"Same dataset and seed."},
+          {key:"c", text:"M ≥ 100 posterior samples in the MC joint-entropy estimator. With M=10 (common to save compute), BatchBALD's joint correction is too noisy and the method reduces to greedy BALD.", correct:true},
+          {key:"d", text:"Same optimizer (Adam vs SGD)."},
+        ]}
+        trap={<>(a)(b)(d) matter generically but aren't BatchBALD-specific. The M parameter is the BatchBALD-specific reproducibility lever.</>}
+        lens={<>BatchBALD's joint-MI MC estimator has variance inversely proportional to M. Below M=100, joint MI ≈ sum of marginals (noisy) → behavior collapses to greedy BALD.</>}
+        stretch={<>Could you reduce the M requirement with control variates or a different MC scheme?</>}
+      />
+
+      {/* axis: F2 — alternative adversarial */}
+      <VIS.TrapProblem
+        id="bald-p28"
+        difficulty="hard"
+        title="P28 — BALD-blind adversary: how to design transactions that BALD will NOT query?"
+        scenario={<><em>Discriminating insight: BALD scores low when the posterior is confident — an attacker who mimics in-distribution normals lands in the low-BALD region; aleatoric-only ambiguity also scores low (BALD subtracts it).</em><br/><br/>An attacker who has read the AL setup wants their transactions to NEVER be labeled. Pick the strategy that minimizes BALD score on their transactions.</>}
+        options={[
+          {key:"a", text:"Submit highly ambiguous transactions — high entropy will confuse BALD."},
+          {key:"b", text:"Submit transactions that look indistinguishable from in-distribution normal behavior. The posterior is confident on them (low first term, AND low second term — both small). BALD score ≈ 0. Aleatoric-noise mimicry also keeps BALD low because BALD subtracts the second term.", correct:true},
+          {key:"c", text:"Submit a fraud ring of 10,000 identical transactions to dilute BatchBALD's diversity penalty."},
+          {key:"d", text:"Submit transactions on the decision boundary — that's where BALD is lowest."},
+        ]}
+        trap={<>(a) raises predictive entropy AND aleatoric — BALD subtracts the latter, so the score depends on epistemic content, not just total entropy. (c) is a BatchBALD-specific attack on diversity, but BALD per-case is unaffected. (d) inverts the meaning.</>}
+        lens={<>BALD is hardest to attack when an attacker mimics normal data — both terms collapse together. The defense is to combine BALD with risk-weighted acquisition (label by amount-at-risk regardless of BALD).</>}
+        stretch={<>What's the ATTACK COST of producing in-distribution transactions vs out-of-distribution?</>}
+      />
+
+      {/* axis: C3 — what's dropped vs baseline */}
+      <VIS.TrapProblem
+        id="bald-p29"
+        difficulty="medium"
+        title="P29 — Greedy top-K BALD drops one specific term vs BatchBALD. Which?"
+        scenario={<><em>Discriminating insight: greedy top-K BALD uses sum of marginal MIs; BatchBALD replaces it with joint MI, which differs by exactly the within-batch label-overlap term.</em><br/><br/>Pick the precise mathematical difference between greedy top-K BALD and BatchBALD.</>}
+        options={[
+          {key:"a", text:"BatchBALD adds a regularization term λ&middot;diversity to greedy BALD."},
+          {key:"b", text:"BatchBALD replaces `Σ_i MI(y_i; θ)` with `MI({y_1,…,y_K}; θ)`. The difference is the within-batch label-overlap term `Σ_i MI(y_i; θ) − MI({y_1,…,y_K}; θ)`, which is non-negative and zero only under conditional independence.", correct:true},
+          {key:"c", text:"BatchBALD multiplies BALD scores by a diversity weight per case."},
+          {key:"d", text:"BatchBALD adds a Lagrangian for cluster constraints."},
+        ]}
+        trap={<>(a)(c)(d) all make up additional structure. The actual difference is sum-of-marginals vs joint, no extra hyperparameter.</>}
+        lens={<>Joint MI ≤ sum of marginals (sub-additivity of joint entropy under correlation). Greedy BALD doesn't see the gap.</>}
+        stretch={<>What does the gap measure in nats — how would you BOUND it for a fraud pool?</>}
+      />
+
+      {/* axis: B4 — when NOT to use */}
+      <VIS.TrapProblem
+        id="bald-p30"
+        difficulty="hard"
+        title="P30 — One regime where you should NOT use BALD/BatchBALD at all."
+        scenario={<><em>Discriminating insight: when posterior approximation is unreliable AND the operating-point metric is far from the bulk of the posterior, BALD's signal is weak and noisy — random + reserve may dominate.</em><br/><br/>Pick the regime where BALD/BatchBALD is the WRONG choice.</>}
+        options={[
+          {key:"a", text:"Ringed fraud — too much label correlation for BatchBALD to recover."},
+          {key:"b", text:"Cold-start with a weak posterior approximation AND a tail-operating-point KPI (e.g., catch-rate at 0.05% FPR). BALD's information-theoretic gains don't translate to the tail, and a noisy posterior estimate makes BALD scores unreliable. Random + stratified reserve dominates.", correct:true},
+          {key:"c", text:"Large label budget (>10k/cycle) — BALD wastes compute."},
+          {key:"d", text:"Imbalanced classes — BALD is class-balance-agnostic."},
+        ]}
+        trap={<>(a) is BatchBALD's sweet spot. (c)(d) misread the regime.</>}
+        lens={<>BALD's value is in *posterior info gain*. When posterior approximation is poor (cold-start) and the metric is on a tail (catch-rate at low FPR), the chain from "posterior tightens" → "tail metric improves" is broken. Skip BALD in this regime.</>}
+        stretch={<>What's the cheapest experiment that tells you if BALD's chain is broken on your problem?</>}
       />
     </VIS.Section>
 
@@ -1710,35 +2073,35 @@ flowchart TB
             <strong>Kirsch, van Amersfoort, Gal — BatchBALD</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2019)</span>
-          <br/>The canonical BatchBALD paper. Sec 3 (joint mutual information) and Sec 5 (MC approximation) are the only sections you need for an interview.
+          <br/>The canonical BatchBALD paper. Section 3 (joint mutual information) and Section 5 (MC approximation) are the only sections you need for an interview.
         </li>
         <li>
           <a href="https://arxiv.org/abs/1112.5745" target="_blank" rel="noopener">
             <strong>Houlsby, Huszar, Ghahramani, Lengyel — BALD</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, 2011)</span>
-          <br/>The original BALD paper. Read for the per-case formula; skip the GP-specific derivations.
+          <br/>The original BALD paper. Read for the per-case formula and the MI decomposition; skip the GP-specific derivations.
         </li>
         <li>
           <a href="https://jacobgil.github.io/deeplearning/activelearning" target="_blank" rel="noopener">
             <strong>Jacob Gildenblat — A practical guide to active learning</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Practitioner-grade walk-through of AL methods including BALD, BatchBALD, BADGE, with code pointers. Build intuition here before reading papers.
+          <br/>Practitioner walk-through of margin, BALD, BatchBALD, BADGE with code. Build intuition here before reading the papers.
         </li>
         <li>
           <a href="https://stripe.com/blog/how-we-built-it-stripe-radar" target="_blank" rel="noopener">
             <strong>Stripe Engineering — How we built Radar</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Companies blog explaining why they use a STRATIFIED RANDOM RESERVE in addition to active learning. Real production constraints.
+          <br/>Production fraud-labeling protocol: AL for training + stratified random reserve for eval. Why the protocol matters as much as the model.
         </li>
         <li>
           <a href="https://www.youtube.com/watch?v=Qv6UVOQXTL4" target="_blank" rel="noopener">
-            <strong>Yarin Gal — Bayesian Deep Learning lecture (Cambridge)</strong>
+            <strong>Yarin Gal — Bayesian Deep Learning (Cambridge lecture)</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(video)</span>
-          <br/>The MC dropout = approximate Bayesian view that makes BALD tractable on neural nets. About 50 min; watch at 1.5x.
+          <br/>The MC-dropout = approximate Bayesian view that makes BALD tractable on neural nets. ~50 min; watch at 1.5x.
         </li>
       </ul>
     </VIS.Section>

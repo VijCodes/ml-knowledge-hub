@@ -1414,279 +1414,560 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// ICL (Internal Contrastive Learning) for tabular anomaly detection.
+// ICL — Internal Contrastive Learning for tabular AD: row-anchored, intra-row contrast over column-view splits.
+// Concept-specific anchor: every trap hinges on the row-anchor + column-split mechanism,
+// the InfoNCE objective with row-as-positive, feature-partition sensitivity, or the autoencoder-memorization contrast.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Deep anomaly detection"
       title="ICL — Internal Contrastive Learning for tabular AD"
-      subtitle="Split features into two views; learn to predict one from the other. Anomalies are the cases the learned predictor cannot reproduce."
+      subtitle="Split each row's columns into two views; contrast the two halves of the SAME row vs halves from OTHER rows. Anomalies break the row-anchored intra-row dependence."
       byline={[
-        {label: "Paper", value: "Shenkar & Wolf, ICLR 2022"},
-        {label: "Year", value: "2022"},
-        {label: "L3", value: "Tabular deep AD"},
+        {label: "Paper", value: "Shenkar & Wolf, 'Anomaly Detection for Tabular Data with Internal Contrastive Learning' (ICLR 2022)"},
+        {label: "L3", value: "Deep anomaly detection"},
+        {label: "Cross-sibling", value: "Distinct from Deep SVDD (hypersphere), DROCC (adversarial shell), AE (reconstruction)"},
       ]}/>
 
     <VIS.TLDR>
-      Autoencoder reconstruction error fails on tabular fraud because a flexible decoder MEMORIZES anomalies it has seen during training and reconstructs them too. ICL avoids memorization by training a CONTRASTIVE prediction: split features into two groups (view A, view B); predict view B from view A. Anomalies break the learned dependency between views — the prediction is wrong, and that error is the AD score.
+      ICL splits each row's columns into two views <code>a</code> and <code>b</code>, then trains two encoders so that <code>(a_i, b_i)</code> from the SAME row are pulled close in embedding space and <code>(a_i, b_j)</code> from DIFFERENT rows are pushed apart (InfoNCE). Anomalies score high because their{" "}
+      <VIS.Term def="The relationship between different columns within a single row. Normal rows have learned column-to-column patterns; an anomaly is a row whose intra-column dependence doesn't match those patterns.">intra-row column dependence</VIS.Term>{" "}
+      doesn't match the learned distribution — their <code>(a, b)</code> pair fails the row-anchored matching even though either half might individually look normal.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — row-anchored intra-row contrast">
       <p>
-        Pick a random feature partition: half the columns become view A, the other half become view B. Train an encoder <code>g(A) -> h</code> and a contrastive objective that aligns <code>h</code> with the encoding of B from the SAME row, and pushes it AWAY from encodings of B from OTHER rows in the batch. At inference, score new rows by the contrastive distance between predicted view-B encoding and actual view-B encoding.
+        Most tabular AD methods are either{" "}
+        <VIS.Term def="Train an autoencoder on normal data; reconstruction error at test time is the anomaly score. Fails because the AE memorizes — given enough capacity, it can reconstruct anomalies too.">reconstruction-based</VIS.Term>{" "}
+        (autoencoders, which memorize anomalies) or one-class deep (Deep SVDD, DROCC, with their own failure modes). ICL takes a third route: self-supervised contrastive learning on FEATURE PARTITIONS within each row.
       </p>
-      <VIS.Equation display
-        tex="\mathcal{L}_{\mathrm{ICL}} = -\log \frac{\exp\!\big(\mathrm{sim}(g_A(x_A), g_B(x_B)) / \tau\big)}{\sum_{j} \exp\!\big(\mathrm{sim}(g_A(x_A), g_B(x_B^{(j)})) / \tau\big)}" />
+      <p>For each row <code>x_i</code> with d columns, partition the column set into two halves: <code>a_i</code> (k columns) and <code>b_i</code> (d−k columns). Two encoders <code>f_a, f_b</code> map each half to a shared d'-dim embedding. Train with InfoNCE so the SAME row's pair is positive and other-row pairs are negatives:</p>
+      <VIS.Equation display tex="\mathcal{L} \;=\; -\log \frac{\exp\!\big(\mathrm{sim}(f_a(a_i), f_b(b_i))/\tau\big)}{\sum_{j} \exp\!\big(\mathrm{sim}(f_a(a_i), f_b(b_j))/\tau\big)}"/>
       <p>
-        Standard InfoNCE-style loss applied across views of the SAME row.
+        Anomaly score for new <code>x</code>: take many random column partitions, compute the mean InfoNCE loss. Anomalies score systematically higher because their intra-row column dependencies don't match the learned distribution.
       </p>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  ROW["Row x = feature vector"]
-  ROW --> SPLIT["Split features: view A and view B"]
-  SPLIT --> A["View A"]
-  SPLIT --> B["View B"]
-  A --> ENCA["Encoder g_A"]
-  B --> ENCB["Encoder g_B"]
-  ENCA --> CONTR["Contrastive loss across views"]
-  ENCB --> CONTR
-  CONTR --> SCORE["AD score = 1 minus similarity of own views"]
-  style SPLIT fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style CONTR fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-      `} />
+  X["Row x_i with d columns"]
+  X --> A["View a_i (k columns)"]
+  X --> B["View b_i (d-k columns)"]
+  A --> EA["Encoder f_a"]
+  B --> EB["Encoder f_b"]
+  EA --> ZA["Embedding f_a(a_i)"]
+  EB --> ZB["Embedding f_b(b_i)"]
+  ZA --> POS["Positive: sim with f_b(b_i)"]
+  ZB --> POS
+  ZA --> NEG["Negatives: sim with f_b(b_j) for j != i"]
+  POS --> INFO["InfoNCE loss"]
+  NEG --> INFO
+  style POS fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style NEG fill:#fef3c7,stroke:#d97706,stroke-width:2px
+      `}/>
+      <p>Blue = positive pair (SAME row, two views). Yellow = negatives (other-row b-views as distractors). The loss makes f_a(a_i) most similar to f_b(b_i) — row-as-anchor.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from baselines">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-vs-ae" title="Why this is the response to autoencoder-AD memorization">
+      <p>
+        Autoencoder-AD's failure mode is memorization: with enough capacity, the decoder reconstructs anomalies too, collapsing the score. ICL avoids this because its objective is{" "}
+        <strong>discriminative, not generative</strong>: the network never tries to reconstruct anomalous values; it tries to MATCH the b-half of the same row, which requires learning the dependence structure between column subsets. Anomalies break the dependence, and the contrastive loss separates them without ever seeing them.
+      </p>
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Method</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Memorization risk</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Needs labels?</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Tabular fit</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Property</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>AE-AD</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>ICL</th>
           </tr>
         </thead>
         <tbody>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Autoencoder</td>
-            <td style={{padding:"8px 10px"}}>High — flexible decoder memorizes anomalies</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Mediocre</td>
+            <td style={{padding:"8px 10px"}}>Objective</td>
+            <td style={{padding:"8px 10px"}}>Reconstruction (generative)</td>
+            <td style={{padding:"8px 10px"}}>InfoNCE row-anchor (discriminative)</td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Deep SVDD</td>
-            <td style={{padding:"8px 10px"}}>Hypersphere collapse</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>OK (assumes isotropic cluster)</td>
+            <td style={{padding:"8px 10px"}}>Anomaly score</td>
+            <td style={{padding:"8px 10px"}}>Reconstruction error</td>
+            <td style={{padding:"8px 10px"}}>InfoNCE loss across random splits</td>
           </tr>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>DROCC</td>
-            <td style={{padding:"8px 10px"}}>Mode collapse on pseudo-negatives</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Good (with right r)</td>
+            <td style={{padding:"8px 10px"}}>Memorization risk</td>
+            <td style={{padding:"8px 10px"}}>High — capacity reconstructs anomalies too</td>
+            <td style={{padding:"8px 10px"}}>Low — anomalies break dependence, not reconstruction</td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>ICL</td>
-            <td style={{padding:"8px 10px"}}>Low — masked prediction generalizes</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Strong (designed for tabular)</td>
+            <td style={{padding:"8px 10px"}}>Key hyperparameter</td>
+            <td style={{padding:"8px 10px"}}>Bottleneck size</td>
+            <td style={{padding:"8px 10px"}}>Column partition + temperature &tau;</td>
           </tr>
         </tbody>
       </table>
-      <p>
-        ICL's discriminating power is that it learns DEPENDENCY between feature groups, not the data manifold itself. An anomaly is anything that breaks the learned dependency — even if its individual feature values are in-range.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Tabular fraud features without strong sequential structure.</strong> ICL is designed for tables; for sequences, prefer DROCC-LF or transformer-based AD.</li>
-        <li><strong>You need generalization to unseen anomaly types.</strong> ICL's masked-prediction objective generalizes naturally to anomalies whose feature dependencies are off.</li>
-        <li><strong>You want zero labels.</strong> ICL is self-supervised; no fraud labels needed.</li>
-      </ul>
     </VIS.Section>
 
     <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Feature partition is a hyperparameter">
-        The split into view A and view B matters. Random splits work but are noisy; correlated features in opposite views give the model an easy shortcut (B is trivially predictable from A); correlated features in the SAME view starve the model of signal. ICL's paper proposes RANDOM splits per minibatch for robustness; some implementations use multiple splits and ensemble.
+      <VIS.Callout kind="gotcha" title="Partition choice is the dominant knob">
+        A bad partition (all categoricals on one side, all numerics on the other) makes the prediction trivially easy or trivially hard. Production uses 10-50 random partitions at inference and averages the score; some teams beat random with a SEMANTIC partition (behavioral vs device vs network).
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Categorical features need encoding">
-        ICL was demonstrated on numeric tabular data; one-hot or embedding encoding for high-cardinality categoricals (merchant ID, MCC) is required and can dominate the input dimension.
+      <VIS.Callout kind="warn" title="Schema changes silently break ICL">
+        Add a new column to the feature schema → old encoder dimensions are wrong → ICL silently scores all new rows as anomalies (their column structure is mismatched). Pin partitions; retrain when schema changes.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Anomalies whose dependency structure is INTACT are missed">
-        If an anomaly's view-A-to-view-B dependency matches normal rows (e.g., a fraudster who carefully matches a legitimate user's behavioral signature on both halves), ICL can't tell it's anomalous. Hybrid with another AD method covers this gap.
+      <VIS.Callout kind="warn" title="Independent columns = no signal">
+        If columns are mutually independent (rare in fraud but possible in over-engineered features), InfoNCE matching is at chance level for everyone — no anomaly signal. ICL needs intra-row dependence to exploit.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on ICL, tabular AD, contrastive objectives, and why autoencoder reconstruction error often fails.
+        Every problem hinges on ICL-specific mechanics: row-anchored intra-row contrast, column-partition sensitivity, InfoNCE with row-as-positive, the discriminative-vs-generative distinction from AE-AD, or aggregation across random splits. Strip the name → option no longer wins.
       </p>
 
+      {/* axis: B3 - stakeholder pitch */}
       <VIS.TrapProblem
         id="icl-p1"
         difficulty="hard"
-        title="P1 — Why autoencoder reconstruction error fails as a fraud score"
-        scenario={<>Your team uses an autoencoder for fraud detection. It trains beautifully (reconstruction loss decreases). But the AUC on a held-out reserve with real fraud is only 0.68. The reconstruction error is LOW for many fraud cases. Why?</>}
+        title="P1 — Pitch ICL to a stakeholder. What's the concept-specific business case?"
+        scenario={<><em>Discriminating insight: the unique pitch is 'discriminative intra-row dependence' (avoids AE memorization). Strip the name → 'self-supervised AD' wins for any masked-prediction method; the row-as-anchor + column-split frame is ICL's unique discriminator.</em><br/><br/>Pick the ICL-specific pitch.</>}
         options={[
-          {key:"a", text:"A flexible autoencoder memorizes the data manifold including any anomalous patterns it sees during training. If even a few fraud cases leak into training (or look similar to ones that do), the AE reconstructs them well. The bottleneck is not selective enough.", correct:true},
-          {key:"b", text:"Reconstruction loss is the wrong loss — switch to perceptual loss."},
-          {key:"c", text:"Autoencoders are theoretically incapable of AD."},
-          {key:"d", text:"Bottleneck is too small."},
+          {key:"a", text:"It's a deep learning method — better than classical."},
+          {key:"b", text:"ICL learns to PREDICT one half of each row's columns from the other half, with row identity as the anchor. Anomalies fail this prediction because their intra-row column dependencies don't match learned patterns — without ICL ever seeing a fraud example. Unlike autoencoders, the discriminative objective doesn't memorize anomalies.", correct:true},
+          {key:"c", text:"It uses contrastive learning, the same technique as SimCLR."},
+          {key:"d", text:"It's faster than Deep SVDD."},
         ]}
-        trap={<>(b) is unrelated. (c) is too strong. (d) usually goes the WRONG way — bigger bottleneck makes memorization worse, not better.</>}
-        lens={<>(a) is the memorization failure. The fix: (i) make the bottleneck tighter, (ii) add a contractive regularizer, OR (iii) move to a method whose loss does NOT incentivize memorization — like ICL, which learns DEPENDENCY between feature views rather than reconstruction of values.</>}
-        stretch={<>How do denoising autoencoders try to address this same problem? Do they fully fix it?</>}
+        trap={<>(a)(d) generic. (c) collapses to 'contrastive learning' — but ICL's unique mechanism is ROW-AS-ANCHOR + COLUMN-SPLIT, not generic contrast.</>}
+        lens={<>The discriminator is the row-anchor + column-split. Any pitch without those specifics is concept-as-costume.</>}
+        stretch={<>What stakeholder concern would you raise about ICL on a feature schema that changes weekly?</>}
       />
 
+      {/* axis: C2 - loss/objective */}
       <VIS.TrapProblem
         id="icl-p2"
         difficulty="hard"
-        title="P2 — ICL's view-split: which split is best?"
-        scenario={<>You're implementing ICL on a payments dataset with 60 features: 20 device, 20 transaction, 20 user-history. Three split strategies. Which is most robust?</>}
+        title="P2 — InfoNCE positive pair in ICL: what specifically is it?"
+        scenario={<><em>Discriminating insight: the positive pair in ICL is (a_i, b_i) — two COLUMN-SUBSETS of the SAME row; negatives are (a_i, b_j) — same a-half, OTHER-row b-halves. Row identity is the anchor.</em><br/><br/>Pick the right description of the InfoNCE positive pair.</>}
         options={[
-          {key:"a", text:"Random split per minibatch — every batch sees a different partition; the model can't shortcut on a fixed dependency. The paper's recommended default.", correct:true},
-          {key:"b", text:"Fixed split: device features (A) vs transaction features (B). Most interpretable."},
-          {key:"c", text:"Fixed split: put highly correlated features together to give the model an easy task."},
-          {key:"d", text:"Fixed split: alphabetical by column name."},
+          {key:"a", text:"Two augmentations of the same row (e.g., noise added)."},
+          {key:"b", text:"Two ROW-SUBSETS of the same feature."},
+          {key:"c", text:"The two column-subset views (a_i, b_i) of the SAME row i. Negatives are (a_i, b_j) for j != i: same a-half, b-half from other rows. Row identity is the anchor; column partition is the view.", correct:true},
+          {key:"d", text:"The original row vs its reconstruction."},
         ]}
-        trap={<>(b) lets the model overfit a single dependency. (c) trivializes the task. (d) is arbitrary.</>}
-        lens={<>(a) is the design choice. Random splitting per batch forces the model to learn ROBUST dependencies that hold under many partitions — anomalies break MANY dependencies, so the AD score generalizes.</>}
-        stretch={<>If you must use a fixed split, what split is least likely to over-fit?</>}
+        trap={<>(a) is SimCLR-style (augmentation), not ICL. (b) inverts row/column. (d) is AE-AD, not ICL.</>}
+        lens={<>The 'row-as-anchor, column-as-view' is THE distinctive ICL choice. SimCLR-style augmentations are a different (less effective) frame for tabular.</>}
+        stretch={<>What changes if you use the same encoder for both views?</>}
       />
 
+      {/* axis: A1 - distinguish from sibling */}
       <VIS.TrapProblem
         id="icl-p3"
         difficulty="hard"
-        multiSelect
-        title="P3 — Diagnose: ICL AUC suddenly drops in production"
-        scenario={<>Your ICL model has held AUC=0.86 on the reserve for 6 months. Last week AUC dropped to 0.71. Which causes are plausible? Select all that apply.</>}
+        title="P3 — ICL vs masked-feature reconstruction. What's the actual difference?"
+        scenario={<><em>Discriminating insight: masked-feature reconstruction predicts column VALUES (regression); ICL predicts row IDENTITY via similarity (contrastive classification over rows in the batch).</em><br/><br/>A colleague says 'ICL is just masked-feature prediction with cross-entropy.' Diagnose.</>}
         options={[
-          {key:"a", text:"Distribution shift — new merchant categories or new device fingerprints changed the natural feature dependencies; ICL's learned dependencies no longer match production.", correct:true},
-          {key:"b", text:"A new fraud typology that does NOT break ICL's known dependencies — it's flying under the radar precisely because it mimics normal cross-view dependency.", correct:true},
-          {key:"c", text:"Feature engineering pipeline changed one input column's encoding; the model's learned dependency on that column is now incorrect.", correct:true},
-          {key:"d", text:"Reserve labels are wrong; retrain on reserve."},
-          {key:"e", text:"AUC is invariant to distribution shift."},
+          {key:"a", text:"True — both mask features and predict them."},
+          {key:"b", text:"Wrong. Masked-feature prediction (e.g., MAE-style) trains the model to predict the VALUE of the masked column from the unmasked ones — regression. ICL trains the model to predict WHICH ROW the b-half came from via similarity in a contrastive softmax. The 'predict identity' frame is what gives ICL its anomaly-score signal: anomalies fail row-anchor matching.", correct:true},
+          {key:"c", text:"True for binary classification only."},
+          {key:"d", text:"True if the temperature is 1.0."},
         ]}
-        trap={<>(d) confuses cause with consequence and would CONTAMINATE the reserve. (e) is false.</>}
-        lens={<>(a), (b), (c) are the realistic failure modes. (a) is distribution shift on input. (b) is the ICL-specific failure: dependency-preserving fraud. (c) is a pipeline bug. All three should be checked in order before retraining.</>}
-        stretch={<>How would you AUTOMATE detection of dependency-preserving fraud?</>}
+        trap={<>(a)(c)(d) elide the regression-vs-classification distinction.</>}
+        lens={<>This is the canonical ICL-vs-MAE confusion. Both partition columns; only ICL uses the contrastive row-identity frame.</>}
+        stretch={<>Could you HYBRIDIZE ICL with masked-value prediction in one loss?</>}
       />
 
+      {/* axis: C4 - hyperparameter */}
       <VIS.TrapProblem
         id="icl-p4"
         difficulty="hard"
-        title="P4 — ICL vs DROCC on the same dataset"
-        scenario={<>Tabular fraud, 0 labels. You run ICL and DROCC. ICL AUC = 0.83; DROCC AUC = 0.81. Compute: ICL 3x cheaper. Pick ONE.</>}
+        title="P4 — ICL InfoNCE temperature &tau;. What does a too-large value do?"
+        scenario={<><em>Discriminating insight: high &tau; flattens the softmax — contrast loses sharpness, positives and negatives blend. Paper uses 0.1; teams sometimes default to 1.0 and wonder why ICL fails.</em><br/><br/>You set InfoNCE &tau; = 1.0 (default for some contrastive setups). What happens vs the paper's recommended &tau; = 0.1?</>}
         options={[
-          {key:"a", text:"ICL — comparable AUC, cheaper train, designed for tabular. DROCC's adversarial inner loop is more useful when you don't have tabular structure to exploit.", correct:true},
-          {key:"b", text:"DROCC — adversarial training is strictly better."},
-          {key:"c", text:"Ensemble both."},
-          {key:"d", text:"Switch to autoencoder."},
+          {key:"a", text:"Faster training, same AUC."},
+          {key:"b", text:"With high &tau; (e.g., 1.0), the InfoNCE softmax flattens — the positive pair and the negatives have similar weights in the loss. The contrastive signal is weak; the encoders learn a fuzzy representation; anomaly scores barely separate normals from anomalies. &tau; = 0.1 sharpens the softmax and forces tight row-anchor matching.", correct:true},
+          {key:"c", text:"High &tau; is required for stability."},
+          {key:"d", text:"&tau; doesn't affect ICL's anomaly score."},
         ]}
-        trap={<>(b) ignores cost. (c) is reasonable but adds operational complexity for a small AUC gain. (d) regresses.</>}
-        lens={<>(a) is the senior choice. ICL is purpose-built for tabular; DROCC is more general. When ICL wins on AUC AND cost, ship ICL.</>}
-        stretch={<>What would have to change about the data to make DROCC win?</>}
+        trap={<>(a)(c)(d) miss the softmax-sharpness role.</>}
+        lens={<>&tau; is the single most-skipped hyperparameter in ICL deployments. Match the paper or sweep [0.05, 0.2].</>}
+        stretch={<>Could you LEARN &tau; rather than fixing it?</>}
       />
 
+      {/* axis: F4 - paper-named failure */}
       <VIS.TrapProblem
         id="icl-p5"
         difficulty="hard"
-        title="P5 — Categorical-heavy data: ICL collapses"
-        scenario={<>Your tabular data is 80% high-cardinality categorical (merchant ID with 500k unique values, user device fingerprint). You one-hot encode and feed to ICL. AUC = 0.55 (almost chance). Diagnose.</>}
+        title="P5 — Shenkar & Wolf flag one practical sensitivity. Which?"
+        scenario={<><em>Discriminating insight: the paper explicitly calls out feature-partition sensitivity — bad partitions degrade the method to near-random; recommends averaging over multiple random partitions at inference.</em><br/><br/>Pick the paper-named practical sensitivity.</>}
         options={[
-          {key:"a", text:"One-hot encoding blows up input dimension and creates extreme sparsity. ICL's contrastive objective on sparse one-hot vectors is degenerate — most feature dependencies are 'this one-hot bit is on iff that one-hot bit is on'. Use learned embeddings for high-cardinality categoricals.", correct:true},
-          {key:"b", text:"ICL doesn't work for categorical data; switch to autoencoder."},
-          {key:"c", text:"Train for many more epochs."},
-          {key:"d", text:"Increase temperature in the contrastive loss."},
+          {key:"a", text:"Batch size."},
+          {key:"b", text:"Feature partition. A bad partition (e.g., all categorical in one view, all numeric in the other) makes the prediction trivially easy on some rows and trivially hard on others, dominating the anomaly score with partition difficulty rather than anomaly content. Paper recommends averaging InfoNCE loss across many random partitions at inference.", correct:true},
+          {key:"c", text:"Encoder depth."},
+          {key:"d", text:"Optimizer."},
         ]}
-        trap={<>(b) is too strong. (c) and (d) don't fix the input-encoding problem.</>}
-        lens={<>(a) is the standard fix: replace one-hot with learned embeddings for high-cardinality columns, OR use a tabular foundation model (TabPFN, SAINT) for the encoder. ICL works fine in continuous embedding space.</>}
-        stretch={<>What's the embedding dimension you'd pick for merchant ID with 500k unique values?</>}
+        trap={<>(a)(c)(d) matter generically but aren't the paper-named sensitivity.</>}
+        lens={<>Partition averaging is load-bearing. Single-partition ICL has high variance per row.</>}
+        stretch={<>Could you LEARN a good partition rather than averaging random ones?</>}
       />
 
+      {/* axis: C5 - data assumption */}
       <VIS.TrapProblem
         id="icl-p6"
-        difficulty="medium"
-        title="P6 — Why does ICL not need labels?"
-        scenario={<>A teammate is confused: "Contrastive learning is usually self-supervised — but how does ICL learn what 'anomaly' means without anomaly labels?"</>}
+        difficulty="hard"
+        title="P6 — Mutually independent columns. What does ICL do?"
+        scenario={<><em>Discriminating insight: ICL exploits intra-row column dependence; if columns are mutually independent given any partition, the InfoNCE prediction is at chance level for EVERY row (normal and anomalous), and anomaly score is uninformative.</em><br/><br/>Your tabular features were heavily engineered to be statistically independent (PCA-decorrelated). What's ICL's behavior?</>}
         options={[
-          {key:"a", text:"ICL learns the DEPENDENCY structure of NORMAL data (since training set is mostly normal). At inference, anomalies have feature dependencies that DIFFER from what the model learned — and that difference is the AD score. No anomaly labels needed.", correct:true},
-          {key:"b", text:"ICL secretly uses anomaly labels in pretraining."},
-          {key:"c", text:"ICL is unsupervised so 'anomaly' is meaningless."},
-          {key:"d", text:"ICL needs a small set of labeled normals."},
+          {key:"a", text:"ICL benefits from independence — easier learning."},
+          {key:"b", text:"ICL fails. Its anomaly signal comes from intra-row column dependence that anomalies break. If columns are mutually independent, both normal and anomalous rows have InfoNCE at chance level — no separation. Use a different AD method (Deep SVDD, GBDT-AD) on decorrelated features.", correct:true},
+          {key:"c", text:"ICL transforms independence into dependence via the encoder."},
+          {key:"d", text:"ICL is invariant to feature correlations."},
         ]}
-        trap={<>(b)-(d) miss the self-supervised nature.</>}
-        lens={<>(a) is the self-supervised logic. ICL is "anomaly detection by exclusion" — learn normal dependency, score deviations. This is also why ICL fails on dependency-preserving fraud (P3-b).</>}
-        stretch={<>How does this differ from learning the data manifold itself (like an autoencoder does)?</>}
+        trap={<>(a)(c)(d) misread the dependence requirement.</>}
+        lens={<>ICL is a dependence-exploiter. Decorrelated features kill its signal.</>}
+        stretch={<>How would you TEST whether your features have enough dependence for ICL?</>}
       />
 
+      {/* axis: A2 - definitional trap */}
       <VIS.TrapProblem
         id="icl-p7"
         difficulty="hard"
-        multiSelect
-        title="P7 — Improving ICL: which knobs help?"
-        scenario={<>Baseline ICL AUC = 0.80. Which design tweaks plausibly improve AUC? Select all that apply.</>}
+        title="P7 — ICL vs SimCLR for tabular. Same thing?"
+        scenario={<><em>Discriminating insight: SimCLR uses DATA AUGMENTATION (noise, perturbations) to create two views; ICL uses COLUMN PARTITION (no augmentation, no noise). The views are constructed differently.</em><br/><br/>A reviewer says 'ICL is SimCLR for tabular.' Diagnose.</>}
         options={[
-          {key:"a", text:"Multiple random splits per minibatch (ensemble of K splits) and average the contrastive loss.", correct:true},
-          {key:"b", text:"Replace one-hot categoricals with learned embeddings before ICL.", correct:true},
-          {key:"c", text:"Use a larger encoder MLP (more parameters).", correct:true},
-          {key:"d", text:"Increase the temperature tau to make the contrastive softmax more uniform."},
-          {key:"e", text:"Add labeled anomalies as hard negatives in the contrastive loss (hybrid with Deep SAD).", correct:true},
+          {key:"a", text:"Same — both are contrastive learning."},
+          {key:"b", text:"Different. SimCLR's two views are AUGMENTATIONS of the same example (crops, color jitter, noise). ICL's two views are DISJOINT COLUMN SUBSETS of the same row — no perturbation, no noise. The augmentation-vs-partition difference matters: tabular data doesn't have good augmentations (what's a 'crop' of a transaction?), but it does have natural column-subset views.", correct:true},
+          {key:"c", text:"Same up to the loss function."},
+          {key:"d", text:"ICL is a special case of SimCLR."},
         ]}
-        trap={<>(d) often hurts — high temperature flattens the discriminative signal. The InfoNCE-temperature sweet spot is typically 0.1-0.5.</>}
-        lens={<>(a), (b), (c), (e) are the productive levers. (a) is the ICL-specific "split ensemble". (b) addresses high-cardinality categoricals. (c) scales capacity. (e) is the hybrid with semi-supervised signal.</>}
-        stretch={<>Which of these is cheapest and most likely to give the largest AUC bump first?</>}
+        trap={<>(a)(c)(d) conflate the methods. ICL's column-partition is a specifically TABULAR adaptation that SimCLR's augmentation frame can't easily provide.</>}
+        lens={<>SimCLR's augmentation frame fails on tabular; ICL's partition frame addresses exactly that gap.</>}
+        stretch={<>What's the closest IMAGE analog of ICL's column partition?</>}
       />
 
+      {/* axis: E2 - friday failure */}
       <VIS.TrapProblem
         id="icl-p8"
         difficulty="hard"
-        title="P8 — Score thresholding"
-        scenario={<>Your ICL model outputs a contrastive distance score. Compliance asks where to set the threshold for auto-decline. The training set contains no labels. What's the right protocol?</>}
+        title="P8 — Friday 3am: feature schema change. ICL silently goes to AUC=0.5. Why?"
+        scenario={<><em>Discriminating insight: a new column added to the schema isn't in the encoder's column-list; the partition is stale, the encoder dimensions are wrong, scoring is broken — but no error, just flat scores.</em><br/><br/>Your data team adds a new feature to the transaction schema. Overnight, ICL anomaly scores collapse to a narrow band, AUC = 0.51. No errors. Diagnose.</>}
         options={[
-          {key:"a", text:"Use a stratified random reserve with labels to compute precision-at-recall across thresholds, then pick the threshold that hits the desired operating point. ICL's training-set quantiles are uninformative about real fraud.", correct:true},
-          {key:"b", text:"Set threshold at the 99th percentile of training-set distances (no labels needed)."},
-          {key:"c", text:"Calibrate ICL's score with Platt scaling on the training set."},
-          {key:"d", text:"Use 99.5th percentile because fraud rate is 0.5%."},
+          {key:"a", text:"Population drift."},
+          {key:"b", text:"Schema mismatch. ICL's column partition is defined over the feature column LIST at training time. A new column added downstream isn't in the partition; the encoder either silently truncates (missing the new signal) or — worse — produces undefined embeddings if the pipeline tries to include it. Pin the partition; retrain when schema changes.", correct:true},
+          {key:"c", text:"Encoder collapsed."},
+          {key:"d", text:"Adversarial attack."},
         ]}
-        trap={<>(b) and (d) use unlabeled training-set quantiles — they reflect normal variation, not fraud separation. (c) needs labels for calibration.</>}
-        lens={<>(a) is the deployment-grade protocol. Self-supervised AD scores are NOT calibrated to fraud probability; only labeled eval data can map them to business operating points. Stratified random reserve is the canonical eval source (see companion visual).</>}
-        stretch={<>If you have zero labels, what's the WEAKEST defensible threshold-selection method?</>}
+        trap={<>(a) is plausible but doesn't match the suddenness. (c) is a Deep SVDD failure. (d) over-reads.</>}
+        lens={<>Schema changes silently break ICL. Add a schema-hash check at inference; refuse to score if mismatch.</>}
+        stretch={<>What's the cheapest GUARD against this in production?</>}
       />
 
+      {/* axis: D1 - intuitive but wrong */}
       <VIS.TrapProblem
         id="icl-p9"
         difficulty="medium"
-        title="P9 — Training cost vs other tabular AD methods"
-        scenario={<>You compare ICL training cost vs DROCC, Deep SVDD, and Isolation Forest. Order them roughly from cheapest to most expensive (per epoch, on the same dataset).</>}
+        title="P9 — 'More negatives = better contrast = better ICL.' True?"
+        scenario={<><em>Discriminating insight: ICL's negatives come from OTHER rows in the SAME BATCH; once batch is large enough to span the normal manifold, more negatives have diminishing return. The bigger lever is the column partition.</em><br/><br/>A teammate says 'bigger batch = more negatives = better ICL.' Diagnose.</>}
         options={[
-          {key:"a", text:"Isolation Forest (no NN) < Deep SVDD ~ ICL < DROCC. Both Deep SVDD and ICL are one forward + backward per batch. DROCC adds the PGD inner loop (multiple inner iterations per batch).", correct:true},
-          {key:"b", text:"DROCC < ICL < Deep SVDD < Isolation Forest."},
-          {key:"c", text:"All four are roughly equal."},
-          {key:"d", text:"ICL is much slower than DROCC because of the dual encoders."},
+          {key:"a", text:"True — more negatives always helps."},
+          {key:"b", text:"Diminishing return. Once the batch is large enough that the b-halves span the normal manifold's variation (a few thousand for typical tabular), adding more negatives doesn't tighten the contrast meaningfully. The larger lever is the COLUMN PARTITION — semantic partitions beat random partitions at lower batch sizes.", correct:true},
+          {key:"c", text:"True only at low temperature."},
+          {key:"d", text:"False — fewer negatives is better."},
         ]}
-        trap={<>(b) inverts the ordering. (c) ignores the PGD cost of DROCC. (d) overstates the cost of dual encoders — they're still one forward each per batch.</>}
-        lens={<>(a) is roughly correct. Isolation Forest dominates on training speed but loses on AUC; DROCC is slowest because of the inner adversarial loop; ICL and Deep SVDD sit in the middle and are usually similar.</>}
-        stretch={<>Where does inference-time cost rank across these four methods?</>}
+        trap={<>(a) is the SimCLR-derived intuition. (c)(d) miss the partition-dominance.</>}
+        lens={<>Batch size matters until you cover the manifold; partition matters always. Don't conflate.</>}
+        stretch={<>What's the SMALLEST batch size that gives ICL stable contrast?</>}
       />
 
+      {/* axis: B4 - when NOT to use */}
       <VIS.TrapProblem
         id="icl-p10"
-        difficulty="hard"
-        title="P10 — Picking among ICL, DROCC, Deep SAD, autoencoder for a production tabular fraud system"
-        scenario={<>Tabular fraud. 100M unlabeled. 0 labeled anomalies. p99 inference 15ms. Retrain weekly. Compliance demands robustness to feature-pipeline drift.</>}
+        difficulty="medium"
+        title="P10 — When is ICL the wrong choice?"
+        scenario={<><em>Discriminating insight: ICL needs (i) intra-row column dependence, (ii) stable feature schema, (iii) tabular structure (no sequences/graphs). Violating any kills the method.</em><br/><br/>Pick the regime where ICL is the wrong choice.</>}
         options={[
-          {key:"a", text:"ICL — designed for tabular, no labels needed, robust to dependency-preserving drift (random per-batch splits), cheaper than DROCC, much less prone to memorization than autoencoder. Hybrid with autoencoder if you find ICL misses a typology.", correct:true},
-          {key:"b", text:"Autoencoder — most explainable per-feature reconstruction error."},
-          {key:"c", text:"DROCC — adversarial training is strictly more robust."},
-          {key:"d", text:"Deep SAD — needs labels we don't have, but more accurate."},
+          {key:"a", text:"Tabular fraud with rich feature dependence."},
+          {key:"b", text:"Sequential transaction data with temporal dependence (use a sequence AD method instead). The column-partition frame is for TABULAR ROWS; applying it to a sequence collapses the temporal structure. Also bad: features engineered to be statistically independent.", correct:true},
+          {key:"c", text:"High-dim image data."},
+          {key:"d", text:"Small training sets."},
         ]}
-        trap={<>(b) sacrifices AUC for explainability. (c) is more expensive without clear AUC gain on tabular. (d) requires labels we explicitly don't have.</>}
-        lens={<>(a) is the senior tabular-AD choice in the zero-label regime. ICL's self-supervised contrastive objective generalizes to unseen anomalies via dependency-violation. Hybrid escape hatch (ensemble with autoencoder) covers dependency-preserving fraud.</>}
-        stretch={<>If you LATER collect 200 labeled anomalies, do you ditch ICL or augment it?</>}
+        trap={<>(a) is ICL's strong regime. (c)(d) are off-axis.</>}
+        lens={<>ICL is tabular-only by construction. Sequences and graphs need different self-supervised frames.</>}
+        stretch={<>How would you ADAPT ICL to sequences? What changes?</>}
+      />
+
+      {/* axis: D2 - cascade */}
+      <VIS.TrapProblem
+        id="icl-p11"
+        difficulty="hard"
+        multiSelect
+        title="P11 — 'ICL is autoencoder with a different loss.' Trace the wrong-assumption cascade."
+        scenario={<><em>Discriminating insight: ICL has NO decoder and NO reconstruction; the wrong assumption leads to wrong architecture, wrong score, wrong diagnostics.</em><br/><br/>A teammate says 'ICL is basically an autoencoder with InfoNCE loss.' Which errors follow? Select all that apply.</>}
+        options={[
+          {key:"a", text:"They'll add a decoder for 'reconstruction help' — destabilizes the contrastive objective.", correct:true},
+          {key:"b", text:"They'll use reconstruction error as the anomaly score — wrong score function for ICL.", correct:true},
+          {key:"c", text:"They'll evaluate by 'reconstruction at test' — score doesn't match training objective.", correct:true},
+          {key:"d", text:"They'll switch to PyTorch Lightning."},
+          {key:"e", text:"They'll use Adam."},
+        ]}
+        trap={<>(d)(e) unrelated.</>}
+        lens={<>The 'AE with InfoNCE' misread cascades into wrong score function. ICL's score is InfoNCE LOSS averaged across partitions, not reconstruction.</>}
+        stretch={<>What's the one-sentence statement of how ICL differs from AE-AD?</>}
+      />
+
+      {/* axis: A4 - composition */}
+      <VIS.TrapProblem
+        id="icl-p12"
+        difficulty="hard"
+        title="P12 — Compose ICL with semantic feature partition. What's the gain?"
+        scenario={<><em>Discriminating insight: semantic partitions (behavioral vs device, transaction vs identity) reflect domain knowledge about which features should correlate; ICL learns these intra-domain dependencies more efficiently than from random partitions.</em><br/><br/>What's the value of a SEMANTIC partition (e.g., 'behavioral features' vs 'device features') vs random partition?</>}
+        options={[
+          {key:"a", text:"No difference — InfoNCE handles all partitions equally."},
+          {key:"b", text:"Semantic partitions exploit domain structure: behavioral features SHOULD correlate with device features (the same user produces both); the encoder learns those cross-domain relationships specifically. Random partitions average over arbitrary splits and may need more partitions to cover the same signal. Semantic partitions often need fewer training epochs.", correct:true},
+          {key:"c", text:"Semantic partitions are slower."},
+          {key:"d", text:"Semantic partitions don't work with InfoNCE."},
+        ]}
+        trap={<>(a)(c)(d) miss the domain-structure advantage.</>}
+        lens={<>Semantic partitions are a free win when domain structure exists. Random is the safe default.</>}
+        stretch={<>What's the RISK of a semantic partition that random partitions don't have?</>}
+      />
+
+      {/* axis: F3 - reverse engineer */}
+      <VIS.TrapProblem
+        id="icl-p13"
+        difficulty="hard"
+        title="P13 — ICL anomaly score correlates with feature COUNT, not feature content. Diagnose."
+        scenario={<><em>Discriminating insight: this is the partition-difficulty signature — some rows have most signal in one half of the partition, making InfoNCE trivially easy or hard regardless of anomaly status.</em><br/><br/>Eval shows ICL anomaly score strongly correlates with how many non-null features a row has — not anomaly status. Diagnose.</>}
+        options={[
+          {key:"a", text:"Population drift."},
+          {key:"b", text:"Partition-difficulty contamination. Rows with mostly-empty a-halves can't predict b; rows with mostly-empty b-halves can't be matched. InfoNCE score is dominated by 'partition feasibility,' not anomaly content. Fix: average across many partitions, normalize by partition-difficulty baseline, or filter rows by completeness.", correct:true},
+          {key:"c", text:"Encoder collapsed."},
+          {key:"d", text:"Temperature too high."},
+        ]}
+        trap={<>(a)(c)(d) miss the partition mechanism.</>}
+        lens={<>ICL is sensitive to per-row partition feasibility. Imputation or partition averaging mitigates.</>}
+        stretch={<>What CONFOUNDER could create the same correlation without partition difficulty?</>}
+      />
+
+      {/* axis: F2 - adversarial */}
+      <VIS.TrapProblem
+        id="icl-p14"
+        difficulty="hard"
+        title="P14 — Attacker who knows the column partition. Best attack?"
+        scenario={<><em>Discriminating insight: attacker constructs a row where both views look individually in-distribution but their CONJUNCTION is novel — ICL's matching might still catch it, but if the attacker also knows the encoders they can find a (a, b) pair that the encoders happen to match (multivariate evasion).</em><br/><br/>White-box attacker knows the partition. Pick the best evasion attack.</>}
+        options={[
+          {key:"a", text:"Submit random transactions."},
+          {key:"b", text:"Craft a row where each view's embedding sits in a high-density region (looks in-distribution per-view), but their conjunction is a novel cross-domain combination. If the attacker also has encoder access, find a (a, b) pair where f_a(a) and f_b(b) happen to be close (multivariate evasion). Defense: ensemble multiple partitions; an attack against partition P is unlikely to fool partition Q.", correct:true},
+          {key:"c", text:"Brute-force feature combinations."},
+          {key:"d", text:"Submit pure-noise transactions."},
+        ]}
+        trap={<>(a)(c)(d) are generic.</>}
+        lens={<>The partition-ensemble defense is the standard recommendation. Single-partition ICL is the vulnerable case.</>}
+        stretch={<>How does the ATTACK COST scale with the number of partitions in the ensemble?</>}
+      />
+
+      {/* axis: E3 - implementation */}
+      <VIS.TrapProblem
+        id="icl-p15"
+        difficulty="medium"
+        title="P15 — Categorical features in one view: what's the encoding gotcha?"
+        scenario={<><em>Discriminating insight: each view's encoder is feature-set-specific; categorical encoding (one-hot, embedding) must be consistent across views and partitions to avoid dimension mismatches.</em><br/><br/>Pick the dominant implementation gotcha for ICL with mixed categorical+numeric features.</>}
+        options={[
+          {key:"a", text:"Categorical encoding must produce CONSISTENT dimensions across partitions and views, or the encoder f_a (or f_b) sees different input dims on different partition draws. Use embedding tables with fixed output dim, not one-hot of varying-cardinality categories.", correct:true},
+          {key:"b", text:"Categorical features must be sorted alphabetically."},
+          {key:"c", text:"Numeric features must be normalized to [0,1]."},
+          {key:"d", text:"InfoNCE doesn't support categoricals."},
+        ]}
+        trap={<>(b)(c) name unrelated practices. (d) is wrong.</>}
+        lens={<>Mixed-type encoding is the most common ICL implementation bug. Fixed-dim embeddings >> variable-dim one-hot for partition-averaged ICL.</>}
+        stretch={<>How would you handle a NEW category appearing post-training (cold-start category)?</>}
+      />
+
+      {/* axis: D3 - senior vs junior */}
+      <VIS.TrapProblem
+        id="icl-p16"
+        difficulty="hard"
+        multiSelect
+        title="P16 — Junior says 'I trained ICL.' Senior follow-ups?"
+        scenario={<><em>Discriminating insight: senior asks about partition strategy, temperature, inference aggregation, and schema invariance — each an ICL-specific decision.</em><br/><br/>Select all senior follow-ups.</>}
+        options={[
+          {key:"a", text:"Random or semantic partition? How many partitions at inference?", correct:true},
+          {key:"b", text:"InfoNCE temperature value?", correct:true},
+          {key:"c", text:"How do you aggregate scores across partitions at inference?", correct:true},
+          {key:"d", text:"How do you handle feature schema changes?", correct:true},
+          {key:"e", text:"Adam or SGD?"},
+          {key:"f", text:"What's your random seed?"},
+        ]}
+        trap={<>(e)(f) noise.</>}
+        lens={<>'I used ICL' without specifying any of (a)-(d) is under-specified.</>}
+        stretch={<>Which of (a)-(d) is most often skipped?</>}
+      />
+
+      {/* axis: A3 - counterfactual */}
+      <VIS.TrapProblem
+        id="icl-p17"
+        difficulty="hard"
+        title="P17 — Counterfactual: no ICL, use autoencoder-AD. What specifically goes wrong?"
+        scenario={<><em>Discriminating insight: AE-AD's memorization problem is the named failure ICL was designed to fix; without ICL, you get the memorization regression on high-capacity AEs.</em><br/><br/>Quantify the cost of switching from ICL to AE-AD.</>}
+        options={[
+          {key:"a", text:"(1) Memorization: with sufficient capacity, the AE reconstructs ANOMALIES too, collapsing the reconstruction-error score. (2) Score saturates: anomaly distribution overlaps normal distribution. (3) Tighter bottleneck loses normal-data fidelity, trading one failure for another.", correct:true},
+          {key:"b", text:"(1) GPU memory: 10x more. (2) Train time: 5x more. (3) Inference: 2x slower."},
+          {key:"c", text:"(1) Recall drops 20pp. (2) Precision drops 15pp. (3) F1 drops 18pp."},
+          {key:"d", text:"No cost — equivalent methods."},
+        ]}
+        trap={<>(b)(c) wrong-axis. (d) ignores the memorization mechanism.</>}
+        lens={<>ICL's value is exactly avoiding AE memorization. The counterfactual cost is structural.</>}
+        stretch={<>Could you BOUND AE capacity to prevent memorization without switching to ICL?</>}
+      />
+
+      {/* axis: F5 - community follow-up */}
+      <VIS.TrapProblem
+        id="icl-p18"
+        difficulty="hard"
+        title="P18 — GADBench on ICL for tabular fraud. What does fair eval show?"
+        scenario={<><em>Discriminating insight: under fair tabular eval, ICL's gains shrink vs tuned GBDT-AD; the contrastive frame doesn't always dominate when feature engineering is already strong.</em><br/><br/>Pick GADBench's finding on ICL.</>}
+        options={[
+          {key:"a", text:"ICL dominates all baselines."},
+          {key:"b", text:"Under GADBench's fair tabular eval, ICL's gains over OC-SVM / Isolation Forest shrink versus the paper's numbers; tuned GBDT-AD with hand-engineered features often matches ICL on real fraud benchmarks. The contrastive frame helps when feature engineering is weak; with strong engineered features, GBDT-AD remains competitive.", correct:true},
+          {key:"c", text:"ICL is unable to train on tabular fraud."},
+          {key:"d", text:"GADBench doesn't include ICL."},
+        ]}
+        trap={<>(a) flips. (c)(d) false.</>}
+        lens={<>Don't assume ICL's published numbers transfer. Benchmark against tuned GBDT-AD on your fraud data.</>}
+        stretch={<>What's the cheapest experiment to confirm ICL's advantage on YOUR feature set?</>}
+      />
+
+      {/* axis: C1 - architectural choice */}
+      <VIS.TrapProblem
+        id="icl-p19"
+        difficulty="medium"
+        title="P19 — Two separate encoders f_a, f_b or one shared encoder?"
+        scenario={<><em>Discriminating insight: ICL uses SEPARATE encoders because the two views (a and b) have different column subsets — different input dimensions, different feature semantics. Sharing the encoder requires per-partition input projection.</em><br/><br/>Pick the right architectural choice for f_a and f_b.</>}
+        options={[
+          {key:"a", text:"Same encoder, share weights."},
+          {key:"b", text:"Two separate encoders f_a and f_b. The two column-subsets have different input dimensions (k and d-k) and different feature semantics, so the encoders must be partition-specific. Sharing weights would require a unified input projection that re-introduces the partition difficulty problem.", correct:true},
+          {key:"c", text:"No encoder — direct InfoNCE on raw columns."},
+          {key:"d", text:"One encoder for f_a; identity for f_b."},
+        ]}
+        trap={<>(a)(c)(d) misread the architecture.</>}
+        lens={<>Separate encoders is the paper's standard. Shared-encoder variants exist but require careful input handling.</>}
+        stretch={<>Could you share LATE layers across f_a and f_b?</>}
+      />
+
+      {/* axis: B2 - sounds reasonable, isn't */}
+      <VIS.TrapProblem
+        id="icl-p20"
+        difficulty="hard"
+        title="P20 — 'Use ICL on a single column-pair (a fixed split).' Reasonable?"
+        scenario={<><em>Discriminating insight: a single partition has high variance per row (some rows have most signal in one half, some in the other); the paper-prescribed aggregation across many random partitions is what makes the score stable.</em><br/><br/>To save compute, a teammate proposes: 'pick one good column partition at training, use it at inference too. One partition, fast.'</>}
+        options={[
+          {key:"a", text:"Reasonable — one partition is the natural simplification."},
+          {key:"b", text:"Wrong. A single partition has high per-row score variance because the partition difficulty varies across rows. The paper's recommendation is to use many random partitions at inference and average — this stabilizes the score across the per-row partition-difficulty variation. One partition gives noisy anomaly scores; AUC degrades vs the averaged version.", correct:true},
+          {key:"c", text:"Reasonable only for small datasets."},
+          {key:"d", text:"Reasonable only with deep encoders."},
+        ]}
+        trap={<>(a)(c)(d) all overlook the per-row variance.</>}
+        lens={<>Multi-partition averaging is the paper's PRESCRIPTION for variance reduction. Skipping it loses the method's reliability.</>}
+        stretch={<>What's the MINIMUM number of partitions at inference for stable scores?</>}
+      />
+
+      {/* axis: F1 - edge case */}
+      <VIS.TrapProblem
+        id="icl-p21"
+        difficulty="medium"
+        title="P21 — ICL with d=2 columns (very few features). What happens?"
+        scenario={<><em>Discriminating insight: with d=2 (one column per view), there's only one partition; each view is a single feature; the InfoNCE matching is trivially easy or trivially hard depending on the marginal distributions. ICL degenerates.</em><br/><br/>You have a fraud dataset with only 2 features. ICL's behavior?</>}
+        options={[
+          {key:"a", text:"Faster training, same quality."},
+          {key:"b", text:"Degenerate. Only one partition possible (1 column per view), no partition averaging, and the contrast reduces to 'does feature 1 marginal predict feature 2 marginal' across rows — essentially a kernel density estimation. Use a classical method (Isolation Forest, GBDT-AD) on small d.", correct:true},
+          {key:"c", text:"Anomaly score equals reconstruction error."},
+          {key:"d", text:"No effect."},
+        ]}
+        trap={<>(a)(c)(d) miss the d-dependence of ICL's value.</>}
+        lens={<>ICL has a feature-count floor. With small d, the partition-averaging premise breaks.</>}
+        stretch={<>What's the smallest d where ICL meaningfully outperforms classical methods?</>}
+      />
+
+      {/* axis: E4 - rollout */}
+      <VIS.TrapProblem
+        id="icl-p22"
+        difficulty="hard"
+        title="P22 — Roll out ICL to production. Phase ordering?"
+        scenario={<><em>Discriminating insight: rollout must validate per-row score stability across partitions BEFORE going live; partition averaging at inference is load-bearing for stable production scores.</em><br/><br/>Pick the right rollout ordering.</>}
+        options={[
+          {key:"a", text:"(1) Train. (2) Ship to production immediately. (3) Measure AUC."},
+          {key:"b", text:"(1) Train ICL with N random partitions. (2) Validate per-row score VARIANCE across partitions on a held-out set — confirm stability. (3) Tune N (number of inference partitions) for the variance/compute tradeoff. (4) Add schema-hash guard. (5) Ship with shadow mode comparing ICL scores to incumbent.", correct:true},
+          {key:"c", text:"(1) Use one partition. (2) Ship."},
+          {key:"d", text:"(1) Train. (2) Ship. (3) Add partition averaging if it doesn't work."},
+        ]}
+        trap={<>(a)(c)(d) skip the per-row variance validation.</>}
+        lens={<>The variance check across partitions is the production-readiness gate.</>}
+        stretch={<>How would you AUTOMATE the partition-count tuning?</>}
+      />
+
+      {/* axis: D4 - misattribution */}
+      <VIS.TrapProblem
+        id="icl-p23"
+        difficulty="hard"
+        title="P23 — 'ICL works great on our fraud data.' Three causes that AREN'T ICL's mechanism."
+        scenario={<><em>Discriminating insight: apparent ICL success could be (i) strong intra-row dependence in fraud features (real ICL win), (ii) lucky partition matching a strong signal, (iii) tighter feature normalization (would help any method) — the senior diagnostic is to ablate.</em><br/><br/>Reported ICL AUC = 0.92. Pick the three causes that aren't ICL's mechanism per se.</>}
+        options={[
+          {key:"a", text:"(1) Better feature normalization compared to baseline. (2) Larger training set than baseline. (3) Implementation details (Adam vs SGD, batch size).", correct:true},
+          {key:"b", text:"(1) The temperature was set wrong. (2) Encoder was shallow. (3) Partition was random."},
+          {key:"c", text:"(1) Used InfoNCE. (2) Used column partition. (3) Averaged across partitions."},
+          {key:"d", text:"(1) Trained on labels. (2) Validated on labels. (3) Eval on labels."},
+        ]}
+        trap={<>(b) names ICL-specific design knobs (not confounds). (c) names ICL's mechanism itself (the wrong-direction). (d) is wrong premise.</>}
+        lens={<>Misattribution of gain is common. Ablate to isolate the ICL contribution.</>}
+        stretch={<>Design the ablation table that ISOLATES ICL's contribution.</>}
+      />
+
+      {/* axis: C3 - what's dropped vs baseline */}
+      <VIS.TrapProblem
+        id="icl-p24"
+        difficulty="medium"
+        title="P24 — ICL drops one specific thing vs autoencoder AD. Which?"
+        scenario={<><em>Discriminating insight: ICL drops the DECODER and the RECONSTRUCTION objective; replaces with two encoders + InfoNCE. The architecture has no asymmetric encode-then-decode; only two parallel encoders + similarity.</em><br/><br/>Pick what ICL drops vs AE-AD.</>}
+        options={[
+          {key:"a", text:"The bottleneck."},
+          {key:"b", text:"ICL drops the DECODER and the RECONSTRUCTION objective entirely. Replaces with two parallel encoders f_a and f_b producing embeddings that are scored by similarity in an InfoNCE loss. No generative component, no reconstruction error.", correct:true},
+          {key:"c", text:"The loss function only — keeps the AE architecture."},
+          {key:"d", text:"Nothing — adds InfoNCE on top of AE."},
+        ]}
+        trap={<>(a) is wrong-detail. (c)(d) misread the relationship.</>}
+        lens={<>The drop is structural (no decoder) and conceptual (no reconstruction). The result is a discriminative method.</>}
+        stretch={<>Could you ADD a decoder back to ICL as auxiliary loss? Helpful or harmful?</>}
+      />
+
+      {/* axis: E5 - reproducibility */}
+      <VIS.TrapProblem
+        id="icl-p25"
+        difficulty="medium"
+        title="P25 — Reproducing Shenkar & Wolf on ODDS benchmark. Which detail is load-bearing?"
+        scenario={<><em>Discriminating insight: the paper's gains rely on the multi-partition averaging at inference AND temperature 0.1; missing either substantially degrades AUC.</em><br/><br/>Pick the most-skipped reproducibility detail.</>}
+        options={[
+          {key:"a", text:"Optimizer."},
+          {key:"b", text:"At inference, average InfoNCE loss across many random partitions (paper uses 10-50). With single-partition inference, AUC drops 5-15pp on the paper's benchmarks. Plus the temperature 0.1 — default 1.0 also degrades severely.", correct:true},
+          {key:"c", text:"Random seed."},
+          {key:"d", text:"Batch size."},
+        ]}
+        trap={<>(a)(c)(d) matter generically but aren't the ICL-specific lever.</>}
+        lens={<>Multi-partition averaging is the load-bearing inference protocol; temperature is the load-bearing training hyperparam.</>}
+        stretch={<>Could you trade off partitions vs temperature to save inference compute?</>}
+      />
+
+      {/* axis: A5 - boundary with sibling */}
+      <VIS.TrapProblem
+        id="icl-p26"
+        difficulty="hard"
+        title="P26 — When does ICL beat Deep SVDD on tabular fraud?"
+        scenario={<><em>Discriminating insight: ICL wins when intra-row column dependence is strong and normal data is multimodal (Deep SVDD's hypersphere can't enclose multimodal); Deep SVDD wins when normals are unimodal and feature distance is meaningful.</em><br/><br/>Pick the regime where ICL beats Deep SVDD.</>}
+        options={[
+          {key:"a", text:"ICL always wins on tabular."},
+          {key:"b", text:"Deep SVDD always wins."},
+          {key:"c", text:"ICL wins when (i) intra-row column dependence is strong (multiple correlated feature families), (ii) normal data is multimodal (Deep SVDD's single hypersphere can't enclose). Deep SVDD wins when normals are unimodal and feature distance is meaningful in raw input space.", correct:true},
+          {key:"d", text:"They are equivalent."},
+        ]}
+        trap={<>(a)(b) over-claim. (d) is wrong.</>}
+        lens={<>The crossover is determined by data structure (dependence, modality), not method preference.</>}
+        stretch={<>What's the cheapest data-side experiment to predict which method wins?</>}
       />
     </VIS.Section>
 
@@ -1694,38 +1975,38 @@ flowchart TB
       <ul>
         <li>
           <a href="https://arxiv.org/abs/2202.08164" target="_blank" rel="noopener">
-            <strong>Shenkar & Wolf — Anomaly Detection for Tabular Data with Internal Contrastive Learning</strong>
+            <strong>Shenkar &amp; Wolf — ICL</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2022)</span>
-          <br/>The ICL paper. Sec 3 (objective) and Sec 4 (feature-split experiments) cover the interview essentials.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2002.05709" target="_blank" rel="noopener">
-            <strong>Chen, Kornblith, Norouzi, Hinton — SimCLR</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2020)</span>
-          <br/>The canonical contrastive-learning paper for representations. ICL borrows the InfoNCE-style loss; understand SimCLR first if contrastive learning is new.
-        </li>
-        <li>
-          <a href="https://www.dbs.ifi.lmu.de/~zimek/publications/KDD2018/Goldstein-tutorial.html" target="_blank" rel="noopener">
-            <strong>Markus Goldstein — Anomaly detection tutorial (KDD 2018)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(tutorial)</span>
-          <br/>Survey of AD methods. Provides the autoencoder-AD baseline ICL was designed to beat.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2206.04015" target="_blank" rel="noopener">
-            <strong>Han et al. — ADBench: Anomaly Detection Benchmark</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2022)</span>
-          <br/>Fair benchmark across 30+ AD methods. Look at ICL's row vs DROCC, Deep SVDD, autoencoder — confirms tabular leadership.
+          <br/>The canonical ICL paper. Section 3 (column-partition InfoNCE), Section 4 (multi-partition inference). Brief; worth reading in full.
         </li>
         <li>
           <a href="https://lilianweng.github.io/posts/2021-05-31-contrastive/" target="_blank" rel="noopener">
             <strong>Lilian Weng — Contrastive Representation Learning</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The most comprehensive blog post on contrastive losses. ICL's loss is a tabular adaptation of InfoNCE; this post explains InfoNCE clearly.
+          <br/>Deep dive on InfoNCE, SimCLR, and the contrastive landscape. Best place to build the contrastive intuition that ICL adapts for tabular.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2002.05709" target="_blank" rel="noopener">
+            <strong>Chen et al. — SimCLR</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2020)</span>
+          <br/>The image-domain contrastive method ICL adapts. Read to understand what ICL CHANGES (augmentation -&gt; column partition) and what it KEEPS (InfoNCE).
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2306.12251" target="_blank" rel="noopener">
+            <strong>GADBench — Tang et al.</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2024)</span>
+          <br/>Fair-eval benchmark showing ICL's tabular AD gains shrink vs tuned GBDT-AD under fair protocols. Read before adopting ICL for production.
+        </li>
+        <li>
+          <a href="https://www.youtube.com/watch?v=YgM4UrTC4ZE" target="_blank" rel="noopener">
+            <strong>Yannic Kilcher — Contrastive Learning explained</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(video)</span>
+          <br/>15-minute walk-through of the contrastive frame; useful warm-up before reading ICL.
         </li>
       </ul>
     </VIS.Section>

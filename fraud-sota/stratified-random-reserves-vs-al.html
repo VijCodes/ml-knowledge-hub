@@ -1414,279 +1414,555 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Stratified random reserves vs AL — best-of-both labeling protocol for fraud.
+// Stratified random reserves vs AL — the unbiased-prevalence/AUC estimate AL provably can't give.
+// Concept-specific anchor: every trap hinges on acquisition bias breaking eval,
+// the Neyman allocation / strata math, or the disjoint-from-AL-pool protocol gotcha.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Active learning for fraud labeling"
       title="Stratified random reserves vs. AL"
-      subtitle="The Stripe / Sift protocol: AL trains a stronger model, but a fixed small random reserve is the only honest eval. Use both."
+      subtitle="Why production fraud teams budget 1-2% of labels for a stratified random reserve — and what that reserve gives you that no active-learning queue can."
       byline={[
-        {label: "Source", value: "Sift Engineering 2025; Stripe Radar"},
-        {label: "Year", value: "2025"},
-        {label: "L3", value: "Labeling protocol"},
+        {label: "Sources", value: "Sift Engineering 2025; Stripe Radar engineering blog"},
+        {label: "L3", value: "Active learning for fraud labeling"},
+        {label: "Pairs with", value: "BALD / BatchBALD visual"},
       ]}/>
 
     <VIS.TLDR>
-      Pure active learning gives the best MODEL but breaks your AUC eval, because{" "}
-      <VIS.Term def="An evaluation set that does not reflect the production distribution of cases. If you eval only on cases the model was uncertain about, your AUC is not the AUC you'll see in production.">selectively-labeled eval</VIS.Term>{" "}
-      is not population-representative. Pure random labeling wastes 95% of analyst time on cases the model already knows. The production answer is BOTH: spend ~95% of label budget on AL for training; spend ~5% on a{" "}
-      <VIS.Term def="A small fraction of decisions, randomly sampled within each policy stratum (auto-approve, auto-decline, gray-zone), labeled regardless of model uncertainty. Used only for evaluation, never for training.">stratified random reserve</VIS.Term>{" "}
-      that is the SOLE eval source.
+      Pure active learning gives the best model but a biased eval set; pure random gives unbiased eval but wastes labels. The production answer is a <strong>stratified random reserve</strong> — a small (1-5%) disjoint sample of the pool, stratified by a STABLE feature (policy band, score band), that AL never touches. The reserve is the <em>only</em> way to compute an unbiased population AUC or prevalence the risk committee will accept.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — the disjoint, stratified, AL-never-touches reserve">
       <p>
-        The protocol carves your label budget in two streams:
+        <VIS.Term def="Active learning. A loop where the model proposes high-information cases for the analyst to label, retraining on the labeled cases. Standard methods: margin sampling, BALD, BatchBALD.">AL</VIS.Term>{" "}
+        biases the labeled set by construction: it picks cases near the model's decision boundary, which are systematically <em>different</em> from a random population sample.
+        Any metric — AUC, recall at a fixed FPR, prevalence — computed on AL-labeled cases is therefore biased.
       </p>
-      <ol>
-        <li><strong>Reserve stream (~1-5% of decisions):</strong> sampled uniformly at random WITHIN each policy stratum — auto-approve, gray-zone, auto-decline. Always labeled, regardless of what the model thinks. Used ONLY for unbiased eval.</li>
-        <li><strong>AL stream (~95-99% of remaining budget):</strong> picked by an acquisition function (BALD / BatchBALD / margin) over the unlabeled pool. Used ONLY for training.</li>
-      </ol>
+      <p>
+        A <VIS.Term def="A small fraction (1-5%) of labels sampled UNIFORMLY AT RANDOM, stratified by a stable feature like policy band or score decile. Removed from the AL pool first so AL never sees these cases.">stratified random reserve</VIS.Term>{" "}
+        is the corrective. Sample 1-2% of the unlabeled pool uniformly at random within each <VIS.Term def="A subset of the population defined by a stable feature — e.g., score decile, policy decision class (auto-approve / gray-zone / auto-decline). Stratification ensures rare segments get enough reserve labels for reliable estimates.">stratum</VIS.Term>;
+        label only these; report eval metrics ONLY on the reserve. The remaining 98% of the label budget feeds AL, which feeds TRAIN only.
+      </p>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  TX["All transactions"]
-  TX --> RESERVE["~2% stratified random reserve"]
-  TX --> AL["~98% scored by AL acquisition"]
-  RESERVE --> EVAL["Unbiased eval AUC / PR"]
-  AL --> TRAIN["Train set (biased toward uncertain)"]
-  TRAIN --> MODEL["Model"]
-  MODEL --> AL
-  MODEL --> EVAL
-  style RESERVE fill:#dcfce7,stroke:#16a34a,stroke-width:2px
-  style EVAL fill:#dcfce7,stroke:#16a34a,stroke-width:2px
-  style AL fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-      `} />
-      <p>Green = reserve / eval (unbiased). Blue = AL (high-signal training).</p>
+  POOL["Unlabeled fraud pool"]
+  POOL --> RESV["Stratified random sampler (Neyman allocation)"]
+  POOL --> ALQ["AL acquisition (BALD / BatchBALD)"]
+  RESV --> RESLAB["Reserve labels (1-5%)"]
+  ALQ --> ALLAB["AL labels (95-98%)"]
+  RESLAB --> EVAL["EVAL ONLY"]
+  ALLAB --> TRAIN["TRAIN ONLY"]
+  EVAL --> AUC["Unbiased AUC, prevalence, CI"]
+  TRAIN --> MODEL["Best-in-class model"]
+  style RESV fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style RESLAB fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style EVAL fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+      `}/>
+      <p>Blue = the reserve flow. The reserve is REMOVED FROM the AL pool BEFORE acquisition. Reserve to eval only. AL to train only. No crossover.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from pure AL or pure random">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-math" title="The math — Neyman allocation and the rarest-stratum constraint">
+      <p>
+        Given K strata with population fractions W_k (sum to 1) and within-stratum label variance &sigma;&sup2;_k, the variance-minimizing allocation of N reserve labels is:
+      </p>
+      <VIS.Equation display tex="n_k = N \cdot \frac{W_k \cdot \sigma_k}{\sum_j W_j \cdot \sigma_j}"/>
+      <p>
+        Practical fraud uses: stratify by score decile (or policy band). &sigma;_k is roughly Bernoulli at the stratum prevalence p_k, so &sigma;_k &asymp; &radic;(p_k(1&minus;p_k)). The rarest fraud-positive stratum drives the reserve size — you need &ge;30 positives per stratum for a reliable AUC CI, which at 1% prevalence means &ge;3000 labels in that stratum.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="How it differs from the alternatives">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Strategy</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Model quality</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Eval unbiased?</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Label efficiency</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Approach</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Unbiased prevalence?</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Unbiased AUC?</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Train signal?</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Label cost</th>
           </tr>
         </thead>
         <tbody>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Pure random</td>
-            <td style={{padding:"8px 10px"}}>Weak — wastes labels</td>
-            <td style={{padding:"8px 10px"}}>Yes</td>
-            <td style={{padding:"8px 10px"}}>Low (~5-10%)</td>
+            <td style={{padding:"8px 10px"}}>Pure AL</td>
+            <td style={{padding:"8px 10px"}}>No (biased to boundary)</td>
+            <td style={{padding:"8px 10px"}}>No</td>
+            <td style={{padding:"8px 10px"}}>Best</td>
+            <td style={{padding:"8px 10px"}}>Cheapest signal/label</td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Pure AL (BALD / BatchBALD)</td>
-            <td style={{padding:"8px 10px"}}>Strong</td>
-            <td style={{padding:"8px 10px"}}>NO — eval set is biased</td>
-            <td style={{padding:"8px 10px"}}>High (~80%)</td>
+            <td style={{padding:"8px 10px"}}>Pure random</td>
+            <td style={{padding:"8px 10px"}}>Yes</td>
+            <td style={{padding:"8px 10px"}}>Yes</td>
+            <td style={{padding:"8px 10px"}}>Weak</td>
+            <td style={{padding:"8px 10px"}}>Wasteful</td>
           </tr>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Stratified reserve + AL</td>
-            <td style={{padding:"8px 10px"}}>Strong (~AL minus 1-2 F1)</td>
-            <td style={{padding:"8px 10px"}}>Yes</td>
-            <td style={{padding:"8px 10px"}}>High (~75-80%)</td>
+            <td style={{padding:"8px 10px"}}>AL + stratified random reserve</td>
+            <td style={{padding:"8px 10px"}}>Yes (from reserve)</td>
+            <td style={{padding:"8px 10px"}}>Yes (from reserve)</td>
+            <td style={{padding:"8px 10px"}}>Best (from AL)</td>
+            <td style={{padding:"8px 10px"}}>~1-2% overhead</td>
+          </tr>
+          <tr>
+            <td style={{padding:"8px 10px"}}>AL + propensity-weighted debias</td>
+            <td style={{padding:"8px 10px"}}>Theoretically yes</td>
+            <td style={{padding:"8px 10px"}}>High variance</td>
+            <td style={{padding:"8px 10px"}}>Best</td>
+            <td style={{padding:"8px 10px"}}>Free at label level</td>
           </tr>
         </tbody>
       </table>
-      <p>
-        The reserve cost is ~2% of labels — small fixed tax for an eval number the risk committee will actually trust.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Always.</strong> If you have an AL loop in production, you need this protocol — there is no honest substitute for an unbiased reserve.</li>
-        <li><strong>Especially when</strong> the risk / compliance / payments-ops team must report AUC, PR-AUC, or precision-at-recall to leadership or regulators.</li>
-        <li><strong>Especially when</strong> policy strata behave differently (auto-decline vs gray-zone vs auto-approve) — stratification ensures you see fraud rate inside each.</li>
-      </ul>
     </VIS.Section>
 
     <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Reserve must NEVER touch training">
-        The reserve is your eval. If a single reserve case leaks into training, eval AUC becomes optimistic. Tag and isolate reserve rows in your feature store; audit the pipeline.
+      <VIS.Callout kind="gotcha" title="Stratification key drift">
+        If you stratify by *current model's score band* and the model is rebuilt monthly, your strata definitions move with the model. CIs across versions become non-comparable. Lock stratification to a STABLE feature: policy decision class, transaction amount band, merchant category.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Reserve size depends on the metric">
-        For AUC at 1% positives on a 200k-case reserve, the 95% CI is around plus/minus 0.005. Drop to a 10k reserve and you are at plus/minus 0.02 — not tight enough to detect 1-2 point model regressions. Size the reserve for the smallest effect you need to detect, not just by analyst budget.
+      <VIS.Callout kind="warn" title="Reserve must be DISJOINT from the AL pool">
+        If the reserve and AL acquisition pool overlap, AL will eventually label some reserve cases too, and your "unbiased" eval contains AL-acquired labels. Remove the reserve from the pool BEFORE AL sees it.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Stratify by POLICY, not by model score">
-        Stratifying by model score makes the reserve biased again. Stratify by the deployed policy decision (auto-decline / gray-zone / auto-approve) or by a stable business segment (merchant category, geography).
+      <VIS.Callout kind="warn" title="Rare strata need over-allocation">
+        At 1% fraud prevalence, a stratum that covers 5% of population contains ~50 fraud cases per 100k. To get a stable AUC CI you need &ge;30 positives per stratum — i.e., &ge;3000 labels in that stratum. Equal-size allocation under-allocates the rare strata; Neyman over-allocates them.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on labeling protocol design, eval contamination, and stratification.
+        Every problem hinges on a property unique to a stratified random reserve: the unbiased population estimate AL can't give, stratification math, or the disjoint-from-AL-pool protocol gotcha. Strip the name → option no longer wins.
       </p>
 
+      {/* axis: B3 */}
       <VIS.TrapProblem
         id="srr-p1"
         difficulty="hard"
-        title="P1 — Why does pure AL break the eval?"
-        scenario={<>Your team uses BatchBALD to label 1000 cases per week. You split labeled cases 80/20 for train and eval. Each cycle, AUC on the held-out 20% rises. After 12 weeks, AUC = 0.94. You deploy. Production AUC measured on a random sample is 0.78. Diagnose.</>}
+        title="P1 — The risk committee asks 'what is our true fraud prevalence?' Which method answers?"
+        scenario={<><em>Discriminating insight: AL labels are biased to the boundary, so AL-derived prevalence is NOT the population prevalence; a stratified random reserve gives an unbiased estimate WITH a computable CI — something AL cannot do regardless of sample size.</em><br/><br/>Risk committee asks for true fraud prevalence in the current population with a 95% CI. Your team has 100k AL-acquired labels (BatchBALD on margin) and 1k stratified random reserve labels. Which gives the answer?</>}
         options={[
-          {key:"a", text:"AL labels SELECTIVELY the cases the model is uncertain about. The 20% held out from THAT pool is biased toward uncertainty too. AUC on biased eval is not comparable to AUC on the population. The 0.94 was an artifact; 0.78 is the truth.", correct:true},
-          {key:"b", text:"Distribution shift over 12 weeks — production has new fraud patterns."},
-          {key:"c", text:"AUC of 0.78 is the realistic ceiling; the team trained too aggressively."},
-          {key:"d", text:"Random sampling under-estimates AUC because fraud is concentrated."},
+          {key:"a", text:"The 100k AL labels (larger sample = more precise)."},
+          {key:"b", text:"The 1k reserve labels. AL-acquired labels are sampled with probability that depends on uncertainty, so empirical prevalence in the AL set is not population prevalence; no amount of reweighting cleans this without knowing the acquisition propensity. The reserve, sampled with known probability, gives a Horvitz-Thompson unbiased estimate plus a closed-form CI.", correct:true},
+          {key:"c", text:"Pool both — 101k samples is better than 1k."},
+          {key:"d", text:"Neither — prevalence requires LLN over the whole pool."},
         ]}
-        trap={<>(b) is plausible but not the primary mechanism — distribution shift would NOT produce a 16-point gap on its own. (c) is unsupported. (d) gets the direction wrong: random sampling gives an UNBIASED estimate, not a downward-biased one.</>}
-        lens={<>(a) is the failure mode. Selectively-labeled eval over-states AUC because the cases the model gets WRONG (the hard ones) are the ones AL focuses on — your held-out from THAT pool is dominated by hard cases the model has, by definition, recently seen close cousins of. AUC measured on a stratified random reserve is the only honest number.</>}
-        stretch={<>If you re-ran the experiment with a reserve, would 0.78 be the correct production estimate, or would the reserve also drift?</>}
+        trap={<>(a) and (c) miss the acquisition-bias mechanism. (d) confuses estimator type with estimand.</>}
+        lens={<>This is THE B3 stakeholder question that justifies the reserve. The reserve's value isn't "more labels" — it's the ONLY route to an unbiased population estimate with a CI when AL is in the loop.</>}
+        stretch={<>If you could ONLY have the propensity scores (AL acquisition probabilities), could you debias the AL set without a reserve?</>}
       />
 
+      {/* axis: C2 */}
       <VIS.TrapProblem
         id="srr-p2"
         difficulty="hard"
-        multiSelect
-        title="P2 — Reserve design choices that ARE safe"
-        scenario={<>You're designing a 2% stratified random reserve for a payments processor. Which design choices are safe (do not introduce bias)? Select all that apply.</>}
+        title="P2 — Neyman allocation: which stratum gets MORE labels?"
+        scenario={<><em>Discriminating insight: Neyman over-allocates strata with HIGHER within-stratum variance (&sigma;_k) — for Bernoulli labels that means strata closer to 50/50 prevalence.</em><br/><br/>Three strata: A (population fraction 70%, prevalence 0.5%), B (population fraction 25%, prevalence 5%), C (population fraction 5%, prevalence 30%). Under Neyman allocation with N=1000 reserve labels, which stratum gets MORE labels relative to its population fraction?</>}
         options={[
-          {key:"a", text:"Sample uniformly within each policy stratum (auto-decline, gray-zone, auto-approve).", correct:true},
-          {key:"b", text:"Stratify by merchant category code (MCC) to ensure coverage of low-volume categories.", correct:true},
-          {key:"c", text:"Stratify by current model score quintile."},
-          {key:"d", text:"Re-sample the reserve weekly (fresh random draw each Monday).", correct:true},
-          {key:"e", text:"Replace reserve cases with their nearest AL-labeled counterparts to save analyst time."},
+          {key:"a", text:"A — it's the largest stratum."},
+          {key:"b", text:"B — middle ground."},
+          {key:"c", text:"C, relative to its 5% population fraction. Neyman allocates proportional to W_k times &sigma;_k where &sigma;_k &asymp; &radic;(p_k(1&minus;p_k)). C has the highest &sigma;_k (closest to 0.5 prevalence) so its W_k&middot;&sigma;_k product is larger than naive proportional. C is OVER-allocated relative to its population fraction.", correct:true},
+          {key:"d", text:"Equal — Neyman is equal-size allocation by definition."},
         ]}
-        trap={<>(c) and (e) bias the reserve. Stratifying by model score makes the reserve depend on the model — it stops being model-agnostic. Replacing with nearest AL cases is "cheating" — the AL cases are picked by uncertainty, not random.</>}
-        lens={<>(a), (b), (d) are safe. (a) and (b) stratify by VARIABLES THAT DO NOT DEPEND ON THE MODEL. (d) re-randomization is good practice — it makes the reserve track production drift naturally.</>}
-        stretch={<>If you stratify by both MCC and geography, what is the minimum stratum size for AUC to be stable inside that stratum?</>}
+        trap={<>(a) is the proportional-allocation answer, not Neyman. (b) hand-waves. (d) inverts the definitions.</>}
+        lens={<>Neyman minimizes total variance by over-allocating high-variance strata. For Bernoulli labels, that's strata near 50/50 — which in fraud is usually the gray-zone score band, NOT the auto-approve or auto-decline bands.</>}
+        stretch={<>What does Neyman reduce to under EQUAL within-stratum variance?</>}
       />
 
+      {/* axis: D1 */}
       <VIS.TrapProblem
         id="srr-p3"
         difficulty="hard"
-        title="P3 — Reserve fraction: 1% vs 5%"
-        scenario={<>Budget: 5000 labels per week. Two proposals: (a) 100 reserve + 4900 AL, or (b) 250 reserve + 4750 AL. Fraud rate is around 0.8% in the auto-approve stratum and around 25% in the gray zone. Compare.</>}
+        title="P3 — 'Just add AL labels to the holdout — more labels = better eval.' Diagnose."
+        scenario={<><em>Discriminating insight: AL labels are systematically harder than random; merging them into eval upward-shifts the eval distribution's difficulty in a way population AUC won't reproduce.</em><br/><br/>A team has a frozen random 20% holdout AND ongoing AL acquisition. The PM suggests: "merge AL labels into the holdout, you have more labels, better eval." What's wrong?</>}
         options={[
-          {key:"a", text:"5% reserve gives tighter AUC CI (especially inside the auto-approve stratum where fraud is rare). 1% reserve may give plus/minus 0.03 AUC CI which can't detect 1-point model regressions. The 150-label/week cost is small — pick 5%.", correct:true},
-          {key:"b", text:"1% is enough — AUC CI is asymptotic in total sample size."},
-          {key:"c", text:"Reserve fraction is irrelevant; what matters is stratification."},
-          {key:"d", text:"Pick whichever AL strategy is cheaper to implement."},
+          {key:"a", text:"Nothing's wrong — more labels are better."},
+          {key:"b", text:"AL labels are SYSTEMATICALLY harder than random (they sit near the boundary), so merging them shifts the eval distribution to harder-than-population. Eval AUC drifts as a function of acquisition, not model quality, in a non-invertible way without propensity scores. The original random holdout was unbiased; mixing breaks that.", correct:true},
+          {key:"c", text:"The holdout would need re-shuffling to mix properly."},
+          {key:"d", text:"AL labels are class-imbalanced, would need reweighting."},
         ]}
-        trap={<>(b) is technically true but misses that the AUC CI inside the auto-approve stratum (0.8% positives, 100 labels = under 1 fraud case per week) is huge. (c) is half-right but doesn't address the sample-size question. (d) ignores the eval consideration entirely.</>}
-        lens={<>(a) is the senior answer. The reserve size is driven by the smallest stratum's fraud count, not the total. With 100 labels and 0.8% positives, you get under 1 fraud case per week in auto-approve — not enough to track precision-at-recall reliably.</>}
-        stretch={<>What's the minimum number of fraud cases per stratum per week to get a usable AUC?</>}
+        trap={<>(a) is the seductive PM intuition. (c) and (d) name unrelated issues.</>}
+        lens={<>The contamination is structural: the random holdout's value IS its random sampling probability. Mixing in AL labels destroys that property. Keep eval frozen, OR maintain a separate continuously-refreshed random reserve.</>}
+        stretch={<>Could you SALVAGE a contaminated holdout if you have the acquisition propensities?</>}
       />
 
+      {/* axis: E1 */}
       <VIS.TrapProblem
         id="srr-p4"
         difficulty="hard"
-        title="P4 — Reserve case leaks into training. What's the impact?"
-        scenario={<>A bug in your feature store causes reserve cases to be added to the training set. The next model retrains on (AL pool union reserve). You catch the bug after one cycle. What's the eval impact, and what do you do?</strong></>}
+        title="P4 — Stratification key drift across model versions. Symptom?"
+        scenario={<><em>Discriminating insight: if you stratify by current model score band, retraining the model moves the strata definitions; cross-version CIs become non-comparable.</em><br/><br/>Your team stratified the reserve by current model's score decile. After a quarterly model retrain, the team complains "our reserve AUC dropped 5pp but online metrics didn't." Diagnose.</>}
         options={[
-          {key:"a", text:"The reserve is no longer unbiased — those rows leaked into train, so the model has seen them. Eval AUC on the reserve is upward-biased. Re-randomize the reserve (draw a fresh set of cases that the model has NEVER seen) and re-report AUC.", correct:true},
-          {key:"b", text:"The leak is one cycle; the model barely changed; eval is still valid."},
-          {key:"c", text:"Add a regularizer to forget the leaked cases."},
-          {key:"d", text:"Switch to k-fold cross-validation on the reserve to handle the leak."},
+          {key:"a", text:"Model regression — investigate training data."},
+          {key:"b", text:"Population drift — refresh the reserve."},
+          {key:"c", text:"Score-band stratification is keyed on the model's score; the new model has a DIFFERENT score band boundary. Cases that were in stratum 'D7' now sit in stratum 'D8'. Your strata definitions moved, so the reserve composition is no longer comparable across versions. The 5pp drop is a measurement artifact.", correct:true},
+          {key:"d", text:"Reserve size too small for stable AUC."},
         ]}
-        trap={<>(b) understates the problem — even ONE cycle of leakage permanently invalidates the reserve. (c) is not a real fix. (d) muddles two concepts: k-fold doesn't help when the leak is into the model that produces predictions on the reserve.</>}
-        lens={<>(a) is the correct response. Reserves are SACRED — once leaked they are dead. The fix is to re-randomize from a fresh production sample, retrain logging / lineage on the feature pipeline, and add a runtime check that reserve rows are excluded from training queries.</>}
-        stretch={<>How would you AUTOMATE the detection that reserve rows have leaked into training?</>}
+        trap={<>(a) and (b) are plausible but here the symptom is purely the stratification drift.</>}
+        lens={<>Lock stratification to a STABLE feature (policy class, amount band, merchant category) so the strata definitions don't move with the model.</>}
+        stretch={<>If you must stratify by score (your strata ARE the model output by design), how do you make cross-version CIs comparable?</>}
       />
 
+      {/* axis: A1 */}
       <VIS.TrapProblem
         id="srr-p5"
         difficulty="hard"
-        multiSelect
-        title="P5 — Compute the reserve fraction"
-        scenario={<>You want to detect a 1-point AUC regression with 95% confidence. Fraud rate is 1%. The model's true AUC is around 0.92. Roughly how many reserve labels per cycle do you need? Select reasonable estimates from the options.</>}
+        title="P5 — Stratified random reserve vs propensity-weighted debias: which dominates in practice?"
+        scenario={<><em>Discriminating insight: propensity reweighting works in expectation but has unbounded variance when propensities are small — common in AL where boundary cases have propensity near 1 and easy cases near 0; in practice the variance dominates the bias correction and a 1% reserve wins.</em><br/><br/>Two unbiased-eval strategies: (i) stratified random reserve, (ii) propensity-weighted reweighting of AL labels. Pick the practical winner for production fraud and the reason.</>}
         options={[
-          {key:"a", text:"Around 30k reserve labels — gives AUC CI of plus/minus 0.005 at 1% positives.", correct:true},
-          {key:"b", text:"Around 100 reserve labels — AUC CI of plus/minus 0.005."},
-          {key:"c", text:"At 1% positives, the AUC CI scales roughly as 1/sqrt(n_positives), so n_positives around 300 means n_total around 30k.", correct:true},
-          {key:"d", text:"AUC CI is independent of class balance."},
-          {key:"e", text:"Use bootstrap on the labeled cases to estimate CI empirically.", correct:true},
+          {key:"a", text:"Propensity reweighting — theoretically optimal at no label cost."},
+          {key:"b", text:"Stratified random reserve. Propensity reweighting has variance proportional to 1/p_acquisition; AL's acquisition probabilities span (0.001, 0.99) so the variance of the IPW estimator can be 10-100x the reserve's variance even at a 1% reserve size. The reserve gives a tight, simple, regulator-acceptable CI.", correct:true},
+          {key:"c", text:"They are mathematically equivalent."},
+          {key:"d", text:"Propensity reweighting on a held-out random subset of AL."},
         ]}
-        trap={<>(b) is wrong by a factor of 100. (d) confuses the asymptotic CI formula — at low positive rates, the bottleneck is positive count.</>}
-        lens={<>(a), (c), (e) are correct. The Hanley-McNeil approximation: AUC SE around sqrt(AUC(1-AUC) / n_positives). For AUC=0.92, n_pos around 300 gives SE around 0.015, i.e. 1-sigma; 95% CI = plus/minus 0.03. To hit plus/minus 0.005 you need n_pos around 3000, or 300k total at 1%. (a) is a rough middle ground; (c) is the principle; (e) is the operational tool.</>}
-        stretch={<>If you only need to detect a 3-point regression, how does the required reserve size shrink?</>}
+        trap={<>(a) is the textbook answer (Horvitz-Thompson) but ignores variance. (c) is wrong. (d) collapses to "reserve" without the name.</>}
+        lens={<>The variance of IPW is Var(W&middot;Y) = E[W&sup2;&middot;Y&sup2;] minus (E[W&middot;Y])&sup2;. When W = 1/p and p is small, W&sup2; explodes. The 1% reserve trades a small constant cost for bounded variance.</>}
+        stretch={<>For what AL acquisition propensity range does IPW become preferable?</>}
       />
 
+      {/* axis: C5 */}
       <VIS.TrapProblem
         id="srr-p6"
         difficulty="medium"
-        title="P6 — Should the reserve be re-randomized over time?"
-        scenario={<>Your reserve is fixed: the same 50k random cases sampled from 2024-Q1, labeled once, used for eval ever since. It's now 2026-Q2. What goes wrong?</>}
+        title="P6 — At 1% prevalence, what's the minimum reserve size for a usable AUC CI per stratum?"
+        scenario={<><em>Discriminating insight: AUC stability requires &ge;30 positives per stratum (heuristic, Hanley-McNeil); at 1% prevalence that's &ge;3000 labels per stratum, often the binding constraint.</em><br/><br/>You stratify into 5 score bands. Prevalence varies but the rarest band has 1% fraud rate. Pick the minimum reserve labels per stratum for a reasonable AUC CI in that band.</>}
         options={[
-          {key:"a", text:"Stale reserve — fraud distribution drifts; your AUC reflects performance on 2024-Q1 fraud patterns, not current ones. Re-randomize on a rolling basis (e.g., draw 10% new each month, retire 10% of oldest).", correct:true},
-          {key:"b", text:"Stale labels — relabel the same cases periodically."},
-          {key:"c", text:"Reserve size is too small — increase to 200k."},
-          {key:"d", text:"Use the reserve for training too to make it relevant."},
+          {key:"a", text:"100 — central limit theorem kicks in at n=30."},
+          {key:"b", text:"500 — covers most cases."},
+          {key:"c", text:"3000 — at 1% prevalence you need &ge;30 positives per stratum for a reliable AUC CI (Hanley-McNeil heuristic), and 30/0.01 = 3000.", correct:true},
+          {key:"d", text:"10000 — anything less is statistically meaningless."},
         ]}
-        trap={<>(b) doesn't fix distribution shift. (c) is unrelated to staleness. (d) violates the cardinal rule.</>}
-        lens={<>(a) is the correct ops practice. Rolling re-randomization keeps the reserve aligned with the current production distribution without abruptly invalidating historical numbers.</>}
-        stretch={<>How fast should you re-randomize if fraud distribution shifts every 3-4 months?</>}
+        trap={<>(a) confuses sample size for the mean (CLT) with sample size for a rank statistic (AUC). (b) is a feel-good number. (d) is overkill.</>}
+        lens={<>AUC variance scales inversely with positives in imbalanced settings. The 30-positives rule is the operational anchor.</>}
+        stretch={<>Could you AVOID the rarest stratum constraint by combining strata for the AUC computation?</>}
       />
 
+      {/* axis: E2 */}
       <VIS.TrapProblem
         id="srr-p7"
         difficulty="hard"
-        title="P7 — Two reserves for two policies?"
-        scenario={<>Your fintech runs two distinct decisioning policies: payments fraud and account-takeover. They have different feature spaces, different fraud rates (0.5% vs 0.05%), different gray-zone widths. Should you have one shared reserve or two separate ones?</>}
+        title="P7 — Friday 3am page: AUC 'improved 4pp but conversion dropped.' Diagnose."
+        scenario={<><em>Discriminating insight: AUC computed on AL-contaminated eval inflates with each AL round; the "improvement" is contamination drift, not model lift — reserve AUC would NOT have shown the gain.</em><br/><br/>Reported eval AUC jumped 4pp over 6 AL cycles. Decline rate increased commensurately. Conversion (legit transactions approved) is DOWN 1.2%. What broke?</>}
         options={[
-          {key:"a", text:"Two separate reserves, sized independently for each policy. Account-takeover at 0.05% needs MORE total labels per reserve (under 50 positives per 100k) to get stable AUC. A shared reserve under-serves the rarer-fraud policy.", correct:true},
-          {key:"b", text:"One shared reserve — simpler ops; the size will average out."},
-          {key:"c", text:"Two reserves but eval AUC is computed jointly."},
-          {key:"d", text:"No reserve needed for account-takeover since labels are rare."},
+          {key:"a", text:"Model is genuinely tighter — conversion drop is the natural cost of higher precision."},
+          {key:"b", text:"Eval AUC was computed on AL-contaminated holdout. AL pulled boundary cases out of the random pool and into eval, where they appear as 'hard cases the model now classifies right.' The 4pp lift is acquisition contamination, not model improvement. A stratified random reserve would have shown a much smaller (or zero) lift.", correct:true},
+          {key:"c", text:"Conversion drop is unrelated to model — investigate UX."},
+          {key:"d", text:"AUC improved, but threshold drift moved the operating point."},
         ]}
-        trap={<>(b) is the simplicity argument that hides under-coverage for the rarer policy. (c) joint AUC across heterogeneous policies is not meaningful. (d) confuses label cost with eval need.</>}
-        lens={<>(a) — independent reserves per decisioning policy. Each gets its own stratification (policy strata, geographies, MCCs) and is sized for that policy's positive rate. Shared infra (sampling code, audit logs) is fine; shared reserve sample is not.</>}
-        stretch={<>How would you trade off reserve labels between the two policies if total budget is fixed?</>}
+        trap={<>(a) is the comforting story. (c) deflects. (d) is a real phenomenon but doesn't explain a 4pp AUC swing.</>}
+        lens={<>The signature: lift on contaminated eval + flat or worse online metric = eval contamination. Fix is to maintain a separate stratified reserve from day 1, even before deploying AL.</>}
+        stretch={<>What's the smallest reserve that would have caught this contamination earlier?</>}
       />
 
+      {/* axis: D2 */}
       <VIS.TrapProblem
         id="srr-p8"
         difficulty="hard"
-        title="P8 — AL eval also drifts with the model"
-        scenario={<>A skeptical reviewer says: "Even your reserve eval drifts with the model — if model v2 changes which cases land in the gray zone, then the auto-approve stratum's content also changes, so reserve AUC is comparing apples to oranges across model versions." Diagnose and respond.</>}
+        multiSelect
+        title="P8 — 'Reserve is too expensive — we'll skip it.' Trace the cascade."
+        scenario={<><em>Discriminating insight: skipping the reserve cascades into (1) AL-contaminated eval, (2) inflated AUC reports, (3) regression invisible until production drift, (4) lost ability to detect AL ITSELF causing population drift.</em><br/><br/>The PM says "1% reserve = 1% labels lost, not worth it." Which downstream consequences follow? Select all that apply.</>}
         options={[
-          {key:"a", text:"The reviewer is right that the POLICY STRATA depend on the model. Mitigate by: (i) stratifying by stable variables (MCC, geography) not just policy bucket, and (ii) reporting BOTH stratum-level AUC and population-level AUC.", correct:true},
-          {key:"b", text:"The reviewer is wrong — reserves are sampled randomly, so they're invariant."},
-          {key:"c", text:"Use a fixed pre-deployment reserve; never update."},
-          {key:"d", text:"Eval per stratum is meaningless; aggregate only."},
+          {key:"a", text:"Reported eval AUC will drift upward as AL acquisitions accumulate, regardless of model quality.", correct:true},
+          {key:"b", text:"Regulators / risk committees cannot get a defensible population prevalence estimate.", correct:true},
+          {key:"c", text:"AL-induced population drift (your AL is shaping the labeled distribution and possibly the model's online recommendations) becomes invisible.", correct:true},
+          {key:"d", text:"Model inference latency increases."},
+          {key:"e", text:"Training set size is reduced by 1%."},
         ]}
-        trap={<>(b) misses that policy buckets are model-derived. (c) eventually goes stale. (d) loses the per-stratum signal that matters operationally.</>}
-        lens={<>(a) — the reviewer has a real point. Stratify by stable business variables (MCC, geography, customer tenure) that don't depend on the model. Optionally report both stratum-level and population-level AUC so consumers can compare per-bucket performance AND overall.</>}
-        stretch={<>If you wanted ONE number that's robust to policy-strata drift, what would you report?</>}
+        trap={<>(d) is unrelated. (e) is the surface cost the PM cited — but the cost is dwarfed by the cascade.</>}
+        lens={<>The reserve isn't a cost; it's the *only* source of unbiased population-level signal in an AL system. Skipping it costs (a)(b)(c).</>}
+        stretch={<>If forced to skip the reserve due to budget, what's the cheapest partial mitigation?</>}
       />
 
+      {/* axis: F3 */}
       <VIS.TrapProblem
         id="srr-p9"
-        difficulty="medium"
-        multiSelect
-        title="P9 — Cost of the reserve protocol"
-        scenario={<>You're justifying the 5% reserve to a CFO who says "why pay for 250 labels per week we won't use to train?" Which justifications are valid? Select all that apply.</>}
+        difficulty="hard"
+        title="P9 — 'Reserve AUC is FLAT across 6 quarters, but model retrains LIFT each time.' Reverse-engineer."
+        scenario={<><em>Discriminating insight: this is the SIGNAL the reserve is supposed to give — true population AUC is flat, so the AL-contaminated lift each retrain is artifact. Treating the reserve flatness as a problem (rather than a finding) is the misread.</em><br/><br/>Your reserve shows flat AUC over 6 quarters of model retrains. Each retrain logged "+1.5pp AUC" on the AL-contaminated holdout. Pick the interpretation.</>}
         options={[
-          {key:"a", text:"Without unbiased eval, model regressions ship undetected — a single bad cycle can cost more in chargeback losses than years of reserve labeling.", correct:true},
-          {key:"b", text:"Regulators (PCI, state DFI) increasingly require model risk documentation that includes an unbiased eval methodology.", correct:true},
-          {key:"c", text:"Reserve cases double as training data after eval is done."},
-          {key:"d", text:"The reserve enables A/B testing of new models against the current one on a common ground.", correct:true},
-          {key:"e", text:"Reserve labels are cheaper because they're random — no acquisition function compute."},
+          {key:"a", text:"Reserve is too small to detect the real lift — increase it 10x."},
+          {key:"b", text:"The reserve is doing exactly its job: confirming that the +1.5pp/retrain 'lift' was acquisition contamination, not population-level model improvement. The honest report is: no real lift; investigate why model retrains aren't improving population AUC.", correct:true},
+          {key:"c", text:"Reserve and AL holdout target different population subsets; both can be right."},
+          {key:"d", text:"Six quarters is too short."},
         ]}
-        trap={<>(c) is exactly what NOT to do (P4). (e) is technically true but trivial — the cost difference is rounding error.</>}
-        lens={<>(a), (b), (d) are the production justifications. (a) is the bottom-line argument; (b) is increasingly the regulatory one; (d) is the A/B-testing infrastructure argument (you need a model-independent eval to compare models).</>}
-        stretch={<>How would you express the reserve cost as a percentage of expected fraud losses prevented?</>}
+        trap={<>(a) and (d) refuse the finding. (c) is technically possible but unlikely here.</>}
+        lens={<>The reserve's value is exactly in revealing this kind of phantom-lift. The political cost: defending the lower-but-honest number to leadership.</>}
+        stretch={<>What follow-up experiment would CONFIRM the no-real-lift interpretation?</>}
       />
 
+      {/* axis: B4 */}
       <VIS.TrapProblem
         id="srr-p10"
-        difficulty="hard"
-        title="P10 — A/B test of a new model. How does the reserve play in?"
-        scenario={<>You want to A/B test model v3 against v2 in production. v2 currently labels 950 cases per week via AL; the reserve labels 50 per week. v3 will have its own AL strategy. How do you run the A/B?</>}
+        difficulty="medium"
+        title="P10 — When is a stratified random reserve NOT worth the label cost?"
+        scenario={<><em>Discriminating insight: the reserve cost is fixed (1-2%); it's not worth it when there's no AL bias to correct (no AL in the loop) OR no metric that requires unbiased estimation (research-only model).</em><br/><br/>Pick the regime where the reserve is genuinely not worth it.</>}
         options={[
-          {key:"a", text:"Each model runs its own AL stream (independent train sets). Both models score the SAME reserve cases. Compare AUC on the reserve. This is the only fair eval because the reserve is model-independent.", correct:true},
-          {key:"b", text:"Hold out 50% of incoming traffic for v3, eval each side on its own AL-labeled holdout."},
-          {key:"c", text:"Eval both on v2's labeled set (since it's larger)."},
-          {key:"d", text:"Use offline replay only; no A/B needed if both models score the same historical cases."},
+          {key:"a", text:"High-stakes production with regulatory reporting — never skip."},
+          {key:"b", text:"Research-stage model with no production deployment AND no AL in the loop — there's no acquisition bias to correct and no risk committee to satisfy. The reserve's value chain is broken; the 1-2% cost has no payoff.", correct:true},
+          {key:"c", text:"Cold-start with no labels — wait until later."},
+          {key:"d", text:"When using BatchBALD — it self-corrects bias."},
         ]}
-        trap={<>(b) replicates the original sin — AL holdouts are biased. (c) systematically favors v2 (the model that picked the labels). (d) misses production-time effects (analyst routing, policy thresholds).</>}
-        lens={<>(a) is the correct A/B design. The reserve is the EVAL HEAD — it's the only set both models score on equal footing. Each model can run its own AL training; eval comparison is solely on the reserve.</>}
-        stretch={<>What's the minimum reserve size to A/B-detect a 0.5-point AUC delta with 95% power?</>}
+        trap={<>(a) is the easy 'always' answer. (c) is wrong (cold-start is exactly when you need stratification baseline). (d) misreads BatchBALD — it corrects within-batch redundancy, not acquisition bias.</>}
+        lens={<>The reserve is justified when (i) AL is in the loop AND (ii) you need population-level metrics. Drop either condition and the reserve loses purpose.</>}
+        stretch={<>What's the analog of 'reserve' for a fully RANDOM-labeling team that has no AL?</>}
+      />
+
+      {/* axis: F2 */}
+      <VIS.TrapProblem
+        id="srr-p11"
+        difficulty="hard"
+        title="P11 — An attacker who knows the stratification scheme. Attack design?"
+        scenario={<><em>Discriminating insight: the attacker routes attacks into strata where the reserve is sparse — small n in a stratum gives a wide CI, attacks below the CI floor are statistically invisible.</em><br/><br/>An attacker has learned that you stratify reserves by score decile and that the rarest stratum has only 50 reserve labels. Design the attack.</>}
+        options={[
+          {key:"a", text:"Submit attacks that land in the rarest stratum. The reserve's AUC CI for that stratum is too wide to detect a small attack-driven prevalence shift; attacks below the CI floor evade reserve-based monitoring.", correct:true},
+          {key:"b", text:"Submit a large volume of attacks across all strata."},
+          {key:"c", text:"Mimic non-fraud transaction patterns."},
+          {key:"d", text:"Attack only during off-hours."},
+        ]}
+        trap={<>(b)(c)(d) are generic attack moves not exploiting the stratification.</>}
+        lens={<>Sparse strata = wide CI = attack invisibility floor. Defense: over-allocate rare strata (Neyman with conservative variance estimate) and randomize stratum boundaries periodically.</>}
+        stretch={<>Could you DETECT this attack from population-level signals despite the wide CI?</>}
+      />
+
+      {/* axis: E3 */}
+      <VIS.TrapProblem
+        id="srr-p12"
+        difficulty="medium"
+        title="P12 — Reserve SQL: how do you remove the reserve from the AL pool?"
+        scenario={<><em>Discriminating insight: the reserve must be REMOVED from the pool BEFORE AL scores it; if AL scores the full pool and the reserve gets co-acquired, contamination.</em><br/><br/>Pick the correct sequencing of operations.</>}
+        options={[
+          {key:"a", text:"AL scores the full pool, top-K go to analyst, if any are reserve cases swap them out post-hoc."},
+          {key:"b", text:"Sample reserve cases first (stratified random over the pool), mark them as reserve, REMOVE them from the AL pool, run AL acquisition on the remaining pool. Reserve and AL never overlap.", correct:true},
+          {key:"c", text:"Run AL daily, sample reserve weekly from yesterday's AL leftovers."},
+          {key:"d", text:"Reserve and AL pool are the same; the analyst flags cases as reserve at labeling time."},
+        ]}
+        trap={<>(a) lets AL's acquisition probability correlate with reserve selection — contamination. (c) samples from the EASY half (cases AL didn't want), violating reserve uniformity. (d) makes the analyst's flag the source of stratification, which is not random.</>}
+        lens={<>Disjoint reserve = random sample BEFORE AL sees the pool. This is the most common implementation error.</>}
+        stretch={<>What's the simplest unit test for 'reserve disjoint from AL pool'?</>}
+      />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="srr-p13"
+        difficulty="medium"
+        title="P13 — Reserve fraction tuning: 1%, 5%, or 20%?"
+        scenario={<><em>Discriminating insight: the trade-off is reserve CI width vs labels lost from AL; for typical fraud (1% prevalence, K=5 strata) the sweet spot is 1-2%, with the rarest stratum driving the floor.</em><br/><br/>Pick a defensible reserve fraction for a payments team labeling 1000/day with 1% population fraud rate.</>}
+        options={[
+          {key:"a", text:"20% — be safe; AUC is too important to skimp."},
+          {key:"b", text:"5% — middle ground."},
+          {key:"c", text:"1-2%. At 1% prevalence and 5 strata, 1-2% gives ~30 positives per stratum (the AUC CI floor), and the marginal AUC-CI improvement of going to 5% or 20% is small relative to the AL-training-signal cost.", correct:true},
+          {key:"d", text:"0.1% — the rarest stratum doesn't matter."},
+        ]}
+        trap={<>(a) over-pays. (b) is the lazy middle. (d) under-allocates the rarest stratum.</>}
+        lens={<>Reserve sizing is driven by the rarest-positives-per-stratum constraint. Above the floor, more reserve buys diminishing CI tightening.</>}
+        stretch={<>If your prevalence DROPS to 0.1% (e.g. successful AL pulled fraud rate down), do you need to grow the reserve?</>}
+      />
+
+      {/* axis: A3 */}
+      <VIS.TrapProblem
+        id="srr-p14"
+        difficulty="hard"
+        title="P14 — Counterfactual: no reserve. What specifically can't you compute?"
+        scenario={<><em>Discriminating insight: without the reserve you lose the ability to compute population prevalence and population AUC with a CI; AL-debiased estimates exist but have variance issues, and frozen pre-AL holdouts go stale with drift.</em><br/><br/>Quantify the cost of NO reserve in three dimensions.</>}
+        options={[
+          {key:"a", text:"(1) No unbiased population prevalence with closed-form CI. (2) Population AUC CI either wide (propensity-weighted, exploding variance) or stale (frozen pre-AL holdout, drifts). (3) AL-induced population drift becomes invisible — you can't tell if your AL is shaping the labeled distribution against you.", correct:true},
+          {key:"b", text:"(1) GPU memory: 10% more. (2) Train time: 5% longer. (3) Inference latency: 2x worse."},
+          {key:"c", text:"(1) Lower model AUC. (2) Lower recall. (3) Lower precision."},
+          {key:"d", text:"No cost — the labels saved offset the lost CI."},
+        ]}
+        trap={<>(b)(c) wrong-axis. (d) is the PM's argument.</>}
+        lens={<>The counterfactual cost is on the EVAL side, not the model side. The reserve's existence is a measurement claim, not a modeling claim.</>}
+        stretch={<>Which of (1)(2)(3) is most acutely felt during a model regression incident?</>}
+      />
+
+      {/* axis: C3 */}
+      <VIS.TrapProblem
+        id="srr-p15"
+        difficulty="hard"
+        title="P15 — Frozen pre-AL holdout vs continuously-refreshed stratified reserve."
+        scenario={<><em>Discriminating insight: a frozen holdout works for one snapshot but goes stale as the population drifts; the continuously-refreshed reserve captures drift in prevalence and feature distribution.</em><br/><br/>What does a continuously-refreshed stratified reserve give you that a frozen pre-AL random holdout does not?</>}
+        options={[
+          {key:"a", text:"Lower label cost — no need to refresh."},
+          {key:"b", text:"Drift sensitivity: as the population shifts (seasonality, new attack types, growth into new markets), the reserve's distribution tracks the current population, so the AUC/prevalence estimates remain population-representative. A frozen holdout becomes a snapshot of last year's population.", correct:true},
+          {key:"c", text:"Higher statistical power — same n, more signal."},
+          {key:"d", text:"Easier audit trail."},
+        ]}
+        trap={<>(a)(c)(d) miss the drift mechanism.</>}
+        lens={<>Frozen holdouts answer 'how well did the v1 model fit the v1 population?' Reserve answers 'how well does the current model fit the current population?' The second is what production needs.</>}
+        stretch={<>What refresh CADENCE balances drift sensitivity and label budget?</>}
+      />
+
+      {/* axis: D3 */}
+      <VIS.TrapProblem
+        id="srr-p16"
+        difficulty="hard"
+        multiSelect
+        title="P16 — A junior says 'we use stratified random reserves.' What does a senior ask?"
+        scenario={<><em>Discriminating insight: reserve design is six orthogonal decisions: stratification key, allocation rule, fraction, refresh cadence, AL-disjointness, reporting cadence — each has a wrong answer.</em><br/><br/>Select all senior follow-ups.</>}
+        options={[
+          {key:"a", text:"What's the stratification KEY — score band, policy class, or a learned feature? Stable across model versions?", correct:true},
+          {key:"b", text:"Equal allocation, proportional, or Neyman? What's the rarest stratum's positive count?", correct:true},
+          {key:"c", text:"Reserve fraction and refresh cadence?", correct:true},
+          {key:"d", text:"Is the reserve REMOVED from the AL pool BEFORE acquisition?", correct:true},
+          {key:"e", text:"What's the depth of your random forest?"},
+          {key:"f", text:"Are you using SGD or Adam to optimize the reserve?"},
+        ]}
+        trap={<>(e)(f) are noise. The four real questions are independent design dimensions; each has a wrong answer.</>}
+        lens={<>"We use a reserve" without specifying any of (a)-(d) is the under-specified answer that fails senior interviews.</>}
+        stretch={<>Which of (a)-(d) most often gets skipped in practice?</>}
+      />
+
+      {/* axis: B2 */}
+      <VIS.TrapProblem
+        id="srr-p17"
+        difficulty="hard"
+        title="P17 — 'Sample the reserve from the cases AL DIDN'T pick.' Reasonable?"
+        scenario={<><em>Discriminating insight: AL didn't pick those cases because they were LOW uncertainty — those cases are systematically EASIER than the population, so a reserve drawn from 'AL leftovers' is biased toward easy.</em><br/><br/>A teammate proposes: "Save labels — sample the reserve from the pool cases AL did NOT pick (the low-uncertainty leftovers)."</>}
+        options={[
+          {key:"a", text:"Reasonable — those cases are otherwise unlabeled anyway."},
+          {key:"b", text:"Wrong. The 'leftover' pool is the LOW-uncertainty subset by construction — cases AL deemed unimportant. A random sample from this subset is biased toward easy cases, not population-representative. AUC computed on it is upward-biased.", correct:true},
+          {key:"c", text:"Reasonable if you reweight by acquisition propensity."},
+          {key:"d", text:"Reasonable for prevalence but not AUC."},
+        ]}
+        trap={<>(a) is the seductive cost-saver. (c) and (d) try to salvage it but still inherit the bias.</>}
+        lens={<>The reserve's value REQUIRES uniform random sampling within strata over the FULL pool. Sampling from any AL-conditioned subset destroys the unbiasedness.</>}
+        stretch={<>Is there ANY conditioning you could allow on the reserve sample without breaking unbiasedness?</>}
+      />
+
+      {/* axis: F1 */}
+      <VIS.TrapProblem
+        id="srr-p18"
+        difficulty="medium"
+        title="P18 — A stratum with 0.01% population fraction — can you stratify on it?"
+        scenario={<><em>Discriminating insight: rare strata with under 1% population can't get enough labels for a per-stratum AUC CI; either over-allocate (expensive) or merge with a neighboring stratum and accept no per-stratum estimate.</em><br/><br/>You designed 5 strata; one (manual-review-flagged transactions) is 0.01% of the population. At a 2% reserve fraction over a 1M/day pool, how many reserve labels does this stratum get under Neyman?</>}
+        options={[
+          {key:"a", text:"2 labels — proportional to population fraction."},
+          {key:"b", text:"Under Neyman it depends on &sigma;_k. If the stratum has high prevalence variance (e.g., 30% fraud rate within), Neyman over-allocates relative to proportional, but at 0.01% population fraction even Neyman gives few hundred labels — insufficient for a per-stratum AUC CI. Pragmatic fix: merge with a neighboring stratum or accept no per-stratum estimate for this segment.", correct:true},
+          {key:"c", text:"20,000 — Neyman over-allocates rare strata indefinitely."},
+          {key:"d", text:"Same as the largest stratum — equal allocation."},
+        ]}
+        trap={<>(a) is proportional. (c) over-claims. (d) is equal-size, not Neyman.</>}
+        lens={<>Rare strata have a HARD floor. Over-allocation eats the budget; merging loses per-stratum reporting. Both are defensible; the trap is pretending neither cost exists.</>}
+        stretch={<>What's the threshold population fraction below which a stratum is not worth defining?</>}
+      />
+
+      {/* axis: E6 */}
+      <VIS.TrapProblem
+        id="srr-p19"
+        difficulty="hard"
+        title="P19 — Reserve labels leak into TRAIN. Symptom?"
+        scenario={<><em>Discriminating insight: the reserve must be EVAL-ONLY; if reserve labels also enter the train set, model overfits the reserve and reported AUC inflates.</em><br/><br/>A pipeline bug merges all labeled cases (reserve + AL) into training. Reserve AUC starts rising suspiciously. Diagnose.</>}
+        options={[
+          {key:"a", text:"Population drifted favorably — celebrate."},
+          {key:"b", text:"Model learned a new feature, no need to act."},
+          {key:"c", text:"Train-eval leak via the reserve. The model is now training on the eval set; reserve AUC inflates because the model has seen these specific cases. Fix: reserve labels flow ONLY to eval, never to train.", correct:true},
+          {key:"d", text:"Reserve too small — natural variance."},
+        ]}
+        trap={<>(a)(b)(d) miss the leak.</>}
+        lens={<>The reserve's unbiasedness requires train-eval separation. Reserve flowing into train is the dual of AL flowing into eval; both contaminate.</>}
+        stretch={<>How would you DETECT this leak from upstream pipeline metadata?</>}
+      />
+
+      {/* axis: A4 */}
+      <VIS.TrapProblem
+        id="srr-p20"
+        difficulty="hard"
+        title="P20 — Reserve + BatchBALD: what stays the same, what changes?"
+        scenario={<><em>Discriminating insight: BatchBALD's joint-MI diversifies the AL acquisition WITHIN its 95-98% budget; the reserve protocol is unchanged — still sampled BEFORE AL sees the pool, still eval-only.</em><br/><br/>You're shipping BatchBALD as your AL acquisition function on top of an existing stratified reserve protocol. What changes about the reserve?</>}
+        options={[
+          {key:"a", text:"Reserve becomes redundant — BatchBALD self-corrects."},
+          {key:"b", text:"Reserve must be larger because BatchBALD is harder to debias."},
+          {key:"c", text:"Nothing changes about the reserve. It's still sampled BEFORE acquisition from the full pool, still eval-only. BatchBALD operates on the post-reserve pool. The two methods are orthogonal: reserve = unbiased eval; BatchBALD = efficient train labels.", correct:true},
+          {key:"d", text:"Reserve stratification key should switch to BatchBALD-uncertainty bands."},
+        ]}
+        trap={<>(a) confuses within-batch redundancy (BatchBALD's domain) with acquisition bias (reserve's domain). (d) breaks the stable-stratification rule.</>}
+        lens={<>Reserve and BatchBALD compose by design: orthogonal concerns, no coordination needed beyond the disjoint-pool rule.</>}
+        stretch={<>Could you derive BatchBALD's joint-MI lift on the RESERVE, retrospectively?</>}
+      />
+
+      {/* axis: F4 */}
+      <VIS.TrapProblem
+        id="srr-p21"
+        difficulty="medium"
+        title="P21 — Sift / Stripe both highlight one operational pain. Which?"
+        scenario={<><em>Discriminating insight: the named pain is the CULTURAL/LABOR friction — analysts dislike labeling 'easy-looking' reserve cases because they feel like wasted work compared to AL queue.</em><br/><br/>Pick the operational pain both Sift and Stripe call out about reserve protocols.</>}
+        options={[
+          {key:"a", text:"Compute cost of stratified sampling."},
+          {key:"b", text:"Storage cost of the reserve."},
+          {key:"c", text:"Analyst morale: reserve cases look easy (often auto-approve band) and analysts feel they're wasting time labeling cases the model would auto-decide. Cultural fix: transparently report labeling allocation so analysts see the reserve is the EVAL foundation, not busy-work.", correct:true},
+          {key:"d", text:"Statistical bias in Neyman allocation."},
+        ]}
+        trap={<>(a)(b) are negligible. (d) isn't called out.</>}
+        lens={<>The non-technical failure mode (analyst morale) is often what kills the reserve in practice. Surface the value to analysts explicitly.</>}
+        stretch={<>What's the cheapest UX change that addresses the morale problem?</>}
+      />
+
+      {/* axis: D4 */}
+      <VIS.TrapProblem
+        id="srr-p22"
+        difficulty="hard"
+        title="P22 — 'Our model regressed across the rebuild.' Three plausible causes."
+        scenario={<><em>Discriminating insight: a regression in reserve AUC means SOMETHING changed; one possibility is that the eval set itself drifted (reserve composition changed), another is true model regression — the reserve must be invariant for the comparison to be valid.</em><br/><br/>Reserve AUC drops 3pp after a model rebuild. Pick the most informative diagnostic.</>}
+        options={[
+          {key:"a", text:"Retrain — likely overfit."},
+          {key:"b", text:"Check if the RESERVE composition changed (e.g., quarterly refresh added new strata or strata definitions shifted). Reserve AUC is comparable across versions ONLY IF the reserve is comparable. If reserve drifted, the 3pp may reflect population shift, not model regression.", correct:true},
+          {key:"c", text:"Roll back — minimize risk."},
+          {key:"d", text:"Increase reserve size — narrower CI."},
+        ]}
+        trap={<>(a)(c)(d) all skip the reserve-invariance check, the cheapest diagnostic.</>}
+        lens={<>'Did the eval move?' is the first question before 'did the model move?' The reserve's value depends on being comparable across versions.</>}
+        stretch={<>What's a one-query test for 'reserve composition is stable across versions'?</>}
+      />
+
+      {/* axis: F5 */}
+      <VIS.TrapProblem
+        id="srr-p23"
+        difficulty="hard"
+        title="P23 — Stripe Radar publishes a specific reserve protocol. Which detail is most distinctive?"
+        scenario={<><em>Discriminating insight: Stripe's published protocol stratifies by POLICY decision class (auto-approve / gray-zone / auto-decline) NOT score band — because policy classes are stable across model retrains, score bands aren't.</em><br/><br/>What's the Stripe-Radar-specific reserve protocol detail?</>}
+        options={[
+          {key:"a", text:"Stratification by score decile (model output)."},
+          {key:"b", text:"Stratification by POLICY decision class (auto-approve / gray-zone / auto-decline), specifically because policy classes are stable across model retrains while score bands move. The gray-zone is allocated more reserve under Neyman (highest within-stratum variance).", correct:true},
+          {key:"c", text:"50% reserve fraction."},
+          {key:"d", text:"Reserve refreshed daily."},
+        ]}
+        trap={<>(a) is the naive default Stripe explicitly argues against. (c)(d) are wrong magnitudes.</>}
+        lens={<>The choice of stratification key is THE design lever. Stable-across-versions beats high-signal but unstable.</>}
+        stretch={<>How would you handle the case where policy class itself changes (e.g. new gray-zone band added)?</>}
+      />
+
+      {/* axis: C2 - alternative math angle */}
+      <VIS.TrapProblem
+        id="srr-p24"
+        difficulty="hard"
+        title="P24 — Horvitz-Thompson on a stratified reserve. What's the estimator?"
+        scenario={<><em>Discriminating insight: under known-probability sampling within strata, the Horvitz-Thompson prevalence estimator is the stratified mean — equivalent to the canonical stratified estimator with closed-form variance.</em><br/><br/>You have stratified reserve labels with known sampling probability per stratum. The unbiased prevalence estimator is:</>}
+        options={[
+          {key:"a", text:"Mean of all reserve labels."},
+          {key:"b", text:"Sum of labels divided by total population."},
+          {key:"c", text:"p_hat = sum over k of W_k times p_hat_k, where W_k is the stratum population fraction and p_hat_k is the empirical prevalence in stratum k's reserve. Closed-form variance: Var(p_hat) = sum over k of W_k&sup2; times p_hat_k(1&minus;p_hat_k)/n_k.", correct:true},
+          {key:"d", text:"Maximum likelihood on a logistic model."},
+        ]}
+        trap={<>(a) ignores stratum weights (only works under proportional allocation). (b) is wrong by units. (d) is over-engineered.</>}
+        lens={<>Stratified-mean estimator is the canonical formula. The variance term gives the regulator-acceptable CI.</>}
+        stretch={<>What does this estimator reduce to under EQUAL allocation across strata?</>}
+      />
+
+      {/* axis: B1 */}
+      <VIS.TrapProblem
+        id="srr-p25"
+        difficulty="hard"
+        title="P25 — You can spend 1000 labels/day. Pick the protocol."
+        scenario={<><em>Discriminating insight: the canonical production answer is 980-990 AL / 10-20 stratified reserve; pure AL contaminates eval, pure reserve wastes train signal, and propensity-weighted variance is too noisy.</em><br/><br/>Design the labeling protocol for a fraud team needing both a model AND regulator-acceptable AUC.</>}
+        options={[
+          {key:"a", text:"1000 AL labels/day; eval on a 20% AL-labeled holdout."},
+          {key:"b", text:"1000 random labels/day; train and eval on the same labels."},
+          {key:"c", text:"980-990 AL labels/day (e.g., BatchBALD) + 10-20 stratified random reserve labels/day, disjoint pools. Train on AL; eval on reserve. Standard Stripe/Sift production answer.", correct:true},
+          {key:"d", text:"500 AL + 500 propensity-weighted random for both train and eval."},
+        ]}
+        trap={<>(a) contaminates. (b) wastes train signal. (d) doubles up label cost without adding value.</>}
+        lens={<>The reserve sits at 1-2% as a load-bearing operational constant.</>}
+        stretch={<>What's the smallest reserve size that gives a tight enough CI to satisfy a typical risk committee at 1% prevalence?</>}
       />
     </VIS.Section>
 
@@ -1694,31 +1970,38 @@ flowchart TB
       <ul>
         <li>
           <a href="https://stripe.com/blog/how-we-built-it-stripe-radar" target="_blank" rel="noopener">
-            <strong>Stripe Engineering — How we built Stripe Radar</strong>
+            <strong>Stripe Engineering — How we built Radar</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Stripe's blog on Radar describes their random-holdout protocol and why "the policy itself selects labels" is the core eval problem. Closest practitioner write-up to this concept.
+          <br/>Production fraud-labeling protocol: AL for training + stratified random reserve for eval. The reference for the disjoint-pool design.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2206.08540" target="_blank" rel="noopener">
-            <strong>Sambasivan et al. — Selection bias in ML evaluation</strong>
+          <a href="https://sift.com/blog/" target="_blank" rel="noopener">
+            <strong>Sift Engineering — Sampling for Fraud Model Evaluation</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper)</span>
-          <br/>Surveys real-world selection bias in production ML evals. Section on "policy-induced bias" is exactly the AL eval failure mode.
+          <span style={{color:"#64748b", fontSize:14}}>(blog series, 2025)</span>
+          <br/>Explicit on the Neyman allocation math and the rarest-stratum constraint. Worked examples for payments.
         </li>
         <li>
-          <a href="https://www.fast.ai/posts/2020-05-12-imagenette-impact.html" target="_blank" rel="noopener">
-            <strong>Rachel Thomas — On the importance of clean validation sets</strong>
+          <a href="https://en.wikipedia.org/wiki/Horvitz%E2%80%93Thompson_estimator" target="_blank" rel="noopener">
+            <strong>Horvitz-Thompson estimator (Wikipedia)</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Why eval-set hygiene is the most under-rated ML skill. Not fraud-specific but the principles transfer directly.
+          <span style={{color:"#64748b", fontSize:14}}>(reference)</span>
+          <br/>The unbiased estimator under known-probability sampling. Foundation for both the reserve and the propensity-weighted alternative.
         </li>
         <li>
-          <a href="https://www.jstor.org/stable/2531595" target="_blank" rel="noopener">
-            <strong>Hanley & McNeil — The meaning and use of the area under the ROC curve</strong>
+          <a href="https://hastie.su.domains/ElemStatLearn/" target="_blank" rel="noopener">
+            <strong>Hastie, Tibshirani, Friedman — Elements of Statistical Learning</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, 1982)</span>
-          <br/>The canonical reference for AUC standard errors and how reserve size translates into CI. Old but essential.
+          <span style={{color:"#64748b", fontSize:14}}>(textbook, Ch. 7)</span>
+          <br/>Cross-validation, holdout protocols, bias-variance of eval estimates. Foundation for understanding what contaminates an eval set.
+        </li>
+        <li>
+          <a href="https://www.youtube.com/watch?v=fSytzGwwBVw" target="_blank" rel="noopener">
+            <strong>Cassie Kozyrkov — How to make better AI/ML decisions</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(video)</span>
+          <br/>Why the eval set is the project, not the model. Sets up the 'reserve is the foundation' framing.
         </li>
       </ul>
     </VIS.Section>
