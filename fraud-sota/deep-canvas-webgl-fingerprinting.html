@@ -1414,287 +1414,519 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Deep canvas / WebGL fingerprinting — learned embedding over 200+ browser-API signals
-// with metric learning for fingerprint stability across browser updates.
+// Deep canvas / WebGL fingerprinting — learned metric embedding over GPU-rendering artifacts.
+// Concept-specific anchor: every trap hinges on per-pixel GPU rendering determinism
+// (sub-pixel anti-aliasing, GLSL shader compile path, SwiftShader fallback) and metric
+// learning over those signals — NOT generic browser fingerprinting.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Device fingerprinting + ML"
       title="Deep canvas / WebGL fingerprinting"
-      subtitle="Learned embedding over 200+ browser-API signals; metric learning gives a fingerprint that survives a browser update."
+      subtitle="Metric embedding over GPU-rendering artifacts — survives a Chrome version bump, breaks under an anti-detect browser, dies on iOS."
       byline={[
-        {label: "Paper", value: "Fingerprinting at Scale: ML on Browser Signals, USENIX Security 2024"},
-        {label: "Year", value: "2024"},
-        {label: "L3", value: "Browser fingerprint"},
+        {label: "Paper", value: "Fingerprinting at Scale: ML on Browser Signals (USENIX Security 2024)"},
+        {label: "L3", value: "Device fingerprinting + ML"},
+        {label: "Anchor", value: "GPU-render determinism, not generic FP"},
       ]}/>
 
     <VIS.TLDR>
-      Classic browser fingerprints concatenate signals (user-agent, canvas hash, WebGL renderer, audio context) into one big string and hash it.{" "}
-      <VIS.Term def="Comparing two items by a single equality check on a hashed string. Any single character difference makes the hash totally different, so even tiny changes break the match.">Hash equality</VIS.Term>{" "}
-      breaks the moment any one signal changes — a Chrome auto-update can drop match rate to almost zero.{" "}
-      <VIS.Term def="Training a neural network so similar items (same device under different conditions) end up close in embedding space and dissimilar items end up far apart. Standard losses: triplet, contrastive, ArcFace.">Metric learning</VIS.Term>{" "}
-      over the same signals produces an embedding where the same device stays near itself across updates, so cosine similarity replaces equality.
+      Classical browser fingerprints SHA-1 ~20 concatenated signals; one bit flip (Chrome auto-updates the canvas anti-aliasing path) drops match rate to near zero.
+      The deep variant trains a{" "}
+      <VIS.Term def="A learned embedding optimized so two observations of the SAME device land close in cosine space and two different devices land far apart. Classic recipes: triplet loss, InfoNCE, ArcFace.">metric embedding</VIS.Term>{" "}
+      with contrastive / triplet loss over <strong>per-pixel GPU rendering artifacts</strong> — sub-pixel anti-aliasing offsets, GLSL shader compile output, audio-context FFT residue. Cosine similarity replaces hash equality, so a single-signal drift becomes a small embedding move instead of a total mismatch.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — embedding 200 GPU-render signals">
       <ol>
-        <li><strong>Input:</strong> 200+ browser-API signals — canvas pixel hashes, WebGL renderer + vendor strings, audio-context impulse response, font enumeration, timezone, screen, plugin list, navigator object, hardware-concurrency.</li>
-        <li><strong>Encoder:</strong> a small MLP or transformer that maps the signal vector into a 128-dim embedding.</li>
-        <li><strong>Training:</strong> contrastive or triplet loss. Positive pairs are two observations of the SAME device (often hours or days apart); negative pairs are different devices.</li>
-        <li><strong>Matching at inference:</strong> compute the embedding for the current visit, look up nearest neighbor in the device store via ANN. If cosine similarity is above threshold, it is the same device.</li>
+        <li><strong>Signal probes (client JS):</strong> draw a fixed string + emoji on a 2D canvas; render a textured cube + gradient triangle in a WebGL context; read back pixel data. Enumerate <code>UNMASKED_VENDOR_WEBGL</code>, <code>UNMASKED_RENDERER_WEBGL</code>, audio-context offline FFT, font width measurements, screen/timezone/hardware concurrency. ~200 raw features.</li>
+        <li><strong>Encoder:</strong> small MLP (or transformer over the categorical buckets) -&gt; 128-dim L2-normalized embedding.</li>
+        <li><strong>Loss:</strong> triplet — anchor = device today, positive = same device at a 24h+ gap, negative = different device with hard-negative mining (same OS + browser, different GPU).</li>
+        <li><strong>Inference:</strong> client posts probes; server runs encoder; HNSW / ScaNN nearest-neighbor against the device-embedding store. Cosine &gt; threshold = same device.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  S["200+ browser signals"]
-  S --> E["Encoder MLP"]
-  E --> V["128-dim embedding"]
-  V --> A["ANN index"]
-  A --> M["Match score"]
+  P["200 browser-API probes (canvas, WebGL, audio, fonts)"]
+  P --> E["Encoder MLP"]
+  E --> V["128-dim L2-normalized embedding"]
+  V --> A["HNSW / ScaNN nearest-neighbor"]
+  A --> M["Cosine vs threshold -> same device decision"]
+  T["Triplet loss with hard-negative mining"] --> E
   style E fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style M fill:#fef3c7,stroke:#d97706,stroke-width:2px
-      `} />
-      <p>
-        Blue box is the learned encoder. Yellow box is the operational decision. Inference is sub-millisecond once the ANN index is warm.
-      </p>
+  style T fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style M fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+      `}/>
+      <p>Blue = the learned encoder. Yellow = the training-time loss that buys stability across signal drift. Red = the runtime decision.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-why" title="Why metric learning beats hash equality">
+      <p>
+        Hash equality is brittle: a single bit flip in any one of ~200 signals propagates through SHA-1 and the entire fingerprint changes. A Chrome 119 -&gt; 120 update can ship a new SwiftShader fallback that flips the canvas readback for 8% of devices overnight; hash match collapses for those users.
+      </p>
+      <p>
+        Metric learning maps each set of signals to an embedding; the same device under the new Chrome lands at cosine ~0.95 of its previous embedding — comfortably above a threshold of 0.90. The training distribution explicitly includes return-visit pairs spanning browser updates, so the loss <em>teaches</em> the encoder which signal channels carry stable hardware identity and which (e.g. UA string) drift cheaply.
+      </p>
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Hash-based fingerprint</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Learned embedding</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Hash FP</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Deep metric FP</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Match rule</td>
-            <td style={{padding:"8px 10px"}}>Hash equality</td>
-            <td style={{padding:"8px 10px"}}>Cosine threshold</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Survives browser update</td>
-            <td style={{padding:"8px 10px"}}>Poor — single bit flip resets match</td>
-            <td style={{padding:"8px 10px"}}>Good — graceful similarity decay</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Re-identification at 30 days</td>
-            <td style={{padding:"8px 10px"}}>30 to 45 percent</td>
-            <td style={{padding:"8px 10px"}}>70 to 85 percent</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Cold-start on new browser</td>
-            <td style={{padding:"8px 10px"}}>Brand new entity</td>
-            <td style={{padding:"8px 10px"}}>Often clusters near old entity</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Privacy regulator status</td>
-            <td style={{padding:"8px 10px"}}>Already restricted (CNIL, ICO)</td>
-            <td style={{padding:"8px 10px"}}>More scrutiny — same data, harder to defeat</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Match rule</td><td style={{padding:"6px 10px"}}>SHA-1 equality</td><td style={{padding:"6px 10px"}}>Cosine threshold</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>1-signal drift</td><td style={{padding:"6px 10px"}}>No match</td><td style={{padding:"6px 10px"}}>Small embedding move</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Open-set new devices</td><td style={{padding:"6px 10px"}}>Trivial (new hash)</td><td style={{padding:"6px 10px"}}>Trivial (new vector)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Anti-detect resistance</td><td style={{padding:"6px 10px"}}>Easy spoof one signal</td><td style={{padding:"6px 10px"}}>Need to spoof full GPU-render path</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>iOS entropy</td><td style={{padding:"6px 10px"}}>Low</td><td style={{padding:"6px 10px"}}>Still low — Apple controls stack</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
+    <VIS.Section id="sec-gpu" title="What's actually unique about GPU-render artifacts">
+      <p>
+        The reason this works (and the reason it sits in a different visual from mobile SDK behavioral FP) is the <strong>per-pixel determinism of the GPU pipeline</strong>:
+      </p>
       <ul>
-        <li><strong>Bot and account-farm detection at top-of-funnel</strong> — sign-up, login, password-reset — where you cannot rely on cookies (cleared) or device-ID (mobile only).</li>
-        <li><strong>Cross-session linking</strong> when users wipe cookies — the embedding survives where hashes do not.</li>
-        <li><strong>Markets without strict consent regimes</strong> — outside the EU and UK, fingerprinting is generally legal with disclosure.</li>
-        <li><strong>You have a labeled positive-pair corpus</strong> — repeated visits from the same authenticated user — so contrastive training is supervisable.</li>
+        <li><strong>Sub-pixel anti-aliasing</strong>: each rasterizer + display-driver combination rounds edge coverage slightly differently. Two devices with identical WebGL renderer strings can still differ at the byte level after rendering the same shader.</li>
+        <li><strong>GLSL compile path</strong>: vendor compilers (NVIDIA, Intel, ARM Mali, Apple GPU) pick different SPIR-V or DXIL optimization passes for the same shader source. The compiled microcode determines small numerical differences in the framebuffer.</li>
+        <li><strong>SwiftShader fallback</strong>: Chrome falls back to its software rasterizer when the GPU isn't trusted. SwiftShader has its own per-Chrome-version output. Detecting which path was used is itself a signal.</li>
+        <li><strong>Audio context FFT</strong>: the offline audio rendering uses CPU + DSP routing; silicon-specific FFT residue completes the GPU-side picture with a CPU-side signal.</li>
       </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="EU regulators are actively hostile">
-        CNIL fined major adtech vendors for cookieless fingerprinting in 2023 and 2024. Learned embeddings do not bypass consent law — the underlying data collection still requires a lawful basis. Plan for explicit consent flows in the EU and UK.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Brave and Tor randomize signals">
-        Brave actively perturbs canvas and WebGL output per session. Tor browser standardizes signals to make all users look identical. Both defeat the embedding deliberately; you must detect and segment these browsers separately.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Apple is aggressively closing fingerprint surfaces">
-        Safari now blocks third-party canvas reads, randomizes audio-context, and rate-limits WebGL queries. iOS Safari fingerprints are far less unique than Chrome desktop. Plan for asymmetric coverage across browsers.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Training data leakage is the silent failure">
-        If your positive-pair corpus is built from logged-in users on a single product surface, the encoder learns to identify that product surface, not the device. Pretrain on diverse public traffic before fine-tuning.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Threshold drift over time">
-        As browsers update, the average cosine between same-device pairs drifts down. A fixed threshold drifts toward more false-rejects. Re-calibrate weekly against a labeled holdout.
+      <VIS.Callout kind="info" title="Concept-redaction litmus">
+        If a problem about this visual could be answered without mentioning shader compile paths / sub-pixel AA / SwiftShader / per-pixel readback, it is a GENERIC FP problem and belongs nowhere.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-limits" title="Limits and gotchas">
+      <VIS.Callout kind="warn" title="iOS homogeneity floor">
+        Every iPhone 14 Pro on iOS 17 Safari renders the same canvas / WebGL output bit-identically — Apple controls silicon, driver, and Safari. Embedding entropy on iOS is roughly <em>per-model</em>, not per-device. Fall back to behavioral signals for iOS.
+      </VIS.Callout>
+      <VIS.Callout kind="warn" title="Browser switch defeats the embedding">
+        The encoder learns hardware identity through the GLSL shader compile path. Chrome -&gt; Firefox uses a different compiler chain (ANGLE vs Mesa-vk on Linux) — same hardware, different output. Cosine collapses below threshold even with the deep model.
+      </VIS.Callout>
+      <VIS.Callout kind="gotcha" title="Anti-detect browsers spoof the readback">
+        Multilogin / Kameleo / GoLogin intercept the canvas <code>getImageData</code> and WebGL <code>readPixels</code> calls and inject controlled noise. Defense: probe RARE fragment shaders (e.g. Mandelbrot iterations, perlin noise) the spoofer never pre-recorded.
+      </VIS.Callout>
+      <VIS.Callout kind="warn" title="CNIL / GDPR consent boundary">
+        EU regulators classify FP as personal-data processing. Legitimate-interest carve-out works for fraud, but only if the same embedding is not also used for ad frequency capping. Keep two stores.
+      </VIS.Callout>
+    </VIS.Section>
+
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Trap problems on learned fingerprints, metric learning, browser quirks, and privacy law.
+        Every problem hinges on a canvas/WebGL-FP-specific mechanism: per-pixel GPU rendering determinism, the GLSL shader compile path, metric-learning vs hash equality, anti-detect spoofing of the readback, or the iOS / browser-switch failure modes. Strip the name -&gt; option no longer wins.
       </p>
 
+      {/* axis A1 — vs hash FP */}
       <VIS.TrapProblem
-        id="dfp-p1"
+        id="cwf-p1"
         difficulty="hard"
-        title="P1 — Why does a hash fingerprint drop to almost zero match after a Chrome auto-update?"
-        scenario={<>Your hash-based fingerprint had 60 percent re-identification at 7 days. Two weeks after a Chrome auto-update, it is at 5 percent. What happened?</>}
+        title="P1 — Chrome auto-updates 119 -&gt; 120; 8% of canvas hashes change overnight. Why does the deep embedding survive?"
+        scenario={<><em>Discriminating insight: the metric-learning loss was trained on cross-version return-visit pairs, so it learned which channels are stable. Hash equality treats all bits identically and cannot.</em><br/><br/>You operate both a hash FP and a deep metric FP. After Chrome 120 ships a new SwiftShader fallback path, hash match rate drops 8 points; deep FP match rate is unchanged within noise. Pick the dominant reason.</>}
         options={[
-          {key:"a", text:"A hash collapses 200+ signals into one string and any single signal change (Chrome version bumped, GPU driver bumped, font set changed) produces a completely different hash. Equality is brittle. The learned embedding maps similar inputs to similar vectors, so a one-signal change moves the embedding slightly rather than entirely.", correct:true},
-          {key:"b", text:"Chrome auto-updates randomize browser signals as a privacy feature."},
-          {key:"c", text:"Hash functions become weaker over time."},
-          {key:"d", text:"Users uninstalled Chrome and reinstalled."},
+          {key:"a", text:"Hash FP uses SHA-256 and deep FP uses SHA-1, so collisions absorb the drift."},
+          {key:"b", text:"The triplet loss was trained on return-visit pairs that span browser-version boundaries; the encoder learned that the canvas readback bits drift while WebGL renderer string + audio-context FFT + font widths stay stable. The 128-dim embedding moves by &lt;0.05 cosine when the canvas signal flips, instead of producing a totally different hash.", correct:true},
+          {key:"c", text:"Deep FP also stores the user's IP, which doesn't change with Chrome version."},
+          {key:"d", text:"SwiftShader output is deterministic across Chrome versions, so deep FP doesn't see drift."},
         ]}
-        trap={<>(b) is partially true for Brave and Tor but not vanilla Chrome. (c) confuses cryptographic strength with semantic stability. (d) cannot explain a population-wide drop.</>}
-        lens={<>(a) is the mechanism. Hashing throws away the geometry of the signal vector; metric learning preserves it. This is the same reason embedding-based retrieval beats exact-match for any noisy signal.</>}
-        stretch={<>What loss function would you pick: triplet, contrastive, or ArcFace, given a million labeled positive pairs?</>}
+        trap={<>(a) misreads what hashing does. (c) introduces an unrelated signal. (d) is factually wrong — SwiftShader output changes between Chrome releases, that's WHY hash FP broke.</>}
+        lens={<>The metric-learning win is not magic; it is that the loss was explicitly trained on drifting return-visit pairs. A deep FP trained on single-session positives would collapse with the hash FP.</>}
+        stretch={<>What concretely changes in the training-pair sampler to teach this stability?</>}
       />
 
+      {/* axis B3 — concept-specific value */}
       <VIS.TrapProblem
-        id="dfp-p2"
+        id="cwf-p2"
         difficulty="hard"
-        title="P2 — Positive-pair construction: where does the training signal come from?"
-        scenario={<>You are building the contrastive training set. Where do labeled positive pairs (same-device observations under different conditions) actually come from?</>}
+        title="P2 — Two devices return the SAME WebGL renderer string. How can the deep FP still discriminate them?"
+        scenario={<><em>Discriminating insight: the renderer string is a coarse vendor tag; the per-pixel framebuffer readback distinguishes specific GPU + driver-version combinations beneath the same string.</em><br/><br/>Two laptops both report <code>UNMASKED_RENDERER_WEBGL = ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0)</code>. The deep FP separates them at cosine ~0.4. Where does the discriminating signal live?</>}
         options={[
-          {key:"a", text:"Authenticated repeat visits from logged-in users — the user-ID gives ground-truth identity across sessions. Augment with synthetic noise (perturb one signal at a time) to expand coverage. Hold out a fraction of users entirely for evaluation, never just a fraction of sessions per user.", correct:true},
-          {key:"b", text:"Random pairs from the same IP address."},
-          {key:"c", text:"Pairs from the same user-agent string."},
-          {key:"d", text:"Pairs sampled at the same wall-clock time."},
+          {key:"a", text:"It must be the user-agent string — driver version is encoded there."},
+          {key:"b", text:"The two laptops use different DirectX driver versions, which produce sub-pixel-different anti-aliasing on the rendered cube + slightly different GLSL shader compile output. The framebuffer readback after rendering a fixed scene carries enough bits to separate them; the renderer string just bucket-labels the vendor.", correct:true},
+          {key:"c", text:"The encoder uses the IP geolocation as a tie-breaker."},
+          {key:"d", text:"The two laptops have different screen resolutions, which dominates the embedding."},
         ]}
-        trap={<>(b) is too noisy — many people share an IP (NAT, public Wi-Fi). (c) is a circular signal — the encoder will just memorize user-agent. (d) is meaningless.</>}
-        lens={<>(a) is the right answer. Hold-out-by-user is critical: hold-out-by-session leaks the encoder's job.</>}
-        stretch={<>How would you augment with hard negatives (different devices that look very similar)?</>}
+        trap={<>(a)(c)(d) shift the signal source away from the GPU pipeline.</>}
+        lens={<>The renderer string is a categorical bucket. The discriminating bits live in the per-pixel readback after fixed-scene rendering, which is what 'canvas/WebGL fingerprinting' actually means.</>}
+        stretch={<>Why does the driver-version subtitle change framebuffer output even when the shader source is byte-identical?</>}
       />
 
+      {/* axis F1 — cross-visual caution (NAT framing) */}
       <VIS.TrapProblem
-        id="dfp-p3"
+        id="cwf-p3"
         difficulty="hard"
-        multiSelect
-        title="P3 — Browsers that deliberately break fingerprinting"
-        scenario={<>Which of these browsers actively perturb or standardize fingerprint signals to defeat tracking? Select all that apply.</>}
+        title="P3 — 200 laptops on a corporate VPN share UA + screen + timezone. Why does this NOT defeat the deep FP?"
+        scenario={<><em>Discriminating insight: even with identical UA / screen / timezone, the GPU-render signal (canvas pixel hash + WebGL framebuffer + audio FFT) is per-device. The 'NAT collapse' failure mode of generic FP does not apply here.</em><br/><br/>A corporate VPN routes 200 laptops through one egress IP with identical OS image (same UA, same screen). Pick the dominant reason the deep canvas/WebGL FP still separates them.</>}
         options={[
-          {key:"a", text:"Brave — perturbs canvas and audio output per session.", correct:true},
-          {key:"b", text:"Tor browser — standardizes signals so all users look identical.", correct:true},
-          {key:"c", text:"Safari — randomizes audio-context and blocks third-party canvas reads.", correct:true},
-          {key:"d", text:"Firefox with Resist Fingerprinting enabled.", correct:true},
-          {key:"e", text:"Vanilla Chrome desktop."},
-          {key:"f", text:"DuckDuckGo browser on iOS — applies fingerprint protection.", correct:true},
+          {key:"a", text:"The encoder weights the IP signal heavily, so the NAT collapses these into one cluster."},
+          {key:"b", text:"They all match — fall back to behavioral biometrics."},
+          {key:"c", text:"Despite identical OS / browser / network, the 200 laptops have different GPU silicon revisions, different driver patch versions, and even small SwiftShader fallback differences when the GPU is briefly busy. The canvas/WebGL framebuffer readback + audio-context FFT separate them.", correct:true},
+          {key:"d", text:"The encoder uses MAC addresses leaked via WebRTC."},
         ]}
-        trap={<>(e) does not deliberately perturb fingerprints — but it does auto-update components, which causes natural drift.</>}
-        lens={<>The right answer is the set of browsers that actively perturb. Production fingerprint systems must detect these browsers (their fingerprints themselves look perturbed) and route to a separate decision policy, often "skip fingerprint, rely on other signals."</>}
-        stretch={<>How would you detect "this browser is deliberately perturbing" from the signal vector alone?</>}
+        trap={<>(a) misreads what the encoder does. (b) is the right action only IF this technique fails — which it does not on this signal. (d) WebRTC MAC leakage was patched years ago.</>}
+        lens={<>This is the cross-visual anchor: NAT defeats generic IP / UA FP. It does NOT defeat canvas/WebGL FP, because the signal source is GPU render output, not network attributes.</>}
+        stretch={<>What about 200 IDENTICAL hardware SKUs from the same factory batch?</>}
       />
 
+      {/* axis D4 — anti-detect browsers */}
       <VIS.TrapProblem
-        id="dfp-p4"
+        id="cwf-p4"
         difficulty="hard"
-        title="P4 — CNIL fines learned-embedding vendor. Why?"
-        scenario={<>Your French team launches a learned-embedding fingerprint product. CNIL opens an investigation. Your CTO argues "no PII, no cookies, just math." Why is CNIL still upset?</>}
+        title="P4 — Anti-detect browser (Multilogin) spoofs canvas readback with controlled noise. How do you harden the probe?"
+        scenario={<><em>Discriminating insight: the spoofer pre-records noise for a few well-known canvas/WebGL probes. Adding probes the spoofer has never seen forces them to either consistently fake unseen shaders (hard) or expose themselves by inconsistency.</em><br/><br/>You run Multilogin against your deep FP. Their canvas spoof intercepts <code>getImageData</code> and adds controlled noise. Pick the most effective hardening.</>}
         options={[
-          {key:"a", text:"Under EU ePrivacy and GDPR, any storage of or access to information on a user's terminal equipment requires consent — and reading 200+ browser-API signals counts as accessing terminal-equipment information regardless of whether you store cookies. The learning-vs-hashing distinction is irrelevant to the legal test; the data collection itself is what triggers consent.", correct:true},
-          {key:"b", text:"Embeddings are PII because they are unique."},
-          {key:"c", text:"Math models are illegal in France."},
-          {key:"d", text:"CNIL only cares about cookies."},
+          {key:"a", text:"Switch from triplet to ArcFace loss."},
+          {key:"b", text:"Increase the embedding from 128-dim to 1024-dim."},
+          {key:"c", text:"Add rare fragment shaders to the probe set — Mandelbrot iteration, perlin noise, ray-marched SDFs. The spoofer's pre-recorded noise table doesn't cover these, so they either fake them inconsistently across sessions or return suspiciously round-numbered pixels. Either signature is detectable.", correct:true},
+          {key:"d", text:"Force users through a CAPTCHA before fingerprinting."},
         ]}
-        trap={<>(b) is closer to the truth than (c) and (d) but the actual legal test is about data collection, not embedding uniqueness. (d) is the common engineer misunderstanding — ePrivacy is broader than cookies.</>}
-        lens={<>(a) is the right answer. Engineering teams routinely think "no cookies, no problem." The legal surface is access to terminal-equipment information, which captures any signal read from the device. Plan for explicit consent regardless of storage mechanism.</>}
-        stretch={<>What is the minimum-viable consent UX that does not destroy bot-detection coverage?</>}
+        trap={<>(a)(b) tune the model but the model isn't the bottleneck — the SIGNAL is. (d) shifts to behavioral.</>}
+        lens={<>The defense against anti-detect browsers is signal-side, not model-side. You must probe what the spoofer didn't pre-record.</>}
+        stretch={<>Why does increasing embedding dimension NOT help here?</>}
       />
 
+      {/* axis F3 — iOS homogeneity */}
       <VIS.TrapProblem
-        id="dfp-p5"
+        id="cwf-p5"
         difficulty="medium"
-        title="P5 — Threshold drift: why re-calibrate weekly?"
-        scenario={<>You launch at cosine threshold 0.82 with 95 percent precision. Two months later precision is at 89 percent and you have not changed the model. Why?</>}
+        title="P5 — Match rate on iOS 17 Safari is 99.9%; on Android Chrome it is 91%. What does the iOS number actually mean?"
+        scenario={<><em>Discriminating insight: 99.9% match on iOS is a homogeneity floor — every iPhone 14 Pro renders the same canvas output bit-identically, so 'match' is per-model, not per-device.</em><br/><br/>Your dashboard shows iOS match rate at 99.9% — better than Android. Senior PM asks if you should default to iOS. Diagnose.</>}
         options={[
-          {key:"a", text:"Browser updates over time perturb signals across the population. The distribution of cosine similarities for same-device pairs drifts downward as time passes between observations. A fixed threshold drifts into a regime with more false-positives unless you periodically re-calibrate against a fresh labeled holdout.", correct:true},
-          {key:"b", text:"The encoder forgot its training."},
-          {key:"c", text:"Cosine similarity is unstable."},
-          {key:"d", text:"Adversaries are attacking the threshold."},
+          {key:"a", text:"Yes — iOS is more stable so the deep FP works better there."},
+          {key:"b", text:"No — iOS match rate is high because every iPhone 14 Pro on iOS 17 Safari produces nearly identical canvas / WebGL output (Apple controls silicon, driver, browser). 'Match' there means 'same model class' not 'same device'. Effective entropy is per-model. Use behavioral signals on iOS.", correct:true},
+          {key:"c", text:"Yes — Apple's privacy stack helps the model generalize."},
+          {key:"d", text:"No — iOS Safari doesn't support WebGL."},
         ]}
-        trap={<>(b) is anthropomorphic nonsense. (c) misnames the issue — cosine is stable, the input distribution drifts. (d) is possible but does not explain a gradual two-month drift.</>}
-        lens={<>(a) is the operational truth. Same-device cosine distributions shift with software update cycles. Either re-calibrate threshold weekly or retrain the encoder monthly.</>}
-        stretch={<>Would you prefer threshold drift compensation or full retraining? Why?</>}
+        trap={<>(a)(c) misread match-rate as quality. (d) factually wrong.</>}
+        lens={<>High match rate without device-discriminating entropy is a homogeneity floor, not a quality signal. Audit by checking the false-match rate on KNOWN-different iPhones.</>}
+        stretch={<>What signal source rescues iOS device-FP?</>}
       />
 
+      {/* axis C3 — loss + hard-negative mining */}
       <VIS.TrapProblem
-        id="dfp-p6"
+        id="cwf-p6"
         difficulty="hard"
-        title="P6 — Encoder learns the product, not the device. Diagnose."
-        scenario={<>Your encoder gets 90 percent re-identification on training-domain traffic but 40 percent on a held-out partner product. Same browsers, same users. What went wrong?</>}
+        title="P6 — Easy negatives in the triplet sampler — what's the failure mode?"
+        scenario={<><em>Discriminating insight: easy negatives are different OS + browser pairs that are separable on UA alone, so the encoder never learns the GPU-render signal. The whole concept-specific advantage collapses.</em><br/><br/>You train the metric encoder with random negatives. Validation triplet loss drops to near zero in 2 epochs; production match rate is barely better than hash FP. Diagnose.</>}
         options={[
-          {key:"a", text:"Positive pairs were drawn only from logged-in users on a single product surface. The encoder learned distinctive signals of that product surface (referrer, A-B-test cookies, internal HTTP headers) rather than the device. Cure: pretrain on diverse cross-product unlabeled traffic, then fine-tune with metric loss; explicitly drop product-correlated signals from the input vector.", correct:true},
-          {key:"b", text:"The partner product has different users."},
-          {key:"c", text:"Encoder over-fitting at the parameter level — add weight decay."},
-          {key:"d", text:"The partner uses a different browser distribution."},
+          {key:"a", text:"Random negatives are dominated by easy pairs (Windows Chrome anchor + iOS Safari negative). The encoder solves these by learning the UA / platform bucket; it never has to look at the canvas / WebGL framebuffer or audio FFT to drive loss down. Switch to hard-negative mining: same-OS, same-browser, different-GPU negatives.", correct:true},
+          {key:"b", text:"Learning rate too high; reduce by 10x."},
+          {key:"c", text:"Triplet margin too small; increase from 0.2 to 1.0."},
+          {key:"d", text:"Embedding dimension too small; increase to 1024."},
         ]}
-        trap={<>(b) restates the symptom. (c) misdiagnoses parameter regularization as the fix when the issue is feature leakage. (d) is plausible noise but does not explain a 50-point drop.</>}
-        lens={<>(a) is the right answer. Feature leakage at the data level is a much bigger source of out-of-domain failure than parameter over-fitting. Always pretrain on cross-product data and audit which signals carry product identity.</>}
-        stretch={<>How would you systematically audit which input signals carry product-identity leakage?</>}
+        trap={<>(b)(c)(d) plausible tuning moves but none address the easy-negative trap.</>}
+        lens={<>Without hard negatives, the encoder learns the cheapest separation. For canvas/WebGL FP that is UA / platform — which the hash FP already had.</>}
+        stretch={<>What's the right NEGATIVE distribution for this task?</>}
       />
 
+      {/* axis E1 — CNIL boundary */}
       <VIS.TrapProblem
-        id="dfp-p7"
-        difficulty="hard"
-        multiSelect
-        title="P7 — Signals being closed by Apple Safari"
-        scenario={<>Apple has been aggressively closing fingerprint surfaces. Which of these are restricted on current Safari? Select all that apply.</>}
+        id="cwf-p7"
+        difficulty="medium"
+        title="P7 — Same embedding used for fraud AND ad frequency-capping in the EU. What breaks?"
+        scenario={<><em>Discriminating insight: legitimate-interest carve-out covers fraud but NOT marketing; CNIL has fined for the combined use. The fix is two separate stores keyed on different consent state.</em><br/><br/>Privacy team flags that your single embedding store powers both fraud blocks AND ad frequency capping. EU traffic is ~30%. Diagnose.</>}
         options={[
-          {key:"a", text:"Third-party canvas reads.", correct:true},
-          {key:"b", text:"Audio-context impulse-response (now randomized).", correct:true},
-          {key:"c", text:"Available font enumeration via system fonts.", correct:true},
-          {key:"d", text:"Battery API.", correct:true},
-          {key:"e", text:"Window size and screen resolution."},
-          {key:"f", text:"WebGL extension list (rate-limited).", correct:true},
+          {key:"a", text:"No issue — fingerprinting is permitted under GDPR for any business purpose."},
+          {key:"b", text:"Issue — the legitimate-interest basis (GDPR recital 47) covers security / fraud but does NOT cover ad frequency capping, which needs explicit consent. Operating both off one store means EU users' embeddings are used without consent. Split into a fraud-only store (legit interest, no consent banner) and a marketing store (consent-gated, dropped on opt-out). CNIL has issued EUR 60M+ fines for exactly this overlap.", correct:true},
+          {key:"c", text:"Issue — encrypt the embedding at rest and the problem is solved."},
+          {key:"d", text:"Issue — switch to a hash FP which is exempt."},
         ]}
-        trap={<>(e) is still exposed — Safari leaves coarse screen size accessible. The trap is assuming Apple closed everything.</>}
-        lens={<>The closed surfaces force fingerprinting on iOS Safari to rely on a much narrower signal set than Chrome desktop. Expect lower entropy per visit; plan for asymmetric coverage and lower confidence thresholds on Safari.</>}
-        stretch={<>What does asymmetric coverage mean for the matching threshold policy?</>}
+        trap={<>(a) misreads GDPR. (c) doesn't address consent purpose. (d) hash FP is also under CNIL scope.</>}
+        lens={<>FP is personal data under GDPR. The legal frame is consent + purpose limitation; two purposes = two consent states = two stores.</>}
+        stretch={<>What does CCPA say about the same setup?</>}
       />
 
+      {/* axis C2 — encoder choice */}
       <VIS.TrapProblem
-        id="dfp-p8"
-        difficulty="hard"
-        title="P8 — Hard-negative mining for metric learning"
-        scenario={<>Random negatives are too easy — most random pairs are obviously different devices. The encoder plateaus. What is the standard fix?</>}
+        id="cwf-p8"
+        difficulty="medium"
+        title="P8 — Encoder choice — why MLP works fine here despite 200 inputs?"
+        scenario={<><em>Discriminating insight: the inputs are mostly fixed-shape numeric / one-hot categoricals; sequence transformers buy nothing because there's no order. The cost case for MLP is correct.</em><br/><br/>A teammate proposes a 12-layer transformer for the deep FP encoder. Justify or reject.</>}
         options={[
-          {key:"a", text:"Hard-negative mining: at each training step, for each anchor, find the nearest neighbor in the current embedding that is a DIFFERENT device, and use it as the negative. This forces the encoder to separate look-alike devices. Periodically refresh the ANN index used for mining (every few epochs) since embeddings move during training.", correct:true},
-          {key:"b", text:"Lower the learning rate."},
-          {key:"c", text:"Add more easy negatives."},
-          {key:"d", text:"Switch to a bigger encoder."},
+          {key:"a", text:"Accept — transformers are SOTA on every task."},
+          {key:"b", text:"Reject — the 200 signals have no sequential order (canvas pixels are summarized to a hash before reaching the encoder; renderer strings are categorical buckets). A 2-3 layer MLP on the concatenated normalized vector matches transformer recall at 1/10 of the latency. Save transformer capacity for the categorical-rich subset (UA, renderer-string tokens) if needed.", correct:true},
+          {key:"c", text:"Accept — transformers attention is necessary to handle the canvas readback."},
+          {key:"d", text:"Reject — transformers cannot handle numeric inputs."},
         ]}
-        trap={<>(b) does not address the easy-negative dominance problem. (c) makes it worse. (d) is a guess.</>}
-        lens={<>(a) is the standard recipe across face-recognition, retrieval, and fingerprinting. Hard-negative mining is the single biggest lever for metric-learning quality after enough data.</>}
-        stretch={<>How often should you refresh the hard-negative ANN index, and what is the failure mode if you never do?</>}
+        trap={<>(a)(c) are cargo-cult. (d) is factually wrong.</>}
+        lens={<>The signal lives in the FIXED feature vector; sequence modeling buys nothing. Don't pay transformer latency for fingerprinting.</>}
+        stretch={<>When would a transformer actually help in this stack?</>}
       />
 
+      {/* axis E2 — deprecation drift */}
       <VIS.TrapProblem
-        id="dfp-p9"
+        id="cwf-p9"
         difficulty="hard"
-        title="P9 — Carding farm rotates browsers per attempt. Does the embedding catch it?"
-        scenario={<>An attacker rotates User-Agent and clears storage per request to defeat detection. The same physical machine drives every attempt. Does the embedding catch it?</>}
+        title="P9 — Chrome ships a Privacy Sandbox change that gates UNMASKED_RENDERER_WEBGL. Match rate drops 6 points over a week. Fix?"
+        scenario={<><em>Discriminating insight: the embedding was trained on a feature distribution that included renderer string entropy; removing that signal at inference time without retraining shifts the encoder out of distribution.</em><br/><br/>Chrome rolls out a flag that returns a generic renderer string on 50% of traffic. Match rate slides 6 points. Pick the right fix.</>}
         options={[
-          {key:"a", text:"Often yes — the user-agent is one of 200+ signals; canvas hash, GPU renderer, font set, audio-context impulse, and timezone are far harder to fake at scale without a real headless-browser farm with diverse hardware. The embedding tends to collapse near-identical machines onto neighbouring embeddings even when surface signals are rotated.", correct:true},
-          {key:"b", text:"No — the attacker controls all signals."},
-          {key:"c", text:"Only if user-agent is unrotated."},
-          {key:"d", text:"Only with cooperation from the browser vendor."},
+          {key:"a", text:"Lower the cosine threshold from 0.92 to 0.85."},
+          {key:"b", text:"Retrain the encoder on data WITH the renderer string masked at the same rate Chrome now masks it. Add canvas/WebGL framebuffer + audio FFT + font-metric probes as primary signals; treat the renderer string as auxiliary that may be masked at inference. The model learns to lean on the remaining signals when the renderer is masked.", correct:true},
+          {key:"c", text:"Inject a synthetic renderer string client-side."},
+          {key:"d", text:"Switch back to hash FP."},
         ]}
-        trap={<>(b) overstates attacker capability — most carding farms cannot diversify GPU and audio context without an expensive hardware fleet. (c) over-narrows to a single signal. (d) is unrelated.</>}
-        lens={<>(a) is the realistic read. The embedding compresses 200+ signals, many of which are hardware-bound and hard to forge. This is exactly why learned fingerprints replaced hash fingerprints for bot detection.</>}
-        stretch={<>What is the cheapest way for an attacker to diversify hardware-bound signals at scale?</>}
+        trap={<>(a) loosens the operating point but doesn't fix the signal regression. (c) is a TOS-violating spoof. (d) is a downgrade.</>}
+        lens={<>Privacy-stack changes are continuous. The encoder must be retrained against the EXPECTED inference-time signal distribution, not the one collected pre-change.</>}
+        stretch={<>How do you simulate future Chrome restrictions in training without waiting for them?</>}
       />
 
+      {/* axis F4 — overclaim */}
       <VIS.TrapProblem
-        id="dfp-p10"
+        id="cwf-p10"
         difficulty="hard"
-        title="P10 — End-to-end pick: top-of-funnel bot defense for a global product"
-        scenario={<>SaaS sign-up flow, 50M unique visitors per month, EU is 30 percent of traffic. Bot sign-ups have spiked. You can ship one fingerprint system this quarter. Pick ONE.</>}
+        title="P10 — User switches Chrome -&gt; Firefox on the same Mac. The deep FP loses them. Why?"
+        scenario={<><em>Discriminating insight: the encoder learned the GLSL shader compile chain (Chrome uses ANGLE; Firefox on macOS uses Apple's Metal-backed WebGL). Same GPU, different compile path, different framebuffer bytes. Cosine drops below threshold.</em><br/><br/>A known user switches Chrome -&gt; Firefox. The deep FP cosine drops from 0.95 to 0.51. Senior asks: 'I thought metric learning fixed this?' Answer.</>}
         options={[
-          {key:"a", text:"Learned embedding over 200+ signals with metric-learning training, ANN-based matching, weekly threshold re-calibration, on-device signal collection with explicit EU consent gate, and a separate routed policy for Brave, Tor, and Safari. Layered with existing CAPTCHA and rate-limit defenses — never the sole defense.", correct:true},
-          {key:"b", text:"Hash-based fingerprint everywhere."},
-          {key:"c", text:"Learned fingerprint with no EU consent flow — easier to integrate."},
-          {key:"d", text:"Skip fingerprinting; rely on CAPTCHA only."},
+          {key:"a", text:"Metric learning was trained on multi-browser triplets, so it should match — there must be a bug."},
+          {key:"b", text:"Yes — the encoder learns hardware identity THROUGH the GLSL shader compile path. Chrome (ANGLE) and Firefox (Metal-backed on macOS) use different compilers; same shader source produces different SPIR-V / Metal IR and different framebuffer bytes. The signal source itself is browser-specific. Cross-browser match is a known limit of canvas/WebGL FP; fall back to a separate cross-browser identity probe (login cookie, behavioral) for this case.", correct:true},
+          {key:"c", text:"The cosine threshold is wrong."},
+          {key:"d", text:"Apple's privacy sandbox blocks WebGL in Firefox."},
         ]}
-        trap={<>(b) ignores update-driven match collapse. (c) is a CNIL fine waiting to happen. (d) is what most teams default to and it visibly fails at scale against carding farms.</>}
-        lens={<>(a) is the senior design. Same encoder globally, EU consent gate, browser-specific policy routing, layered with non-fingerprint defenses. The hard parts are EU consent and Brave-Tor routing — not the model.</>}
-        stretch={<>What single metric tells you in week 1 whether the EU consent gate is destroying coverage?</>}
+        trap={<>(a) misreads the data distribution — most training pairs are within-browser. (c) doesn't address the signal regression. (d) factually wrong.</>}
+        lens={<>Metric learning makes the FP robust to MINOR signal drift (Chrome version bump). It does NOT make it robust to a wholesale signal-source change (browser switch).</>}
+        stretch={<>Could you train a cross-browser-stable FP? What's the cost?</>}
+      />
+
+      {/* axis A3 — vs classifier */}
+      <VIS.TrapProblem
+        id="cwf-p11"
+        difficulty="medium"
+        title="P11 — Why not train a softmax classifier over device-ids instead of a metric embedding?"
+        scenario={<><em>Discriminating insight: softmax over device-ids assumes a fixed closed set; FP is open-set with millions of new devices per day. Metric learning ports straight to nearest-neighbor over unseen IDs.</em><br/><br/>A teammate proposes: 'Train a softmax over the top-10M device-ids; predict id, take argmax.' Diagnose.</>}
+        options={[
+          {key:"a", text:"Reasonable — softmax is the standard recipe."},
+          {key:"b", text:"Wrong — softmax is a closed-set classifier; device-FP is open-set (millions of new devices arrive daily, you cannot retrain hourly). The deep FP uses metric learning + ANN lookup precisely because new devices get a new vector without retraining. The right comparison is FaceNet / ArcFace — not softmax-over-ids.", correct:true},
+          {key:"c", text:"Wrong — softmax doesn't support hard-negative mining."},
+          {key:"d", text:"Wrong — softmax requires too much VRAM."},
+        ]}
+        trap={<>(c) is incidental. (d) is engineering not architecture.</>}
+        lens={<>Open-set retrieval ~ metric learning; closed-set classification ~ softmax. Device-FP is the former.</>}
+        stretch={<>Hybrid: a softmax head plus a metric head sharing trunk. When does that help?</>}
+      />
+
+      {/* axis B1 — appropriate scope */}
+      <VIS.TrapProblem
+        id="cwf-p12"
+        difficulty="medium"
+        title="P12 — Mobile-app-only traffic. Apply the deep canvas/WebGL FP?"
+        scenario={<><em>Discriminating insight: a native iOS / Android app has no DOM canvas and no WebGL context. The signal source DOES NOT EXIST. This is where the mobile SDK behavioral FP takes over.</em><br/><br/>Your app is iOS + Android native only — no web surface. PM asks for canvas / WebGL FP. Diagnose.</>}
+        options={[
+          {key:"a", text:"Implement via embedded WKWebView running a hidden canvas."},
+          {key:"b", text:"The technique does not apply — native apps have no canvas/WebGL context, only the browser-side does. The right approach is the mobile SDK behavioral FP (IMU bias, accelerometer dc-offset, touch radius distribution). The two visuals cover different stacks; do not confuse the signal sources.", correct:true},
+          {key:"c", text:"Implement in the app's background browser tab."},
+          {key:"d", text:"Use the WebGL signal from desktop sessions of the same user."},
+        ]}
+        trap={<>(a) is technically possible but adds UI risk and an attacker surface for very little signal. (c)(d) don't exist on the platform.</>}
+        lens={<>Canvas/WebGL FP is intrinsically browser-side. Mobile native = different visual.</>}
+        stretch={<>If the app DID have a hidden WebView, would the canvas FP still work cleanly?</>}
+      />
+
+      {/* axis E3 — Friday failure */}
+      <VIS.TrapProblem
+        id="cwf-p13"
+        difficulty="hard"
+        title="P13 — Risk decisions go noisy overnight, hash FP match drops, deep FP match steady. PM thinks deep FP is broken. Diagnose."
+        scenario={<><em>Discriminating insight: hash FP dropping means signal drift; deep FP staying steady is correct behavior — the operator is reading false alarms from the wrong system.</em><br/><br/>Risk-decision alerts spike. Hash FP match rate drops 8 points; deep FP match rate stable. PM emails 'deep FP must be broken too.' Diagnose.</>}
+        options={[
+          {key:"a", text:"PM is right — both should drop in parallel."},
+          {key:"b", text:"Deep FP working correctly. The Chrome auto-update flipped one signal channel (canvas hash) and the metric embedding absorbed the move; hash FP cannot. The fix is to deprecate hash FP from production decisions and monitor the deep FP's PER-DEVICE embedding drift instead. The PM is reading hash-FP noise as truth.", correct:true},
+          {key:"c", text:"Deep FP must be broken — re-train it."},
+          {key:"d", text:"Roll back the Chrome update via enterprise policy."},
+        ]}
+        trap={<>(a)(c) misread the signal. (d) impossible at consumer scale.</>}
+        lens={<>Monitor deep FP via per-device embedding drift, NOT match-equality. Hash FP becomes a misleading baseline post-deploy.</>}
+        stretch={<>What's the right alarm on the deep FP itself?</>}
+      />
+
+      {/* axis C3 — training pairs sampling */}
+      <VIS.TrapProblem
+        id="cwf-p14"
+        difficulty="hard"
+        title="P14 — Positive pairs all sampled from the same browsing session. What breaks?"
+        scenario={<><em>Discriminating insight: same-session positives have near-identical signals; the loss is trivially solved and the encoder never learns cross-time stability. Validation looks great; production drift kills you.</em><br/><br/>Triplet positives sampled at &lt;30 min apart. Loss trains beautifully. Production match drops 7 points one week post-deploy. Diagnose.</>}
+        options={[
+          {key:"a", text:"Embedding dimension too small."},
+          {key:"b", text:"Positives at &lt;30min are nearly bit-identical, so the encoder solves the loss without learning ACROSS-TIME stability (which is the whole point — Chrome auto-updates, font installs, GPU driver bumps). Resample positives with a 24h+ gap; include known cross-browser-version pairs in the positive set. The encoder must SEE drift to absorb it.", correct:true},
+          {key:"c", text:"Learning rate too low."},
+          {key:"d", text:"Triplet margin too small."},
+        ]}
+        trap={<>(a)(c)(d) plausible but not the cause.</>}
+        lens={<>What you sample for positives determines what the encoder learns is invariant. For deep FP the invariance must span time + version, not just session.</>}
+        stretch={<>What's the right MAX gap for positives?</>}
+      />
+
+      {/* axis F2 — adversarial */}
+      <VIS.TrapProblem
+        id="cwf-p15"
+        difficulty="hard"
+        title="P15 — An attacker controls the client JS. Can they reach a TARGETED embedding (impersonate a specific device)?"
+        scenario={<><em>Discriminating insight: gradient-based attacks against a public embedding model + smooth signal-to-embedding map make targeted impersonation feasible if the attacker knows the encoder. The defense is server-side probe randomization (rare shaders per session) so the attacker cannot pre-compute responses.</em><br/><br/>An attacker has your client SDK and the encoder ONNX. They want a target user's embedding for ATO. How feasible?</>}
+        options={[
+          {key:"a", text:"Infeasible — the model is too large."},
+          {key:"b", text:"Feasible — they can solve for canvas / WebGL / audio inputs that produce the target embedding via gradient descent on the encoder. Defense: SERVER chooses which probes the client must render this session (rare fragment shaders, randomized parameters). The attacker cannot pre-compute responses to unseen shaders, and the encoder is anchored on those server-chosen probes.", correct:true},
+          {key:"c", text:"Feasible only if they have GPU access."},
+          {key:"d", text:"Infeasible — the embedding is L2-normalized."},
+        ]}
+        trap={<>(a)(c)(d) underestimate the attacker / misread the defense.</>}
+        lens={<>An open-source encoder gives the attacker a differentiable surface. The defense moves the entropy server-side via randomized probe selection.</>}
+        stretch={<>What's the per-session probe-selection bandwidth cost?</>}
+      />
+
+      {/* axis A2 — vs cookies */}
+      <VIS.TrapProblem
+        id="cwf-p16"
+        difficulty="medium"
+        title="P16 — User clears cookies. Hash FP also re-keys. How does the deep FP track them?"
+        scenario={<><em>Discriminating insight: the deep FP signal is independent of cookies — it lives in GPU-render output. Cosine NN over the embedding store recovers the same device across cookie wipes.</em><br/><br/>User clears all cookies and incognito-browses. Hash FP issues a new ID. What does the deep FP do?</>}
+        options={[
+          {key:"a", text:"Issues a new ID — the cookie is the primary key."},
+          {key:"b", text:"Recovers the user — the signal source is GPU render output, which doesn't change with cookie state. The client posts probes, encoder produces an embedding within ~0.97 cosine of the user's prior embedding, ANN nearest-neighbor returns the existing device ID. Incognito changes UA hints slightly but doesn't touch the GPU pipeline.", correct:true},
+          {key:"c", text:"Recovers via localStorage backup."},
+          {key:"d", text:"Cannot recover — incognito disables WebGL."},
+        ]}
+        trap={<>(c) is the wrong mechanism. (d) is factually wrong.</>}
+        lens={<>The whole pitch is cookieless. The signal source is hardware/GPU-render output that cookie state cannot change.</>}
+        stretch={<>Is incognito-mode legally cleared for deep FP under GDPR?</>}
+      />
+
+      {/* axis C5 — inference latency */}
+      <VIS.TrapProblem
+        id="cwf-p17"
+        difficulty="medium"
+        title="P17 — Inference budget is 50ms p99 server-side. Encoder is 8ms, ANN is 3ms. What's the dominant time?"
+        scenario={<><em>Discriminating insight: in practice the client-side probe RUN dominates — drawing the canvas + WebGL scenes + offline-audio rendering takes 60-200ms on mid-tier hardware. The 50ms server budget is rarely the bottleneck.</em><br/><br/>Server-side budget: 50ms. Encoder 8ms, ANN 3ms, network 10ms. Why might your end-to-end p99 still be 300ms?</>}
+        options={[
+          {key:"a", text:"The ANN index is cold."},
+          {key:"b", text:"The CLIENT-SIDE probe run dominates. Rendering the canvas scene, running the offline AudioContext FFT, enumerating fonts and reading them back takes 60-200ms on mobile, sometimes &gt;1s on cold tabs. Server-side is fine; the latency lives in the browser. The fix is probe parallelization client-side and dropping the costliest probes when total time exceeds a budget.", correct:true},
+          {key:"c", text:"TLS handshake."},
+          {key:"d", text:"Encoder forward pass on the server."},
+        ]}
+        trap={<>(a)(c)(d) are sub-dominant.</>}
+        lens={<>Server budget is the easy part; client-side probe execution dominates and is the lever you actually pull.</>}
+        stretch={<>What probes can you drop with the least entropy loss?</>}
+      />
+
+      {/* axis D2 — canvas hash IS the FP */}
+      <VIS.TrapProblem
+        id="cwf-p18"
+        difficulty="medium"
+        title="P18 — Brave randomizes canvas readback per session. Is the deep FP dead?"
+        scenario={<><em>Discriminating insight: canvas readback is one of ~200 probes; randomizing it shifts the embedding by ~0.05 cosine, well within threshold. The robustness was the whole point.</em><br/><br/>Brave Browser ships per-session canvas randomization. Match rate on Brave traffic. Diagnose.</>}
+        options={[
+          {key:"a", text:"Deep FP is dead — canvas is THE signal."},
+          {key:"b", text:"Match rate drops slightly but the deep FP survives. Canvas is one of ~200 signals; the others (WebGL framebuffer, audio FFT, font widths, screen, hardware concurrency) carry enough entropy. The metric encoder produces an embedding within ~0.05 cosine of the prior; cosine threshold 0.90 still matches. Hash FP, in contrast, dies on every Brave session.", correct:true},
+          {key:"c", text:"Match rate unchanged."},
+          {key:"d", text:"Switch to a Brave-specific encoder."},
+        ]}
+        trap={<>(a) misreads the signal portfolio. (c) overclaims. (d) infeasible.</>}
+        lens={<>The whole portfolio matters. No single probe is load-bearing once you train end-to-end.</>}
+        stretch={<>What if Brave randomizes WebGL too?</>}
+      />
+
+      {/* axis B2 — sounds reasonable */}
+      <VIS.TrapProblem
+        id="cwf-p19"
+        difficulty="hard"
+        title="P19 — 'Let's drop the canvas/WebGL probes and use only the UA + screen + timezone — same signal, less PII risk.' Diagnose."
+        scenario={<><em>Discriminating insight: dropping canvas/WebGL drops the per-pixel GPU-render entropy and removes the whole reason this technique works. The 'less PII' framing is also wrong — UA + screen + timezone tuple is itself fingerprinting under GDPR.</em><br/><br/>Privacy intern proposes the above. Diagnose.</>}
+        options={[
+          {key:"a", text:"Reasonable — UA + screen + timezone gives enough entropy."},
+          {key:"b", text:"Wrong. Without canvas/WebGL/audio you have generic browser FP with ~16 bits of entropy (UA + screen + timezone) — collides heavily, defeated by NAT, and STILL classified as personal data under GDPR. The unique value of this technique is the GPU-render entropy that pushes total entropy past ~30 bits per device. Dropping it leaves you with both worse signal AND the same legal exposure.", correct:true},
+          {key:"c", text:"Reasonable — privacy first."},
+          {key:"d", text:"Wrong — UA is more PII than canvas."},
+        ]}
+        trap={<>(a)(c) misread the entropy math; (d) misreads GDPR scope.</>}
+        lens={<>The PII line is at fingerprinting itself; partial-signal FP is the worst of both worlds.</>}
+        stretch={<>What's the right approach if you really do want lower entropy for compliance?</>}
+      />
+
+      {/* axis A1 — vs IP reputation */}
+      <VIS.TrapProblem
+        id="cwf-p20"
+        difficulty="medium"
+        title="P20 — Why is canvas/WebGL FP better than IP-based velocity rules for new-account abuse?"
+        scenario={<><em>Discriminating insight: residential proxies make IP velocity unreliable; canvas/WebGL FP looks at the device, not the network, so 1000 accounts from one device on rotating IPs still match.</em><br/><br/>Account farm uses 1000 residential proxy IPs from one MacBook. IP velocity rules see 1 signup per IP — clean. Pick the right defense.</>}
+        options={[
+          {key:"a", text:"IP rule with smaller buckets."},
+          {key:"b", text:"Canvas/WebGL FP — the MacBook's GPU-render output is constant across all 1000 sessions, so the embedding store sees 1000 sign-ups all matching the same device-id within cosine 0.97. IP velocity sees nothing; device FP sees the whole farm.", correct:true},
+          {key:"c", text:"Block all residential proxies."},
+          {key:"d", text:"Require email verification."},
+        ]}
+        trap={<>(c) breaks legitimate users. (d) is orthogonal.</>}
+        lens={<>Network-side defenses are defeated by residential proxies. Device-side FP is the right layer.</>}
+        stretch={<>What if the attacker uses 1000 cloud-Mac instances on Mac mini farms?</>}
+      />
+
+      {/* axis F4 — overclaim 2 */}
+      <VIS.TrapProblem
+        id="cwf-p21"
+        difficulty="hard"
+        title="P21 — Paper claims the deep FP 'survives ANY single-signal change'. Hold up under stress test?"
+        scenario={<><em>Discriminating insight: the claim holds for ONE signal channel changing at a time; multiple simultaneous changes (Chrome update + new font install + GPU driver bump) compound the embedding drift past threshold.</em><br/><br/>You stress-test by simultaneously flipping canvas + GPU driver version + adding 100 new fonts. Match drops to 73%. Is the paper wrong?</>}
+        options={[
+          {key:"a", text:"Yes — the paper overclaims."},
+          {key:"b", text:"The paper's claim is per-channel; simultaneous changes compound the embedding drift past the cosine threshold. In production, this scenario is rare (Chrome auto-update + driver bump usually staggered by weeks). The honest framing is 'robust to one-channel drift; not robust to coordinated multi-channel events'. Operationally, accept brief match-rate dips after major OS updates.", correct:true},
+          {key:"c", text:"No — the paper meant cumulative robustness."},
+          {key:"d", text:"Yes — switch to hash FP."},
+        ]}
+        trap={<>(a) over-corrects. (c) misreads the paper. (d) is regression.</>}
+        lens={<>Multi-channel drift is real but rare. Plan for it on major OS launches.</>}
+        stretch={<>How would you detect coordinated multi-channel drift in production?</>}
+      />
+
+      {/* axis A1 - vs behavioral biometrics */}
+      <VIS.TrapProblem
+        id="cwf-p22"
+        difficulty="medium"
+        title="P22 — Deep canvas/WebGL FP vs behavioral biometrics — when use which?"
+        scenario={<><em>Discriminating insight: canvas/WebGL fires at page-load with zero interaction; behavioral biometrics needs 5-30s of typing/mouse input. The two are sequenced, not substituted.</em><br/><br/>You can deploy ONE of canvas/WebGL FP or behavioral biometrics at signup. Pick.</>}
+        options={[
+          {key:"a", text:"Behavioral — more entropy per session."},
+          {key:"b", text:"Canvas/WebGL — it fires at page-load before the user types or clicks anything, so it makes a risk decision in the first 200ms. Behavioral biometrics needs accumulated input (keystroke dwell, mouse jitter) and produces a score after 5-30s. At signup the user often abandons before producing enough behavioral signal. Sequence them: canvas/WebGL first for instant gating, behavioral later for medium-confidence cases.", correct:true},
+          {key:"c", text:"Behavioral — works on iOS."},
+          {key:"d", text:"Canvas/WebGL — never collides."},
+        ]}
+        trap={<>(a)(c) get the operating-point picture wrong. (d) overclaims.</>}
+        lens={<>The two are complementary at different latency budgets; the question is sequencing, not substitution.</>}
+        stretch={<>What's the right cascade order at login (not signup)?</>}
+      />
+
+      {/* axis D3 — threshold tuning */}
+      <VIS.TrapProblem
+        id="cwf-p23"
+        difficulty="hard"
+        title="P23 — 'Set cosine threshold to 0.95 because that's the validation number.' Reasonable?"
+        scenario={<><em>Discriminating insight: 0.95 is the validation-set 1/100k FPR point; production traffic is non-iid (more iOS, more anti-detect, more drift) so the operating point must be tuned online against the actual cost ratio of FP/FN. The validation value is a starting guess, not a target.</em><br/><br/>Validation 1/100k FPR sits at cosine 0.95. Production teammate sets 0.95 in prod. Diagnose.</>}
+        options={[
+          {key:"a", text:"Correct — validation FPR == production FPR."},
+          {key:"b", text:"Wrong — production traffic distribution differs (more iOS, more anti-detect, more drift); the actual production FPR at cosine 0.95 will not match. Tune the threshold ONLINE against the cost ratio of FP (block legitimate user) vs FN (let bot through). Use per-customer thresholds when the business cost differs (banking vs ecommerce). Validation is a starting point only.", correct:true},
+          {key:"c", text:"Wrong — always set 0.90."},
+          {key:"d", text:"Correct if you also retrain monthly."},
+        ]}
+        trap={<>(c) is arbitrary. (d) addresses drift but not the FPR mismatch.</>}
+        lens={<>Operating-point selection is cost-driven and online; validation gives you the curve, not the point.</>}
+        stretch={<>What signal flags 'operating point has drifted'?</>}
+      />
+
+      {/* axis C4 — training data */}
+      <VIS.TrapProblem
+        id="cwf-p24"
+        difficulty="hard"
+        title="P24 — Where do you get ground-truth device identity to train this in the first place?"
+        scenario={<><em>Discriminating insight: the supervision label comes from a LOGGED-IN surface where session cookies establish 'same user on same device over time'. Unlogged traffic gives only weak co-occurrence labels.</em><br/><br/>You need device-identity labels at scale to train metric learning. Pick the dominant source.</>}
+        options={[
+          {key:"a", text:"Manual labeling — hire annotators."},
+          {key:"b", text:"Logged-in surfaces — when a user signs into the same account from the same browser across days, all those sessions are positive pairs. Negative pairs come from different accounts. Scale: 100M+ pairs/week from any large consumer property. Unlogged or session-only traffic gives only weak co-occurrence (same cookie ID until cleared) — usable but lower-quality.", correct:true},
+          {key:"c", text:"DGraph-Fin dataset."},
+          {key:"d", text:"MAC address leaks."},
+        ]}
+        trap={<>(a) doesn't scale. (c) is the wrong domain. (d) is plugged.</>}
+        lens={<>Self-supervised pair labels from logged-in sessions are the engine. No login surface = no training data.</>}
+        stretch={<>Can you bootstrap without a login surface?</>}
       />
     </VIS.Section>
 
@@ -1705,35 +1937,35 @@ flowchart TB
             <strong>Fingerprinting at Scale: ML on Browser Signals</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, USENIX Security 2024)</span>
-          <br/>The reference paper. Section on metric-learning loss choice and ANN index design is the keeper.
+          <br/>The canonical metric-learning FP paper. Sections on training-pair sampling and hard-negative mining are the must-reads.
         </li>
         <li>
-          <a href="https://amiunique.org/" target="_blank" rel="noopener">
-            <strong>AmIUnique — INRIA browser-fingerprint tester</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(interactive)</span>
-          <br/>The classic INRIA tool for inspecting your own fingerprint surface. Best 5 minutes for intuition about which signals carry entropy.
-        </li>
-        <li>
-          <a href="https://www.cnil.fr/en/cookies-and-other-tracking-devices" target="_blank" rel="noopener">
-            <strong>CNIL — Cookies and other tracking devices guidelines</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(regulatory)</span>
-          <br/>Read this BEFORE designing an EU deployment. Defines the consent surface for fingerprinting under ePrivacy.
-        </li>
-        <li>
-          <a href="https://lilianweng.github.io/posts/2021-05-31-contrastive/" target="_blank" rel="noopener">
-            <strong>Lilian Weng — Contrastive Representation Learning</strong>
+          <a href="https://www.eff.org/deeplinks/2010/01/primer-information-theory-and-privacy" target="_blank" rel="noopener">
+            <strong>EFF / Panopticlick — Primer on FP entropy</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Practitioner walkthrough of contrastive losses. Useful background for the metric-learning choices in the fingerprint paper.
+          <br/>Where browser fingerprinting started; the per-signal bits-of-entropy table is the right mental model before reading the deep variant.
         </li>
         <li>
-          <a href="https://brave.com/privacy-updates/" target="_blank" rel="noopener">
-            <strong>Brave — Privacy updates and fingerprint randomization</strong>
+          <a href="https://arxiv.org/abs/1503.03832" target="_blank" rel="noopener">
+            <strong>FaceNet — Schroff et al.</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(vendor docs)</span>
-          <br/>Brave's documentation of which signals they actively perturb. Required reading before deploying against Brave traffic.
+          <span style={{color:"#64748b", fontSize:14}}>(paper, CVPR 2015)</span>
+          <br/>The triplet-loss + hard-negative recipe deep FP rides on. Same architecture pattern, different signal.
+        </li>
+        <li>
+          <a href="https://www.cnil.fr/en" target="_blank" rel="noopener">
+            <strong>CNIL — fingerprinting under GDPR</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(regulator)</span>
+          <br/>Authoritative source for what is allowed under legitimate interest vs requires consent. Read before deploying in EU.
+        </li>
+        <li>
+          <a href="https://github.com/fingerprintjs/fingerprintjs" target="_blank" rel="noopener">
+            <strong>FingerprintJS</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(open-source)</span>
+          <br/>Open-source signal-collection reference. Read the probes to understand what 200 features actually look like in practice.
         </li>
       </ul>
     </VIS.Section>

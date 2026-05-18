@@ -1414,289 +1414,491 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Mobile SDK behavioral fingerprint (sensor + device) — fuses IMEI-free sensor signals
-// (gyro bias, mic noise floor) with OS metadata to ID devices across resets.
+// Mobile SDK behavioral fingerprint (sensor + device) — survive device reset / app reinstall
+// by reading stationary-baseline sensor distributions that are hardware-permanent at the
+// silicon level. Cross-visual anchor: this is APP-side, sensor-distribution-determined —
+// NOT the same as canvas/WebGL FP (browser-side, GPU-render-determined).
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Device fingerprinting + ML"
       title="Mobile SDK behavioral fingerprint (sensor + device)"
-      subtitle="Fuse IMEI-free sensor signals (gyro bias, mic noise floor) with OS metadata to identify a phone even after a factory reset rotates every device-ID."
+      subtitle="Stationary-baseline sensor distributions are hardware-permanent — survive factory reset, defeat emulators by their suspiciously-clean zeros."
       byline={[
-        {label: "Source", value: "Sift Engineering — Multi-signal device fingerprinting"},
-        {label: "Year", value: "2025"},
-        {label: "L3", value: "Mobile fingerprint"},
+        {label: "Source", value: "Sift Engineering — Multi-signal device fingerprinting (2025)"},
+        {label: "L3", value: "Device fingerprinting + ML"},
+        {label: "Anchor", value: "Silicon-level signal, not behavior, not network"},
       ]}/>
 
     <VIS.TLDR>
-      Classic mobile fingerprints relied on{" "}
-      <VIS.Term def="A hardware identifier embedded in cellular modems — historically used to uniquely identify a phone. Modern OS APIs no longer expose it to apps.">IMEI</VIS.Term>{" "}
-      or per-app{" "}
-      <VIS.Term def="An app-scoped or device-scoped UUID exposed by Android (advertising-ID) or iOS (IDFA). Modern OS releases let users reset these on demand.">advertising-ID</VIS.Term>{" "}
-      values, both of which the user can reset. A sensor fingerprint reads hardware-permanent characteristics — gyroscope bias, microphone noise floor, magnetometer offset — that the user cannot rotate without buying a new phone. Fused with rapidly-changing OS metadata, the model learns to ignore the rotated bits and lean on the permanent ones.
+      Inside every phone the IMU silicon has a per-device <strong>stationary baseline</strong>: when the phone sits flat on a table, the gyro reads a non-zero rotation rate (DC bias), the accelerometer reads ~9.81 with a per-axis offset of milligees, the magnetometer has a soft-iron correction, the mic captures silicon-specific ADC shot noise. These are manufacturing-specific, fixed at silicon time, and survive every OS-level reset. A small MLP encoder maps this stationary baseline + OS metadata to a 128-dim embedding; the FP holds across reset and reinstall because the silicon does not change. The two giveaways for an{" "}
+      <VIS.Term def="A virtual Android or iOS environment running on a desktop (Genymotion, BlueStacks, Apple iOS simulator). Emits synthetic sensor values rather than reading silicon.">emulator</VIS.Term>{" "}
+      are an unusually clean zero baseline and missing temperature drift.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — passive stationary sensor probe">
       <ol>
-        <li><strong>Hardware-permanent inputs:</strong> gyroscope zero-rate bias, accelerometer bias and scale, mic noise floor, magnetometer offsets, battery internal-resistance curve, camera dark-frame fixed-pattern noise.</li>
-        <li><strong>OS-rotatable inputs:</strong> advertising-ID, install-time UUID, app-data-dir inode, locale, install source.</li>
-        <li><strong>Fusion model:</strong> an MLP or small transformer over the concatenated vector; metric-learning loss aligns positive pairs (same device, different installs).</li>
-        <li><strong>Matching:</strong> embedding cosine similarity. Above threshold means same physical device even when every rotatable ID is fresh.</li>
+        <li><strong>Probe</strong>: SDK runs a silent 1-3s probe at app cold-start. Sensors at 50-100 Hz. Stats computed locally: per-axis mean, std, FFT bands of the noise; mic noise floor PSD; soft-iron transform.</li>
+        <li><strong>Signals</strong>:
+          <ul>
+            <li>Gyro DC bias — per-axis offset from zero at rest (0.01-0.1 deg/s, manufacturing-specific)</li>
+            <li>Accelerometer dc-offset — per-axis additive bias on top of gravity (milligees)</li>
+            <li>Magnetometer soft-iron correction — per-device 3x3 transform</li>
+            <li>Mic noise floor — spectral signature of the ADC at silence</li>
+            <li>IMU temperature-drift coefficient — slope of gyro bias vs device temperature</li>
+            <li>OS metadata — version, build, screen density, installed system packages</li>
+          </ul>
+        </li>
+        <li><strong>Encoder</strong>: small MLP / 1D-CNN to 128-dim embedding. Trained with metric learning (triplet / SimCLR) on multi-day same-device positives from logged-in app sessions.</li>
+        <li><strong>Match</strong>: server-side ANN over the device store; cosine above threshold = same device.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  H["Hardware-permanent"]
-  O["OS-rotatable"]
-  H --> F["Fusion encoder"]
-  O --> F
-  F --> V["Device embedding"]
-  V --> M["Match score"]
-  style H fill:#dcfce7,stroke:#16a34a,stroke-width:2px
-  style O fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style F fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-      `} />
+  S["Stationary 1-3s probe (gyro DC, accel dc-offset, mag soft-iron, mic noise floor, temp drift, OS meta)"]
+  S --> Z["Local stats: mean / std / FFT bands"]
+  Z --> E["Encoder MLP"]
+  E --> V["128-dim embedding"]
+  V --> A["Server ANN -> same-device decision"]
+  T["Metric loss on multi-day positives"] --> E
+  style E fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style T fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style A fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+      `}/>
+      <p>Blue = encoder. Yellow = training-time loss that learns sensor-channel stability. Red = runtime decision.</p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-why" title="Why this survives reset (and canvas/WebGL FP doesn't even apply)">
       <p>
-        Green = stays put across resets. Red = rotates on reset. Blue = the encoder learns which inputs to weight more.
+        The whole pitch sits on one fact: silicon does not change. A factory reset wipes the OS; an app reinstall issues a new IDFA / Android-ID. Neither alters the IMU's manufacturing variation. The gyro that read +0.03 deg/s DC bias on X-axis at 25°C yesterday reads the same today and a year from now.
       </p>
+      <p>
+        This sits in a different visual from canvas / WebGL FP for a reason. Canvas/WebGL FP is BROWSER-side and lives on per-pixel GPU-rendering artifacts (sub-pixel anti-aliasing, GLSL shader compile path). It does not exist inside a native app — there is no canvas element, no WebGL context. Conversely, sensors are not present inside a browser tab. The two techniques cover different stacks; the lessons do not transfer.
+      </p>
+      <VIS.Callout kind="info" title="Cross-visual anchor">
+        Spoofing canvas/WebGL FP needs JS-level readback interception inside a browser. Spoofing THIS FP needs either hardware-level sensor replay or a jailbreak hook on the sensor API. Different attack surface; different defense.
+      </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead>
-          <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Classical mobile fingerprint</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Sensor + device fusion</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Primary signal</td>
-            <td style={{padding:"8px 10px"}}>IMEI or advertising-ID</td>
-            <td style={{padding:"8px 10px"}}>Sensor hardware noise</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Survives factory reset</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Yes (hardware unchanged)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Emulator detection</td>
-            <td style={{padding:"8px 10px"}}>Weak — emulators rotate ID</td>
-            <td style={{padding:"8px 10px"}}>Strong — emulator sensors look fake</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>iOS 17+ availability</td>
-            <td style={{padding:"8px 10px"}}>Limited</td>
-            <td style={{padding:"8px 10px"}}>More limited — sensor APIs gated</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>User-consent surface</td>
-            <td style={{padding:"8px 10px"}}>Already disclosed</td>
-            <td style={{padding:"8px 10px"}}>Higher scrutiny — sensors are sensitive</td>
-          </tr>
-        </tbody>
-      </table>
-    </VIS.Section>
-
-    <VIS.Section id="sec-when" title="When to pick">
+    <VIS.Section id="sec-emulator" title="Emulator detection comes for free">
+      <p>
+        Emulators (Genymotion, BlueStacks, Apple iOS simulator) emit synthetic sensor values. They almost always emit a <em>clean</em> stationary baseline — gyro reads exactly 0.0 DC bias, accelerometer reads exactly 9.81 with no axis offset, std=0. Real silicon never does this. Two signatures fall out:
+      </p>
       <ul>
-        <li><strong>Mobile ATO and emulator detection</strong> — install farms rotate every software ID; sensor noise is the residual signal.</li>
-        <li><strong>App-install fraud</strong> — adtech reattribution where adversary spins fresh IDs per install.</li>
-        <li><strong>Android-first deployments</strong> — Android still exposes raw sensors to apps under standard permissions.</li>
-        <li><strong>You can ship an SDK</strong> — sensor reads require a long-lived app process, not a one-shot web request.</li>
+        <li><strong>Zero-bias signature</strong>: a sensor stream with bias = 0.000 to fp32 precision is almost certainly synthetic.</li>
+        <li><strong>Missing temperature drift</strong>: leave the SDK probe running for 30s while the CPU warms up; a real device's gyro bias shifts by a small per-silicon slope; an emulator's stays flat.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="iOS 17+ closes sensor APIs from background">
-        Apple gates sensor access behind foreground-app state and explicit user permission. Continuous background sensor reads are largely impractical on iOS. Plan for asymmetric coverage: rich on Android, sparse on iOS.
+    <VIS.Section id="sec-ios" title="iOS 17 motion-permission gate">
+      <p>
+        iOS 17 ships a permission for high-frequency motion APIs (CoreMotion <code>startDeviceMotionUpdates</code>). Apps without a clear motion use case cannot prompt the user without App Review friction. The signal portfolio degrades on iOS, NOT the technique itself: low-rate accelerometer + OS metadata remain; high-rate gyro + mag soft-iron are gated.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-limits" title="Limits and gotchas">
+      <VIS.Callout kind="gotcha" title="Temperature drift is a feature, not noise">
+        The slope of gyro DC bias vs device temperature is silicon-specific. Averaging it out across temperatures destroys per-device entropy. Estimate and KEEP the slope; do not denoise.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Sensor noise drifts with temperature and age">
-        Gyro bias is hardware-permanent but drifts a few percent over a year and with temperature. Train with augmentations covering thermal variation, and re-anchor the device prototype every few weeks.
+      <VIS.Callout kind="warn" title="Same phone, two family users = same FP">
+        This is correct behavior — the FP is per-DEVICE, not per-user. Combine with user-level signals if you need user identity.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Emulators can be detected, but advanced emulators forge sensors">
-        Modern emulator-detection benefits from sensor signatures — emulator gyros either return zero or return scripted patterns. But adversaries with custom Frida hooks can inject realistic sensor traces. Treat emulator detection as one signal, not the verdict.
+      <VIS.Callout kind="warn" title="Android 14 idle-sensor downsampling">
+        Power-saving downsamples idle sensors to 1 Hz, making the noise-PSD estimate unreliable. Wake the IMU via <code>SENSOR_DELAY_FASTEST</code> for the duration of the probe.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Microphone access is consent-heavy">
-        Reading mic noise floor requires microphone permission, which is a strong consent ask. Many production deployments skip the mic signal and rely on gyro and accelerometer alone, at modest accuracy cost.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Pretraining corpus determines hardware coverage">
-        Sensor signatures cluster by chipset and manufacturer. If your pretraining corpus is one-vendor-heavy, the encoder underperforms on the others. Stratify pretraining across hardware brands.
+      <VIS.Callout kind="gotcha" title="Sensor replay defeats the passive probe">
+        An attacker can capture a target phone's real sensor trace and replay it inside an emulator. Defense: only viable inside apps with a legitimate motion-permission use — add a randomized motion challenge that requires live sensor response. Otherwise accept residual risk and lean on jailbreak detection.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Trap problems on sensor permanence, emulator detection, iOS restrictions, and SDK design.
+        Every problem hinges on a mobile-SDK-FP-specific mechanism: stationary-baseline sensor distributions, hardware-permanence at silicon level, emulator detection via clean-zero or missing temperature drift, the iOS-17 motion-permission gate, or the temperature-drift-coefficient as a feature. Strip the name -&gt; option no longer wins. Lessons here do NOT transfer to canvas/WebGL FP.
       </p>
 
       <VIS.TrapProblem
-        id="msf-p1"
+        id="msbf-p1"
         difficulty="hard"
-        title="P1 — Emulator farm rotates device-IDs every install. Which signals survive?"
-        scenario={<>An attacker runs a 10,000-emulator farm. Each install gets a fresh advertising-ID, fresh app-data UUID, fresh package signature checks. Which signals will your fingerprint still see?</>}
+        title="P1 — User factory-resets the phone and reinstalls the app. IDFA changes. Why does this FP still match the prior install?"
+        scenario={<><em>Discriminating insight: the signal source is silicon-level manufacturing variation (IMU bias, mag soft-iron, mic ADC noise). Factory reset wipes OS-level IDs; it does not alter the silicon. The FP is constructed precisely so that reset has zero effect.</em><br/><br/>A user does a factory reset + app reinstall. IDFA / Android-ID rotate. The FP matches the prior install at cosine 0.96. Pick the dominant reason.</>}
         options={[
-          {key:"a", text:"Sensor signals — gyroscope bias and accelerometer scale — survive ID rotation because they come from physical hardware noise that an emulator typically does not simulate (returns zero or a generic constant). Battery internal-resistance curve and microphone noise floor are similarly hardware-rooted. Build the encoder to weight these heavily and discount the rotated software IDs.", correct:true},
-          {key:"b", text:"Advertising-ID — it persists across installs."},
-          {key:"c", text:"User-agent string."},
-          {key:"d", text:"App version code."},
+          {key:"a", text:"The SDK persists a fingerprint UUID in shared keychain that survives reset."},
+          {key:"b", text:"The signal source is silicon manufacturing variation — gyro DC bias, accelerometer dc-offset, magnetometer soft-iron correction, mic noise floor — none of which a factory reset touches. The OS-level ID rotates; the silicon-level baseline does not. Embedding produced from those sensors is the same within noise.", correct:true},
+          {key:"c", text:"The encoder reads the MAC address."},
+          {key:"d", text:"Apple Push Notification token re-binds to the device after reset."},
         ]}
-        trap={<>(b) is exactly the thing rotated. (c) is software-level and easy to forge. (d) carries zero per-device entropy.</>}
-        lens={<>(a) is the right answer. Hardware-rooted noise is the residual signal once an adversary has rotated every software ID. This is the entire reason sensor fingerprints exist.</>}
-        stretch={<>How would you distinguish a real device with zero-bias gyro from an emulator that returns zero?</>}
+        trap={<>(a) is the trivial wrong answer — keychain persistence is precisely what the user opted to wipe. (c) iOS / Android both block MAC. (d) is unrelated to FP.</>}
+        lens={<>Reset wipes OS state; the technique deliberately reads BELOW the OS. The signal is hardware-permanent.</>}
+        stretch={<>What ONE hardware change WOULD invalidate this FP?</>}
       />
 
       <VIS.TrapProblem
-        id="msf-p2"
+        id="msbf-p2"
         difficulty="hard"
-        title="P2 — iOS 17+ has gated background sensor access. Which sensor signals can you still read in 2026?"
-        scenario={<>Your iOS SDK launches in 2026. You want sensor-based fingerprinting. Which signals are realistically available?</>}
+        title="P2 — Emulator farm has perfectly clean sensors. Detection signature?"
+        scenario={<><em>Discriminating insight: real silicon has non-zero DC bias and non-zero stationary noise PSD; emulators emit suspiciously clean zeros. The clean signature IS the detector.</em><br/><br/>Genymotion emulator runs your app. Sensor stream returns gyro=(0.0, 0.0, 0.0) and accelerometer=(0.0, 0.0, 9.81000) with std=0 across the 3s probe. Pick the dominant detector.</>}
         options={[
-          {key:"a", text:"Foreground-only sensor reads via CoreMotion while the app is active, with explicit user permission. Workout-API motion data only during recognized walking sessions. Background sensor access is not feasible without a Workout or Navigation entitlement that Apple grants sparingly. Plan for sparse, opportunistic sensor collection on iOS.", correct:true},
-          {key:"b", text:"All sensors at 50 Hz continuously in the background."},
-          {key:"c", text:"No sensor access at all on iOS."},
-          {key:"d", text:"Sensors only on iPad, not iPhone."},
+          {key:"a", text:"Flag as emulator — gyro DC bias of exactly 0.0 to fp32 precision and accelerometer noise std of exactly 0 are physically implausible for real silicon. Real IMUs always have bias in [0.01, 0.1] deg/s and noise std &gt; 0 even at rest. The CLEAN zero is the signature.", correct:true},
+          {key:"b", text:"Looks like a high-quality phone — allow."},
+          {key:"c", text:"Need behavioral biometrics; sensors alone can't tell."},
+          {key:"d", text:"Block all iOS users on safari."},
         ]}
-        trap={<>(b) is the engineer naive expectation — Apple rejects this at App Store review. (c) is too pessimistic — foreground access exists. (d) is fictional.</>}
-        lens={<>(a) is the calibrated read. iOS gives you a thin, foreground-only sensor surface. Either accept the sparser signal or focus the product on Android.</>}
-        stretch={<>What is the resulting EER asymmetry between iOS and Android, roughly?</>}
+        trap={<>(b) is the naive misread. (c) overshoots. (d) is irrelevant.</>}
+        lens={<>The cleanness is the smoking gun. Real silicon is always slightly noisy at rest.</>}
+        stretch={<>What if the attacker adds Gaussian noise to the synthetic stream?</>}
       />
 
       <VIS.TrapProblem
-        id="msf-p3"
+        id="msbf-p3"
         difficulty="hard"
-        multiSelect
-        title="P3 — Which sensor characteristics are hardware-permanent rather than software?"
-        scenario={<>You are choosing which signals to include in the encoder. Which of these are rooted in physical hardware and therefore stable across factory reset? Select all that apply.</>}
+        title="P3 — 100 employees on the same corp WiFi with identical iPhone 14 Pro SKUs from the same factory batch. Does the FP collapse?"
+        scenario={<><em>Discriminating insight: network attributes collapse (same WiFi, same egress IP); silicon-level sensor distributions do not — each phone's IMU has manufacturing-specific bias. The 'NAT defeats FP' lesson belongs to network-layer FP, not this one.</em><br/><br/>100 identical iPhone 14 Pro SKUs from one factory batch on one corporate WiFi. UA collapses; IP collapses. What does the deep sensor FP do?</>}
         options={[
-          {key:"a", text:"Gyroscope zero-rate bias.", correct:true},
-          {key:"b", text:"Accelerometer bias and scale factor.", correct:true},
-          {key:"c", text:"Microphone self-noise floor.", correct:true},
-          {key:"d", text:"Battery internal-resistance curve.", correct:true},
-          {key:"e", text:"Advertising-ID."},
-          {key:"f", text:"Camera dark-frame fixed-pattern noise.", correct:true},
+          {key:"a", text:"FP collapses — they all match."},
+          {key:"b", text:"FP separates them — even from one factory batch, each phone's IMU has its own manufacturing variation: gyro DC bias differs by tens of milli-deg/s, accel dc-offset by milligees, mag soft-iron correction by per-axis percent. The encoder reads silicon, not network. Network collapse does not propagate.", correct:true},
+          {key:"c", text:"FP is undefined."},
+          {key:"d", text:"Use canvas/WebGL FP instead."},
         ]}
-        trap={<>(e) is the obvious software-rotatable one — it is here to stop pattern-matching candidates from selecting every option.</>}
-        lens={<>The right answer set is the hardware-rooted signals. All of them are residuals of manufacturing variation that cannot be changed without replacing silicon.</>}
-        stretch={<>Which of those signals would you drop on consent-cost grounds for a banking SDK?</>}
+        trap={<>(a) imports the wrong lesson from network FP. (d) is a native app — canvas/WebGL FP does not apply.</>}
+        lens={<>Signal source determines failure mode. Sensor distributions are silicon, not network — NAT does not apply.</>}
+        stretch={<>What level of factory batch homogeneity DOES collapse this FP?</>}
       />
 
       <VIS.TrapProblem
-        id="msf-p4"
+        id="msbf-p4"
         difficulty="hard"
-        title="P4 — Frida-hooked emulator forges realistic gyro bias. How do you still catch it?"
-        scenario={<>A sophisticated adversary uses Frida to inject realistic gyro bias and accelerometer noise into an emulated device. Sensor signals look real. What residual signal does the emulator struggle to forge?</>}
+        title="P4 — iOS 17 ships. Match rate on iOS drops 25 points. Diagnose and fix."
+        scenario={<><em>Discriminating insight: iOS 17 gates high-rate motion APIs behind NSMotionUsageDescription; non-motion apps cannot prompt without App Review friction. The signal portfolio loses gyro + mag, leaving accelerometer + OS metadata. Retrain on the reduced portfolio.</em><br/><br/>iOS 17 ships. iOS match rate drops 25 points overnight. Pick the dominant fix.</>}
         options={[
-          {key:"a", text:"Coherence across many sensors at the same time. A real device's gyro, accelerometer, magnetometer, and barometer noise are correlated (same physical motion, same thermal environment). A scripted emulator usually injects each sensor independently. Detection: train a discriminator that scores the joint sensor trace, not single-sensor traces.", correct:true},
-          {key:"b", text:"Microphone audio - emulators have no microphone."},
-          {key:"c", text:"Battery percentage."},
-          {key:"d", text:"Screen resolution."},
+          {key:"a", text:"Switch to canvas/WebGL FP."},
+          {key:"b", text:"Retrain on the iOS-17-available subset: low-rate accelerometer + OS metadata + installed-system-package list. Drop the gated high-rate gyro / mag from the iOS-specific encoder branch. Match rate will not recover all 25 points but reaches ~15 points below pre-iOS-17 — accept that ceiling on iOS, lean harder on behavioral biometrics for borderline scores.", correct:true},
+          {key:"c", text:"Ask user for motion permission with a fraud-explanation copy — App Review will accept."},
+          {key:"d", text:"Use background sensor sampling — works fine without permission."},
         ]}
-        trap={<>(b) is partially true but easily worked around with audio injection. (c) and (d) carry no useful entropy.</>}
-        lens={<>(a) is the right answer. Real physical motion is jointly correlated across sensors; scripted noise rarely is. Joint-distribution discriminators raise the bar for the adversary substantially.</>}
-        stretch={<>What is the simplest discriminator you would ship: a learned joint model, or hand-crafted cross-sensor correlations?</>}
+        trap={<>(a) wrong stack — iOS native, no canvas. (c) App Review usually rejects fraud-only motion permission requests. (d) the OS blocks background high-rate sampling for non-permitted apps.</>}
+        lens={<>The technique survives by retraining on the reduced portfolio. Permission gates remove signals, not the method.</>}
+        stretch={<>Which apps DO legitimately get the full motion stream?</>}
       />
 
       <VIS.TrapProblem
-        id="msf-p5"
+        id="msbf-p5"
+        difficulty="hard"
+        title="P5 — A teammate filters out temperature drift from gyro bias to 'clean up the signal'. AUC drops. Why?"
+        scenario={<><em>Discriminating insight: the slope of gyro bias vs temperature is itself silicon-specific. Filtering it out is filtering out per-device entropy.</em><br/><br/>Match-rate AUC drops 0.04 after a refactor that median-filters gyro bias over device temperature. Diagnose.</>}
+        options={[
+          {key:"a", text:"The filter introduces lag and the embedding goes stale."},
+          {key:"b", text:"The TEMPERATURE-DRIFT COEFFICIENT (slope of gyro DC bias vs device temperature) is per-silicon and is itself one of the most discriminating features. Median-filtering across temperatures averages it out — the encoder loses a signal it was leaning on. Restore raw bias + temperature pair as input features.", correct:true},
+          {key:"c", text:"Median filtering is not differentiable."},
+          {key:"d", text:"Gyro bias is too noisy to use."},
+        ]}
+        trap={<>(a)(c)(d) are mechanically wrong or off-topic.</>}
+        lens={<>'Noise' that the ML reader instinctively wants to filter can be the signal. Audit before denoising.</>}
+        stretch={<>How do you ESTIMATE the drift coefficient in a 3s probe?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p6"
+        difficulty="hard"
+        title="P6 — Same iPhone 14 family-shared between mom + teenager. Gait biometrics separate them. Does this FP?"
+        scenario={<><em>Discriminating insight: this FP is DEVICE-discriminating (silicon-level passive baseline) — same phone yields the same FP regardless of who holds it. Gait is USER-discriminating (active behavioral). Don't conflate.</em><br/><br/>Mom and teenager share one iPhone 14. Gait biometrics distinguish them by walking pattern. Does the mobile SDK sensor FP also distinguish them?</>}
+        options={[
+          {key:"a", text:"Yes — sensor readings differ when each user holds the phone."},
+          {key:"b", text:"No — this FP is per-DEVICE, not per-user. The stationary-baseline probe reads silicon-level IMU bias which is identical regardless of which user holds the phone. Gait / accelerometer biometrics is a SEPARATE technique that reads active motion patterns and separates users. Combine: device FP for device identity, gait for user identity.", correct:true},
+          {key:"c", text:"No — both users have the same IDFA."},
+          {key:"d", text:"Yes — different microbiome affects the mic noise floor."},
+        ]}
+        trap={<>(a)(d) confuse passive vs active. (c) IDFA is OS-level, not the signal source.</>}
+        lens={<>Same hardware, different user -&gt; same FP by design. This is correct behavior, not a bug.</>}
+        stretch={<>How do you combine device + user identity into one risk score?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p7"
+        difficulty="hard"
+        title="P7 — Attacker captures a target's sensor trace and replays it in an emulator. Defense?"
+        scenario={<><em>Discriminating insight: passive replay is undetectable by a passive probe. The only defense is an ACTIVE motion challenge that requires live sensor response — only available to apps with legitimate motion permission.</em><br/><br/>Attacker records a target phone's 3-second sensor trace from a phishing app and replays it inside Genymotion. Your passive FP matches the target. Pick the right defense.</>}
+        options={[
+          {key:"a", text:"Raise the cosine threshold to 0.99."},
+          {key:"b", text:"Active motion challenge: at suspect scores, the app asks the user to rotate the phone in a specific pattern in 2s. Real silicon responds in real time with a unique trace; the replay attacker cannot mint a fresh response that matches both the challenge pattern AND the target silicon. Only deployable in apps with a legitimate motion-permission justification.", correct:true},
+          {key:"c", text:"Block all emulators."},
+          {key:"d", text:"Replay attacks are impossible on iOS 17."},
+        ]}
+        trap={<>(a) doesn't address replay. (c) is a downstream consequence not a defense for THIS attack. (d) factually wrong.</>}
+        lens={<>Passive defenses cannot detect passive replay. Active challenge is the only escalation, with the permission constraint.</>}
+        stretch={<>What's the App Review story for asking motion permission only for fraud?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p8"
         difficulty="medium"
-        title="P5 — Gyro bias drifts with temperature. How do you anchor a stable device embedding?"
-        scenario={<>Gyro zero-rate bias varies by a few percent across a year and with phone temperature. The naive prototype embedding for one device drifts away from itself. How do you stabilize?</>}
+        title="P8 — Match rate is 92% on Android, 75% on iOS. Why is iOS lower?"
+        scenario={<><em>Discriminating insight: iOS gates high-rate motion APIs; Android exposes more sensor channels by default. The portfolio is asymmetric — iOS uses fewer signals, lower entropy, lower match rate.</em><br/><br/>Match rate 92% Android, 75% iOS. Pick the dominant cause.</>}
         options={[
-          {key:"a", text:"Train with thermal and aging augmentations during pretraining so the encoder produces a bias-shift-invariant embedding. At deployment, re-anchor the device prototype every few weeks by averaging recent in-distribution sessions. Track prototype drift and alarm if it moves faster than the population norm.", correct:true},
-          {key:"b", text:"Use a fixed prototype forever."},
-          {key:"c", text:"Re-enroll the user every week."},
-          {key:"d", text:"Drop temperature-sensitive sensors."},
+          {key:"a", text:"iOS has fewer Android phones."},
+          {key:"b", text:"iOS 17 motion-permission gate restricts high-rate gyro + mag for apps without a motion use case. iOS encoder runs on a reduced portfolio (low-rate accel + OS metadata + installed packages), giving fewer bits of entropy per device. Android exposes the full sensor stream by default; richer portfolio, higher match.", correct:true},
+          {key:"c", text:"iPhones share serial numbers."},
+          {key:"d", text:"iOS Safari blocks the SDK."},
         ]}
-        trap={<>(b) decays steadily over months. (c) destroys UX. (d) discards too much signal.</>}
-        lens={<>(a) is the standard approach for any biometric or hardware-rooted ID: train invariance into the encoder and let the per-device prototype drift slowly with new evidence.</>}
-        stretch={<>What is the failure mode if you let the prototype drift too quickly?</>}
+        trap={<>(a) nonsense. (c) factually wrong. (d) iOS Safari is irrelevant to a native SDK.</>}
+        lens={<>Match rate maps to bits-of-entropy in the available portfolio. iOS portfolio is smaller; live with the ceiling.</>}
+        stretch={<>What's the right operating point for iOS-specific cosine threshold?</>}
       />
 
       <VIS.TrapProblem
-        id="msf-p6"
+        id="msbf-p9"
         difficulty="hard"
-        title="P6 — Microphone signal has high entropy. Should you include it?"
-        scenario={<>Microphone noise floor is among the most discriminative sensor signals. Including it lifts accuracy 3 points. But mic permission is a strong consent ask. What is the right call for a banking app?</>}
+        title="P9 — Android 14 ships idle-sensor downsampling. Match rate drops on Android. Fix?"
+        scenario={<><em>Discriminating insight: power-save downsamples idle sensors to 1Hz, making the noise-PSD estimate unreliable. Explicitly wake the IMU during the probe via SensorManager.SENSOR_DELAY_FASTEST.</em><br/><br/>Android 14 power-save ships. Idle gyro / accel rate drops to 1Hz. SDK probe still requests SENSOR_DELAY_NORMAL; noise PSD estimates go to zero. Match rate drops. Fix.</>}
         options={[
-          {key:"a", text:"Usually skip the mic in a banking SDK. Mic permission triggers a sharp consent friction (user perception is high-risk) and many users decline outright, losing more signal at the consent step than the mic adds to accuracy. Gyro plus accelerometer plus battery already give competitive coverage. Reserve mic for high-risk events where you can justify the consent ask narratively.", correct:true},
-          {key:"b", text:"Always include it — accuracy matters most."},
-          {key:"c", text:"Never include it — illegal."},
-          {key:"d", text:"Include it only at install time."},
+          {key:"a", text:"Switch to iOS-only."},
+          {key:"b", text:"Request SENSOR_DELAY_FASTEST for the duration of the probe, which overrides the idle-downsampling and gives full 50-100Hz samples for the 3s probe window. Cost: ~50mW extra for 3s, negligible battery hit. The noise-PSD estimate recovers, embedding stability returns.", correct:true},
+          {key:"c", text:"Increase probe to 30 seconds."},
+          {key:"d", text:"Use the magnetometer only — power-save doesn't affect it."},
         ]}
-        trap={<>(b) ignores consent-decline cost. (c) overstates the legal position. (d) is operationally awkward and barely helps.</>}
-        lens={<>(a) is the senior product call. Consent surface costs are not a side issue — they are part of the model design. Compute net coverage with consent decline factored in.</>}
-        stretch={<>How would you measure the net coverage cost of adding mic permission?</>}
+        trap={<>(a) loses platform. (c) hurts UX, doesn't fix the sampling rate. (d) factually wrong.</>}
+        lens={<>The right knob is the sensor-delay hint, not the probe duration.</>}
+        stretch={<>What's the latency cost of waking the IMU?</>}
       />
 
       <VIS.TrapProblem
-        id="msf-p7"
-        difficulty="hard"
-        multiSelect
-        title="P7 — App-install fraud: which fraudulent install signatures will the fingerprint catch?"
-        scenario={<>You launch the SDK in an adtech reattribution use case. Which of these adversary tactics will it catch? Select all that apply.</>}
+        id="msbf-p10"
+        difficulty="medium"
+        title="P10 — Why not just use IDFA / Android Advertising ID?"
+        scenario={<><em>Discriminating insight: IDFA / AAID can be reset by the user at any time AND iOS 14.5+ ATT defaults to opt-out. They are designed to be resettable — the OPPOSITE of what fraud needs.</em><br/><br/>PM proposes using IDFA only. Diagnose.</>}
         options={[
-          {key:"a", text:"Click-spammers re-installing the same emulator farm under different advertising-IDs.", correct:true},
-          {key:"b", text:"Real users running the same app many times.", incorrect:false},
-          {key:"c", text:"Device farms with one physical phone per install — different real hardware.", incorrect:false},
-          {key:"d", text:"VPN proxies hiding origin IPs.", incorrect:false},
-          {key:"e", text:"SDK-spoofing - apps that fake the SDK's outbound request without instrumenting the device.", correct:true},
-          {key:"f", text:"Emulator farms switching emulator software versions.", correct:true},
+          {key:"a", text:"Reasonable — IDFA is unique per device."},
+          {key:"b", text:"Wrong — IDFA / AAID are explicitly designed to be RESETTABLE by the user (and on iOS, opt-out by default since ATT in iOS 14.5). The entire point of the deep sensor FP is to survive that reset. IDFA-only fraud detection is defeated by Settings -&gt; Reset Advertising Identifier; the deep FP is not.", correct:true},
+          {key:"c", text:"Wrong — IDFA was deprecated."},
+          {key:"d", text:"Reasonable but combine with cookies."},
         ]}
-        trap={<>(b), (c), (d) are NOT caught by sensor fingerprinting — those are real or distinct hardware. The trap is conflating fingerprinting with VPN detection or with detecting legitimate distinct users.</>}
-        lens={<>The fingerprint catches the same physical device pretending to be many — (a), (e), (f). It does not catch distinct real devices, distinct hardware farms, or network-layer tricks. Layer it with other signals.</>}
-        stretch={<>What is the cheapest defense against a one-phone-per-install hardware farm?</>}
+        trap={<>(c) factually wrong. (d) cookies don't exist in a native app.</>}
+        lens={<>The platform IDs are designed for user control. Fraud needs a control-resistant signal, which is the silicon-level read.</>}
+        stretch={<>What about Apple's SKAdNetwork ID?</>}
       />
 
       <VIS.TrapProblem
-        id="msf-p8"
+        id="msbf-p11"
         difficulty="hard"
-        title="P8 — Pretraining corpus is one-vendor-heavy. What happens at deployment?"
-        scenario={<>Your pretraining data is 80 percent Samsung Galaxy. At deployment, Pixel and OnePlus traffic shows much lower re-identification. Why and what is the fix?</>}
+        title="P11 — Triplet positives all sampled within one boot session. What breaks?"
+        scenario={<><em>Discriminating insight: same-boot positives share OS-state context (uptime, temperature, current cell-tower). The encoder solves the loss without learning silicon-level invariance. Validation looks good; production drift kills you.</em><br/><br/>Positives all sampled &lt;1h apart, same boot session. Training loss bottoms out in 2 epochs. Production match drops 12 points one week post-deploy. Diagnose.</>}
         options={[
-          {key:"a", text:"Sensor signatures cluster by chipset and manufacturer. An encoder pretrained on a Samsung-heavy corpus learned features tuned to Samsung's sensor stack and underweights signals that matter for other vendors. Fix: rebalance pretraining across vendors with a stratified sample, OR pretrain a single shared encoder followed by per-vendor lightweight adapters.", correct:true},
-          {key:"b", text:"Pixel and OnePlus users walk differently."},
-          {key:"c", text:"Sensor APIs differ across vendors and break the encoder."},
-          {key:"d", text:"Encoder needs more parameters."},
+          {key:"a", text:"Embedding dim too small."},
+          {key:"b", text:"Positives within one boot session share OS-state context (CPU temperature, cell tower, battery) and the encoder solves triplet loss by latching on those, NOT the silicon-level bias / drift / noise. Resample positives across boot sessions and days, with deliberate inclusion of post-reboot / post-temperature-change pairs.", correct:true},
+          {key:"c", text:"Learning rate too low."},
+          {key:"d", text:"Triplet margin too small."},
         ]}
-        trap={<>(b) is a non-sequitur. (c) is partly true but the API layer is normalized in the SDK; the real issue is data distribution. (d) treats a representation issue as a capacity issue.</>}
-        lens={<>(a) is the right answer. Vendor-stratified pretraining is the standard fix for hardware-rooted models, the same way racial-stratified data is required for face recognition.</>}
-        stretch={<>Would per-vendor adapters or a vendor-aware single encoder be your default?</>}
+        trap={<>(a)(c)(d) plausible tuning, none address the data sampling problem.</>}
+        lens={<>The encoder learns whatever is invariant in your POSITIVE pairs. If positives are within-session, you learn within-session, not within-silicon.</>}
+        stretch={<>What's the right MIN gap for a positive pair?</>}
       />
 
       <VIS.TrapProblem
-        id="msf-p9"
-        difficulty="hard"
-        title="P9 — Threshold drift over a year. What is the cause and the fix?"
-        scenario={<>You launch at threshold 0.85. After 12 months the same-device cosine averages drift down to 0.78 on long-tenure devices. False-rejects climb. Why?</>}
+        id="msbf-p12"
+        difficulty="medium"
+        title="P12 — Jailbroken iPhone with Frida hook on CoreMotion. FP risk?"
+        scenario={<><em>Discriminating insight: jailbreak frameworks can hook the sensor API and inject arbitrary values. Defense is jailbreak detection + drop trust score, not signal-level.</em><br/><br/>Jailbroken iPhone uses Frida to hook CoreMotion and return faked sensor values. The FP shows whatever the attacker chose. Defense.</>}
         options={[
-          {key:"a", text:"Hardware sensor characteristics drift slowly with aging and use (especially battery internal resistance and gyro bias). Long-tenure devices show natural drift away from the original enrollment prototype. Fix: continuously re-anchor each prototype with a moving-average over recent sessions; alarm if drift exceeds a population-normalized rate.", correct:true},
-          {key:"b", text:"The encoder is overfitting."},
-          {key:"c", text:"Users are deliberately attacking the threshold."},
-          {key:"d", text:"Cosine becomes unstable over time."},
+          {key:"a", text:"Increase probe duration to 30s — the hook will reveal inconsistencies."},
+          {key:"b", text:"Jailbreak detection: scan for known JB markers (Cydia / Sileo, frida-server processes, suspicious dylibs), drop the trust score to zero on detection. The sensor FP is unreliable on a jailbroken device regardless of the signal — defense is at the platform-integrity layer.", correct:true},
+          {key:"c", text:"Switch to Android-only."},
+          {key:"d", text:"Use mic noise floor only — Frida can't hook audio."},
         ]}
-        trap={<>(b) is misnamed. (c) is unlikely population-wide. (d) is mathematical nonsense.</>}
-        lens={<>(a) is the right answer. Hardware drift is real and gradual; the production fix is per-device prototype re-anchoring, not encoder retraining.</>}
-        stretch={<>How fast should the moving average be: hours, days, or weeks?</>}
+        trap={<>(a) optimistic. (c) loses platform. (d) factually wrong — Frida hooks any API.</>}
+        lens={<>Once root trust is broken, the FP signal source can be faked. Defend at platform integrity, not at signal.</>}
+        stretch={<>How would you detect Frida without itself being hooked?</>}
       />
 
       <VIS.TrapProblem
-        id="msf-p10"
+        id="msbf-p13"
         difficulty="hard"
-        title="P10 — End-to-end design: mobile-ATO defense for a top-10 banking app"
-        scenario={<>Top-10 US banking app, 30M MAU, 50/50 iOS and Android, ATO from emulator farms rising. You can ship one new device signal this quarter. Pick ONE.</>}
+        title="P13 — 'Normalize sensor readings by removing the DC component — that's standard signal processing.' Apply here?"
+        scenario={<><em>Discriminating insight: DC component IS the signal in this technique. Standard signal-processing intuition (DC=noise, AC=signal) is inverted here.</em><br/><br/>DSP engineer joins, says 'always remove DC bias from sensor data — that's signal processing 101.' Diagnose.</>}
         options={[
-          {key:"a", text:"Sensor + device fusion fingerprint, full coverage on Android with gyro plus accelerometer plus battery and opportunistic foreground-only sensors on iOS. Mic excluded for consent friction. Vendor-stratified pretraining; per-device prototype re-anchoring monthly; layered with existing IP and behavioral signals. Emulator-detection branch keyed on joint sensor coherence.", correct:true},
-          {key:"b", text:"Require microphone permission from all users."},
-          {key:"c", text:"Continuous background sensor reads on iOS - identical to Android."},
-          {key:"d", text:"Skip iOS entirely - too restrictive."},
+          {key:"a", text:"Reasonable — DC removal is best practice."},
+          {key:"b", text:"Wrong here — DC bias IS the discriminating feature. This technique inverts the standard DSP assumption: for motion analysis DC is noise; for device fingerprinting DC is silicon-level identity. Keep DC; estimate and embed it as a feature. The DSP engineer is correct for gait recognition (the sibling visual) and wrong for this one.", correct:true},
+          {key:"c", text:"Reasonable but apply only to gyro."},
+          {key:"d", text:"Wrong — DSP doesn't apply to mobile sensors."},
         ]}
-        trap={<>(b) destroys consent rate. (c) is an App Store rejection. (d) abandons half the MAU.</>}
-        lens={<>(a) is the senior design. Same encoder, platform-appropriate sampling, no mic, vendor-stratified data, layered with non-sensor defenses. Most teams fail by ignoring the iOS consent surface or by relying on sensor fingerprinting as the sole verdict.</>}
-        stretch={<>What metric tells you in week 1 that emulator-detection is actually working?</>}
+        trap={<>(a)(c)(d) misread the role of DC for this concept.</>}
+        lens={<>What is noise vs signal depends on the QUESTION. Filter intuition must be re-derived per task.</>}
+        stretch={<>What other 'noise' should you keep?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p14"
+        difficulty="medium"
+        title="P14 — Install-rebate fraud: same phone reinstalls the app 50 times to collect $1 each. Best defense?"
+        scenario={<><em>Discriminating insight: every install rotates IDFA / AAID, defeating any OS-ID-based dedup. The sensor FP matches all 50 installs to the same device because silicon doesn't change.</em><br/><br/>Affiliate marketing rebate: $1 per new install. Fraudster reinstalls 50 times on one phone. IDFA changes each time. Pick the right defense.</>}
+        options={[
+          {key:"a", text:"Block by IP."},
+          {key:"b", text:"Mobile SDK behavioral FP — all 50 installs produce the same silicon-level baseline, encoder produces 50 embeddings within cosine 0.97 of each other, ANN dedups to one device. IDFA rotation is irrelevant; the FP reads BELOW the OS layer.", correct:true},
+          {key:"c", text:"Email verification."},
+          {key:"d", text:"CAPTCHA."},
+        ]}
+        trap={<>(a)(c)(d) are easy to bypass with cheap proxies / disposable email / human solvers.</>}
+        lens={<>Sub-OS signal source defeats OS-level dedup defeat.</>}
+        stretch={<>What about 50 phones from one fraudster?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p15"
+        difficulty="hard"
+        title="P15 — Two iPhones from the same factory batch. How close in cosine are they likely to be?"
+        scenario={<><em>Discriminating insight: factory batch homogeneity raises bias mean similarity but the NOISE PSD shape still differs per silicon. Empirical cosine: ~0.6-0.8 in batch, well below threshold of 0.90.</em><br/><br/>Two iPhone 14 Pro from the same factory batch, same SKU, same OS version. Approximate cosine?</>}
+        options={[
+          {key:"a", text:"&gt; 0.98 — they match."},
+          {key:"b", text:"Roughly 0.6-0.8 — manufacturing variation across silicon batches still produces enough bias-vector difference to separate. Plus the noise-PSD shape (not just mean) differs per silicon: two phones from one batch can have similar gyro DC bias but different PSD curves. Cosine sits well below typical threshold of 0.90.", correct:true},
+          {key:"c", text:"Exactly 1.0 — same hardware."},
+          {key:"d", text:"Random — uniform on [-1, 1]."},
+        ]}
+        trap={<>(a)(c) overclaim batch homogeneity. (d) ignores that the encoder is metric-trained.</>}
+        lens={<>Even within a batch, silicon variation provides usable entropy. The technique is not defeated by batch homogeneity.</>}
+        stretch={<>What WOULD collapse this further?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p16"
+        difficulty="medium"
+        title="P16 — Account-farm uses 1000 residential proxy IPs from 1 emulator instance on a single VM. Defense?"
+        scenario={<><em>Discriminating insight: emulator detection via clean-zero / missing temp-drift fires immediately; IP velocity sees 1 sign-up per IP and finds nothing.</em><br/><br/>Account farm: 1000 residential IPs, 1 Genymotion instance on a desktop VM. Pick the right defense.</>}
+        options={[
+          {key:"a", text:"IP velocity rules with tighter bucket."},
+          {key:"b", text:"Mobile SDK FP with emulator detection — Genymotion emits clean-zero sensor values (gyro=0.0, no temp drift). All 1000 sign-ups carry the same emulator signature, plus the same emulator embedding. The FP flags the farm via two independent signatures (suspect-cluster + emulator-signature) where IP velocity sees nothing.", correct:true},
+          {key:"c", text:"Email verification."},
+          {key:"d", text:"Require phone verification."},
+        ]}
+        trap={<>(a) defeated by residential proxies. (c)(d) defeated by disposable email / SIM farms.</>}
+        lens={<>Device-side detection looks AT the device, not the network. The whole technique is built for this attack.</>}
+        stretch={<>What if the attacker uses 1000 real phones?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p17"
+        difficulty="medium"
+        title="P17 — Payload budget is 2 KB per cold start. What goes in?"
+        scenario={<><em>Discriminating insight: send STATISTICS (mean, std, FFT bands), not raw 100Hz sensor streams. Local stat reduction shrinks 100Hz x 3s x 3 axes (~3.6KB raw) into ~200 bytes of stats.</em><br/><br/>SDK payload budget 2KB. 100Hz x 3s x 9 sensor axes raw = 10.8KB. Pick the right serialization.</>}
+        options={[
+          {key:"a", text:"Send raw — bandwidth is cheap."},
+          {key:"b", text:"Compute statistics LOCALLY (mean, std, FFT band magnitudes, slope vs temperature) and send the ~200-byte stat vector plus OS metadata. The encoder is trained on those stats; raw streams add no signal once the stats are correctly chosen. Battery + bandwidth budget preserved.", correct:true},
+          {key:"c", text:"Send raw but compress with gzip."},
+          {key:"d", text:"Stream raw to server WebSocket."},
+        ]}
+        trap={<>(a)(c)(d) all hammer bandwidth and battery for no signal gain.</>}
+        lens={<>The encoder consumes stat-vectors; design the SDK to ship stat-vectors.</>}
+        stretch={<>Which stats are load-bearing and which are nice-to-have?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p18"
+        difficulty="hard"
+        title="P18 — Mobile app embeds a WebView showing third-party HTML. Use canvas/WebGL FP inside the WebView?"
+        scenario={<><em>Discriminating insight: WebView CAN run canvas/WebGL FP but the GPU-render artifacts pass through an extra ANGLE layer that is platform-specific, reducing entropy. For native-app device-id, the silicon-level sensor FP is the right tool. Use canvas/WebGL only for web-context tracking.</em><br/><br/>App embeds a WebView for partner content. PM asks 'should we run canvas/WebGL FP in there to dedup the device?' Diagnose.</>}
+        options={[
+          {key:"a", text:"Yes — same as web."},
+          {key:"b", text:"Use the SDK sensor FP for device-id (it's available natively, the SDK is already loaded). Canvas/WebGL FP inside a WebView passes through an extra abstraction layer (ANGLE / WebKit) that flattens some of the per-pixel GPU artifacts. It works, but with less entropy than the native sensor signal. The two visuals are not interchangeable.", correct:true},
+          {key:"c", text:"No — WebView doesn't support canvas."},
+          {key:"d", text:"Yes — always prefer browser-side."},
+        ]}
+        trap={<>(a)(d) miss the platform asymmetry. (c) factually wrong.</>}
+        lens={<>Native context = sensor FP. Browser context = canvas/WebGL FP. Don't cross.</>}
+        stretch={<>If the app is ONLY a WebView wrapper, what's the right choice?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p19"
+        difficulty="hard"
+        title="P19 — Sophisticated emulator emits non-zero bias + Gaussian noise. How do you still detect it?"
+        scenario={<><em>Discriminating insight: emulators rarely simulate temperature-drift coupling — leave the probe running while the CPU warms up; real silicon's gyro bias shifts on a per-device slope; emulator's stays flat.</em><br/><br/>An advanced emulator injects realistic-looking Gaussian noise around plausible bias values. The clean-zero signature no longer fires. What's the next-layer detection?</>}
+        options={[
+          {key:"a", text:"Give up — emulator is undetectable."},
+          {key:"b", text:"Temperature-drift coupling. Real silicon's gyro bias shifts with device temperature on a per-device slope; emulators rarely model this coupling. Run a 30-second probe while the CPU warms up (loop a small compute task), measure gyro-bias vs temperature slope. Real device shows a clear non-zero slope; emulator shows flat-line. The MISSING temperature drift is the signature.", correct:true},
+          {key:"c", text:"Use accelerometer only."},
+          {key:"d", text:"Use mic noise."},
+        ]}
+        trap={<>(a) defeatist. (c)(d) name signals without the temperature-coupling insight.</>}
+        lens={<>Emulator detection is an arms race; the next layer is always a physical coupling the emulator forgot to model.</>}
+        stretch={<>What's the NEXT layer after temperature drift?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p20"
+        difficulty="medium"
+        title="P20 — Cosine match between two app sessions: 0.97. Two installs on the same phone, or one user fooling us?"
+        scenario={<><em>Discriminating insight: 0.97 is well above threshold; SDK FP says 'same device'. Whether it's the same user is OUTSIDE this technique's scope — combine with user-level signals to answer that.</em><br/><br/>Two sessions match at cosine 0.97. Senior asks 'are these the same user?' Answer.</>}
+        options={[
+          {key:"a", text:"Yes — same device implies same user."},
+          {key:"b", text:"The FP says same DEVICE with high confidence (0.97 well above threshold). It says nothing about the user — could be one user with two installs, two users sharing one phone, or a sold device. Combine with user-level signals (auth, behavior, account-link graph) to answer the user question. The device FP is a building block, not a complete identity.", correct:true},
+          {key:"c", text:"No — cosine 0.97 is below threshold."},
+          {key:"d", text:"Yes — IDFA confirms it."},
+        ]}
+        trap={<>(a) conflates device with user. (c) misreads the operating point. (d) IDFA would have rotated on reinstall.</>}
+        lens={<>Device FP and user identity are orthogonal layers. The technique answers exactly one question.</>}
+        stretch={<>How would you combine the two layers into one risk score?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p21"
+        difficulty="hard"
+        title="P21 — Where do you get ground-truth same-device labels at scale?"
+        scenario={<><em>Discriminating insight: logged-in app surfaces give same-device-over-time pairs via account+sensor co-occurrence. Reinstall labels come from users who log back into the same account post-reinstall.</em><br/><br/>You need 100M+ same-device positive pairs. Source.</>}
+        options={[
+          {key:"a", text:"Manual labeling."},
+          {key:"b", text:"Logged-in app sessions: when the SAME account signs into the SAME app across multiple days with positive sensor co-occurrence, those sessions form same-device positive pairs. Reinstall-survival pairs come from users who log back into the same account after a reinstall — IDFA rotated but account didn't. Negatives come from different-account pairs with disjoint sensor signatures.", correct:true},
+          {key:"c", text:"DGraph-Fin."},
+          {key:"d", text:"MAC addresses."},
+        ]}
+        trap={<>(a) doesn't scale. (c) wrong domain. (d) blocked.</>}
+        lens={<>Logged-in app surfaces are the ground-truth engine. The reinstall-survival positive class is what makes the FP useful.</>}
+        stretch={<>How would you bootstrap with NO login surface?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p22"
+        difficulty="medium"
+        title="P22 — Per-device embedding drifts 0.02 cosine per month. Concerning?"
+        scenario={<><em>Discriminating insight: small per-month drift is expected (IMU aging + ambient temp distribution shift). Operationally tolerated up to a budget; raise an alert only on sudden step changes.</em><br/><br/>Long-tail device cohort shows steady 0.02 cosine drift per month. Concerning?</>}
+        options={[
+          {key:"a", text:"Yes — retrain immediately."},
+          {key:"b", text:"Normal — small drift is expected from IMU silicon aging, ambient temperature-distribution shifts across seasons, and slow OS-metadata changes. Threshold for retraining: alert on sudden STEP changes (Chrome-style version bumps applied to mobile OS, or a fleet-wide OS update); steady slow drift is absorbed by the embedding margin.", correct:true},
+          {key:"c", text:"Yes — silicon doesn't age."},
+          {key:"d", text:"No — sensors are noiseless."},
+        ]}
+        trap={<>(a) overreacts. (c)(d) factually wrong.</>}
+        lens={<>Slow drift is expected; step changes are the alarm.</>}
+        stretch={<>What's the right step-change detection rule?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p23"
+        difficulty="medium"
+        title="P23 — A family of 4 shares one iPad. The FP sees 4 different IDFAs over time. Match them all together?"
+        scenario={<><em>Discriminating insight: same device with multiple Apple-IDs produces the same silicon-level FP. ALL 4 IDFAs match to one device — correct behavior.</em><br/><br/>Family-shared iPad: 4 distinct Apple-IDs sign in over a year, 4 distinct IDFAs. FP behavior.</>}
+        options={[
+          {key:"a", text:"Each IDFA gets its own embedding cluster."},
+          {key:"b", text:"All 4 IDFAs map to ONE device embedding — silicon is unchanged; the FP correctly identifies one device across 4 user accounts. This is the desired behavior: device-level identity is below user-level. Risk decisions should combine device FP with user-level signals (account-link graph, behavior).", correct:true},
+          {key:"c", text:"FP returns 4 separate devices."},
+          {key:"d", text:"FP returns 'error - too many users'."},
+        ]}
+        trap={<>(a)(c) confuse device and user. (d) is a fake error.</>}
+        lens={<>One device, many users = correct collapsing. The technique answers ONE question.</>}
+        stretch={<>Should this fact be exposed to the risk engine downstream?</>}
+      />
+
+      <VIS.TrapProblem
+        id="msbf-p24"
+        difficulty="hard"
+        title="P24 — Block at cosine &lt; 0.85 vs cosine &lt; 0.92 — what does that decision swing?"
+        scenario={<><em>Discriminating insight: tighter threshold (0.92) cuts FPR (fewer good users falsely blocked) at the cost of higher FNR (more bots get through). The right point is the cost-ratio between FP and FN.</em><br/><br/>Pick the right framing for the threshold decision.</>}
+        options={[
+          {key:"a", text:"0.92 is always better — higher confidence."},
+          {key:"b", text:"0.85 catches more bots but blocks more legitimate users; 0.92 lets some bots through but rarely blocks legit users. The right point is the cost ratio: at a bank where each fraud=$5k and each false-block=$10 of CX cost, 0.85 wins; at a free game where each fraud=$1 and false-block=$0.10 of lost retention, 0.92 wins. Tune per-product.", correct:true},
+          {key:"c", text:"0.85 always — better recall."},
+          {key:"d", text:"0.92 always — better precision."},
+        ]}
+        trap={<>(a)(c)(d) ignore the cost ratio.</>}
+        lens={<>Operating point is a cost decision, not a model decision.</>}
+        stretch={<>How do you make this auto-tune online?</>}
       />
     </VIS.Section>
 
@@ -1707,35 +1909,35 @@ flowchart TB
             <strong>Sift Engineering — Multi-signal device fingerprinting</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog, 2025)</span>
-          <br/>The source post on fusing sensor signals with OS metadata. Best practitioner overview of the production tradeoffs.
+          <br/>Source for the technique; practitioner-side feature-engineering details for stationary-baseline sensor probes.
         </li>
         <li>
           <a href="https://developer.apple.com/documentation/coremotion" target="_blank" rel="noopener">
-            <strong>Apple — Core Motion Documentation</strong>
+            <strong>Apple CoreMotion / iOS 17 motion-permission docs</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(docs)</span>
-          <br/>Read this BEFORE designing an iOS deployment. Defines what sensor access is allowed in foreground vs background, with vs without entitlements.
+          <br/>What the permission gate actually requires. Read before claiming sensor access in App Review.
         </li>
         <li>
-          <a href="https://developer.android.com/develop/sensors-and-location/sensors" target="_blank" rel="noopener">
-            <strong>Android — Sensors overview</strong>
+          <a href="https://arxiv.org/abs/1408.1416" target="_blank" rel="noopener">
+            <strong>AccelPrint — Fingerprinting smartphones via accelerometer</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, NDSS 2014)</span>
+          <br/>The foundational accelerometer-based device-FP paper. Concise demo that DC bias is silicon-permanent.
+        </li>
+        <li>
+          <a href="https://developer.android.com/reference/android/hardware/SensorManager" target="_blank" rel="noopener">
+            <strong>Android SensorManager — sampling rate hints</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(docs)</span>
-          <br/>The Android sensor API. More permissive than iOS but still subject to Doze and App Standby restrictions.
+          <br/>SENSOR_DELAY_FASTEST is the right knob for cold-start probes; necessary reading after Android 14 power-save changes.
         </li>
         <li>
-          <a href="https://www.cs.princeton.edu/~felten/sensor-id.pdf" target="_blank" rel="noopener">
-            <strong>Bojinov et al. — Mobile Device Identification via Sensor Fingerprinting</strong>
+          <a href="https://frida.re/" target="_blank" rel="noopener">
+            <strong>Frida — dynamic instrumentation toolkit</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper)</span>
-          <br/>The early academic paper proving accelerometer fingerprints are unique-enough across phones. Foundational reading.
-        </li>
-        <li>
-          <a href="https://lilianweng.github.io/posts/2021-05-31-contrastive/" target="_blank" rel="noopener">
-            <strong>Lilian Weng — Contrastive Representation Learning</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Practitioner walkthrough of contrastive losses — useful background for the metric-learning choices.
+          <span style={{color:"#64748b", fontSize:14}}>(tool)</span>
+          <br/>Understand the jailbreak / hooking attack surface before designing platform-integrity defenses.
         </li>
       </ul>
     </VIS.Section>
