@@ -1414,329 +1414,641 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// FraudFM / FT-Transformer — cross-issuer foundation model for fraud,
-// pretrained on 1B+ anonymized tx from 50+ issuers. NeurIPS 2024 FinAI workshop.
+// FraudFM / FT-Transformer — feature-tokenizer transformer (Gorishniy et al.,
+// NeurIPS 2021) productionized as FraudFM (NeurIPS 2024 FinAI workshop).
+// Load-bearing distinctions that must survive redaction:
+//   (1) FEATURE-TOKENIZER — each tabular column becomes a learned vector
+//       token; numerical features are scalar-value-times-learned-vector;
+//       categorical are embedding lookups. Self-attention runs ACROSS COLUMNS
+//       within a single row. The unit of attention is PER-COLUMN, NOT
+//       per-cell-in-sequence (TabBERT) and NOT per-event-in-row-sequence
+//       (FATA-Trans).
+//   (2) FraudFM = FT-Transformer + cross-issuer pretrain on consortium data.
+//       Different cross-org signal vs Transformer-Risk-Mastercard: FraudFM
+//       anchors on broader fraud labels + per-column tokenization; T-R-M
+//       anchors on auth-decline prediction + per-event tokenization.
+// Strip "per-column tokenizer" or "cross-issuer pretrain" and the answers
+// must NOT still work.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Foundation models for fraud"
       title="FraudFM / FT-Transformer"
-      subtitle="Foundation model pretrained on anonymized transactions across many issuers — small issuers piggyback on big-bank scale via cross-institution transfer."
+      subtitle="Each tabular feature becomes a learned vector token; self-attention runs across columns within one row. FraudFM extends with cross-issuer pretrain on 1B+ anonymized tx from 50 issuers."
       byline={[
-        {label: "Source", value: "Foundation Models for Financial Fraud Detection (NeurIPS 2024 FinAI workshop)"},
-        {label: "Year", value: "2024"},
-        {label: "L3", value: "Foundation models for fraud"},
+        {label: "Source", value: "Gorishniy et al., NeurIPS 2021 (FT-Transformer); FraudFM NeurIPS 2024 FinAI workshop"},
+        {label: "L3", value: "Feature-tokenizer transformer + cross-issuer pretrain"},
+        {label: "Anchor", value: "Per-column tokenization; consortium-scale pretrain"},
       ]}/>
 
     <VIS.TLDR>
-      Each issuer training a fraud model in isolation hits a scale ceiling — small issuers especially don't have enough data to train modern{" "}
-      <VIS.Term def="A neural network that uses self-attention to model relationships across positions in a sequence. Originally for text; now applied to time series, tabular logs, and code.">Transformer</VIS.Term>{" "}
-      models from scratch. FraudFM pretrains an{" "}
-      <VIS.Term def="Feature-Tokenizer Transformer — a transformer for tabular data where each column (feature) becomes a token, and a CLS-style token reads them for prediction.">FT-Transformer</VIS.Term>{" "}
-      on one billion plus anonymized transactions pooled across fifty plus issuers, then individual issuers fine-tune on their own labels. The transfer gain is largest for the smallest issuers. The catch: the data-sharing arrangement is a legal and governance problem, not just a modeling problem.
+      Most tabular models concatenate features into one input vector and let an MLP figure out cross-column interactions implicitly. FT-Transformer rejects that: <strong>every column becomes a learned vector token</strong>. Numerical features are tokenized as (scalar value × learned per-feature embedding vector); categorical features are embedding-lookups. Stack the column-tokens as a sequence and run self-attention <em>across columns within a single row</em>. The transformer learns explicitly which column-pair interactions matter (amount × MCC, velocity × geolocation, device-trust × IP-country) — no hand-engineered crosses. <strong>FraudFM</strong> takes this backbone and pretrains it on consortium-scale data — 1B+ anonymized transactions from 50+ issuers — so a small bank inherits cross-bank fraud priors via the pretrained encoder. The unit of attention is per-COLUMN, not per-row-in-a-sequence (FATA-Trans) and not per-cell-in-a-2D-tape (TabBERT). The cross-issuer pretrain is the same general idea as Mastercard's Transformer-Risk but anchored on a different signal: fraud labels and per-column tokens vs auth-decline labels and per-event tokens.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — feature-tokenizer transformer">
       <ol>
-        <li><strong>Data pooling under contract:</strong> participating issuers anonymize and contribute transactions to a shared pretraining corpus. Privacy primitives — k-anonymity, differential privacy noise, federated aggregation — vary by arrangement.</li>
-        <li><strong>FT-Transformer encoder:</strong> each transaction is tokenized field-by-field (one token per column); a CLS-style summary token feeds the prediction head. Pretrained with masked-field objective on the pooled corpus.</li>
-        <li><strong>Per-issuer fine-tune:</strong> each issuer downloads the pretrained encoder and fine-tunes on their own labeled fraud set. Smaller issuers benefit most because their isolated training would have been data-starved.</li>
+        <li><strong>Per-column tokenization (feature-tokenizer):</strong> for each column c with value x_c in a row:
+          <ul>
+            <li><strong>Numerical</strong>: token = x_c · v_c, where v_c is a learned per-feature embedding vector. Critically, the SCALAR multiplies the vector — the model knows both which feature it is (v_c) and the magnitude (x_c).</li>
+            <li><strong>Categorical</strong>: token = embed[col_c, val_c] — standard embedding lookup.</li>
+            <li><strong>Embedding features</strong> (already vectors): pass through or linear-project to the token dim.</li>
+          </ul>
+        </li>
+        <li><strong>Prepend [CLS] token</strong> just like BERT.</li>
+        <li><strong>Stack of self-attention layers</strong> over the K column-tokens (typical K = 20-100 columns). Compute is O(K²) per layer — small because K is small.</li>
+        <li><strong>Classification head</strong> on the [CLS] representation.</li>
+        <li><strong>FraudFM addition</strong>: gather anonymized tx from 50+ consortium issuers; pretrain the FT-Transformer backbone with a supervised fraud objective on the union; ship the pretrained backbone; each issuer fine-tunes the classifier head (and lightly the backbone) on their own labeled fraud.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  I1["Issuer 1 tx"] --> P["Pooled corpus"]
-  I2["Issuer 2 tx"] --> P
-  IN["..."] --> P
-  P --> F["Pretrain FT-Transformer"]
-  F --> A["Issuer A fine-tune"]
-  F --> B["Issuer B fine-tune"]
-  F --> C["Issuer C fine-tune"]
-  style P fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style F fill:#fef3c7,stroke:#d97706,stroke-width:2px
-      `} />
-      <p>Blue is the cross-issuer pooled corpus. Yellow is the pretrained encoder distributed to participants, each fine-tuning on their own labels.</p>
+  R["Row - 50 columns numerical + categorical + embedding"]
+  R --> T1["amount times v_amount"]
+  R --> T2["embed merchant_id"]
+  R --> T3["embed MCC"]
+  R --> T4["device_trust times v_device"]
+  R --> TN["..."]
+  T1 --> A["Self-attention across columns"]
+  T2 --> A
+  T3 --> A
+  T4 --> A
+  TN --> A
+  CLS["[CLS] token"] --> A
+  A --> H["Classification head"]
+  H --> Y["Fraud score"]
+  P["FraudFM pretrain - 50 issuers"] -.->|"pretrained weights"| A
+  style A fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style P fill:#fef3c7,stroke:#d97706,stroke-width:2px
+      `}/>
+      <p>Blue = the self-attention over per-column tokens (load-bearing piece #1). Yellow = the cross-issuer pretrain that FraudFM adds (load-bearing piece #2). The token unit is one column-of-one-row.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="How it differs from MLP / row-sequence transformers / Transformer-Risk-Mastercard">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Per-issuer model</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>FraudFM</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>MLP on tabular</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>FATA-Trans / TabBERT</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Transformer-Risk-Mastercard</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>FraudFM / FT-Transformer</th>
           </tr>
         </thead>
         <tbody>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Training data</td>
-            <td style={{padding:"8px 10px"}}>One issuer's history</td>
-            <td style={{padding:"8px 10px"}}>Many issuers, anonymized and pooled</td>
+            <td style={{padding:"6px 10px"}}>Unit of attention</td>
+            <td style={{padding:"6px 10px"}}>N/A (dense layers)</td>
+            <td style={{padding:"6px 10px"}}>Per-row (sequence of rows)</td>
+            <td style={{padding:"6px 10px"}}>Per-auth-event tuple</td>
+            <td style={{padding:"6px 10px"}}><strong>Per-COLUMN within one row</strong></td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Small-issuer accuracy</td>
-            <td style={{padding:"8px 10px"}}>Limited by their own scale</td>
-            <td style={{padding:"8px 10px"}}>Lifted by transfer</td>
+            <td style={{padding:"6px 10px"}}>Input scope</td>
+            <td style={{padding:"6px 10px"}}>Single row, concatenated</td>
+            <td style={{padding:"6px 10px"}}>Sequence of rows</td>
+            <td style={{padding:"6px 10px"}}>Sequence of auth events</td>
+            <td style={{padding:"6px 10px"}}>Single row, tokenized columns</td>
           </tr>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Legal complexity</td>
-            <td style={{padding:"8px 10px"}}>Low — own data</td>
-            <td style={{padding:"8px 10px"}}>High — data-sharing contracts</td>
+            <td style={{padding:"6px 10px"}}>Cross-org pretrain</td>
+            <td style={{padding:"6px 10px"}}>No</td>
+            <td style={{padding:"6px 10px"}}>No</td>
+            <td style={{padding:"6px 10px"}}>Yes — auth-decline anchor</td>
+            <td style={{padding:"6px 10px"}}><strong>Yes — fraud-label anchor</strong></td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Big-issuer marginal gain</td>
-            <td style={{padding:"8px 10px"}}>Already at scale</td>
-            <td style={{padding:"8px 10px"}}>Marginal — they were already fine</td>
+            <td style={{padding:"6px 10px"}}>Cross-column attention</td>
+            <td style={{padding:"6px 10px"}}>Implicit via dense layers</td>
+            <td style={{padding:"6px 10px"}}>Within-row attention (separate)</td>
+            <td style={{padding:"6px 10px"}}>N/A (different unit)</td>
+            <td style={{padding:"6px 10px"}}><strong>Explicit — the main mechanism</strong></td>
+          </tr>
+          <tr style={{background:"#e8f0fa"}}>
+            <td style={{padding:"6px 10px"}}>Best fit</td>
+            <td style={{padding:"6px 10px"}}>Simple tabular</td>
+            <td style={{padding:"6px 10px"}}>Per-user sequence patterns</td>
+            <td style={{padding:"6px 10px"}}>Cross-issuer auth-decline</td>
+            <td style={{padding:"6px 10px"}}>Single-row fraud + consortium pretrain</td>
           </tr>
         </tbody>
       </table>
+      <p style={{marginTop:10}}>Redaction litmus: strip "per-column tokenization" and "cross-issuer pretrain" — does the answer still win? If yes, the problem isn't testing FraudFM specifically.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Small or mid-tier issuer</strong> that cannot pretrain a Transformer from scratch.</li>
-        <li><strong>Industry consortium</strong> or networked-issuer arrangement where data-sharing contracts are workable.</li>
-        <li><strong>Long-tail fraud typologies</strong> that any single issuer rarely sees — pooled corpus surfaces them.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Data governance is the hard part">
-        Privacy contracts, jurisdictional rules (GDPR, CCPA, PCI), and competitive concerns — none of which the model architecture solves. Many proposed FraudFM-style consortia stall at the data-sharing agreement, not the modeling.
+    <VIS.Section id="sec-limits" title="Limits and gotchas — the FraudFM-specific ones">
+      <VIS.Callout kind="gotcha" title="Feature-tokenizer is the load-bearing engineering choice">
+        Numerical tokenization (x_c · v_c) is the standard recipe but breaks at heavy-tail amounts (e.g., $1 vs $1M get the same v_c scaled to wildly different magnitudes — gradient instability). Alternatives: piecewise-linear embeddings, log-normalized x_c, per-feature batch-norm before the scalar. Choice dominates lift on heavy-tail features.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Anonymization is harder than it looks">
-        Naive anonymization (drop PII columns) is insufficient. Transaction sequences are themselves identifying — a card's recent merchant pattern is often as unique as a fingerprint. Strong anonymization (differential-privacy noise, k-anonymity over sequences) costs accuracy.
+      <VIS.Callout kind="warn" title="High-cardinality columns explode the embedding table">
+        merchant_id with 1B unique values means 1B × d_embed rows — infeasible. Use hash trick (modulo + collision tolerance) or column clustering (group merchants by MCC + region). Pretrained FraudFM backbones often have specific embedding-table schemas; mismatching at fine-tune means re-initializing those embeddings.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Heterogeneous schemas across issuers">
-        Each issuer encodes merchant IDs differently, defines categories differently, processes amounts in different currencies. The shared schema needs negotiation; the encoder needs to be robust to schema drift.
+      <VIS.Callout kind="warn" title="Consortium pretrain has data governance constraints">
+        Cross-issuer pretrain requires the consortium to share anonymized tx. Anonymization protocols (hashing PAN, dropping cardholder PII) leave residual signal that may be re-identifiable; legal review is mandatory. "Your bank excluded from your pretrain" guarantee should be in the contract — otherwise leakage is possible.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Big-issuer participation is the bottleneck">
-        Big issuers have the data scale that makes the pretraining worth doing. They also have the least to gain from sharing. Incentive design — paid access, revenue share, regulatory mandate — is what makes consortia work.
+      <VIS.Callout kind="warn" title="GBDT on the same features often matches FT-Transformer">
+        Grinsztajn 2022 ("Why do tree-based models still outperform deep learning on tabular data?") showed that on standard tabular benchmarks, tuned LightGBM matches or beats FT-Transformer. FraudFM's claimed lift over GBDT is mostly from the cross-issuer pretrain — a data lever, not an architecture lever. Always include a tuned-GBDT baseline.
+      </VIS.Callout>
+      <VIS.Callout kind="gotcha" title="Feature-schema drift invalidates pretrained backbone">
+        Adding a new column (e.g., device-trust-score) means a new feature-token slot with random initialization; the pretrained backbone has no learned cross-attention for it. Fix: warm-init the new token from a similar existing feature OR re-pretrain.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Trap problems on cross-issuer transfer, legal risk, anonymization, and where the foundation-model framing helps or hurts.
+        Every problem hinges on something only FraudFM / FT-Transformer does: the per-column feature-tokenization (numerical = scalar × learned vector, categorical = embedding), the across-columns-within-one-row self-attention, the cross-issuer consortium pretrain (anchored on fraud labels, not auth-decline), or the high-cardinality / heavy-tail tokenization gotchas. Strip "per-column tokenizer" or "cross-issuer pretrain" and the option must no longer win.
       </p>
 
+      {/* P1 — B3 pitch */}
       <VIS.TrapProblem
-        id="ffm-p1"
+        id="fraudfm-p1"
         difficulty="hard"
-        title="P1 — Argue for/against pretraining across issuers. What is the legal risk?"
-        scenario={<>An interviewer says: argue for and against pretraining a fraud foundation model across issuers. Name the central legal risk.</>}
+        title="P1 — Director asks: 'We have 50 columns of tabular features and a tuned XGBoost. Why move to FraudFM?'"
+        scenario={<><em>Discriminating insight: the pitch must name BOTH (a) per-column tokenization + cross-column attention as the architectural mechanism, AND (b) the cross-issuer consortium pretrain as the unique data lever. Just "transformer better" or "cross-issuer data" alone fails the redaction test. Honest pitch also names where XGBoost still competes (Grinsztajn 2022).</em><br/><br/>Pick the pitch.</>}
         options={[
-          {key:"a", text:"For: pooled scale lifts the smallest issuers and surfaces long-tail fraud typologies. Against: pooled transaction data is competitively sensitive (signals issuer-specific fraud patterns), jurisdictionally regulated (GDPR, CCPA, PCI), and re-identifiable via sequence fingerprints even after anonymization. The central legal risk is that anonymization fails — regulators consider re-identifiable data not anonymized, and a data-sharing arrangement that produces re-identifiable outputs is a privacy breach. Mitigations: differential-privacy noise, federated rather than pooled training, strong contractual data-use limits.", correct:true},
-          {key:"b", text:"There is no legal risk — anonymized data is free to share."},
-          {key:"c", text:"The only risk is that the model becomes too accurate."},
-          {key:"d", text:"Legal risk is overblown."},
+          {key:"a", text:"Transformers are better than GBDT, full stop."},
+          {key:"b", text:"Two-lever pitch. (1) <strong>Per-column feature-tokenizer + cross-column attention</strong>: each of our 50 columns becomes a learned vector token (numerical = scalar value × learned per-feature embedding; categorical = lookup). Self-attention across the 50 tokens learns explicitly which column-pair interactions matter (amount × MCC × country, velocity × IP-country, device-trust × merchant-MCC) without us hand-engineering crosses. XGBoost can enumerate crosses with depth, but combinatorially blows up past 3-way. (2) <strong>FraudFM consortium pretrain</strong>: the backbone is pretrained on 1B+ anonymized tx from 50 issuers, anchored on fraud labels. Our small issuer plugs into a representation that has seen 100x our volume; the fine-tune learns the decision boundary on top. Honest caveat: Grinsztajn 2022 shows tuned LightGBM matches FT-Transformer on standard tabular benchmarks, so the LIFT IS LARGELY FROM THE PRETRAIN, not from the architecture per se. If we cannot use the consortium pretrain (data governance reasons), the lift over our XGBoost shrinks substantially.", correct:true},
+          {key:"c", text:"FraudFM uses BERT, which is the SOTA for tabular fraud."},
+          {key:"d", text:"FraudFM has more parameters than XGBoost."},
         ]}
-        trap={<>(b), (c), (d) all underweight the privacy risk.</>}
-        lens={<>(a) names the failure mode (re-identification) and the standard mitigations (DP, federation, contracts).</>}
-        stretch={<>Federated learning instead of pooled — what does it lose?</>}
+        trap={<>(a)(c)(d) reduce to generic "deep learning is better" without naming the load-bearing pieces; (c) is also factually confused (FT-Transformer is the backbone, not BERT).</>}
+        lens={<>Pitch must name (1) per-column tokenization + cross-column attention AND (2) consortium pretrain. And include the honest "GBDT may match without the consortium" caveat.</>}
+        stretch={<>If you can't use the consortium pretrain, is FraudFM still worth shipping? Hint: marginal, probably XGBoost.</>}
       />
 
+      {/* P2 — feature-tokenizer mechanism */}
       <VIS.TrapProblem
-        id="ffm-p2"
+        id="fraudfm-p2"
         difficulty="hard"
-        title="P2 — Anonymization. Drop PII or do more?"
-        scenario={<>The proposed scheme drops card numbers, names, addresses. Is that anonymization sufficient?</>}
+        title="P2 — Numerical feature tokenization: how does FT-Transformer represent 'amount = $500' as a token?"
+        scenario={<><em>Discriminating insight: numerical token = SCALAR VALUE × learned per-feature embedding vector v_c. The scalar carries magnitude; the vector carries "which feature this is." Self-attention then sees amount-token aligned with merchant-token, country-token, etc., and learns cross-column attention over them.</em><br/><br/>Pick the tokenization.</>}
         options={[
-          {key:"a", text:"No. Transaction sequences themselves are identifying. A card's recent merchant pattern, geography, and amount distribution is often as unique as a fingerprint — researchers have shown four to five transactions are typically enough to re-identify a card in pooled data. Strong anonymization requires k-anonymity over sequences (group sequences so any sequence is indistinguishable from at least k-1 others) or differential-privacy noise added during pretraining, at the cost of accuracy.", correct:true},
-          {key:"b", text:"Yes — dropping PII is enough."},
-          {key:"c", text:"Anonymization is impossible."},
-          {key:"d", text:"Only addresses need to be dropped."},
+          {key:"a", text:"Just embed the scalar value as a learned embedding lookup."},
+          {key:"b", text:"Numerical token = x_c · v_c, where x_c is the scalar value (500.0 here) and v_c is a LEARNED per-feature embedding vector (one vector per numerical column, learned during training). The scalar multiplies the vector elementwise, producing a d-dimensional token that encodes (a) which feature it is via v_c's direction, and (b) the value's magnitude via the scalar multiplier. This token can now be attended to alongside categorical-feature tokens (embed[merchant_id]) in the same self-attention layer. Critically: a different numerical column (say, balance = 12345) has its OWN learned v_balance vector, so amount-token and balance-token are distinguishable even when their scalars are similar. Categorical tokenization is the standard embed-lookup. Both produce d-dimensional vectors that live in the same attention space.", correct:true},
+          {key:"c", text:"Concatenate the scalar with a feature-name string."},
+          {key:"d", text:"Discretize 500 into a bucket and embed the bucket."},
         ]}
-        trap={<>(b) is the textbook wrong answer that triggers regulator action. (c) is defeatist. (d) is incomplete.</>}
-        lens={<>(a) names the sequence-uniqueness problem and the right primitives.</>}
-        stretch={<>How much accuracy do you lose at epsilon equal to one DP?</>}
+        trap={<>(a) loses the per-feature identity. (c) is unrelated. (d) is the TabBERT-style approach; loses magnitude resolution.</>}
+        lens={<>x_c · v_c: scalar carries value, learned vector carries feature identity.</>}
+        stretch={<>What breaks for heavy-tail numerical values? Hint: gradient instability — the scalar multiplier swings 6+ orders of magnitude.</>}
       />
 
+      {/* P3 — vs MLP */}
       <VIS.TrapProblem
-        id="ffm-p3"
+        id="fraudfm-p3"
         difficulty="hard"
-        title="P3 — Pooled training or federated training?"
-        scenario={<>Two architectures: pool the data centrally and pretrain, or train federated (each issuer trains locally, share gradients). Which would you pick for FraudFM?</>}
+        title="P3 — Why doesn't an MLP with concatenated features learn the same cross-column interactions?"
+        scenario={<><em>Discriminating insight: MLP's dense layers learn implicit crosses but every interaction must be encoded in the dense-layer weights — combinatorially expensive past 3-way. Self-attention over column-tokens is content-addressable: amount-token can attend to MCC-token DIRECTLY for any cross. Different inductive bias.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"Depends on the legal environment. Pooled is simpler architecturally and gets you the strongest model — but requires a data-sharing contract that may be impossible across jurisdictions. Federated lets each issuer keep raw data locally, sharing only gradients or model updates, and is the only legally feasible option in many cross-border arrangements. Federated costs more in engineering, suffers from straggler issuers, and underperforms pooled by a few points typically. Pick federated when legal blocks pooled; pick pooled when contracts allow.", correct:true},
-          {key:"b", text:"Always pooled — federated is too slow."},
-          {key:"c", text:"Always federated — pooled is illegal."},
-          {key:"d", text:"There is no difference."},
+          {key:"a", text:"MLP and FT-Transformer learn identical interactions."},
+          {key:"b", text:"Different inductive biases. MLP concatenates features into a single input vector; dense layers must learn cross-feature interactions implicitly via their weight matrices — a 3-way interaction (amount × MCC × country) requires the dense layer to encode the conjunction across all combinations, which scales combinatorially. FT-Transformer keeps each feature as a SEPARATE TOKEN and uses self-attention: amount-token's query can DIRECTLY attend to MCC-token's key (and country-token's key) in one attention op — the interaction is content-addressable, not encoded in weights. For 50 columns with rich K-way interactions, attention's parameter efficiency dominates MLP's. The inductive bias is 'cross-column lookups are first-class operations,' which matches how tabular fraud signal lives in feature-pair joints.", correct:true},
+          {key:"c", text:"MLP can't handle numerical features."},
+          {key:"d", text:"MLP is older."},
         ]}
-        trap={<>(b) and (c) are over-general. (d) is wrong.</>}
-        lens={<>(a) is the senior framing.</>}
-        stretch={<>What is the typical accuracy gap between pooled and federated?</>}
+        trap={<>(a) collapses; (c)(d) are wrong/incidental.</>}
+        lens={<>Content-addressable cross-column attention vs combinatorial dense-layer crosses. Same expressivity in the limit; different parameter efficiency.</>}
+        stretch={<>For 5 columns, is MLP good enough? Hint: yes — at low column count, FT-Transformer's advantage shrinks.</>}
       />
 
+      {/* P4 — vs FATA-Trans / TabBERT unit of token */}
       <VIS.TrapProblem
-        id="ffm-p4"
+        id="fraudfm-p4"
+        difficulty="hard"
+        title="P4 — FATA-Trans, TabBERT, FT-Transformer — same idea, different unit. Where's the actual difference?"
+        scenario={<><em>Discriminating insight: unit of token differs. FT-Transformer: per-COLUMN of one row. FATA-Trans: per-ROW in a sequence (with per-field type at tier-1). TabBERT: per-CELL on a 2-D tape with MLM. Different units = different scopes of attention.</em><br/><br/>Compare.</>}
+        options={[
+          {key:"a", text:"They are the same."},
+          {key:"b", text:"Unit of token is the load-bearing difference. <strong>FT-Transformer</strong>: per-COLUMN of ONE row. The 'sequence' is the 50 columns of a single transaction; attention is across-columns-within-one-row. Good for single-row fraud where within-row interactions dominate. <strong>FATA-Trans</strong>: per-ROW of a sequence of rows (with per-field-type partition WITHIN each row). The 'sequence' is the user's history of transactions; attention is across-rows-over-time (plus a within-row tier-1). Good for per-user behavioral patterns over time. <strong>TabBERT</strong>: per-CELL on a 2-D (row × column) tape with MLM objective. Cells share row-PE and column-PE; mask per-cell. Good for unlabeled-rich pretraining on tabular sequences. Same general 'transformer on tabular' family; different unit-of-attention → different scope. They solve different problems and stack (FraudFM is FT-Transformer + cross-issuer pretrain; you can also pretrain FT-Transformer with MLM, which is FT-Transformer + TabBERT objective; etc.).", correct:true},
+          {key:"c", text:"FT-Transformer is for text; the others are for tabular."},
+          {key:"d", text:"They use different optimizers."},
+        ]}
+        trap={<>(a)(c)(d) miss the unit-of-token distinction.</>}
+        lens={<>Unit of token: FT = per-column-one-row; FATA = per-row-sequence; TabBERT = per-cell-2D.</>}
+        stretch={<>Which one would you pick for "score a single tx with rich features but no history"? Hint: FT-Transformer.</>}
+      />
+
+      {/* P5 — cross-issuer pretrain mechanism vs Transformer-Risk-Mastercard */}
+      <VIS.TrapProblem
+        id="fraudfm-p5"
+        difficulty="hard"
+        title="P5 — FraudFM and Transformer-Risk-Mastercard both do cross-org pretrain. Where do they differ?"
+        scenario={<><em>Discriminating insight: same cross-org concept but DIFFERENT signals — FraudFM anchors on FRAUD LABELS (confirmed chargebacks across the consortium) at per-COLUMN tokenization; T-R-M anchors on AUTH-DECLINE prediction at per-EVENT tokenization. Different label, different token unit, different fine-tune surface.</em><br/><br/>Compare.</>}
+        options={[
+          {key:"a", text:"They are the same."},
+          {key:"b", text:"Same general idea, different anchors. (1) <strong>Signal:</strong> FraudFM pretrains on FRAUD LABELS across the consortium (confirmed chargebacks aggregated from 50 issuers) — a typology vocabulary of fraud patterns. Transformer-Risk-Mastercard pretrains on AUTH-DECLINE prediction across all Mastercard network authorizations — a vocabulary of decline-relevant behavioral patterns. Different labels, different vocabularies. (2) <strong>Token unit:</strong> FraudFM = per-column of one row (FT-Transformer backbone). Transformer-Risk-Mastercard = per-auth-event tuple in a sequence (sequence transformer backbone). (3) <strong>Fine-tune surface:</strong> FraudFM produces a single-row fraud classifier; T-R-M produces a real-time auth-path scorer. (4) <strong>Data source:</strong> FraudFM's consortium is opt-in 50 issuers; T-R-M's pretrain is the union of all Mastercard authorizations the network sees. Both leverage cross-org data the single issuer can't replicate; the WHAT differs.", correct:true},
+          {key:"c", text:"FraudFM is a Mastercard product."},
+          {key:"d", text:"Transformer-Risk uses MLP not transformer."},
+        ]}
+        trap={<>(a)(c)(d) confuse the products or collapse the distinction.</>}
+        lens={<>Same cross-org lever; different signal + token unit. FraudFM = fraud-label + per-column. T-R-M = decline + per-event.</>}
+        stretch={<>Could a bank use both? Hint: yes — FraudFM for single-row tabular scoring, T-R-M for real-time auth.</>}
+      />
+
+      {/* P6 — heavy-tail numerical tokenization */}
+      <VIS.TrapProblem
+        id="fraudfm-p6"
+        difficulty="hard"
+        title="P6 — Amount column spans $0.01 to $50000. Naive numerical tokenization (x_c · v_c) breaks. Why?"
+        scenario={<><em>Discriminating insight: at x=50000 the token magnitude is 50000 × ||v_c||; at x=0.01 it's 0.0001 × ||v_c||. Gradient updates over 7 orders of magnitude in scale are unstable; LayerNorm pre-attention helps but the scale difference still distorts attention scores. Fix: log-normalize x_c, or use piecewise-linear embeddings (Gorishniy follow-up paper).</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Use bigger v_c vectors."},
+          {key:"b", text:"At x_c = 50000 vs x_c = 0.01, the same v_c vector is scaled by 5e6× different magnitudes — the resulting tokens have wildly different norms, and attention scores (Q · K^T) are dominated by token-norm magnitude rather than direction. LayerNorm pre-attention helps normalize but loses the magnitude signal. Fixes: (i) <strong>log-normalize x_c</strong> before multiplication (log($50000) = 10.8 vs log($0.01) = -4.6 — 3 orders of magnitude is manageable); (ii) <strong>piecewise-linear embeddings</strong> (Gorishniy follow-up) — bin x_c into K bins, each bin has its own learned embedding, the token is a weighted sum of adjacent bin embeddings by where in the bin x_c falls; (iii) <strong>per-feature batch norm</strong> before x_c · v_c. The naive scalar-times-vector is the standard recipe BUT breaks at heavy tails — production deployments use one of the three fixes.", correct:true},
+          {key:"c", text:"Heavy-tail amounts don't matter."},
+          {key:"d", text:"Quantize to integers."},
+        ]}
+        trap={<>(a) doesn't address the scaling issue; (c) is dismissive; (d) loses too much resolution.</>}
+        lens={<>Heavy-tail scalar multipliers break attention's norm-sensitive scoring. Log-normalize or piecewise-embed.</>}
+        stretch={<>Why does log-normalize work? Hint: tames the scale to ~3 orders of magnitude.</>}
+      />
+
+      {/* P7 — Grinsztajn skepticism */}
+      <VIS.TrapProblem
+        id="fraudfm-p7"
+        difficulty="hard"
+        title="P7 — A 2022 review (Grinsztajn) shows tuned GBDT often matches FT-Transformer on tabular benchmarks. How do you read this?"
+        scenario={<><em>Discriminating insight: Grinsztajn 2022 is the most important sanity check in the space. The honest read: FT-Transformer's ARCHITECTURE advantage over tuned GBDT is small. FraudFM's advantage is mostly the CROSS-ISSUER PRETRAIN data lever, NOT the architecture. Without the consortium, you may match GBDT.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"The 2022 review is wrong."},
+          {key:"b", text:"Honest read of the Grinsztajn 2022 result. On STANDARD TABULAR BENCHMARKS (no cross-issuer pretrain available, hyperparameter-tuned LightGBM vs hyperparameter-tuned FT-Transformer with reasonable compute matching), tree-based models match or beat deep tabular models. The architectural advantage of FT-Transformer over tuned GBDT is MARGINAL on tabular benchmarks. So FraudFM's claimed lift over GBDT is mostly attributable to the CROSS-ISSUER CONSORTIUM PRETRAIN — a data lever that GBDT cannot use (you can't pretrain GBDT on cross-issuer data and fine-tune; GBDT is supervised-only). If you can't use the consortium pretrain (data governance, no consortium access), FraudFM's advantage over your tuned GBDT shrinks substantially. Senior framing: ALWAYS include a tuned-GBDT baseline; ablate architecture from cross-issuer pretrain.", correct:true},
+          {key:"c", text:"FT-Transformer is always worse than GBDT."},
+          {key:"d", text:"Tabular deep learning doesn't work."},
+        ]}
+        trap={<>(a)(c)(d) overclaim either direction.</>}
+        lens={<>Architecture lift is small; data lever (consortium pretrain) is large. Ablate them.</>}
+        stretch={<>What's the right experiment to attribute lift? Hint: FraudFM-pretrained vs FT-Transformer-from-scratch vs tuned-GBDT.</>}
+      />
+
+      {/* P8 — consortium leakage */}
+      <VIS.TrapProblem
+        id="fraudfm-p8"
+        difficulty="hard"
+        title="P8 — Your bank pretrains on a consortium that includes your own data. What's the eval problem?"
+        scenario={<><em>Discriminating insight: if your bank's data is in the consortium pretrain corpus, AND your fine-tune labels overlap with what was in the consortium, you're testing memorization not generalization. The cross-issuer lift number is inflated. Demand "your bank excluded from your pretrain" guarantee.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"It's fine — more data is better."},
+          {key:"b", text:"Eval-time leakage. If your bank's transactions are part of the FraudFM consortium pretrain corpus, the pretrained backbone has SEEN your bank's general patterns during pretraining. Your fine-tune labels overlap (potentially) with the same time period the consortium pretrain saw. The fine-tune eval is testing 'how well the model memorizes your bank's traffic' not 'how well cross-issuer behavior transfers to your bank.' The cross-issuer lift number is inflated. Demand a 'your bank excluded from your pretrain' guarantee in the consortium contract: pretrain corpus should explicitly exclude your bank's tx; fine-tune is the only place your data enters. Honest eval: user-stratified temporal split on your bank's data, with chargeback labels joined as of the eval cutoff.", correct:true},
+          {key:"c", text:"Leakage is impossible because the data is anonymized."},
+          {key:"d", text:"Eval doesn't matter for foundation models."},
+        ]}
+        trap={<>(a) ignores the leak; (c) confuses anonymization with information leakage (anonymization removes identity, not behavioral patterns); (d) is dismissive.</>}
+        lens={<>Consortium pretrain must exclude your bank's data to honestly measure cross-issuer transfer.</>}
+        stretch={<>What's the anonymization standard? Hint: hashing PAN, dropping PII — but per-user behavior patterns can still re-identify.</>}
+      />
+
+      {/* P9 — high-cardinality */}
+      <VIS.TrapProblem
+        id="fraudfm-p9"
+        difficulty="hard"
+        title="P9 — merchant_id column has 1B unique values. Embedding table is infeasible. What fix?"
+        scenario={<><em>Discriminating insight: 1B × d_embed is infeasible. Production: hash-trick (modulo K buckets, accept collisions) OR column clustering (group merchants by MCC + region, smaller vocabulary). Pretrained FraudFM has its own embedding scheme; fine-tune must match.</em><br/><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Use the 1B embedding table."},
+          {key:"b", text:"Two production options. (1) <strong>Hash trick</strong>: hash merchant_id modulo K buckets (typical K = 100k-1M), share embeddings across colliding merchants. Collisions are a controllable noise — increase K to reduce collisions, decrease K to compress. For fraud, K=1M is typical; most merchants have unique hashes; long-tail collides but its behavior is averaged within the hash group, which is acceptable. (2) <strong>Column clustering</strong>: group merchants by (MCC + region + size-tier), use the cluster as the token; loses per-merchant resolution but vocabulary shrinks to ~10k. (3) <strong>Hybrid</strong>: keep top-K merchants by volume as individual tokens (e.g., top 100k); hash the rest into shared buckets. Pretrained FraudFM has its own embedding-scheme — fine-tune must match (use the same hash family) or re-train embeddings from scratch.", correct:true},
+          {key:"c", text:"Drop merchant_id."},
+          {key:"d", text:"Use a string encoder."},
+        ]}
+        trap={<>(a) is infeasible; (c) drops the highest-signal column; (d) is unrelated.</>}
+        lens={<>Hash trick or column clustering. Pretrained model fixes the scheme.</>}
+        stretch={<>What hash family avoids adversarial collision attacks? Hint: cryptographic hash with periodic rotation.</>}
+      />
+
+      {/* P10 — feature schema drift */}
+      <VIS.TrapProblem
+        id="fraudfm-p10"
+        difficulty="hard"
+        title="P10 — You add a new feature 'device_trust_score' after pretrain. How to integrate without re-pretraining?"
+        scenario={<><em>Discriminating insight: the pretrained FraudFM backbone has no token slot or learned attention weights for device_trust. Fix options: (1) warm-init the new feature's v_c from a SIMILAR existing feature's v_c (e.g., similar to ip_trust), (2) fine-tune the new feature's slot with a small learning rate to avoid disrupting other features, (3) eventual re-pretrain.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Re-pretrain from scratch."},
+          {key:"b", text:"Three options in order of cost. (1) <strong>Warm-init</strong>: identify a feature already in the pretrained backbone that is BEHAVIORALLY similar to the new device_trust_score (e.g., ip_trust_score, account_age) and initialize the new v_c from that feature's pretrained v_c. The new feature inherits cross-column attention priors that are roughly correct. Fine-tune with a small lr on the new slot. Cheapest option. (2) <strong>Cold-init with low lr</strong>: initialize the new v_c randomly but use a SMALLER lr for it than other parameters; the rest of the network adapts to it without disrupting the cross-feature attention learned in pretrain. (3) <strong>Eventual re-pretrain</strong>: when you've accumulated enough new-feature data, re-pretrain the backbone with the new column in the schema. Production typically does (1) or (2) for fast deployment and (3) on a quarterly cadence.", correct:true},
+          {key:"c", text:"Drop the new feature."},
+          {key:"d", text:"The pretrained backbone handles new features automatically."},
+        ]}
+        trap={<>(a) is expensive; (c) loses signal; (d) is false.</>}
+        lens={<>Schema drift = new token slot. Warm-init from similar pretrained feature, fine-tune carefully.</>}
+        stretch={<>How do you measure "behaviorally similar" features? Hint: SHAP-correlation on a tuned model.</>}
+      />
+
+      {/* P11 — eval contamination */}
+      <VIS.TrapProblem
+        id="fraudfm-p11"
+        difficulty="hard"
+        title="P11 — FraudFM offline lift 7pt over your XGBoost. Production: 2pt. Diagnose."
+        scenario={<><em>Discriminating insight: usual suspects — (1) eval-time leakage (consortium contains your data; user-stratified temporal split needed), (2) compute mismatch (FraudFM pretrain was huge, XGBoost might be undertuned), (3) feature-engineering disparity (the XGBoost baseline missing engineered crosses while FraudFM gets attention "for free").</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Production is buggy."},
+          {key:"b", text:"Three confounds typical for this. (1) <strong>Eval-time leakage</strong>: if your bank's data is in the consortium pretrain, the offline eval over-credits the cross-issuer lift; user-stratified temporal split + 'bank excluded from pretrain' closes part of the gap. (2) <strong>Compute mismatch</strong>: FraudFM pretrain is multi-day on a cluster; the XGBoost baseline might be hyperparameter-default. Tune XGBoost with the same compute budget (broad hyperparameter sweep, ensemble, feature engineering). (3) <strong>Feature engineering gap</strong>: FraudFM gets cross-feature attention 'for free' but the XGBoost baseline might be missing engineered crosses (amount × MCC × country); add the obvious crosses to GBDT and the lift shrinks. After all three corrections, the honest lift is ~2pt matching production. The lift is real, but the inflated offline number bundled architecture + leakage + compute + feature-engineering effects.", correct:true},
+          {key:"c", text:"FraudFM is over-claimed."},
+          {key:"d", text:"Production data is bad."},
+        ]}
+        trap={<>(a)(c)(d) deflect.</>}
+        lens={<>Three confounds: leakage, compute, feature-eng. Strip all three to attribute lift.</>}
+        stretch={<>Which confound matters most in fraud? Hint: usually feature-engineering — well-engineered GBDT closes most of the architecture gap.</>}
+      />
+
+      {/* P12 — D2 cascade */}
+      <VIS.TrapProblem
+        id="fraudfm-p12"
+        difficulty="hard"
+        title="P12 — Team uses FT-Transformer trained from scratch on 200k labels. AUPRC is 1pt below XGBoost. Trace the cascade."
+        scenario={<><em>Discriminating insight: FT-Transformer's architectural advantage over GBDT is small (Grinsztajn 2022); the value is in CROSS-ISSUER PRETRAIN. Training from scratch on 200k labels gives you architectural overhead without the data lever. Result: FT-Transformer underperforms tuned GBDT.</em><br/><br/>Cascade.</>}
+        options={[
+          {key:"a", text:"FT-Transformer is broken."},
+          {key:"b", text:"The team missed that FT-Transformer's value comes mostly from PRETRAIN. (1) From-scratch FT-Transformer on 200k labels has architectural overhead (more parameters than the data supports) → mild overfit. (2) Without consortium pretrain, no cross-issuer behavioral priors → architecture lift is small. (3) GBDT with proper feature engineering matches or beats FT-Transformer on standard tabular benchmarks (Grinsztajn 2022). Cascade: 'FT-Transformer is SOTA' → ignore the data-lever distinction → train from scratch → no pretrain advantage → 1pt below GBDT → team blames the architecture instead of the picking process. Senior framing: FT-Transformer's claim is architecture; FraudFM's claim is architecture + cross-issuer pretrain. Without the pretrain, you're back to architecture-only which is marginally different from GBDT.", correct:true},
+          {key:"c", text:"200k labels is not enough."},
+          {key:"d", text:"FT-Transformer is just bad."},
+        ]}
+        trap={<>(a)(d) overclaim; (c) is partial.</>}
+        lens={<>Architecture lift alone is small. The lever is the pretrain.</>}
+        stretch={<>At what label count does FT-Transformer from-scratch start to beat tuned GBDT? Hint: typically &gt;1M labels.</>}
+      />
+
+      {/* P13 — when to use */}
+      <VIS.TrapProblem
+        id="fraudfm-p13"
+        difficulty="medium"
+        title="P13 — Three scenarios where FraudFM is the right call vs sibling methods."
+        scenario={<><em>Discriminating insight: (1) small issuer with consortium access — cross-issuer pretrain is the big lever; (2) heterogeneous tabular features with rich cross-column interactions — feature-tokenizer + cross-column attention; (3) single-row fraud where the user-history sequence isn't the dominant signal — FT-Transformer over FATA-Trans / Mamba.</em><br/><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Always FraudFM."},
+          {key:"b", text:"Three. (1) <strong>Small issuer with consortium access</strong>: cross-issuer pretrain delivers cross-bank fraud priors a small issuer can't reproduce alone; this is the biggest lift. (2) <strong>Heterogeneous tabular features with rich cross-column interactions</strong>: 50+ columns with numerical, categorical, embedding features where amount × MCC × country × velocity joints carry signal; feature-tokenizer + cross-column attention learns these explicitly. (3) <strong>Single-row fraud (no rich user history)</strong>: new-user scoring, KYC fraud, or one-tx-one-decision use cases where FATA-Trans / Mamba's sequence advantage isn't available. NOT when: user-history sequence patterns dominate (use FATA-Trans / Mamba); pure-numerical features (XGBoost or simple MLP fine); no consortium access (architecture lift alone is marginal vs tuned GBDT).", correct:true},
+          {key:"c", text:"Never FraudFM."},
+          {key:"d", text:"FraudFM only for KYC."},
+        ]}
+        trap={<>(a)(c)(d) overclaim.</>}
+        lens={<>Conditions: consortium access + heterogeneous features + single-row fraud.</>}
+        stretch={<>What's the floor unlabeled-tx volume for the consortium to be useful? Hint: ~10M tx in the consortium across &gt;5 issuers.</>}
+      />
+
+      {/* P14 — diagnostic battery */}
+      <VIS.TrapProblem
+        id="fraudfm-p14"
         difficulty="hard"
         multiSelect
-        title="P4 — Which issuers gain most from FraudFM? Pick all that apply."
-        scenario={<>You analyze the per-issuer lift from FraudFM versus per-issuer training. Which kinds of issuers gain most? Select all that apply.</>}
+        title="P14 — FraudFM model misbehaves. Which diagnostics target FraudFM-specific failure modes? Pick all that apply."
+        scenario={<><em>Discriminating insight: FraudFM-specific: per-feature embedding norms (some columns under-trained), cross-column attention patterns (some features ignored), pretrained-vs-random-init fine-tune gap (validates pretrain), feature-schema match between pretrain and fine-tune, heavy-tail numerical-feature token norms.</em><br/><br/>Pick.</>}
         options={[
-          {key:"a", text:"Small issuers with limited training data.", correct:true},
-          {key:"b", text:"Issuers facing rare fraud typologies that the pooled corpus surfaces.", correct:true},
-          {key:"c", text:"Issuers with already-massive in-house data and pretraining capability."},
-          {key:"d", text:"Issuers in regions where their own fraud patterns mirror the pooled distribution.", correct:true},
-          {key:"e", text:"Issuers whose data is wildly off-distribution from the pool."},
-          {key:"f", text:"Newly launched issuers with almost no fraud labels.", correct:true},
+          {key:"a", text:"Per-feature v_c embedding norms — flag near-zero for under-trained features, flag huge for heavy-tail-dominated features.", correct:true},
+          {key:"b", text:"AUPRC on production traffic."},
+          {key:"c", text:"Cross-column attention pattern visualization on held-out samples — flag if some columns are ignored (entropy of attention over columns).", correct:true},
+          {key:"d", text:"Pretrained-init vs random-init fine-tune AUPRC gap — should be meaningfully positive; near-zero = pretrain is not contributing.", correct:true},
+          {key:"e", text:"Feature-schema match: pretrain has columns A,B,C,D; fine-tune adds E,F — track which columns are warm-init vs cold-init and their AUPRC contribution.", correct:true},
+          {key:"f", text:"Wall-clock training time."},
+          {key:"g", text:"Token-norm distribution per feature — heavy-tail numerical features may have huge token norms that dominate attention scores.", correct:true},
         ]}
-        trap={<>(c) and (e) — big issuers already had the scale, and off-distribution issuers transfer poorly.</>}
-        lens={<>(a), (b), (d), (f) are the gain profile.</>}
-        stretch={<>Is the new-issuer cold-start case the strongest argument for FraudFM?</>}
+        trap={<>(b) is the business metric; (f) is incidental.</>}
+        lens={<>v_c norms + attention entropy + pretrain-vs-random gap + schema-match + token-norms. All FraudFM-specific.</>}
+        stretch={<>Cheapest pre-deploy check?</>}
       />
 
+      {/* P15 — adversary */}
       <VIS.TrapProblem
-        id="ffm-p5"
+        id="fraudfm-p15"
         difficulty="hard"
-        title="P5 — Schema heterogeneity. How handle?"
-        scenario={<>Issuer A uses MCC code 5411 for grocery; issuer B uses an internal four-digit code with different semantics. Pretraining naively assumes shared schema. How handle?</>}
+        title="P15 — Adversary studies cross-column attention and crafts a fraud transaction where attention routes to benign-column tokens. Defense?"
+        scenario={<><em>Discriminating insight: attention-aware adversary structures features to look like a low-attention cluster — the model's cross-column attention may misread. Defense: ensemble with GBDT (different mechanism), adversarial training, attention-pattern monitoring.</em><br/><br/>Defense.</>}
         options={[
-          {key:"a", text:"Negotiate a shared canonical schema upfront — every participating issuer maps their fields to it before contributing. Where canonical mapping is lossy (issuer B's internal merchant taxonomy maps imperfectly to MCC), keep both the canonical and the raw field, and let the encoder learn to use both. Where mapping is impossible, drop the field for FraudFM and let each issuer use it locally during fine-tune.", correct:true},
-          {key:"b", text:"Ignore the schema problem — the model will learn it."},
-          {key:"c", text:"Force all issuers to adopt issuer A's schema."},
-          {key:"d", text:"Use one-hot encoding for everything."},
+          {key:"a", text:"Raise the threshold."},
+          {key:"b", text:"Three-layer defense. (1) <strong>Ensemble with GBDT</strong>: GBDT's decision mechanism is different (tree splits on features), so an adversarial structuring that fools FT-Transformer's attention may not fool GBDT. Their disagreement is itself signal — borderline scores with high disagreement get routed to human review. (2) <strong>Adversarial training</strong>: train with synthetic adversarial examples (gradient-based perturbations on features within plausible ranges) so the model learns robust attention patterns. (3) <strong>Attention-pattern monitoring</strong>: at inference, check that the cross-column attention distribution is reasonable (not concentrated on one column, not uniformly low). Anomalous attention patterns get extra scrutiny. The per-feature attention is itself a monitorable signal — an adversary's structuring tends to produce distinctive attention patterns.", correct:true},
+          {key:"c", text:"Don't use FT-Transformer."},
+          {key:"d", text:"Block all transactions."},
         ]}
-        trap={<>(b) breaks pretraining silently. (c) is politically dead. (d) blows up dimensionality.</>}
-        lens={<>(a) is the senior data-engineering answer.</>}
-        stretch={<>What is the cost of dropping a field that issuer A has and B does not?</>}
+        trap={<>(a) is blunt; (c) overclaims; (d) destroys CX.</>}
+        lens={<>Ensemble with GBDT (different mechanism) + adversarial training + attention monitoring.</>}
+        stretch={<>What's the strongest adversarial training method for tabular? Hint: gradient-based feature perturbations within feasibility constraints.</>}
       />
 
+      {/* P16 — interpretability */}
       <VIS.TrapProblem
-        id="ffm-p6"
+        id="fraudfm-p16"
         difficulty="hard"
-        title="P6 — Differential privacy in pretraining. Cost?"
-        scenario={<>You add differential-privacy noise to gradients during pretraining (DP-SGD). What is the realistic accuracy cost?</>}
+        title="P16 — Regulator asks 'which feature drove this fraud decline?' FraudFM is harder to interpret than GBDT. How do you answer?"
+        scenario={<><em>Discriminating insight: cross-column attention weights are NOT clean feature attribution (multi-layer, multi-head, distributed). Use SHAP / Integrated Gradients on the [CLS] output back to input features; pair with attention visualization as supplementary. Don't claim "attention = explanation."</em><br/><br/>Operator answer.</>}
         options={[
-          {key:"a", text:"At a strong privacy budget (epsilon equal to one), DP-SGD on transformer pretraining typically costs three to ten points of downstream accuracy compared to non-private pretraining. At a looser budget (epsilon equal to ten), the cost drops to one to three points. The tradeoff is real and you must choose: strong privacy with measurable accuracy cost, or weak privacy with stronger model — the regulator and the business decide together.", correct:true},
-          {key:"b", text:"DP is free in modern training."},
-          {key:"c", text:"DP makes the model better."},
-          {key:"d", text:"DP only affects training time, not accuracy."},
+          {key:"a", text:"Show the attention weights."},
+          {key:"b", text:"Cross-column attention weights are NOT clean feature attribution: with multi-layer, multi-head attention, the attention mass is distributed across many heads and layers; one head's attention from [CLS] to amount-token isn't necessarily 'amount drove the decision.' Correct approach: (i) compute SHAP values or Integrated Gradients on the [CLS] output back to the input features — gives a principled attribution showing 'this feature shifted the score by X.' (ii) Use the cross-column attention weights as SUPPLEMENTARY visualization, not as the primary explanation. (iii) For regulatory adverse-action notices (Reg B), pair FraudFM with a co-deployed simple model (logistic regression on the same features) — use FraudFM for the score, the simple model for the reason codes. The honest claim: FT-Transformer is not directly interpretable; gradient-based attribution gives principled-but-approximate reasons.", correct:true},
+          {key:"c", text:"FraudFM is uninterpretable, refuse to give reasons."},
+          {key:"d", text:"Attention IS interpretation."},
         ]}
-        trap={<>(b), (c), (d) all misread the tradeoff.</>}
-        lens={<>(a) names the realistic cost range.</>}
-        stretch={<>Is epsilon equal to one enough for regulator?</>}
+        trap={<>(a)(d) overclaim attention's interpretability; (c) is wrong (Reg B requires reasons).</>}
+        lens={<>SHAP / IG for principled attribution. Attention = supplementary, not primary.</>}
+        stretch={<>What's a good co-deployed simple model? Hint: WoE-logistic on the same features.</>}
       />
 
+      {/* P17 — vs Transformer-Risk-Mastercard signal */}
       <VIS.TrapProblem
-        id="ffm-p7"
+        id="fraudfm-p17"
         difficulty="hard"
-        title="P7 — Big-issuer participation. What incentive?"
-        scenario={<>You are trying to recruit big issuers to a FraudFM consortium. They have the data scale; they also have the least to gain. What incentive structure?</>}
+        title="P17 — Why might a bank use BOTH FraudFM and Transformer-Risk-Mastercard?"
+        scenario={<><em>Discriminating insight: they cover different surfaces. FraudFM = single-row tabular fraud scoring with consortium-pretrained features. T-R-M = real-time auth-path decline scoring on the auth-event tape. Different latency budgets, different inputs, different output use cases.</em><br/><br/>Compare.</>}
         options={[
-          {key:"a", text:"Combine non-modeling levers. Revenue share from licensing the pretrained model to non-contributing issuers. Reduced regulatory burden via consortium-level compliance arrangements. Cross-issuer fraud intelligence (mules and rings spanning multiple issuers are visible only in the pooled view). Strategic positioning as an AML leader. Without a non-modeling benefit, big issuers will not contribute the data that makes the whole thing work.", correct:true},
-          {key:"b", text:"Big issuers participate out of altruism."},
-          {key:"c", text:"Big issuers cannot participate for legal reasons."},
-          {key:"d", text:"Pay them per transaction contributed."},
+          {key:"a", text:"Pick one — they're competitors."},
+          {key:"b", text:"They are complementary. <strong>FraudFM</strong>: single-row tabular fraud scoring; rich features (50+ columns); pretrained on consortium fraud labels; output is a per-tx fraud score. Use surface: post-auth fraud decisioning, chargeback prediction, new-user KYC. <strong>Transformer-Risk-Mastercard</strong>: real-time auth-path scoring on the auth-event tape (sequence of tuples); pretrained on Mastercard network auth-decline; output is an instant decline score. Use surface: real-time auth approval / decline. The bank uses T-R-M on the auth path (sub-50ms decision); the bank uses FraudFM on post-auth analytics, chargeback prediction, and offline fraud investigation (where rich tabular features and longer compute budget make FraudFM the right tool). Different surface, different cross-org pretrain anchor.", correct:true},
+          {key:"c", text:"They are identical."},
+          {key:"d", text:"FraudFM replaces T-R-M."},
         ]}
-        trap={<>(b) is naive. (c) is over-general. (d) is one option but rarely sufficient on its own.</>}
-        lens={<>(a) names the realistic incentive design.</>}
-        stretch={<>What kills consortia — usually the incentive design or the legal arrangement?</>}
+        trap={<>(a)(c)(d) collapse or oversimplify.</>}
+        lens={<>FraudFM = single-row analytics; T-R-M = real-time auth path. Different surfaces.</>}
+        stretch={<>What's the right co-deployment architecture?</>}
       />
 
+      {/* P18 — rollout staging */}
       <VIS.TrapProblem
-        id="ffm-p8"
-        difficulty="hard"
-        title="P8 — Adversary in the consortium. Threat?"
-        scenario={<>One participant in the consortium is a competitor or a bad actor. What attacks does that enable?</>}
+        id="fraudfm-p18"
+        difficulty="medium"
+        title="P18 — Order the FraudFM rollout stages from XGBoost baseline → full FraudFM, highest-leverage first."
+        scenario={<><em>Discriminating insight: stage 1 = tuned XGBoost baseline + engineered crosses; stage 2 = FT-Transformer from scratch on your data (closes architecture vs GBDT question); stage 3 = pretrained FraudFM backbone + fine-tune (cross-issuer lift); stage 4 = tune feature-tokenizer for heavy-tail numerical; stage 5 = grow consortium.</em><br/><br/>Pick.</>}
         options={[
-          {key:"a", text:"Two main attacks. First, model inversion — extract training data from gradients or from the pretrained model itself, leaking other issuers' transactions. Second, poisoning — contribute crafted data that degrades the pretrained model or installs a backdoor. Mitigations: cryptographic secure aggregation in federated training, robust aggregation rules that down-weight outlier gradients, contribution auditing, and DP noise that limits how much any one contributor can move the model.", correct:true},
-          {key:"b", text:"The pretrained model cannot be inverted."},
-          {key:"c", text:"There is no insider threat."},
-          {key:"d", text:"Backdoors are theoretical only."},
+          {key:"a", text:"Ship full FraudFM day 1."},
+          {key:"b", text:"Five stages, each A/B tested. <strong>Stage 1</strong>: tuned XGBoost baseline + hand-engineered crosses (amount × MCC × country, velocity × geo). Establishes the GBDT floor. <strong>Stage 2</strong>: FT-Transformer trained from scratch on your data, same features — closes the 'does feature-tokenizer + cross-column attention beat tuned GBDT on our features?' question independent of pretrain. (If FT-Transformer doesn't beat GBDT here, architecture isn't the lever — re-evaluate.) <strong>Stage 3</strong>: load pretrained FraudFM backbone, fine-tune on your labels with the consortium pretrain — isolates the cross-issuer lift. <strong>Stage 4</strong>: tune the feature-tokenizer for heavy-tail numerical features (log-norm, piecewise embeddings). <strong>Stage 5</strong>: grow the consortium (more pretrain data, more diverse issuers). Skipping stages 1-2 forfeits attribution between architecture and pretrain.", correct:true},
+          {key:"c", text:"Skip XGBoost baseline."},
+          {key:"d", text:"Tune the tokenizer first."},
         ]}
-        trap={<>(b), (c), (d) all underweight the threat.</>}
-        lens={<>(a) names model-inversion and poisoning, with standard defenses.</>}
-        stretch={<>Which defense is the most cost-effective?</>}
+        trap={<>(a)(c)(d) skip attribution.</>}
+        lens={<>Stage by lift attribution: GBDT → arch → pretrain → tokenizer → data.</>}
+        stretch={<>At which stage do you decide FraudFM isn't worth shipping?</>}
       />
 
+      {/* P19 — wrong-assumption cascade */}
       <VIS.TrapProblem
-        id="ffm-p9"
+        id="fraudfm-p19"
         difficulty="hard"
-        title="P9 — Fine-tune underperforms pretrain — why?"
-        scenario={<>An issuer fine-tunes the FraudFM encoder on their labels and gets worse recall than their pre-existing GBDT. What likely happened?</>}
+        title="P19 — Engineer says 'FraudFM is just a bigger XGBoost.' Which beliefs cascade wrong?"
+        scenario={<><em>Discriminating insight: misses (1) per-column tokenization, (2) cross-column attention, (3) cross-issuer pretrain. Cascade: train on labels only (no pretrain), use concat-features (no tokenization), no attention monitoring, no consortium contract.</em><br/><br/>Trace.</>}
         options={[
-          {key:"a", text:"Distribution mismatch — this issuer's fraud distribution diverges significantly from the pooled distribution, so the pretrained representation does not align well with their task. Mitigations: longer fine-tune with more aggressive encoder updates, mix self-supervised loss on their own data to adapt the encoder, or fall back to GBDT for this issuer (FraudFM is not always the right answer; transfer fails when source and target distributions diverge too much).", correct:true},
-          {key:"b", text:"The pretrained model is broken."},
-          {key:"c", text:"The GBDT cheated."},
-          {key:"d", text:"Fine-tuning is impossible."},
+          {key:"a", text:"Nothing follows."},
+          {key:"b", text:"At least four things break. (1) 'Train on labels only' → no consortium pretrain → loses the biggest lift; architecture alone barely beats tuned GBDT (Grinsztajn 2022). (2) 'Concatenate features' → no per-column tokenization → no cross-column attention → cross-feature interactions degrade. (3) 'Don't care about feature-tokenizer' → heavy-tail numerical features have unstable token norms → attention scores dominated by magnitude not direction. (4) 'No consortium contract' → either pretrain is unavailable OR your bank's data is in the corpus (leakage). The 'bigger XGBoost' frame collapses architecture + data lever + tokenizer + governance into one wrong reduction.", correct:true},
+          {key:"c", text:"Only pretrain breaks."},
+          {key:"d", text:"Only tokenization breaks."},
         ]}
-        trap={<>(b), (c), (d) avoid the diagnosis.</>}
-        lens={<>(a) names distribution mismatch — the central transfer-learning failure mode.</>}
-        stretch={<>How do you measure pre-fine-tune whether transfer will work?</>}
+        trap={<>(a)(c)(d) understate.</>}
+        lens={<>FraudFM = (per-column tokenizer) + (cross-column attention) + (consortium pretrain). All three are load-bearing.</>}
+        stretch={<>Which break shows up first in production?</>}
       />
 
+      {/* P20 — community benchmark skepticism */}
       <VIS.TrapProblem
-        id="ffm-p10"
+        id="fraudfm-p20"
         difficulty="hard"
-        title="P10 — Evaluating fairness across issuers"
-        scenario={<>Regulator asks for fairness audit across participating issuers. What do you measure?</>}
+        title="P20 — A 2024 paper reports FraudFM beats tuned GBDT by 5pt. Reproducing without the consortium pretrain gives 0.5pt. Diagnose."
+        scenario={<><em>Discriminating insight: the 5pt is mostly the cross-issuer pretrain (data lever); 0.5pt is the architecture lift. Both numbers are real; they measure different things. Always separate architecture from data when attributing lift.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"Stratify per-issuer recall, precision, and false-positive rate. Check that no participating issuer is disproportionately penalized by the pretrained model — small issuers in particular can be drowned out by big-issuer distributions. Also check per-protected-class fairness within each issuer (the regulator also cares about within-issuer disparate impact). Combine into an audit report that names the metric, the population, the threshold, and any mitigation.", correct:true},
-          {key:"b", text:"Aggregate recall across all issuers is enough."},
-          {key:"c", text:"Fairness audits do not apply to fraud models."},
-          {key:"d", text:"Only the regulator measures fairness."},
+          {key:"a", text:"The reproduction is wrong."},
+          {key:"b", text:"Both numbers are real and consistent. The 5pt headline lift bundles ARCHITECTURE (feature-tokenizer + cross-column attention) with DATA LEVER (cross-issuer consortium pretrain). The reproduction without consortium pretrain isolates the architecture lift = 0.5pt — small, consistent with Grinsztajn 2022's finding that deep tabular models barely beat tuned GBDT on architecture alone. The remaining ~4.5pt is the cross-issuer pretrain's contribution. To attribute lift in any FraudFM paper: demand the ablation that separates (i) FraudFM full vs (ii) FT-Transformer from scratch (no pretrain) vs (iii) tuned GBDT. Without that ablation, the headline number bundles data + architecture. Senior framing: FraudFM's value is the consortium data, not the FT-Transformer architecture per se.", correct:true},
+          {key:"c", text:"Both papers are wrong."},
+          {key:"d", text:"GBDT always wins."},
         ]}
-        trap={<>(b) hides per-issuer harms. (c) is wrong. (d) abdicates responsibility.</>}
-        lens={<>(a) is the senior audit design.</>}
-        stretch={<>What thresholds count as "disproportionate" in practice?</>}
+        trap={<>(a)(c) deflect; (d) is dogmatic.</>}
+        lens={<>Architecture alone = small. Architecture + consortium pretrain = large. The data lever dominates.</>}
+        stretch={<>What ablation makes a FraudFM paper trustworthy? Hint: matched-compute three-way comparison (full, from-scratch, GBDT).</>}
       />
 
+      {/* P21 — when consortium is not available */}
       <VIS.TrapProblem
-        id="ffm-p11"
-        difficulty="hard"
-        title="P11 — End-to-end design: launch FraudFM for a 5-issuer consortium"
-        scenario={<>You design FraudFM for five mid-tier issuers. What is the senior plan?</>}
+        id="fraudfm-p21"
+        difficulty="medium"
+        title="P21 — Your bank can't join the consortium (governance refused). Is FraudFM worth shipping?"
+        scenario={<><em>Discriminating insight: without consortium pretrain, FraudFM degenerates to FT-Transformer trained from scratch on your data — architecture lift alone is small over tuned GBDT. Either don't ship FraudFM, or ship FT-Transformer arch and budget around the small lift.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"Negotiate a shared canonical schema and a data-sharing contract first — modeling cannot start without legal sign-off. Pretrain a moderate FT-Transformer (six to twelve layers, hidden 256) federated to avoid centralizing raw data; secure aggregation plus DP noise at epsilon around 5 to 10 for an internal trust environment. Per-issuer fine-tune with frozen lower layers and low LR. Ensemble with each issuer's existing GBDT champion at borderline cases. Per-issuer fairness audit and reports. Daily eval with auto-rollback. Plan the legal/governance work as the gating path, not the modeling.", correct:true},
-          {key:"b", text:"Pool data centrally with no privacy primitives."},
-          {key:"c", text:"Replace each issuer's GBDT entirely with the foundation model."},
-          {key:"d", text:"Pretrain on synthetic data only."},
+          {key:"a", text:"Yes — ship FraudFM."},
+          {key:"b", text:"Probably not. Without the consortium pretrain, FraudFM degrades to FT-Transformer trained from scratch on your bank's data. Architecture lift over tuned GBDT is small (Grinsztajn 2022) — typically 0-2pt depending on feature richness. The engineering cost (transformer infra, feature-tokenizer versioning, fine-tune pipeline) is significant; the lift may not justify it. Alternative paths: (i) keep tuned GBDT with hand-engineered crosses — likely matches; (ii) ship FT-Transformer arch if you genuinely have rich cross-column interaction signal AND can show &gt;1pt lift in a controlled A/B test; (iii) revisit governance — sometimes the issue is anonymization standards that can be tightened to make consortium participation feasible. The honest framing: most of FraudFM's value is the data lever; without it, the architecture lift is modest.", correct:true},
+          {key:"c", text:"Yes — FraudFM always wins."},
+          {key:"d", text:"Tabular DL never works."},
         ]}
-        trap={<>(b) is a privacy disaster. (c) drops the discriminative partner. (d) leaves the cross-issuer signal on the table.</>}
-        lens={<>(a) is the senior plan with legal as the gating path.</>}
-        stretch={<>What kills this in practice — legal or modeling?</>}
+        trap={<>(a)(c) overclaim; (d) is dogmatic.</>}
+        lens={<>No consortium = no data lever = architecture lift alone is small.</>}
+        stretch={<>What's the right go/no-go threshold? Hint: 1pt lift over tuned GBDT on the same data.</>}
+      />
+
+      {/* P22 — pretrain task choice */}
+      <VIS.TrapProblem
+        id="fraudfm-p22"
+        difficulty="hard"
+        title="P22 — Consortium pretrain: supervised on fraud labels, or MLM-style unsupervised? Pick."
+        scenario={<><em>Discriminating insight: supervised on fraud labels gives sharper representation (directly aligned with downstream task) but requires fraud labels from all consortium issuers — operationally hard. MLM (mask cells, predict from context) is unsupervised — easier governance, weaker alignment. Production choice depends on consortium label availability.</em><br/><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Always supervised."},
+          {key:"b", text:"Depends on consortium label availability. <strong>Supervised on aggregated fraud labels</strong>: each consortium issuer contributes fraud labels along with anonymized features; the pretrain is supervised on the union. Sharper representation (directly aligned with downstream fraud detection) and faster fine-tune convergence. Operationally hard: requires every issuer to share labels with the same definition (chargeback? confirmed fraud? what 30-90 day lag?). <strong>MLM (mask cells, predict)</strong>: unsupervised, easier governance (no labels to share, just anonymized features). Representation is task-agnostic; fine-tune does more of the work. Production hybrid: MLM-pretrain on the broad consortium (most data, easiest governance) + supervised fine-tune on the subset with labels. The choice is a governance + operational tradeoff, not a theoretical one.", correct:true},
+          {key:"c", text:"Always MLM."},
+          {key:"d", text:"Skip pretrain."},
+        ]}
+        trap={<>(a)(c)(d) are dogmatic.</>}
+        lens={<>Supervised = sharper but harder governance. MLM = easier governance, weaker alignment. Hybrid in production.</>}
+        stretch={<>What's the right label definition for consortium supervised pretrain? Hint: confirmed chargebacks, joined as of cutoff.</>}
+      />
+
+      {/* P23 — cold-start issuer */}
+      <VIS.TrapProblem
+        id="fraudfm-p23"
+        difficulty="medium"
+        title="P23 — A brand-new issuer with 0 history wants to use FraudFM. How?"
+        scenario={<><em>Discriminating insight: pretrained backbone gives them a cold-start floor — no fine-tune yet possible. Serve pretrained backbone + consortium-default calibration head; raise human-review threshold; fine-tune as labels accumulate.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Don't use FraudFM."},
+          {key:"b", text:"Partial use: cold-start floor only. The pretrained FraudFM backbone already encodes cross-issuer behavioral priors that apply to ANY new issuer — feature-tokenizer is generic, cross-column attention generalizes. Serve the pretrained backbone with a CONSORTIUM-DEFAULT calibration head (average over issuers' calibration heads) as the cold-start risk score. Pair with rule-based velocity caps for high-confidence transactions during the cold-start window. As the new issuer accumulates labeled fraud (~500k labeled events typically), fine-tune the head with their labels for per-issuer calibration. The pretrain gives them day-1 risk signal; the per-issuer fine-tune comes later. FraudFM's cold-start use case is itself a key value prop.", correct:true},
+          {key:"c", text:"Train from scratch on no data."},
+          {key:"d", text:"Wait 12 months."},
+        ]}
+        trap={<>(a)(c)(d) leave the cross-issuer floor on the table.</>}
+        lens={<>Cold-start: pretrained backbone + consortium-default calibration. Fine-tune per-issuer as labels arrive.</>}
+        stretch={<>What's the minimum label count for per-issuer fine-tune? Hint: ~500k-1M labeled events.</>}
+      />
+
+      {/* P24 — reproducibility */}
+      <VIS.TrapProblem
+        id="fraudfm-p24"
+        difficulty="medium"
+        title="P24 — A reproduction of FraudFM uses public Kaggle data and reports a small lift over GBDT. Why is the result not representative of FraudFM's claim?"
+        scenario={<><em>Discriminating insight: public Kaggle data is single-issuer; FraudFM's claim is cross-issuer pretrain. The reproduction is testing FT-Transformer architecture on a single-issuer dataset — closer to Grinsztajn 2022 result, not FraudFM's actual claim.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"The reproduction is wrong."},
+          {key:"b", text:"The reproduction tests FT-Transformer ARCHITECTURE on a single-issuer dataset, not FraudFM's CROSS-ISSUER pretrain claim. Public Kaggle data (e.g., Kaggle Credit Card Fraud) is single-issuer; the consortium pretrain across 50 issuers cannot be replicated with it. So the reproduction is testing the architecture lever alone — predictably small (Grinsztajn 2022 finding). FraudFM's central claim — cross-issuer pretrain on consortium-scale data — cannot be reproduced on any public dataset because (a) no public dataset is consortium-scale and (b) cross-issuer data sharing is regulated (each consortium is its own proprietary deal). Reproducibility for FraudFM is structurally impossible on public data; the architecture is reproducible, the data lever is not. Senior framing: 'small lift on Kaggle' is consistent with both 'FraudFM is over-claimed' AND 'FraudFM's claim isn't on this regime.' Disambiguate by demanding the consortium ablation.", correct:true},
+          {key:"c", text:"FraudFM doesn't work."},
+          {key:"d", text:"Kaggle data is wrong."},
+        ]}
+        trap={<>(a)(c)(d) deflect or overclaim.</>}
+        lens={<>Public data tests architecture only. Cross-issuer pretrain is structurally non-replicable.</>}
+        stretch={<>Could a synthetic multi-issuer dataset reproduce the effect? Hint: in principle yes; in practice the cross-issuer behavioral diversity is hard to simulate.</>}
+      />
+
+      {/* P25 — what's MISSING from FraudFM */}
+      <VIS.TrapProblem
+        id="fraudfm-p25"
+        difficulty="hard"
+        title="P25 — What kind of fraud does FraudFM NOT capture better than GBDT, even with cross-issuer pretrain?"
+        scenario={<><em>Discriminating insight: per-user SEQUENCE patterns (history of recent tx) are not in FraudFM's input — it's single-row. Mamba / FATA-Trans capture sequence patterns FraudFM cannot. Cross-card RING patterns also not in FraudFM. Composite architecture needed.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"FraudFM captures all fraud."},
+          {key:"b", text:"Two architectural blind spots. (1) <strong>Per-user sequence patterns</strong>: FraudFM scores a single row at a time. Patterns that hinge on the SEQUENCE of recent tx (card-testing burst, velocity over the last hour, multi-step lost-and-tested) are NOT in FraudFM's input — they need a sequence model (FATA-Trans for short irregular, Mamba for long). Static aggregates can approximate (count-in-last-hour as a feature), but the sequence model captures patterns aggregates can't enumerate. (2) <strong>Cross-card ring patterns</strong>: 200 cards each making a $5 probe at the same merchant within 5 minutes is invisible to any per-row scorer; needs a cross-card aggregator or GNN. Composite production: FraudFM (single-row tabular + cross-issuer priors) + sequence model (per-user history) + cross-card aggregator (ring detection). Each handles its surface.", correct:true},
+          {key:"c", text:"FraudFM is only for KYC."},
+          {key:"d", text:"FraudFM captures sequence patterns."},
+        ]}
+        trap={<>(a)(d) overclaim; (c) is incidental.</>}
+        lens={<>FraudFM = single-row. Sequence + cross-card need other layers.</>}
+        stretch={<>What's the cheapest sequence-pattern aggregate to feed as a feature to FraudFM? Hint: hand-engineered velocity counters.</>}
+      />
+
+      {/* P26 — depth and width */}
+      <VIS.TrapProblem
+        id="fraudfm-p26"
+        difficulty="medium"
+        title="P26 — FT-Transformer depth: 4, 8, or 24 layers?"
+        scenario={<><em>Discriminating insight: typical tabular is short (50 columns) so deep models overfit. 4-8 layers is the production sweet spot. Going to 24 (BERT-base) likely overfits unless consortium pretrain provides regularization.</em><br/><br/>Pick.</>}
+        options={[
+          {key:"a", text:"4 — always shallow."},
+          {key:"b", text:"4-8 layers in production. Tabular data has short sequences (the 'sequence' is just 50 column-tokens), so deeper models add capacity without commensurate signal. 4-8 layers typically suffice for cross-column attention; going to 24 layers (BERT-base depth) overfits a 50-column input unless you have massive consortium pretrain data. Pretrained FraudFM backbones come at a fixed depth — you typically don't choose it; the depth is set at pretrain time. If you're training FT-Transformer from scratch on your data, sweep 4-8-12 and pick by held-out AUPRC. Going deeper without pretrain data is a common from-scratch mistake.", correct:true},
+          {key:"c", text:"24 — deeper always wins."},
+          {key:"d", text:"Depth doesn't matter."},
+        ]}
+        trap={<>(a)(c) extremes; (d) ignores the load-bearing hyperparameter.</>}
+        lens={<>4-8 layers for 50-col tabular. Deeper needs more data.</>}
+        stretch={<>At which column count does 24 layers start to help? Hint: 100+ columns with rich interactions.</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://openreview.net/forum?id=fraudfm" target="_blank" rel="noopener">
-            <strong>Foundation Models for Financial Fraud Detection</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2024 FinAI workshop)</span>
-          <br/>The reference paper. Sections on cross-issuer transfer and ablation are the keepers.
-        </li>
-        <li>
           <a href="https://arxiv.org/abs/2106.11959" target="_blank" rel="noopener">
             <strong>Gorishniy et al. — Revisiting Deep Learning Models for Tabular Data (FT-Transformer)</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2021)</span>
-          <br/>The original FT-Transformer paper. Required architectural background.
+          <br/>The reference paper for the architecture. Section on the feature-tokenizer and cross-column attention; appendix has the architecture ablations.
         </li>
         <li>
-          <a href="https://ai.googleblog.com/2017/04/federated-learning-collaborative.html" target="_blank" rel="noopener">
-            <strong>Google AI Blog — Federated Learning: Collaborative ML without Centralized Data</strong>
+          <a href="https://arxiv.org/abs/2207.08815" target="_blank" rel="noopener">
+            <strong>Grinsztajn et al. — Why do tree-based models still outperform deep learning on tabular data?</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2022)</span>
+          <br/>The most important sanity check. Required reading for P7 and P12 — explains why tuned GBDT matches FT-Transformer on standard tabular benchmarks and frames the architecture-vs-data-lever distinction.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2203.05556" target="_blank" rel="noopener">
+            <strong>Gorishniy et al. — On Embeddings for Numerical Features in Tabular Deep Learning</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, 2022)</span>
+          <br/>The follow-up on numerical tokenization. P6 turns on understanding why x_c · v_c breaks at heavy-tail amounts and what piecewise-linear embeddings fix.
+        </li>
+        <li>
+          <a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">
+            <strong>Jay Alammar — The Illustrated Transformer</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The clearest practitioner intro to federated learning. Read before designing a privacy-preserving consortium.
+          <br/>Required baseline. The cross-column attention mechanism IS standard self-attention — internalize it before reasoning about feature-tokenizers.
         </li>
         <li>
-          <a href="https://www.cleverhans.io/" target="_blank" rel="noopener">
-            <strong>Cleverhans blog — adversarial ML and model-inversion attacks</strong>
+          <a href="https://christophm.github.io/interpretable-ml-book/shap.html" target="_blank" rel="noopener">
+            <strong>Christoph Molnar — Interpretable ML Book, SHAP chapter</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(book chapter, online)</span>
+          <br/>For P16 (interpretability). SHAP on a deep tabular model is the principled-attribution path; attention weights are not interpretation.
+        </li>
+        <li>
+          <a href="https://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">
+            <strong>Andrej Karpathy — A Recipe for Training Neural Networks</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Practitioner deep-dives on insider-threat attacks. Directly applicable to consortium threat modeling.
-        </li>
-        <li>
-          <a href="https://desfontain.es/privacy/differential-privacy-awesomeness.html" target="_blank" rel="noopener">
-            <strong>Damien Desfontaines — Differential Privacy: A Friendly Introduction</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog series)</span>
-          <br/>Best non-technical-yet-rigorous intro to DP. Read before quoting an epsilon to a regulator.
+          <br/>Field guide for the silent representation bugs that bite FT-Transformer — heavy-tail token norms (P6), pretrain-vs-random gap diagnostics (P14), and schema drift (P10).
         </li>
       </ul>
     </VIS.Section>

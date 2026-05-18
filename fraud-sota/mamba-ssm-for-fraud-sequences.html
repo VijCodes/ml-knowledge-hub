@@ -1414,289 +1414,583 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Mamba / SSM for fraud sequences — linear-time state-space model
-// for very long card histories. Gu & Dao (2023); applied 2025.
+// Mamba / SSM for fraud sequences (Gu & Dao 2023; productionized 2024-25)
+// Load-bearing distinctions that must survive the redaction test:
+//   (1) LINEAR-time (O(L)) selective scan vs transformer's O(L^2) attention.
+//       Enables 1k-10k+ events per card.
+//   (2) SELECTIVE mechanism — the SSM transition parameters Δ, A, B, C are
+//       INPUT-DEPENDENT (functions of x), not fixed. This is what beats
+//       vanilla SSMs (S4 family).
+//   (3) The compressed hidden state replaces transformer's per-token KV
+//       cache. Trades exact-retrieval (transformer wins) for compression
+//       (Mamba wins).
+// Strip "O(L) selective scan" or "long sequence" and the pitch collapses
+// to "use an RNN" which has been worse than transformer for years.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · Transaction sequence transformers"
+      pill="Fraud SOTA · Long-sequence architectures"
       title="Mamba / SSM for fraud sequences"
-      subtitle="State-space model with linear-time long-context handling — makes year-long card histories (10K+ transactions) tractable."
+      subtitle="Selective state-space model with LINEAR-time scan over per-card auth histories. The compute regime transformer can't reach: 1000+ to 10000+ events per card."
       byline={[
-        {label: "Source", value: "Gu and Dao — Mamba (arXiv 2023); Mamba for Transactions (2025)"},
-        {label: "Year", value: "2025"},
-        {label: "L3", value: "Transaction sequence transformers"},
+        {label: "Source", value: "Gu & Dao, 'Mamba: Linear-Time Sequence Modeling with Selective State Spaces' (2023)"},
+        {label: "L3", value: "Selective SSM with hardware-aware scan kernel"},
+        {label: "Anchor", value: "O(L) selective scan; input-dependent state transitions"},
       ]}/>
 
     <VIS.TLDR>
-      A{" "}
-      <VIS.Term def="A neural network that uses self-attention to model relationships across positions in a sequence. Originally for text; now applied to time series, tabular logs, and code.">Transformer</VIS.Term>{" "}
-      costs O of N squared in attention — at sequence length 10,000 it is fifty times more expensive than at 1,000. Mamba (a selective{" "}
-      <VIS.Term def="State-Space Model — a sequence model that maintains a fixed-size hidden state updated by a structured linear recurrence. Reads tokens left-to-right in O of N time, like an RNN but with a far more expressive update rule.">state-space model</VIS.Term>) runs in O of N. For a year of card history (10K to 100K transactions per card), Mamba makes long-context scoring tractable where a Transformer would not fit. Use it when long-range patterns dominate (installment-loan eligibility, sleeper-fraud detection); stick with Transformer for retrieval-heavy short sequences.
+      Transformer attention is O(L²) in compute and O(L) in per-token cache. For per-card auth histories of 5000+ events (installment-loan eligibility, full-year behavioral context, multi-year subscription patterns), attention's memory and time become infeasible — 5000² = 25M attention ops per layer per token. Mamba replaces attention with a <strong>selective state-space model</strong>: the sequence is compressed into a small hidden state via a learned recurrence, and the recurrence's transition parameters (Δ, A, B, C) are <strong>input-dependent</strong> — the SSM can "remember" or "forget" based on what just happened. Compute is O(L) and per-step memory is O(1) — a HARDWARE-AWARE parallel-scan kernel achieves this without sacrificing parallelism. The tradeoff: transformer's attention does exact content-addressable lookup over all past tokens; Mamba's compressed state can only approximate that. <strong>Mamba wins when the signal is compressible across long history; transformer wins when exact retrieval at distance matters.</strong> Hybrid architectures (Mamba + local attention) hedge.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — selective state-space model">
       <ol>
-        <li><strong>Selective state-space layer:</strong> a linear recurrence with content-dependent step size — the model decides how much to update the hidden state based on the current token. This is the key difference from older SSMs (S4, etc.) that had input-independent dynamics.</li>
-        <li><strong>Linear-time inference:</strong> O of N in sequence length, O of 1 per-step. Hidden state has constant size; you stream tokens through.</li>
-        <li><strong>Hardware-aware:</strong> the Mamba implementation uses parallel scan plus selective-state caching to extract good throughput on modern GPUs.</li>
+        <li><strong>State-space equation:</strong> at each step t, the hidden state h evolves as <code>h(t+1) = A(x) h(t) + B(x) x(t)</code>; the output is <code>y(t) = C(x) h(t)</code>. The state h is a small vector of dimension d_state (typical 16-64).</li>
+        <li><strong>Selective mechanism:</strong> A, B, C, and the discretization step Δ are functions of the current input x — implemented as a small MLP that maps x to the SSM parameters. This makes the recurrence INPUT-DEPENDENT: the SSM learns to forget or remember based on content. (Contrast: S4, the predecessor, had FIXED A, B, C — input-independent.)</li>
+        <li><strong>Selective scan kernel:</strong> the linear-time recurrence is compiled to a hardware-aware parallel-scan (Blelloch-style) CUDA kernel that runs in O(L log L) parallel time with O(L) total work, no materialized attention matrix.</li>
+        <li><strong>Per-step memory: O(1)</strong> — only h flows forward; past tokens are not stored.</li>
+        <li><strong>For fraud:</strong> each token is one auth event (tokenized as in transformer-based models — BIN, merchant, MCC, amount-bucket, channel); sequence length per card is the full history (1k-10k+). Output: per-event risk score.</li>
       </ol>
 
       <VIS.Mermaid chart={`
-flowchart TB
-  T0["Tx 1"] --> S1["Update state"]
-  T1["Tx 2"] --> S1
-  S1 --> S2["Update state"]
-  T2["Tx 3"] --> S2
-  S2 --> SK["..."]
-  SK --> SN["State at tx N"]
-  SN --> Y["Risk score"]
-  style S1 fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+flowchart LR
+  X0["x_0 - auth event 0"] --> S0["h_0"]
+  X1["x_1 - auth event 1"] --> S1["h_1"]
+  XN["x_N - latest"] --> SN["h_N"]
+  S0 -.->|"A(x), B(x) input-dep"| S1
+  S1 -.->|"selective scan"| SN
+  SN --> Y["risk score"]
+  P["Small MLP per token"] -.->|"emits A, B, C, delta"| S0
+  P -.-> S1
+  P -.-> SN
+  style P fill:#dbeafe,stroke:#2563eb,stroke-width:2px
   style SN fill:#fef3c7,stroke:#d97706,stroke-width:2px
-      `} />
-      <p>Blue is the selective state update — one per token, O of 1 cost. Yellow is the final hidden state that summarizes the whole history.</p>
+      `}/>
+      <p>Blue = the selective mechanism: a small MLP makes A, B, C, Δ functions of the input x. Yellow = the hidden state, the only thing that flows forward. There is NO O(L²) attention matrix.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="How it differs from transformer / RNN / S4">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>RNN / LSTM</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>S4 (fixed SSM)</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Transformer</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Mamba (SSM)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Mamba</th>
           </tr>
         </thead>
         <tbody>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Sequence cost</td>
-            <td style={{padding:"8px 10px"}}>O of N squared (attention)</td>
-            <td style={{padding:"8px 10px"}}>O of N (linear scan)</td>
+            <td style={{padding:"6px 10px"}}>Compute in L</td>
+            <td style={{padding:"6px 10px"}}>O(L)</td>
+            <td style={{padding:"6px 10px"}}>O(L)</td>
+            <td style={{padding:"6px 10px"}}>O(L²)</td>
+            <td style={{padding:"6px 10px"}}><strong>O(L)</strong></td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Memory per step</td>
-            <td style={{padding:"8px 10px"}}>Grows with sequence</td>
-            <td style={{padding:"8px 10px"}}>Constant (fixed hidden state)</td>
+            <td style={{padding:"6px 10px"}}>Per-step memory</td>
+            <td style={{padding:"6px 10px"}}>O(1)</td>
+            <td style={{padding:"6px 10px"}}>O(1)</td>
+            <td style={{padding:"6px 10px"}}>O(L) (KV cache)</td>
+            <td style={{padding:"6px 10px"}}>O(1)</td>
           </tr>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Long-context tractability</td>
-            <td style={{padding:"8px 10px"}}>Hard greater than 1K tokens</td>
-            <td style={{padding:"8px 10px"}}>Fine up to 10K-100K tokens</td>
+            <td style={{padding:"6px 10px"}}>State-transition</td>
+            <td style={{padding:"6px 10px"}}>Input-dependent (gates)</td>
+            <td style={{padding:"6px 10px"}}>Fixed (input-INdep)</td>
+            <td style={{padding:"6px 10px"}}>N/A (attention)</td>
+            <td style={{padding:"6px 10px"}}><strong>Input-dependent (selective)</strong></td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Random retrieval ("find that one tx")</td>
-            <td style={{padding:"8px 10px"}}>Strong — attention</td>
-            <td style={{padding:"8px 10px"}}>Weaker — bottlenecked by hidden state</td>
+            <td style={{padding:"6px 10px"}}>Parallel along L?</td>
+            <td style={{padding:"6px 10px"}}>No (sequential)</td>
+            <td style={{padding:"6px 10px"}}>Yes (FFT trick)</td>
+            <td style={{padding:"6px 10px"}}>Yes</td>
+            <td style={{padding:"6px 10px"}}>Yes (parallel scan)</td>
+          </tr>
+          <tr style={{background:"#e8f0fa"}}>
+            <td style={{padding:"6px 10px"}}>Exact retrieval at distance</td>
+            <td style={{padding:"6px 10px"}}>Hard</td>
+            <td style={{padding:"6px 10px"}}>Hard</td>
+            <td style={{padding:"6px 10px"}}><strong>Native</strong> (attention is content-addressable lookup)</td>
+            <td style={{padding:"6px 10px"}}>Approximate (compressed state)</td>
           </tr>
         </tbody>
       </table>
+      <p style={{marginTop:10}}>Redaction litmus: strip "O(L) selective scan" and "long sequence" — does the answer still win? If yes, the problem isn't testing Mamba specifically; it belongs in a generic sequence-model visual.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Year-long card histories</strong> for installment-loan eligibility, longitudinal fraud, or sleeper-account detection.</li>
-        <li><strong>Long-range temporal dependence dominates</strong> — recurring patterns matter more than retrieval of one specific past transaction.</li>
-        <li><strong>You can tolerate less mature tooling</strong> — Mamba is younger than Transformer; debugging support is thinner.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Retrieval tasks favor Transformer">
-        Hard retrieval ("did this card visit Acme Corp three months ago?") needs random access to past tokens. Attention does it natively; Mamba bottlenecks through a fixed-size hidden state. For retrieval-heavy fraud patterns, Transformer still wins.
+    <VIS.Section id="sec-limits" title="Limits and gotchas — the Mamba-specific ones">
+      <VIS.Callout kind="gotcha" title="Exact retrieval at distance is Mamba's weak spot">
+        Transformer attention is a content-addressable lookup — "what merchant_id appeared at position 500?" is one attention op. Mamba's hidden state is a compressed summary; recovering a specific past token requires that the SSM learned to encode it explicitly into the state. For retrieval-heavy fraud signals ("did this card visit this exact merchant 3 weeks ago?"), transformer wins. Hybrid Mamba+attention is the production pattern.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Tooling immaturity">
-        Fewer pretrained checkpoints, fewer pre-built quantization tools, fewer deployment guides than Transformer. The deployment cost of Mamba in 2026 is higher than equivalent-quality Transformer simply because the ecosystem is smaller.
+      <VIS.Callout kind="warn" title="State dimension d_state is the load-bearing hyperparameter">
+        Too small (d_state=4): long-range information bottleneck; recall on multi-event patterns collapses. Too large (d_state=256): you've reinvented an O(L·d_state²) model with no speed advantage. Production sweet spot: 16-64. Tune empirically per task.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Hidden-state capacity is a hyperparameter">
-        Too small: model cannot remember enough across thousands of tokens. Too large: O of N cost still inflates by a constant. Tune hidden-state dim per sequence length and task.
+      <VIS.Callout kind="warn" title="CUDA kernel is mandatory; CPU fallback voids the speedup">
+        The O(L) advantage comes from the parallel-scan CUDA kernel (selective_scan_cuda). On CPU or under torch.compile failures, the implementation falls back to a sequential loop — orders of magnitude slower. Verify the kernel is loaded; "Mamba on CPU" is a different (worse) model.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Mixing Mamba and Attention can beat either alone">
-        Hybrid Transformer-Mamba blocks ("Jamba" style) often outperform pure Mamba on tasks that need a bit of retrieval. Don't bet on pure-SSM if you have not benchmarked the hybrid.
+      <VIS.Callout kind="warn" title="Short sequences don't exercise Mamba's advantage">
+        At length L &lt; 100, transformer attention's O(L²) = 10k is tiny — Mamba's O(L) = 100 saves nothing in practice, and transformer's content-addressable lookup wins on retrieval. The compute advantage requires LONG sequences.
+      </VIS.Callout>
+      <VIS.Callout kind="gotcha" title="Initialization matters for long-range stability">
+        SSM matrices need careful initialization (HiPPO-style or diagonal real-parts) for the hidden state to be stable over thousands of steps. Bad init → state explodes or collapses to zero at length 500+.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Trap problems on SSM vs Transformer tradeoffs, long-context cost, and the specific dependency patterns that flip the answer.
+        Every problem hinges on something specific to Mamba: O(L) selective scan, input-dependent state-transition (selective mechanism), compressed hidden state replacing transformer's KV cache, sequence-length regime where Mamba beats vs loses to transformer, retrieval-vs-compression tradeoff, or hardware-aware parallel-scan kernel. Strip "O(L)" / "selective scan" / "long history" and the option must no longer win.
       </p>
 
+      {/* P1 — B3 pitch */}
       <VIS.TrapProblem
-        id="mam-p1"
+        id="mamba-p1"
         difficulty="hard"
-        title="P1 — When does Mamba beat Transformer for fraud sequences?"
-        scenario={<>You are choosing between Mamba and Transformer for card-fraud sequence scoring. What specific dependency pattern flips the answer to Mamba?</>}
+        title="P1 — A staff engineer asks: 'We use transformer-on-auth-tape today. Why would we adopt Mamba?'"
+        scenario={<><em>Discriminating insight: pitch must name the O(L) selective scan as the lever AND the specific use case where O(L²) attention is infeasible (long histories of 1k-10k+ events). "Newer architecture" / "faster" / "more parameters" all fail the redaction test.</em><br/><br/>Pick the pitch.</>}
         options={[
-          {key:"a", text:"Long-range temporal dependence with smooth aggregate signal — for example, year-long spending patterns where the fraud signal is in the gradual drift of merchant mix, cadence change, and amount distribution over months. Mamba's linear-time recurrence handles tens of thousands of tokens cheaply, and the fixed-size hidden state is sufficient because the relevant signal is an aggregate, not a specific past transaction.", correct:true},
-          {key:"b", text:"Hard retrieval — find one specific past transaction at position T-5000."},
-          {key:"c", text:"Short sequences with sharp local patterns."},
-          {key:"d", text:"Mamba always beats Transformer."},
+          {key:"a", text:"Mamba is a newer architecture, so it's better."},
+          {key:"b", text:"Specific regime: per-card auth histories at 5000-10000 events make transformer attention's O(L²) memory infeasible — attention on 5000 events is 25M ops per layer per token; KV cache scales with L. For installment-loan eligibility, full-year behavioral context, or multi-year subscription pattern detection, we need that length. Mamba replaces attention with a SELECTIVE state-space model: the sequence is compressed into a small hidden state via a recurrence whose transition parameters (Δ, A, B, C) are INPUT-DEPENDENT — the SSM learns to remember or forget based on what just happened. Compute is O(L), per-step memory is O(1), and a hardware-aware parallel-scan CUDA kernel keeps it fast. We trade transformer's exact-retrieval-at-distance (which Mamba's compression weakens) for being able to process the long history at all. For short auth-tape sequences (&lt;100), keep transformer; Mamba is the long-history tool.", correct:true},
+          {key:"c", text:"Mamba has more parameters than transformer."},
+          {key:"d", text:"Mamba uses gradient checkpointing."},
         ]}
-        trap={<>(b) is the opposite — retrieval favors Transformer. (c) is short-sequence territory where both are cheap. (d) is over-general.</>}
-        lens={<>(a) is the concept. Smooth long-range aggregation favors SSM; sharp retrieval favors attention.</>}
-        stretch={<>What hybrid handles both?</>}
+        trap={<>(a) is the cargo-cult pitch; (c)(d) are unrelated.</>}
+        lens={<>Pitch must name (1) the O(L) regime (long sequences), (2) the selective mechanism (input-dependent transitions), and (3) the retrieval-vs-compression tradeoff.</>}
+        stretch={<>If your sequence length is 64, is Mamba worth shipping? Hint: no — transformer wins by retrieval at that length.</>}
       />
 
+      {/* P2 — selective mechanism */}
       <VIS.TrapProblem
-        id="mam-p2"
+        id="mamba-p2"
         difficulty="hard"
-        title="P2 — Attention is O of N squared. Why is it actually a problem at length 10K?"
-        scenario={<>An ML engineer claims "modern GPUs and FlashAttention solve the quadratic cost." Is that right at length ten thousand?</>}
+        title="P2 — What does the SELECTIVE in 'selective state-space model' actually do that vanilla S4 doesn't?"
+        scenario={<><em>Discriminating insight: vanilla S4 has FIXED (input-independent) A, B, C — the recurrence is the same regardless of content. Selective Mamba makes A, B, C, Δ functions of the current input x — so the SSM can choose to "remember" a card-testing burst pattern and "forget" routine traffic. This input-dependence is what closes the gap to attention.</em><br/><br/>Pick the mechanism.</>}
         options={[
-          {key:"a", text:"Only partially. FlashAttention reduces memory cost from O of N squared to O of N (no longer materializing the attention matrix), but compute is still O of N squared. At length 10K vs 1K, you do one hundred times more FLOPs and roughly one hundred times more wall-clock for the attention layer. Memory pressure is solved; compute pressure is not. For high-throughput authorization paths, that 100x is fatal.", correct:true},
-          {key:"b", text:"Yes — FlashAttention removes the quadratic entirely."},
-          {key:"c", text:"No — attention is not parallelizable."},
-          {key:"d", text:"Quadratic cost is myth."},
+          {key:"a", text:"Selective means it skips some tokens."},
+          {key:"b", text:"Selective means the SSM transition parameters Δ, A, B, C are INPUT-DEPENDENT — implemented as a small MLP that maps the current input x to the SSM parameters. In vanilla S4 (the predecessor), A, B, C are FIXED weights — the recurrence transition is the same regardless of content. The SSM compresses sequences uniformly; it can't choose what to remember vs forget. Selective Mamba lets the SSM choose: if the current input looks like a card-testing burst (small amount, short delta-t), the model can learn a Δ that compresses less aggressively (remember this); if the current input is routine, the model can compress more (forget). This input-dependence is what closes the expressivity gap between SSMs and attention — vanilla SSMs were too rigid to compete on real language / behavior tasks. Compute cost: small MLP per token; the per-token MLP plus the selective scan still runs in O(L).", correct:true},
+          {key:"c", text:"Selective is the attention mask."},
+          {key:"d", text:"Selective is a regularizer on the hidden state."},
         ]}
-        trap={<>(b) confuses memory savings with compute savings. (c) is wrong. (d) is wrong.</>}
-        lens={<>(a) is the right read. FlashAttention is necessary but not sufficient at very long context.</>}
-        stretch={<>At what sequence length does Mamba pull ahead in throughput?</>}
+        trap={<>(a)(c)(d) miss that the parameters Δ, A, B, C themselves become functions of x.</>}
+        lens={<>S4 = fixed transition. Mamba = input-dependent transition (the "selective" piece).</>}
+        stretch={<>What's the per-token compute cost of computing A(x), B(x), C(x), Δ(x)? Hint: O(d_state · d_in) — small.</>}
       />
 
+      {/* P3 — O(L^2) vs O(L) infeasibility */}
       <VIS.TrapProblem
-        id="mam-p3"
+        id="mamba-p3"
         difficulty="hard"
-        title="P3 — Hidden-state capacity. How big?"
-        scenario={<>Mamba carries a fixed-size hidden state across tens of thousands of tokens. If you set the state too small, what fails?</>}
+        title="P3 — At sequence length L=10000, transformer is infeasible. Why specifically?"
+        scenario={<><em>Discriminating insight: attention compute is L² = 100M ops per layer per token; KV cache memory is L · d_model per layer (multiply over heads). At length 10k, the KV cache alone is several GB. Mamba's hidden-state is O(d_state) = ~16-64 values per layer per token.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"The model cannot retain enough independent dimensions of past context. Fraud patterns that depend on combinations (e.g., recurring small-amount transactions at a specific merchant cluster over the last six months) compress into the same hidden-state dim and become indistinguishable. Recall on those patterns drops. Mitigations: increase state dim (cost goes up linearly), use multiple SSM layers (depth helps capacity), or hybridize with attention at one layer.", correct:true},
-          {key:"b", text:"The model becomes faster."},
-          {key:"c", text:"Hidden state is not a hyperparameter."},
-          {key:"d", text:"Capacity does not matter for long sequences."},
+          {key:"a", text:"Transformer cannot handle long sequences."},
+          {key:"b", text:"Two compounding problems at L=10000. (1) ATTENTION COMPUTE is O(L²) — attention matrix has 10000² = 100M entries per layer per attention head; with 16 heads and 24 layers, that's ~38 billion attention multiply-adds per token forward pass. For real-time auth path scoring (10ms budget), this is infeasible on commodity GPUs. (2) KV CACHE MEMORY is O(L · d_model) — at L=10000, d_model=512, 24 layers, 16 heads, in FP16 you're at multiple GB per active card. For an issuer scoring millions of cards in parallel, KV cache memory blows the VRAM budget. Mamba: O(L) compute (no L² blow-up), O(d_state) per-token state (typical d_state=16-64, so a few KB per active card — fits in shared memory). The regime change is what makes 10k+ histories feasible.", correct:true},
+          {key:"c", text:"Transformers always overfit at long lengths."},
+          {key:"d", text:"Tokenization breaks at L=10000."},
         ]}
-        trap={<>(b), (c), (d) avoid the mechanism.</>}
-        lens={<>(a) names the failure: capacity bottleneck.</>}
-        stretch={<>Is depth or state dim the better lever?</>}
+        trap={<>(a) is over-general; (c)(d) misidentify the bottleneck.</>}
+        lens={<>O(L²) attention + O(L) KV cache. Both blow up at L=10k. Mamba's O(L) + O(1) state escapes both.</>}
+        stretch={<>What's the FlashAttention savings at L=10k? Hint: it makes attention IO-efficient but compute is still O(L²).</>}
       />
 
+      {/* P4 — when transformer beats Mamba */}
       <VIS.TrapProblem
-        id="mam-p4"
+        id="mamba-p4"
+        difficulty="hard"
+        title="P4 — A junior says 'Mamba is always better — let's switch everything.' Where does transformer beat Mamba?"
+        scenario={<><em>Discriminating insight: transformer wins on (1) short sequences (L &lt; 100), (2) retrieval-heavy tasks ("find this exact past token"). Attention is native content-addressable lookup; SSM compression can't retrieve exact past tokens reliably. Community benchmarks (Jelassi 2024 "Repeat After Me") show this clearly.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Transformer never beats Mamba."},
+          {key:"b", text:"Two regimes where transformer beats Mamba decisively. (1) SHORT SEQUENCES (L &lt; 100-200) — attention's O(L²) at L=100 is just 10k ops which is trivial, and attention does CONTENT-ADDRESSABLE LOOKUP natively: 'what was the amount at position 47?' is one attention op. Mamba must encode that in its compressed hidden state, which it does approximately at best. (2) RETRIEVAL-HEAVY TASKS — when the fraud signal requires recovering a SPECIFIC past token ('did this card visit Best Buy 3 weeks ago?'), transformer attention is native; SSM compression can't reliably recover individual past tokens at distance. Community benchmarks: Jelassi et al. 2024 'Repeat After Me' synthetic copy task — Mamba significantly worse than transformer. Production pattern: HYBRID — Mamba over long history + attention over a local recent window. Don't blindly switch.", correct:true},
+          {key:"c", text:"Transformer wins only on text data."},
+          {key:"d", text:"Mamba always wins because it's newer."},
+        ]}
+        trap={<>(a)(d) are dogmatic; (c) is false.</>}
+        lens={<>Short seq + retrieval = transformer. Long seq + compressible = Mamba. Hybrid hedges both.</>}
+        stretch={<>What's the smallest fraud task that benefits from hybrid? Hint: scoring with full-history context but exact-recent-merchant matching.</>}
+      />
+
+      {/* P5 — vs RNN/LSTM */}
+      <VIS.TrapProblem
+        id="mamba-p5"
+        difficulty="hard"
+        title="P5 — 'Mamba is just an RNN with a fancy name.' Diagnose."
+        scenario={<><em>Discriminating insight: classical RNN/LSTM is sequential along sequence (no parallelism over L during training), has vanishing-gradient issues at length 1k+, and lacks the hardware-aware kernel. Mamba's selective mechanism + parallel scan + careful initialization (HiPPO-style) make it trainable on long sequences where LSTM fails.</em><br/><br/>Compare.</>}
+        options={[
+          {key:"a", text:"They are the same."},
+          {key:"b", text:"Mamba shares with RNN the recurrent structure (compressed hidden state evolving step-by-step) but differs on three load-bearing points. (1) PARALLELIZABLE TRAINING — RNN/LSTM is sequential along L during training (you can't compute step t+1 until step t finishes); Mamba's selective scan is a Blelloch-style parallel scan that computes all states in O(L log L) parallel time on GPU. RNN training at L=10000 takes minutes per batch; Mamba is wall-clock comparable to transformer at L=10000. (2) VANISHING / EXPLODING GRADIENTS — classical RNN/LSTM struggle past length 500-1000 because gradients flow through L matrix multiplications; Mamba's careful initialization (diagonal real-parts inspired by HiPPO theory) keeps the SSM stable to length 10000+. (3) HARDWARE-AWARE KERNEL — Mamba's selective_scan_cuda is co-designed with GPU memory hierarchy (no materialized intermediate state) — orders of magnitude faster than naive PyTorch RNN. Calling it 'just an RNN' misses why Mamba works in 2023+ when RNNs were superseded by transformer in 2017.", correct:true},
+          {key:"c", text:"Mamba is just LSTM."},
+          {key:"d", text:"Mamba is an RNN that uses transformers internally."},
+        ]}
+        trap={<>(a)(c)(d) collapse or confuse the architecture.</>}
+        lens={<>Mamba = (recurrent structure) + (parallel-scan trainability) + (input-dependent transitions) + (HiPPO-style init). Not just an RNN.</>}
+        stretch={<>Why does LSTM work at L=200 but break at L=2000? Hint: vanishing gradients × L hops.</>}
+      />
+
+      {/* P6 — state dimension hyperparameter */}
+      <VIS.TrapProblem
+        id="mamba-p6"
+        difficulty="hard"
+        title="P6 — d_state hyperparameter: 4, 16, or 256?"
+        scenario={<><em>Discriminating insight: too small (d_state=4) bottlenecks long-range info; too large (256) blows compute. Sweet spot is 16-64. The cost is O(L · d_state²) so doubling d_state quadruples compute.</em><br/><br/>Pick.</>}
+        options={[
+          {key:"a", text:"4 — smaller is faster."},
+          {key:"b", text:"16-64 in practice. d_state is the bottleneck of the compressed hidden state: too small (d_state=4) means long-range information is squeezed through 4 floats per token — recall on multi-event patterns collapses. Too large (d_state=256) means the per-token state-update cost is 256² = 65k ops per step; for L=10000 that's 650M ops per layer per token, which approaches transformer's territory and erases the speed advantage. The 16-64 sweet spot keeps per-step cost low (256-4096 ops) while preserving enough capacity for long-range patterns. The cost scales as O(L · d_state²) so doubling d_state quadruples compute. Tune empirically per task; fraud auth-tape typically lands at d_state=16-32.", correct:true},
+          {key:"c", text:"256 — bigger always wins."},
+          {key:"d", text:"d_state doesn't matter."},
+        ]}
+        trap={<>(a)(c) extremes; (d) ignores the load-bearing hyperparameter.</>}
+        lens={<>d_state = compression bandwidth. Too low = bottleneck. Too high = compute blows up. 16-64.</>}
+        stretch={<>At which L does d_state=4 stop being adequate? Hint: depends on pattern density.</>}
+      />
+
+      {/* P7 — Retrieval task fail mode */}
+      <VIS.TrapProblem
+        id="mamba-p7"
+        difficulty="hard"
+        title="P7 — Symptom: recall on 'card visited Best Buy in last 90 days?' is 60% with Mamba but 95% with transformer. Diagnose."
+        scenario={<><em>Discriminating insight: this is a retrieval task — does the exact merchant_id appear in past tokens? Mamba's compressed state can only retain a finite amount of information; specific past-token identities at distance are exactly what compression loses. Transformer's attention does this natively. Fix: hybrid model with attention over the recent window OR offload retrieval to an external aggregate counter.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Mamba is broken."},
+          {key:"b", text:"Retrieval-vs-compression tradeoff. The task 'did this card visit Best Buy in the last 90 days?' is RETRIEVAL — it asks whether a specific token (merchant_id = Best Buy) appears in the past tokens. Transformer attention can ask this directly: at scoring time, the current token's query attends over all past tokens' keys; if any past token's key matches Best Buy's embedding, the attention mass routes to it. Mamba's compressed hidden state must have encoded 'this card visited Best Buy 53 days ago' INTO the d_state-dimensional state vector — but the state has finite capacity and the SSM was trained to compress generic patterns, not preserve specific merchant identities. Result: Mamba's recall on this exact-retrieval task is bounded by what the state preserved. Fix options: (i) hybrid architecture — Mamba over long history + attention over a recent window; (ii) external aggregate counters: maintain a per-card visited-merchant set as a side channel; (iii) train an explicit retrieval-aware Mamba variant. Senior framing: pick architecture to match task — retrieval needs attention.", correct:true},
+          {key:"c", text:"Increase d_state."},
+          {key:"d", text:"Train Mamba longer."},
+        ]}
+        trap={<>(c) helps marginally but doesn't escape the compression bound; (d) doesn't fix the architectural mismatch.</>}
+        lens={<>Retrieval = transformer's home turf. Mamba's state can't reliably preserve specific past tokens.</>}
+        stretch={<>What's the smallest hybrid that recovers retrieval? Hint: attention over last 128 tokens + Mamba over everything earlier.</>}
+      />
+
+      {/* P8 — CUDA kernel mandatory */}
+      <VIS.TrapProblem
+        id="mamba-p8"
+        difficulty="hard"
+        title="P8 — Engineer benchmarks Mamba on CPU; it's slower than transformer. Diagnose."
+        scenario={<><em>Discriminating insight: Mamba's O(L) advantage requires the hardware-aware selective_scan CUDA kernel. On CPU it falls back to a sequential loop — orders of magnitude slower. The architectural compute advantage is conditional on the kernel.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Mamba is just slow."},
+          {key:"b", text:"CPU fallback kills the O(L) speedup. Mamba's compute advantage comes from a HARDWARE-AWARE parallel-scan CUDA kernel (selective_scan_cuda) that is co-designed with GPU memory hierarchy — it keeps intermediate state in shared memory, never materializes the full per-token state matrix, and exploits parallel-scan algorithms (Blelloch). On CPU (or under torch.compile / TF graph failures), the implementation falls back to a sequential PyTorch loop: this is orders of magnitude slower than transformer attention at any practical L because transformer attention has highly optimized CPU paths (BLAS, MKL). 'Mamba on CPU' is functionally a slow RNN. Diagnostic: verify the CUDA kernel is loaded (check selective_scan_cuda import; benchmark a small Mamba vs naive Python implementation — should be 100x+ faster). If running on CPU is the constraint, transformer is the right choice.", correct:true},
+          {key:"c", text:"Mamba is incompatible with PyTorch."},
+          {key:"d", text:"Use a smaller Mamba."},
+        ]}
+        trap={<>(a) is dismissive; (c) is false; (d) doesn't fix the kernel issue.</>}
+        lens={<>Mamba's O(L) is conditional on the CUDA kernel. CPU fallback voids the architecture.</>}
+        stretch={<>What's the right benchmark protocol? Hint: GPU + matched batch + same sequence length.</>}
+      />
+
+      {/* P9 — hybrid architecture */}
+      <VIS.TrapProblem
+        id="mamba-p9"
+        difficulty="hard"
+        title="P9 — Production pattern: hybrid Mamba + attention. Where does attention go?"
+        scenario={<><em>Discriminating insight: attention goes on the RECENT window (last 128-512 tokens) for exact retrieval; Mamba processes the long history. Recent-window attention handles "did this card visit this merchant in the last week" precisely; Mamba handles "what's the user's long-term spend pattern." Layer structure: alternating Mamba and attention blocks, or attention only on the last few layers.</em><br/><br/>Pick the placement.</>}
+        options={[
+          {key:"a", text:"Attention on the whole sequence."},
+          {key:"b", text:"Place attention on a RECENT WINDOW (last 128-512 tokens) where exact retrieval is most valuable AND O(L²) is affordable (128² = 16k ops). Mamba processes the full 10k-token history with O(L) cost. Two production patterns: (i) ALTERNATING BLOCKS — Mamba block + attention block + Mamba block + attention block, with the attention blocks limited to a windowed range; (ii) ATTENTION ONLY ON FINAL LAYERS — pure Mamba stack with the last 1-2 layers being windowed attention that does exact retrieval over recent tokens. Why recent window: most retrieval-relevant fraud signal (recent merchant pattern, recent velocity burst) is in the recent past; ancient history is summarizable. Bonus: the recent window matches how human reviewers think about a card's risk.", correct:true},
+          {key:"c", text:"Attention on the whole 10k sequence — defeats the purpose."},
+          {key:"d", text:"Attention on the oldest tokens."},
+        ]}
+        trap={<>(a)(c) blow up compute; (d) inverts where retrieval matters.</>}
+        lens={<>Mamba long history. Attention recent window. Match task structure to architecture.</>}
+        stretch={<>How long should the attention window be? Hint: cover the typical fraud-pattern lookback (~30-90 days).</>}
+      />
+
+      {/* P10 — Friday 3am */}
+      <VIS.TrapProblem
+        id="mamba-p10"
+        difficulty="hard"
+        title="P10 — Friday 3am: a card-testing ring is spread across 200 cards with full-history attack patterns. Mamba recall on the ring drops 5pt. Diagnose."
+        scenario={<><em>Discriminating insight: per-card Mamba can see one card's long history but cannot see CROSS-CARD patterns. Coordinated rings are visible across cards, not within one card. Mamba per-card + cross-card aggregator is the right composite.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Mamba is broken — retrain."},
+          {key:"b", text:"Architectural ceiling, not a bug. Mamba is a PER-CARD sequence model — it sees one card's auth history (10k events) but it does NOT see other cards' histories. A coordinated ring (200 cards each making one $5 test at the same merchant within 5 minutes) is INVISIBLE to any per-card model because each card's individual sequence looks benign. The ring pattern is in the CROSS-CARD aggregation: 200 cards, one merchant, 5-minute window. Fix: keep Mamba as the per-card score (it's still excellent for per-card patterns over long history), and add a UPSTREAM cross-card aggregation layer — a per-merchant velocity counter, or a small GNN over the card-merchant bipartite graph at recent timestamps. The composite score is Mamba (per-card) + cross-card aggregator. This is the same architectural limit a per-card transformer has — switching to Mamba doesn't fix it.", correct:true},
+          {key:"c", text:"Use a bigger Mamba."},
+          {key:"d", text:"Switch back to transformer."},
+        ]}
+        trap={<>(a)(c)(d) miss the per-card vs cross-card distinction.</>}
+        lens={<>Mamba per-card has the same cross-card blind spot as any per-card model.</>}
+        stretch={<>What's the cheapest cross-card signal? Hint: per-merchant per-minute auth count.</>}
+      />
+
+      {/* P11 — selective mechanism mathematical */}
+      <VIS.TrapProblem
+        id="mamba-p11"
+        difficulty="hard"
+        title="P11 — Mathematically, the selective mechanism makes A, B, C, Δ FUNCTIONS of x. Why does this break the closed-form FFT trick that S4 used?"
+        scenario={<><em>Discriminating insight: vanilla S4's FIXED A allows precomputing a global kernel via FFT — closed-form across the whole sequence in O(L log L). Mamba's input-dependent A means the kernel changes at every step; no global FFT closed form exists. Mamba uses a parallel SCAN instead (still O(L log L) parallel, but a different algorithm).</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"It doesn't break anything."},
+          {key:"b", text:"S4's FFT trick relies on FIXED A: the recurrence h(t+1) = A h(t) + B x(t) with constant A can be unrolled as a CONVOLUTION with kernel [A^0 B, A^1 B, A^2 B, ...] applied to x — and convolution-with-fixed-kernel is FFT-computable in O(L log L). Mamba's A(x) is INPUT-DEPENDENT, so the kernel changes at every step; there is no global fixed kernel to FFT. Mamba replaces FFT with a PARALLEL SCAN (Blelloch / associative-scan): the recurrence is still associative (with input-dependent operators), so a tree-structured parallel scan computes all states in O(L log L) parallel time with O(L) total work. The selective mechanism cost the FFT closed form but gained input-dependent expressivity — and the parallel scan recovers similar wall-clock with a smarter algorithm.", correct:true},
+          {key:"c", text:"Mamba doesn't use FFT or scan."},
+          {key:"d", text:"Mamba is exactly S4."},
+        ]}
+        trap={<>(a)(c)(d) mis-describe the algorithmic step.</>}
+        lens={<>FFT needs fixed kernel. Input-dependent kernel needs parallel scan. Both are O(L log L) parallel.</>}
+        stretch={<>What's the associative operator for the parallel scan? Hint: matrix-vector compose.</>}
+      />
+
+      {/* P12 — D2 cascade */}
+      <VIS.TrapProblem
+        id="mamba-p12"
+        difficulty="hard"
+        title="P12 — Team adopts Mamba 'because newer.' Their actual sequence length is 80. AUPRC drops 2pt vs transformer. Cascade."
+        scenario={<><em>Discriminating insight: Mamba's edge requires long sequences. At L=80, transformer's L²=6400 is trivial AND attention's retrieval beats Mamba's compression. The team paid Mamba's expressivity cost (compression loses retrieval) without getting any compute advantage.</em><br/><br/>Cascade.</>}
+        options={[
+          {key:"a", text:"Mamba is just worse for fraud."},
+          {key:"b", text:"Mamba was adopted out of architecture-as-fashion, not architecture-to-task fit. At L=80, transformer's compute is trivial (attention matrix is 6400 entries — negligible). Mamba's compute advantage doesn't fire at short L. Meanwhile, Mamba's hidden-state compression loses retrieval power that attention has natively — short-sequence fraud often DOES benefit from exact recent-merchant lookup, which Mamba does worse than transformer. So at L=80, Mamba pays the expressivity cost (compression) without earning the compute reward (long-L speedup). Result: 2pt AUPRC drop. The right diagnostic step BEFORE picking Mamba is profiling actual sequence length and asking 'is the fraud signal retrieval-heavy or compression-friendly?' Cascade: 'newer = better' → ignore length profile → ignore retrieval-vs-compression → 2pt AUPRC loss → team blames Mamba instead of the picking-process.", correct:true},
+          {key:"c", text:"Mamba doesn't work."},
+          {key:"d", text:"The team didn't tune learning rate."},
+        ]}
+        trap={<>(a)(c) overclaim Mamba failure; (d) misses the architectural mismatch.</>}
+        lens={<>Architecture picking starts with task profile, not paper recency.</>}
+        stretch={<>What's the right profiling step before picking Mamba? Hint: length histogram + ablation on a transformer baseline.</>}
+      />
+
+      {/* P13 — state size scaling */}
+      <VIS.TrapProblem
+        id="mamba-p13"
+        difficulty="hard"
+        title="P13 — At L=10000, doubling d_state from 16 to 32 doubles AUPRC lift but quadruples training time. Why quadruples?"
+        scenario={<><em>Discriminating insight: Mamba's per-step cost is O(d_state²) (the SSM state update is a small matrix-vector multiply over the state). Total cost is O(L · d_state²). Doubling d_state → 4x cost.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"It only doubles, not quadruples."},
+          {key:"b", text:"Mamba's per-step state-update cost is O(d_state²) — the hidden state evolves as h(t+1) = A(x) h(t) + B(x) x(t), and the A · h matrix-vector multiply is d_state × d_state · d_state = d_state². Total training cost over the whole sequence is O(L · d_state²). Doubling d_state from 16 to 32 → d_state² goes from 256 to 1024, a 4x increase. AUPRC lift might double (linear in d_state capacity) while compute quadruples — the marginal return is decreasing. Optimal d_state is where marginal AUPRC per unit compute is highest; typically 16-32 for fraud auth-tape.", correct:true},
+          {key:"c", text:"It quadruples because GPU memory."},
+          {key:"d", text:"It's a bug."},
+        ]}
+        trap={<>(a) confuses the scaling; (c)(d) misattribute the cost.</>}
+        lens={<>O(L · d_state²) total. Doubling d_state = 4x compute. Decreasing marginal AUPRC return.</>}
+        stretch={<>What's the analog scaling for transformer? Hint: O(L² · d_model) for attention, O(L · d_model²) for FFN — different scaling axes.</>}
+      />
+
+      {/* P14 — diagnostic battery */}
+      <VIS.TrapProblem
+        id="mamba-p14"
         difficulty="hard"
         multiSelect
-        title="P4 — Symptoms that you should switch from Mamba back to Transformer"
-        scenario={<>You shipped Mamba and recall on certain fraud cohorts is lower than the Transformer baseline. Which symptoms indicate Mamba is wrong for those cohorts? Select all that apply.</>}
+        title="P14 — Mamba is silently degraded — possibly retrieval-task failure, state explosion, or CUDA kernel fallback. Pick all diagnostics that apply."
+        scenario={<><em>Discriminating insight: Mamba-specific diagnostics: (a) profile wall-clock per token (should scale linearly in L; nonlinear = CUDA kernel not loaded), (b) hidden-state norm over time (should be stable; exploding = bad init), (c) retrieval-task synthetic eval, (d) compare to transformer at the same length, (e) check d_state is sized for the task.</em><br/><br/>Pick.</>}
         options={[
-          {key:"a", text:"Recall drops on fraud cases where the discriminating signal is a specific past transaction far back in the sequence.", correct:true},
-          {key:"b", text:"Recall improves on year-long aggregate patterns."},
-          {key:"c", text:"Probing with retrieval-style queries shows Mamba's hidden state has lost the specific transaction.", correct:true},
-          {key:"d", text:"Adding a single attention layer to Mamba recovers the recall.", correct:true},
-          {key:"e", text:"Training loss is identical to Transformer's."},
-          {key:"f", text:"Recall drops specifically on fraud signaled by rare, sharp events in the distant past.", correct:true},
+          {key:"a", text:"Profile wall-clock per token across L=100, 1000, 10000 — should scale linearly. Nonlinear scaling means the CUDA selective-scan kernel is NOT loaded.", correct:true},
+          {key:"b", text:"Hidden state norm vs L: if h(t) norm explodes past some L, initialization is bad.", correct:true},
+          {key:"c", text:"Synthetic retrieval task ('what merchant appeared at position 500?') — Mamba should be approximate; significant degradation past a depth means state capacity is exhausted.", correct:true},
+          {key:"d", text:"AUPRC on the actual fraud task."},
+          {key:"e", text:"Side-by-side transformer at the same L on a held-out set; transformer should be comparable at short L and worse at long L.", correct:true},
+          {key:"f", text:"d_state sweep on a held-out slice; AUPRC should rise then plateau — flat curve means d_state was too small AND too large simultaneously (probably broken).", correct:true},
         ]}
-        trap={<>(b) is Mamba's strength, not a problem. (e) is unrelated.</>}
-        lens={<>(a), (c), (d), (f) point to retrieval bottleneck — switch to hybrid or Transformer.</>}
-        stretch={<>What is the cheapest fix — add one attention layer?</>}
+        trap={<>(d) is the integrated test you're trying to short-circuit.</>}
+        lens={<>Wall-clock, state-norm, retrieval, side-by-side, d_state sweep.</>}
+        stretch={<>Cheapest to run?</>}
       />
 
+      {/* P15 — vs FATA-Trans on cadence */}
       <VIS.TrapProblem
-        id="mam-p5"
+        id="mamba-p15"
         difficulty="hard"
-        title="P5 — Hybrid Mamba+Attention. What does it buy you?"
-        scenario={<>You consider a hybrid: Mamba layers throughout, one attention layer near the top. Why?</>}
+        title="P15 — A peer says: 'Mamba and FATA-Trans both solve long irregular sequences.' Where do they actually compete?"
+        scenario={<><em>Discriminating insight: FATA-Trans solves IRREGULAR (delta-t encoding) at moderate length. Mamba solves LONG (O(L) compute) at any cadence. They are orthogonal axes of the problem; you can have a Mamba with delta-t input embeddings.</em><br/><br/>Compare.</>}
         options={[
-          {key:"a", text:"The hybrid keeps Mamba's linear-time bulk for general long-range aggregation, but adds one attention layer that lets the model do random retrieval over the sequence when needed. One attention layer at length 10K is much cheaper than a stack of attention layers, and it gives the model the retrieval primitive without sacrificing the speed advantage. This is the design behind Jamba-style hybrids and consistently outperforms pure-SSM at modest cost.", correct:true},
-          {key:"b", text:"Hybrids are always worse than pure Mamba."},
-          {key:"c", text:"Hybrids are always worse than pure Transformer."},
-          {key:"d", text:"Attention layers do not help with retrieval."},
+          {key:"a", text:"They are the same."},
+          {key:"b", text:"They solve different problems and are not direct competitors. <strong>FATA-Trans</strong> tackles IRREGULAR CADENCE at moderate length: bursty users (10 tx/min vs 1 tx/month) get the wrong positional signal under sinusoidal PE; delta-t bucket embeddings restore the velocity input. FATA-Trans uses transformer attention (O(L²)), so at L=10000 it has the same compute problem any transformer does. <strong>Mamba</strong> tackles LONG SEQUENCES at any cadence: O(L) compute makes 10k+ histories feasible. Mamba doesn't have a built-in delta-t mechanism — you'd add delta-t bucket embeddings as input features. The two are orthogonal: SHORT + irregular → FATA-Trans; LONG + any cadence → Mamba; LONG + irregular → Mamba with delta-t input embeddings (or hybrid).", correct:true},
+          {key:"c", text:"FATA-Trans is a Mamba variant."},
+          {key:"d", text:"Mamba is a FATA-Trans variant."},
         ]}
-        trap={<>(b), (c), (d) all dismiss the mechanism.</>}
-        lens={<>(a) names the hybrid recipe. One attention layer at the right depth is the sweet spot.</>}
-        stretch={<>Top, middle, or bottom for the attention layer?</>}
+        trap={<>(a)(c)(d) confuse the axes.</>}
+        lens={<>Irregular cadence = positional encoding fix. Long sequence = compute regime change. Orthogonal.</>}
+        stretch={<>What goes in a Mamba's input to handle irregular cadence? Hint: delta-t bucket embed concatenated to event token.</>}
       />
 
+      {/* P16 — community benchmarks */}
       <VIS.TrapProblem
-        id="mam-p6"
+        id="mamba-p16"
         difficulty="hard"
-        title="P6 — Training is unstable. Common cause?"
-        scenario={<>Your Mamba run diverges after 5K steps. What is the most common cause?</>}
+        title="P16 — A 2024 paper reports Mamba beats transformer by 4pt on a fraud benchmark. The benchmark has L=512. Diagnose the result."
+        scenario={<><em>Discriminating insight: at L=512, transformer's L²=262k is small; Mamba's compute advantage is marginal. The 4pt gap is unexplained by Mamba's known mechanism. Suspect: confounded compute (Mamba bigger model), confounded data leakage, or transformer baseline poorly tuned.</em><br/><br/>Skeptical read.</>}
         options={[
-          {key:"a", text:"Initialization of the SSM matrices is delicate. Mamba uses a specific initialization (HiPPO matrix or its variants) for the A matrix; deviating breaks stability. Other common causes: learning rate too high for the recurrent dynamics, missing gradient clipping, or numerical issues in the parallel scan. Fix: use the canonical init from the reference repo, lower LR, add gradient clipping, and check that the scan kernel is the production one not a hand-written prototype.", correct:true},
-          {key:"b", text:"Mamba is fundamentally unstable."},
-          {key:"c", text:"It is overfitting."},
-          {key:"d", text:"Sequence is too short."},
+          {key:"a", text:"The paper is correct — Mamba is better."},
+          {key:"b", text:"Skeptical read needed. At L=512, transformer's compute (262k attention ops per layer per token) is small — Mamba's O(L)=512 advantage saves maybe 100x compute but doesn't change the regime. A 4pt AUPRC gap is large for an architectural change that mostly affects compute, not expressivity. Likely confounders: (i) the Mamba model was bigger than the transformer baseline (more params); (ii) the transformer baseline used a weak default config (no FlashAttention, suboptimal LR); (iii) eval-time data leakage that Mamba's compression accidentally avoided (unlikely but possible); (iv) the benchmark's signal happens to live in long-range patterns that Mamba's compression compresses well. To attribute the gap, demand: matched parameter count, matched compute budget, FlashAttention transformer baseline, user-stratified temporal split. If the gap survives, it's real; otherwise it's a confound.", correct:true},
+          {key:"c", text:"Mamba always wins."},
+          {key:"d", text:"The paper is wrong."},
         ]}
-        trap={<>(b) is dismissive. (c) does not explain divergence. (d) is the opposite of the typical scenario.</>}
-        lens={<>(a) is the practitioner read. Init, LR, clipping, kernel — check all four.</>}
-        stretch={<>Which is the most common single offender?</>}
+        trap={<>(a)(c) over-trust; (d) dismisses.</>}
+        lens={<>At L=512, architectural compute differences don't drive 4pt AUPRC. Suspect confounds.</>}
+        stretch={<>What's the right matched-compute baseline? Hint: FLOPs, not wall-clock, with FlashAttention.</>}
       />
 
+      {/* P17 — when NOT to use */}
       <VIS.TrapProblem
-        id="mam-p7"
-        difficulty="hard"
-        title="P7 — Inference: streaming or full-sequence?"
-        scenario={<>At inference, you can either re-run Mamba on the full history each time a new transaction arrives, or stream — keep the hidden state and update with one token at a time. Tradeoff?</>}
+        id="mamba-p17"
+        difficulty="medium"
+        title="P17 — Three populations where Mamba is NOT the right architecture."
+        scenario={<><em>Discriminating insight: short sequences (L &lt; 200), retrieval-heavy tasks (exact past-token lookup), CPU-bound serving (kernel not available). All three are well-known.</em><br/><br/>Pick.</>}
         options={[
-          {key:"a", text:"Streaming is the obvious choice and Mamba is built for it. Maintain the hidden state per card; on each new transaction, do one O of 1 step. Saves ninety-nine percent of inference cost compared to re-running on the full history. Caveat: hidden state must be persisted reliably (DB or in-memory store) keyed by card; drift between training-time and inference-time hidden-state semantics is a silent bug source.", correct:true},
-          {key:"b", text:"Always re-run on the full history."},
-          {key:"c", text:"Streaming changes the model's prediction."},
-          {key:"d", text:"Mamba cannot stream."},
+          {key:"a", text:"Mamba is always right."},
+          {key:"b", text:"Three. (1) SHORT SEQUENCES (L &lt; 200) — transformer's compute is trivial and its retrieval is native; Mamba's compression-vs-retrieval tradeoff is a net loss. (2) RETRIEVAL-HEAVY TASKS — when the fraud signal requires exact past-token lookup ('did this exact merchant_id appear?'), transformer wins via attention's content-addressable lookup. Use hybrid Mamba + attention if you must process long sequences but need retrieval. (3) CPU-BOUND SERVING — Mamba's O(L) advantage requires the GPU selective_scan kernel; CPU fallback is much slower than transformer attention's optimized BLAS paths. If serving is CPU-only, transformer is the right choice.", correct:true},
+          {key:"c", text:"Mamba is never right."},
+          {key:"d", text:"Mamba only works for text."},
         ]}
-        trap={<>(b) wastes compute. (c) is false if state is consistent. (d) is wrong — streaming is a key Mamba selling point.</>}
-        lens={<>(a) names the production pattern and the silent-bug failure mode.</>}
-        stretch={<>How would you detect state drift?</>}
+        trap={<>(a)(c)(d) extremes.</>}
+        lens={<>Short + retrieval + CPU = transformer. Long + compressible + GPU = Mamba.</>}
+        stretch={<>What's the right architecture for CPU-bound long sequences? Hint: hand-engineered aggregates + small transformer.</>}
       />
 
+      {/* P18 — initialization */}
       <VIS.TrapProblem
-        id="mam-p8"
+        id="mamba-p18"
         difficulty="hard"
-        title="P8 — Cost comparison at length 50K"
-        scenario={<>Sequence length 50K. Mamba and Transformer of equal hidden dim and depth. Roughly what is the FLOPs ratio?</>}
+        title="P18 — Hidden state explodes at L=1500. What initialization is the fix?"
+        scenario={<><em>Discriminating insight: SSM matrix A must have eigenvalues with negative real parts (stable) — HiPPO-style initialization (diagonal with negative real parts) provides this. Random init or wrong init lets eigenvalues exceed unit circle → state explodes over many steps.</em><br/><br/>Pick.</>}
         options={[
-          {key:"a", text:"Mamba is roughly 50 to 500 times cheaper depending on the specific hidden dim and the cost of attention vs scan. Quadratic attention at length 50K is enormous; linear scan grows with N. The ratio improves further if you use FlashAttention only for memory savings (compute still quadratic). For production at length much greater than 10K, Mamba is the only economically viable choice.", correct:true},
-          {key:"b", text:"Mamba is roughly 2 times cheaper."},
-          {key:"c", text:"They are the same."},
-          {key:"d", text:"Transformer is cheaper at length 50K."},
+          {key:"a", text:"Lower learning rate."},
+          {key:"b", text:"SSM stability initialization. The hidden state evolves as h(t+1) = A h(t) + (input term); over L steps, h(L) ~ A^L h(0). Stability requires A's eigenvalues to have magnitude ≤ 1 (or negative real parts in continuous time). Random initialization of A doesn't guarantee this — eigenvalues can have positive real parts (continuous time) or magnitude &gt;1 (discrete), causing h to blow up exponentially over many steps. Mamba uses HiPPO-style initialization: A is parameterized as DIAGONAL with negative real parts (stable by construction), and the parameterization is constrained to keep stability throughout training. This is why Mamba works at L=10000 where naive RNN initialization fails. Fix: verify A is initialized with the HiPPO scheme (look for 'A_log' parameterization with negative-real-parts constraint); if not, switch.", correct:true},
+          {key:"c", text:"Use a smaller d_state."},
+          {key:"d", text:"Increase batch size."},
         ]}
-        trap={<>(b) understates the gap. (c) and (d) are wrong.</>}
-        lens={<>(a) is the order-of-magnitude read.</>}
-        stretch={<>What sequence length is the Mamba crossover?</>}
+        trap={<>(a)(c)(d) don't address the stability constraint.</>}
+        lens={<>SSM stability = eigenvalue constraint. HiPPO-style diagonal init enforces it.</>}
+        stretch={<>What's the connection between HiPPO and orthogonal polynomials? Hint: HiPPO derives A from optimal-projection theory.</>}
       />
 
+      {/* P19 — eval contamination */}
       <VIS.TrapProblem
-        id="mam-p9"
+        id="mamba-p19"
         difficulty="hard"
-        title="P9 — Tooling immaturity. What concretely hurts?"
-        scenario={<>Your team adopts Mamba in 2026. What tooling gap most slows you down?</>}
+        title="P19 — Offline Mamba beats transformer by 6pt at L=8000. Production: 1pt. Diagnose."
+        scenario={<><em>Discriminating insight: random-row split leaks future-from-same-user; long sequences amplify the leak (10k events of the same user spread across train + eval). User-stratified temporal split closes the gap. Also check matched compute.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"Quantization, pruning, and distillation libraries are Transformer-first. Mamba support is patchy. Pretrained checkpoints are fewer; you may end up pretraining from scratch. Deployment guides for sub-50ms inference assume Transformer. Plan extra weeks for these. The model itself is fine; the supporting ecosystem is what bites.", correct:true},
-          {key:"b", text:"Mamba does not work on GPUs."},
-          {key:"c", text:"Mamba does not have PyTorch bindings."},
-          {key:"d", text:"Tooling is mature."},
+          {key:"a", text:"Production is buggy."},
+          {key:"b", text:"Two confounds in the offline number. (1) Eval-time leakage. At L=8000 per user, a random-row split spreads thousands of tokens from the same user across train and eval folds; Mamba's compressed state of one user's long history overlaps train and eval — the offline eval is testing memorization, not generalization. (2) Compute mismatch likely (Mamba bigger / longer training than the transformer baseline). Switch to USER-STRATIFIED TEMPORAL split (no user in both folds; eval strictly after train cutoff) AND match compute (same FLOPs, same parameter count). Honest lift drops to ~1pt matching production. The lift is real but smaller; the bigger number was leakage + compute confound.", correct:true},
+          {key:"c", text:"Mamba is over-claimed."},
+          {key:"d", text:"Production data is bad."},
         ]}
-        trap={<>(b), (c), (d) all misread the state of the ecosystem.</>}
-        lens={<>(a) is the practical 2026 picture.</>}
-        stretch={<>What is the cheapest workaround for missing quantization?</>}
+        trap={<>(a)(c)(d) deflect.</>}
+        lens={<>User-stratified temporal split + matched compute. Always.</>}
+        stretch={<>Why is the leak worse at long L? Hint: more per-user tokens means more leakage surface.</>}
       />
 
+      {/* P20 — wrong-assumption cascade */}
       <VIS.TrapProblem
-        id="mam-p10"
+        id="mamba-p20"
         difficulty="hard"
-        title="P10 — Installment-loan eligibility. Mamba or Transformer?"
-        scenario={<>You score installment-loan eligibility from one year of card history (around 5K to 15K transactions). Pick Mamba or Transformer.</>}
+        title="P20 — Engineer says 'Mamba is a transformer replacement.' Which beliefs cascade wrong?"
+        scenario={<><em>Discriminating insight: under "drop-in transformer replacement" the engineer ignores retrieval tasks, doesn't profile sequence length, uses default d_state, runs on CPU, and doesn't add upstream cross-card layers. Each break is specific.</em><br/><br/>Cascade.</>}
         options={[
-          {key:"a", text:"Mamba (or hybrid Mamba+attention). The decision depends mostly on aggregate behavior across the year — spending stability, recurring obligations, cadence — which is exactly what Mamba's smooth long-range recurrence is good at. At 5K to 15K tokens, Transformer attention is expensive but not impossible; if your team has stronger Transformer infrastructure and only modest sequence-length needs, a Transformer at 5K is workable but more expensive at scale.", correct:true},
-          {key:"b", text:"Transformer — attention is always better."},
-          {key:"c", text:"GBDT on aggregates — sequences do not help."},
-          {key:"d", text:"Neither — use a credit-bureau model."},
+          {key:"a", text:"Nothing follows."},
+          {key:"b", text:"At least four things break. (1) 'Drop-in for short sequences' → at L=80, Mamba loses to transformer; AUPRC drops. (2) 'Retrieval tasks are the same' → exact past-token lookup degrades because Mamba's state is compressed; recall on 'did this card visit X' drops. (3) 'Default d_state is fine' → d_state=16 might bottleneck the task; d_state needs tuning per task. (4) 'Run on CPU like transformer' → CPU fallback voids the O(L) speedup; Mamba on CPU is just a slow RNN. (5) 'Per-card model handles rings' → no, cross-card patterns need a separate aggregator regardless of architecture. The 'transformer replacement' frame collapses five orthogonal axes (length regime, retrieval need, hyperparameter, hardware, cross-card) into one wrong reduction.", correct:true},
+          {key:"c", text:"Only retrieval breaks."},
+          {key:"d", text:"Only length breaks."},
         ]}
-        trap={<>(b) ignores the cost. (c) leaves signal on the table. (d) ignores the question.</>}
-        lens={<>(a) is the senior read for long-range aggregate scoring.</>}
-        stretch={<>What is the cheapest hybrid you would try?</>}
+        trap={<>(a)(c)(d) understate.</>}
+        lens={<>Mamba is NOT a drop-in transformer replacement. It's a specific tool for long + compressible + GPU.</>}
+        stretch={<>Which break is hardest to diagnose post-hoc?</>}
       />
 
+      {/* P21 — production rollout */}
       <VIS.TrapProblem
-        id="mam-p11"
-        difficulty="hard"
-        title="P11 — End-to-end design for sleeper-fraud detection over 12 months"
-        scenario={<>"Sleeper" fraud — a card stays normal for months, then erupts. Twelve months of history per card, around 10K transactions. What stack?</>}
+        id="mamba-p21"
+        difficulty="medium"
+        title="P21 — Order the Mamba rollout stages."
+        scenario={<><em>Discriminating insight: stage 1 = profile sequence length distribution; stage 2 = identify the long-history use cases (loan eligibility, full-year behavioral context); stage 3 = pilot Mamba on those use cases; stage 4 = hybrid Mamba+attention; stage 5 = move from per-card to composite cross-card.</em><br/><br/>Pick.</>}
         options={[
-          {key:"a", text:"Mamba backbone over the full year (10K tokens), with one attention layer near the top for rare-event retrieval, hidden-state streaming at inference so each new transaction is one O of 1 step. Ensemble with the existing short-window Transformer for sharp local signals. Daily eval; auto-rollback on recall-at-precision floor. Long-range aggregate features (cadence drift, merchant-mix entropy) computed by the SSM; short-range velocity features computed by the Transformer; ensemble combines.", correct:true},
-          {key:"b", text:"Transformer on 10K tokens, full attention, no ensembling."},
-          {key:"c", text:"GBDT on year-long aggregates only."},
-          {key:"d", text:"Mamba only, no ensembling, no short-window model."},
+          {key:"a", text:"Ship Mamba everywhere day 1."},
+          {key:"b", text:"Staged. <strong>Stage 1:</strong> profile per-card sequence length distribution; identify use cases with L &gt; 500 (long enough for Mamba's advantage). <strong>Stage 2:</strong> for those use cases, baseline a transformer at the L the use case actually needs (might be infeasible — confirm the compute pain). <strong>Stage 3:</strong> pilot Mamba on the long-history use case; verify CUDA kernel loaded; tune d_state; validate AUPRC. <strong>Stage 4:</strong> hybrid Mamba + windowed attention to recover retrieval. <strong>Stage 5:</strong> add cross-card aggregation upstream for ring detection. Skipping stage 1 is the most common error — adopting Mamba before profiling length leads to the P12 cascade.", correct:true},
+          {key:"c", text:"Skip the length profile."},
+          {key:"d", text:"Start with hybrid before pure Mamba."},
         ]}
-        trap={<>(b) is unaffordable. (c) loses sequence signal. (d) misses sharp-event recall.</>}
-        lens={<>(a) is the senior stack. Long-range SSM plus short-range attention plus ensemble.</>}
-        stretch={<>What single metric tells you the SSM long-range signal is firing?</>}
+        trap={<>(a)(c) skip the profile; (d) reverses the simpler-first staging.</>}
+        lens={<>Profile length → confirm transformer pain → pilot Mamba → hybrid → cross-card.</>}
+        stretch={<>What's the smallest pilot dataset to validate the architecture choice?</>}
+      />
+
+      {/* P22 — KV cache analog */}
+      <VIS.TrapProblem
+        id="mamba-p22"
+        difficulty="hard"
+        title="P22 — Transformer's KV cache stores L tokens per active session. What's Mamba's analog at serving time?"
+        scenario={<><em>Discriminating insight: Mamba's "cache" is just the d_state-dim hidden state (~16-64 floats). Constant per active session, not O(L). This is a major serving advantage — millions of cards can have active state without KV cache memory blowing up.</em><br/><br/>Compare serving state.</>}
+        options={[
+          {key:"a", text:"Mamba has no per-session state."},
+          {key:"b", text:"Mamba's serving-time state is just the d_state-dimensional hidden state h (~16-64 floats per layer per session) plus the input-dependent SSM parameters (computed fresh from the current token). Constant size regardless of how long the session has been running. Transformer's KV cache scales as O(L · d_model · n_heads · n_layers) per session — for L=10000, d_model=512, 16 heads, 24 layers in FP16 that's gigabytes per active card. For millions of active cards, transformer's KV cache memory is the serving bottleneck; Mamba's per-session state is megabytes-not-gigabytes. Even if Mamba's per-event compute were the SAME as transformer's, the constant-state serving advantage would justify it for high-cardinality session-state systems. This is a major operational reason to pick Mamba even when compute is a wash.", correct:true},
+          {key:"c", text:"Mamba's state grows linearly in L."},
+          {key:"d", text:"Mamba uses transformer's KV cache."},
+        ]}
+        trap={<>(a)(c)(d) misdescribe the state.</>}
+        lens={<>Mamba serving state = d_state floats per session. Transformer KV cache = O(L). Constant vs linear.</>}
+        stretch={<>How many active sessions can a single GPU hold? Hint: VRAM / state-size-per-session.</>}
+      />
+
+      {/* P23 — adversarial */}
+      <VIS.TrapProblem
+        id="mamba-p23"
+        difficulty="hard"
+        title="P23 — Adversary stretches an attack across the full 10000-event history so the relevant fraud signal is far from the current step. What's Mamba's failure mode?"
+        scenario={<><em>Discriminating insight: Mamba's compressed state can forget long-distance specifics; an adversary can exploit this by ensuring the attack pattern spans events compressed away. Hybrid with attention over a longer window mitigates; explicit external aggregates also help.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Mamba handles all attacks."},
+          {key:"b", text:"Distance attack. Mamba's hidden state compresses past tokens; specific patterns at large distance can be compressed away if the selective mechanism didn't 'choose to remember' that specific token. An adversary can probe: identify which long-range patterns Mamba compresses (by observing scores on synthetic test sequences) and structure the attack so the trigger pattern is in the compressed region. Defenses: (i) hybrid Mamba + attention with a LARGER attention window (covers the typical attack stretch); (ii) external aggregates (per-merchant velocity counters over 30/60/90-day windows — concrete signal that doesn't depend on Mamba's state); (iii) periodic anomaly checks on Mamba's hidden state distribution (an adversary mimicking common patterns to fool compression will show different state-norm distribution). The architectural limit (compression loses retrieval at distance) is real; hedge with hybrid + external aggregates.", correct:true},
+          {key:"c", text:"Block long sequences."},
+          {key:"d", text:"Retrain Mamba weekly."},
+        ]}
+        trap={<>(a)(c) overclaim or destroy CX; (d) doesn't address the architectural limit.</>}
+        lens={<>Compression loses distance. Hybrid + external aggregates hedge.</>}
+        stretch={<>How does the adversary find Mamba's compression weak spots? Hint: probing with synthetic test sequences.</>}
+      />
+
+      {/* P24 — reproducibility */}
+      <VIS.TrapProblem
+        id="mamba-p24"
+        difficulty="medium"
+        title="P24 — Mamba-fraud paper reports 8pt lift; reproduction with the open-source mamba-ssm kernel gives 1pt. Diagnose."
+        scenario={<><em>Discriminating insight: the gap often comes from (1) production-grade selective_scan kernel optimizations not in the OSS release, (2) dataset differences (proprietary long-history corpus vs public short data), (3) careful sequence-length matching, (4) compute matching. Reproducibility on Mamba in fraud is non-trivial.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"The reproduction is wrong."},
+          {key:"b", text:"Three structural reasons. (1) DATASET DIFFERENCE: the original paper used a proprietary issuer dataset with 10k+ events per card; the OSS reproduction often uses Kaggle / IEEE-CIS which are at L=100-500 (Mamba's regime advantage doesn't fire). (2) KERNEL DIFFERENCE: production teams sometimes have additional optimizations in the selective_scan kernel (fused norms, custom dtypes) that aren't in the public release; the public mamba_ssm is correct but not always the same wall-clock. (3) COMPUTE / HYPERPARAMETER MATCHING: the paper likely tuned d_state, depth, and training for the long-history regime; reproductions often use defaults. To make a fair reproduction: long-history corpus + matched compute + tuned d_state + warm-init + same eval split. Without all four, the gap is mostly the regime mismatch, not architecture failure.", correct:true},
+          {key:"c", text:"Mamba doesn't work in fraud."},
+          {key:"d", text:"OSS kernel is broken."},
+        ]}
+        trap={<>(a)(c) overclaim; (d) is rarely true.</>}
+        lens={<>Reproducibility for Mamba-fraud requires matching the long-history regime, the kernel, and the compute.</>}
+        stretch={<>What's the smallest realistic long-history public dataset? Hint: none ideal — see TabBERT P23.</>}
+      />
+
+      {/* P25 — what to log */}
+      <VIS.TrapProblem
+        id="mamba-p25"
+        difficulty="medium"
+        multiSelect
+        title="P25 — Production telemetry for a Mamba-fraud model. Which signals matter? Pick all that apply."
+        scenario={<><em>Discriminating insight: Mamba-specific telemetry — hidden-state norm distribution (detect explosion / collapse), per-token wall-clock (detect CUDA kernel falling back), d_state utilization (singular-value of state matrix), input-dependent transition entropy (selective mechanism activity).</em><br/><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Per-token p99 wall-clock latency (should be constant; growth means kernel fallback or batching issue).", correct:true},
+          {key:"b", text:"AUPRC on production traffic."},
+          {key:"c", text:"Hidden-state norm distribution at the last step of each scoring pass (anomaly = state explosion).", correct:true},
+          {key:"d", text:"d_state utilization — singular-value spectrum of the state matrix; collapsing values mean d_state is too large for what the task uses.", correct:true},
+          {key:"e", text:"Distribution of input-dependent Δ values (selective mechanism activity — if Δ collapses to a constant the SSM is no longer selective).", correct:true},
+          {key:"f", text:"Number of training epochs."},
+          {key:"g", text:"CUDA kernel version + driver version (kernel changes can subtly change numerics).", correct:true},
+        ]}
+        trap={<>(b) is the integrated business metric; (f) is incidental.</>}
+        lens={<>State norm + wall-clock + d_state utilization + Δ activity + kernel version. All Mamba-specific.</>}
+        stretch={<>Cheapest to monitor?</>}
+      />
+
+      {/* P26 — hybrid vs pure */}
+      <VIS.TrapProblem
+        id="mamba-p26"
+        difficulty="hard"
+        title="P26 — Pure Mamba vs hybrid Mamba+attention vs pure transformer at L=5000. Which one ships?"
+        scenario={<><em>Discriminating insight: at L=5000, pure transformer is borderline (attention is 25M ops). Hybrid likely wins: Mamba over the full 5000 history + attention over the last 256 for retrieval. Pure Mamba leaves retrieval recall on the table.</em><br/><br/>Decide.</>}
+        options={[
+          {key:"a", text:"Pure transformer."},
+          {key:"b", text:"Hybrid. At L=5000, attention is computationally borderline (5000² = 25M ops per layer per token — tight for real-time auth path but feasible with FlashAttention). Pure Mamba over 5000 gets the O(L) compute win but loses the retrieval recall (P7). Pure transformer is feasible but expensive and loses if you push L higher. Hybrid: Mamba over the full 5000 history (captures long-range patterns) + windowed attention over the last 256 tokens (captures recent-merchant exact retrieval). Total compute is O(L) + O(window²) = O(L). Recall is competitive with pure transformer; serving state is dominated by the small attention window's KV cache plus Mamba's tiny hidden state. Ship hybrid.", correct:true},
+          {key:"c", text:"Pure Mamba."},
+          {key:"d", text:"Two separate models."},
+        ]}
+        trap={<>(a) is expensive and doesn't scale to L=10k; (c) loses retrieval; (d) doubles inference.</>}
+        lens={<>Hybrid combines Mamba's long-history reach with attention's retrieval power. Production default at moderate L.</>}
+        stretch={<>How wide should the attention window be? Hint: cover the typical recent-merchant lookback (~128-256).</>}
       />
     </VIS.Section>
 
@@ -1704,38 +1998,45 @@ flowchart TB
       <ul>
         <li>
           <a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener">
-            <strong>Gu and Dao — Mamba: Linear-Time Sequence Modeling with Selective State Spaces</strong>
+            <strong>Gu &amp; Dao — Mamba: Linear-Time Sequence Modeling with Selective State Spaces</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, 2023)</span>
-          <br/>The reference paper. Section 3 on selective SSMs is the keeper.
+          <br/>The reference paper. Section 3 (selective mechanism) and the hardware-aware selective-scan algorithm are the keepers.
         </li>
         <li>
-          <a href="https://srush.github.io/annotated-s4/" target="_blank" rel="noopener">
-            <strong>Sasha Rush — The Annotated S4</strong>
+          <a href="https://srush.github.io/annotated-mamba/" target="_blank" rel="noopener">
+            <strong>Sasha Rush — The Annotated Mamba</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The clearest explainer of SSMs from first principles. Read before Mamba.
+          <br/>Best practitioner walkthrough. Annotated PyTorch code + diagrams of selective scan. Required reading for understanding the kernel mechanics (P8, P11).
         </li>
         <li>
-          <a href="https://www.maartengrootendorst.com/blog/mamba/" target="_blank" rel="noopener">
-            <strong>Maarten Grootendorst — A Visual Guide to Mamba</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Practitioner-friendly visual walkthrough of selective SSMs. Best non-paper intro.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2403.19887" target="_blank" rel="noopener">
-            <strong>Jamba — Hybrid Transformer-Mamba</strong>
+          <a href="https://arxiv.org/abs/2402.01032" target="_blank" rel="noopener">
+            <strong>Jelassi et al. — Repeat After Me: Transformers are Better than State Space Models at Copying</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, 2024)</span>
-          <br/>The reference hybrid architecture. Sections on attention-layer placement are directly applicable.
+          <br/>The critical companion paper. Empirical evidence on retrieval-heavy tasks where Mamba loses to transformer. Required reading for P4 and P7.
         </li>
         <li>
-          <a href="https://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">
-            <strong>Andrej Karpathy — A Recipe for Training Neural Networks</strong>
+          <a href="https://arxiv.org/abs/2111.00396" target="_blank" rel="noopener">
+            <strong>Gu et al. — Efficiently Modeling Long Sequences with Structured State Spaces (S4)</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2022)</span>
+          <br/>The S4 predecessor with FIXED transition. P2 and P11 turn on understanding why S4's FFT trick doesn't survive Mamba's input-dependent A.
+        </li>
+        <li>
+          <a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">
+            <strong>Jay Alammar — The Illustrated Transformer</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Field guide for diagnosing the kind of stability bugs that hit Mamba runs (init, LR, clipping).
+          <br/>Required baseline. Mamba's selective scan is contrasted with transformer attention throughout; you can't reason about the tradeoff without internalizing attention first.
+        </li>
+        <li>
+          <a href="https://karpathy.github.io/2015/05/21/rnn-effectiveness/" target="_blank" rel="noopener">
+            <strong>Andrej Karpathy — The Unreasonable Effectiveness of Recurrent Neural Networks</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
+          <br/>The classic RNN intro. Useful for grounding why classical RNNs failed at long sequences (vanishing gradients) — the problems Mamba's careful initialization and selective scan solve.
         </li>
       </ul>
     </VIS.Section>

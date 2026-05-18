@@ -1414,290 +1414,591 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// FATA-Trans — Field And Time-Aware Transformer for sequential tabular data.
-// Sun et al., CIKM 2023. Encodes field-level attention plus irregular delta-t.
+// FATA-Trans (Sun et al., CIKM 2023) — Field And Time-Aware Transformer
+// for sequential tabular data. Load-bearing distinctions that must survive
+// the redaction test:
+//   (1) per-FIELD-TYPE attention sub-spaces — numerical, categorical, and
+//       temporal fields get distinct attention parameter sets at the per-row
+//       layer. NOT one shared attention head across heterogeneous columns.
+//   (2) delta-t positional encoding (learned over log-bucketed inter-tx gaps)
+//       REPLACING sinusoidal-of-integer-position. The PE carries velocity.
+//   (3) two-tier attention: per-row field-aware attention FIRST, then a
+//       sequence-level attention BETWEEN rows. Vanilla is one-tier.
+// Strip "field-type partition" or "delta-t PE" and the answers should NOT
+// still work. If a problem reduces to "transformer good for sequences" or
+// "use SSL pretraining" it belongs in a sibling visual (TabBERT, Mamba),
+// not here.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Transaction sequence transformers"
       title="FATA-Trans"
-      subtitle="Field- and time-aware transformer that explicitly encodes irregular time gaps between transactions, not just positional index."
+      subtitle="Field-type-aware attention sub-spaces + delta-t positional encoding. Two-tier attention (within-row by field-type, then across-rows by elapsed time) on irregular tabular transaction sequences."
       byline={[
         {label: "Source", value: "Sun et al., CIKM 2023 — FATA-Trans"},
-        {label: "Year", value: "2023"},
-        {label: "L3", value: "Transaction sequence transformers"},
+        {label: "L3", value: "Field-type partitioned attention + delta-t PE"},
+        {label: "Anchor", value: "Per-field-type attention sub-spaces; sinusoidal PE replaced by learned delta-t embed"},
       ]}/>
 
     <VIS.TLDR>
-      A standard{" "}
-      <VIS.Term def="A neural network that uses self-attention to model relationships across positions in a sequence. Originally for text; now applied to time series, tabular logs, and code.">Transformer</VIS.Term>{" "}
-      assumes positions in a sequence are evenly spaced. Card transactions are not — one user might transact 50 times a day, another once a month. FATA-Trans replaces sinusoidal positional encoding with a learned function of the actual time delta between adjacent transactions, and adds a field-level attention layer that lets each tabular column attend to others within a row. Result: better recall on bursty / irregular transaction histories than vanilla sequence transformers.
+      A vanilla{" "}
+      <VIS.Term def="Encoder that mixes positions in a sequence via self-attention. Standard recipe: token embed + sinusoidal positional encoding + stacked attention layers.">sequence transformer</VIS.Term>{" "}
+      treats a transaction row as one concatenated token and feeds sinusoidal-of-integer-position as the positional signal. Both choices are wrong for irregular tabular transaction sequences: (1) heterogeneous columns (numerical amount, categorical merchant, temporal delta-t) share one attention head and their semantic differences get averaged away; (2) sinusoidal PE encodes ORDER but not VELOCITY — two users with 10 transactions look identical to PE whether they happened in an hour or a year. FATA-Trans fixes both: per-field-TYPE attention sub-spaces at the per-row layer (numerical heads, categorical heads, temporal heads — separate parameters), then a sequence-level layer with a learned embedding over log-bucketed delta-t replacing sinusoidal PE. <strong>The load-bearing inductive bias is the field-type partition combined with the delta-t PE.</strong> Strip either and the answers collapse to "any transformer on transactions."
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — two-tier attention, partitioned by field-type">
       <ol>
-        <li><strong>Field-level attention:</strong> within each transaction (a row of fields — amount, merchant, MCC, channel, geography), a small attention layer mixes fields before the row is summarized into a single token. This catches intra-row interactions (large amount AT a small-ticket merchant IN a foreign country) that naive concatenation flattens.</li>
-        <li><strong>Time-aware positional encoding:</strong> instead of position index i feeding sinusoidal PE, the model encodes the delta-t (in hours or days) between consecutive transactions. A user with one transaction last month and one yesterday gets a very different time signal than a user with two transactions one minute apart.</li>
-        <li><strong>Sequence transformer on top:</strong> the resulting row tokens (each carrying a field-aware summary plus a time-aware position) go into a standard causal transformer that scores the latest transaction.</li>
+        <li><strong>Field-TYPE taxonomy:</strong> every column is tagged as <code>numerical</code> (amount, balance), <code>categorical</code> (merchant_id, MCC, country, channel), or <code>temporal</code> (delta-t, hour-of-day). The taxonomy is an input, not learned.</li>
+        <li><strong>Per-row field-aware attention (tier 1):</strong> within a single row, separate attention parameter blocks run for each field-type. Numerical fields attend over numerical sub-space; categorical over categorical sub-space; temporal over temporal. A cross-type bias then mixes the type-pooled summaries. The row is summarized into a single row token.</li>
+        <li><strong>Delta-t positional encoding:</strong> instead of sinusoidal of integer position, the model embeds the LOG-BUCKETED inter-transaction gap (typical buckets &lt;1m, 1-5m, 5-30m, 30m-2h, 2h-1d, 1-7d, 7-30d, 30d+). This embed is concatenated to each row token.</li>
+        <li><strong>Sequence attention (tier 2):</strong> the row tokens (each carrying field-aware summary + delta-t embed) feed a standard causal transformer that scores the latest transaction.</li>
+        <li><strong>Output:</strong> per-transaction risk score.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  R["Row of fields"]
-  R --> F["Field attention"]
-  F --> T["Row token"]
-  T --> P["Add time-aware PE"]
-  P --> S["Sequence transformer"]
-  S --> Y["Risk score"]
-  style F fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style P fill:#fef3c7,stroke:#d97706,stroke-width:2px
-      `} />
-      <p>Blue is the new piece on top of a vanilla sequence transformer: a per-row field-attention layer. Yellow is the second new piece: a positional encoding driven by actual delta-t, not index.</p>
+  R["Row: amount, merchant_id, MCC, country, delta_t"]
+  R --> N["Numerical fields"]
+  R --> C["Categorical fields"]
+  R --> T["Temporal fields"]
+  N --> AN["Numerical attention sub-space"]
+  C --> AC["Categorical attention sub-space"]
+  T --> AT["Temporal attention sub-space"]
+  AN --> X["Cross-type bias + pool"]
+  AC --> X
+  AT --> X
+  X --> TOK["Row token"]
+  TOK --> DT["+ delta-t PE bucket embed"]
+  DT --> SEQ["Sequence transformer across rows"]
+  SEQ --> Y["Risk score"]
+  style AN fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style AC fill:#dcfce7,stroke:#16a34a,stroke-width:2px
+  style AT fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style DT fill:#fce7f3,stroke:#db2777,stroke-width:2px
+      `}/>
+      <p>Blue/green/yellow = the per-field-type attention sub-spaces. Pink = the delta-t positional embed. These two pieces, together, are what makes FATA-Trans not "yet another transformer on transactions."</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="How it differs from vanilla / TabTransformer / TabBERT">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Vanilla sequence transformer</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Vanilla seq transformer</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>TabTransformer (Huang 2020)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>TabBERT</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>FATA-Trans</th>
           </tr>
         </thead>
         <tbody>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Positional signal</td>
-            <td style={{padding:"8px 10px"}}>Sinusoidal of index i</td>
-            <td style={{padding:"8px 10px"}}>Learned function of delta-t</td>
+            <td style={{padding:"6px 10px"}}>Within-row mixing</td>
+            <td style={{padding:"6px 10px"}}>Concat of field embeds</td>
+            <td style={{padding:"6px 10px"}}>Attention over categorical only; numerical via MLP</td>
+            <td style={{padding:"6px 10px"}}>Tokenize each cell; flat self-attention</td>
+            <td style={{padding:"6px 10px"}}><strong>Per-field-TYPE attention sub-spaces</strong></td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Row representation</td>
-            <td style={{padding:"8px 10px"}}>Concatenation of field embeddings</td>
-            <td style={{padding:"8px 10px"}}>Field-level attention then summary</td>
+            <td style={{padding:"6px 10px"}}>Sequence modeling</td>
+            <td style={{padding:"6px 10px"}}>Yes — sinusoidal PE</td>
+            <td style={{padding:"6px 10px"}}>No (single row)</td>
+            <td style={{padding:"6px 10px"}}>Yes — sequence of cells</td>
+            <td style={{padding:"6px 10px"}}>Yes — <strong>delta-t PE</strong></td>
           </tr>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Irregular cadence handling</td>
-            <td style={{padding:"8px 10px"}}>Implicit only</td>
-            <td style={{padding:"8px 10px"}}>Explicit and end-to-end learned</td>
+            <td style={{padding:"6px 10px"}}>Pretraining objective</td>
+            <td style={{padding:"6px 10px"}}>Supervised default</td>
+            <td style={{padding:"6px 10px"}}>Supervised default</td>
+            <td style={{padding:"6px 10px"}}><strong>Masked-cell MLM</strong></td>
+            <td style={{padding:"6px 10px"}}>Supervised default (orthogonal to MLM)</td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Cost vs vanilla</td>
-            <td style={{padding:"8px 10px"}}>Baseline</td>
-            <td style={{padding:"8px 10px"}}>Small overhead from field attention</td>
+            <td style={{padding:"6px 10px"}}>Irregular cadence</td>
+            <td style={{padding:"6px 10px"}}>Implicit only</td>
+            <td style={{padding:"6px 10px"}}>N/A</td>
+            <td style={{padding:"6px 10px"}}>Implicit only</td>
+            <td style={{padding:"6px 10px"}}>Explicit, learned, end-to-end</td>
+          </tr>
+          <tr style={{background:"#e8f0fa"}}>
+            <td style={{padding:"6px 10px"}}>Cost vs vanilla</td>
+            <td style={{padding:"6px 10px"}}>Baseline</td>
+            <td style={{padding:"6px 10px"}}>~1.0x</td>
+            <td style={{padding:"6px 10px"}}>~1.2x (longer seq)</td>
+            <td style={{padding:"6px 10px"}}>~1.4x (two-tier attn)</td>
           </tr>
         </tbody>
       </table>
+      <p style={{marginTop:10}}>The redaction litmus: <em>strip "field-type" + "delta-t" from any FATA-Trans claim — if the remaining claim still wins, the claim is generic and belongs in a sibling visual.</em></p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Irregular transaction cadence dominates the population</strong> — many users transact rarely; some burst.</li>
-        <li><strong>Intra-row interactions carry signal</strong> — amount-times-merchant-category-times-country patterns matter and you do not want to hand-engineer the crosses.</li>
-        <li><strong>You have enough data</strong> to train end-to-end without overfitting the extra parameters introduced by field attention.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Complex PE hurts very long sequences">
-        Learned time-aware PE is more expressive but less stable than sinusoidal at extreme lengths. For sequences much greater than a thousand tokens, the encoding can collapse or drift; use bucketed delta-t or hybrid PE.
+    <VIS.Section id="sec-limits" title="Limits and gotchas — the FATA-specific ones">
+      <VIS.Callout kind="gotcha" title="Field-type taxonomy is YOUR job">
+        FATA-Trans assumes every column carries a numerical / categorical / temporal tag. Garbage in: if you tag <code>amount-bucket</code> (a discretization of a continuous field) as categorical when it should be numerical, the wrong attention sub-space owns it and the lift evaporates. Pre-flight: write down the taxonomy explicitly and review it.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Delta-t needs careful normalization">
-        Raw delta-t in seconds blows up the embedding lookup table; raw in days loses sub-day resolution. Log-bucket the delta-t into roughly 16 to 64 buckets covering minutes to months.
+      <VIS.Callout kind="warn" title="Delta-t bucketing must be log-spaced">
+        Linear-spaced delta-t buckets (e.g., 0-1d in 1-min bins) burn the entire embedding table on sub-day patterns and lump everything past 1 day into one bucket. Log buckets give roughly equal information per bucket from seconds to months. A config bug that flips log → linear silently kills recall on bursty users.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Field attention adds latency">
-        Per-row attention is cheap but not free. On a strict authorization budget, profile to make sure the field-attention layer is not the bottleneck.
+      <VIS.Callout kind="warn" title="Per-row attention adds latency that compounds with sequence length">
+        Tier-1 (per-row) attention runs once per row; tier-2 (across rows) is the standard quadratic. Combined cost is ~1.4x vanilla at length 64, ~1.7x at length 256. Tight latency budgets need profiling — sometimes the highest-leverage cut is dropping tier-1 and keeping just delta-t PE.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Pretraining helps more than vanilla">
-        Because FATA-Trans has more parameters than a vanilla transformer of equal depth, masked-field pretraining on unlabeled transactions pays off more than for the baseline. Consider TabBERT-style pretraining before fine-tuning.
+      <VIS.Callout kind="warn" title="Learned PE drifts at very long sequences">
+        At length &gt;1k tokens, the learned delta-t bucket embeddings extrapolate poorly when cumulative time covers many years. Hard-cap the largest bucket (e.g., 30d+) and pair with windowed attention.
+      </VIS.Callout>
+      <VIS.Callout kind="gotcha" title="Ablation discipline: most of the lift is delta-t, not field-attention">
+        The paper's own table shows that on uniform-cadence subsets, removing field-type partition costs little; removing delta-t PE costs a lot. On bursty subsets both matter. If you ship FATA-Trans without ablating, you may be paying 1.4x latency for the smaller of two effects.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Trap problems on time encoding, positional schemes, row representation, and irregular sequence handling.
+        Every problem turns on something only FATA-Trans does: the per-field-TYPE attention sub-space partition, the delta-t-bucketed positional encoding replacing sinusoidal-of-position, the two-tier (within-row then across-rows) attention architecture, the field-type taxonomy as input, or the ablation behavior across uniform vs bursty cadence subsets. Strip "field-type partition" or "delta-t PE" and the option no longer wins.
       </p>
 
+      {/* P1 — B3 stakeholder pitch */}
       <VIS.TrapProblem
         id="fata-p1"
         difficulty="hard"
-        title="P1 — Why does sinusoidal positional encoding mislead on irregular tx sequences?"
-        scenario={<>Two users have ten transactions each. User A transacts ten times in one hour. User B transacts once per month for ten months. A vanilla transformer with sinusoidal PE assigns them identical positional patterns. Why is this wrong for fraud?</>}
+        title="P1 — A staff engineer asks: 'We already use a sequence transformer on transactions. Why upgrade to FATA-Trans?'"
+        scenario={<><em>Discriminating insight: the redaction-proof pitch must name the TWO load-bearing pieces — field-type attention partition AND delta-t PE replacing sinusoidal. A generic "more accurate" or "more capacity" pitch collapses under the redaction test. The pitch must say WHAT changes and WHY it matters for transaction data specifically.</em><br/><br/>Your current model is a vanilla sequence transformer over tx tokens with sinusoidal PE. A staff engineer wants the FATA-Trans pitch in 60 seconds. Pick the pitch that names the load-bearing pieces.</>}
         options={[
-          {key:"a", text:"Sinusoidal PE encodes position index, not real elapsed time. The model sees ten tokens spaced by index, regardless of whether they are seconds or months apart. Fraud signal depends crucially on velocity — a burst of ten transactions in an hour is a strong fraud signal that a once-per-month cadence is not. Encoding actual delta-t restores the missing axis.", correct:true},
-          {key:"b", text:"Sinusoidal PE is too low-dimensional."},
-          {key:"c", text:"Sinusoidal PE only works on text data."},
-          {key:"d", text:"The model would do fine with sinusoidal PE if trained longer."},
+          {key:"a", text:"FATA-Trans uses larger hidden dims and trains longer, so it's more accurate."},
+          {key:"b", text:"Two architectural changes carry the lift, both transaction-specific. (1) <em>Field-TYPE attention sub-spaces</em>: at the per-row tier, numerical fields (amount), categorical fields (merchant_id, MCC), and temporal fields (delta-t) get SEPARATE attention parameter blocks — so numerical-vs-categorical cross-field interactions are an explicit attention op, not an averaged head across heterogeneous columns. (2) <em>Delta-t positional encoding</em>: sinusoidal-of-integer-position is replaced by a learned embedding over log-bucketed inter-transaction gaps — this restores VELOCITY (1-min burst vs monthly cadence) as an explicit input. Together: tier-1 attention learns intra-row cross-type interactions; tier-2 attention sees velocity. Vanilla transformer has neither.", correct:true},
+          {key:"c", text:"FATA-Trans uses a different optimizer that converges faster on tabular data."},
+          {key:"d", text:"FATA-Trans is BERT pretrained on transactions, so it transfers better."},
         ]}
-        trap={<>(b) is unrelated. (c) is false. (d) cannot recover missing information.</>}
-        lens={<>(a) is the conceptual answer. Velocity is fraud signal; positional encoding must carry it.</>}
-        stretch={<>What is the cheapest hand-engineered alternative — a delta-t feature concatenated to each token?</>}
+        trap={<>(a) is the generic "more capacity" pitch — fails the redaction test. (c) is a training-recipe claim, not an architectural one. (d) confuses FATA-Trans with TabBERT (different paper, different mechanism).</>}
+        lens={<>The pitch must redact-test: if you strip "field-type" and "delta-t" the option must NO LONGER win. Only (b) does.</>}
+        stretch={<>If you could only ship ONE of the two pieces, which gives larger lift on bursty users vs uniform users?</>}
       />
 
+      {/* P2 — field-type partition mechanism */}
       <VIS.TrapProblem
         id="fata-p2"
         difficulty="hard"
-        title="P2 — Bucket the delta-t. Linear or log?"
-        scenario={<>You decide to bucket delta-t and learn an embedding per bucket. The deltas in your data span seconds to years. Linear or log buckets?</>}
+        title="P2 — What does the per-field-TYPE attention partition actually compute that a shared attention head can't?"
+        scenario={<><em>Discriminating insight: per-type sub-spaces let numerical-to-categorical attention learn a DIFFERENT projection than categorical-to-categorical or numerical-to-numerical. A shared head must average a single Q/K/V projection over heterogeneous columns, which throws away the type-specific structure (e.g., "compare amount magnitudes" is a different operation than "match merchant categories").</em><br/><br/>Pick the precise mechanistic statement.</>}
         options={[
-          {key:"a", text:"Log buckets. Linear buckets force you to choose between sub-minute resolution (millions of buckets) and useful sub-day resolution (one bucket covers all of it). Log buckets give roughly equal information per bucket across the relevant range from seconds to months, matching how fraud patterns themselves are scale-free across time.", correct:true},
-          {key:"b", text:"Linear buckets with 100 evenly spaced buckets."},
-          {key:"c", text:"No buckets — feed raw delta-t as a float."},
-          {key:"d", text:"Random buckets."},
+          {key:"a", text:"It computes the same attention but with type-specific dropout rates."},
+          {key:"b", text:"Type-specific attention assigns DISTINCT Q/K/V projection matrices per field-type. Numerical-numerical attention learns a magnitude-comparison projection (amount vs balance); categorical-categorical learns a co-occurrence-lookup projection (merchant_id vs MCC); numerical-categorical learns a cross-type interaction (amount-conditioned-on-MCC). A single shared projection across all types must average these incompatible operations — the model can still memorize crosses with enough capacity, but the inductive bias for tabular heterogeneity is gone. With a fixed parameter budget, partitioned sub-spaces win on cross-type interactions that are the most fraud-relevant patterns.", correct:true},
+          {key:"c", text:"Type-specific attention is a hard mask preventing numerical fields from attending to categorical ones."},
+          {key:"d", text:"It's a regularizer — same attention weights, type-specific noise injected."},
         ]}
-        trap={<>(b) wastes most buckets on long deltas. (c) cannot be embedded as a learned lookup. (d) is wrong.</>}
-        lens={<>(a) is standard. Log buckets are the right inductive bias for time deltas that span many orders of magnitude.</>}
-        stretch={<>How many buckets is enough — sixteen, sixty four, or two hundred fifty six?</>}
+        trap={<>(a) is unrelated. (c) is wrong — the cross-type bias term explicitly mixes types after per-type attention. (d) is wrong — it's a parameter partition, not a regularizer.</>}
+        lens={<>The partition is in the PROJECTION MATRICES, not in the attention mask. Different field-types get different Q/K/V — that's the inductive bias.</>}
+        stretch={<>Why doesn't TabTransformer's "categorical-only attention + MLP on numerical" capture this? Hint: it can't learn numerical-to-categorical attention.</>}
       />
 
+      {/* P3 — delta-t PE design */}
       <VIS.TrapProblem
         id="fata-p3"
         difficulty="hard"
-        title="P3 — Field-level attention vs concatenation. What does it buy you?"
-        scenario={<>You can represent each transaction row either by concatenating its field embeddings or by running a small attention layer over fields and pooling. What does the attention buy you?</>}
+        title="P3 — Two users each have 10 tx; sinusoidal PE assigns them identical positional patterns. Why is that broken for fraud?"
+        scenario={<><em>Discriminating insight: sinusoidal PE encodes ORDER (position 0..N-1) not VELOCITY (real elapsed time). User A's 10 tx in one hour and User B's 10 tx over a year look identical to sinusoidal PE; FATA-Trans's delta-t bucket embedding makes the velocity input explicit so the model can score the burst differently from the spread.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"Field attention lets the row token represent intra-row interactions explicitly — large amount AT small-ticket merchant IN foreign country becomes one composed signal rather than three independent dims that the sequence transformer must re-combine. It is the tabular analog of self-attention over text tokens; the model learns which field pairs matter together.", correct:true},
-          {key:"b", text:"Field attention reduces the dimensionality of the row representation."},
-          {key:"c", text:"Field attention removes the need for a sequence transformer."},
-          {key:"d", text:"Concatenation always works as well."},
+          {key:"a", text:"Sinusoidal PE is too low-dimensional for fraud data."},
+          {key:"b", text:"Sinusoidal PE encodes integer position 0..N-1, not real elapsed time. User A (10 tx in an hour) and User B (10 tx over a year) get identical positional patterns. But VELOCITY is one of the strongest fraud signals — a burst of 10 small-amount card-not-present authorizations in 60 seconds is a classic card-testing fingerprint, and a monthly cadence with the same amounts is normal. FATA-Trans replaces sinusoidal with a learned embedding over log-bucketed delta-t (e.g., &lt;1m, 1-5m, 5-30m, ..., 30d+) so the model can attend differently to the 1-min-gap row vs the 30d-gap row. The PE carries the velocity signal that sinusoidal discards.", correct:true},
+          {key:"c", text:"Sinusoidal PE only works for text-token sequences."},
+          {key:"d", text:"With longer training, sinusoidal PE will learn the velocity signal."},
         ]}
-        trap={<>(b) is incidental. (c) is wrong — you still need temporal modeling. (d) loses interaction signal.</>}
-        lens={<>(a) is the right framing. Field attention is a row-level self-attention; the sequence transformer above it stays focused on temporal patterns.</>}
-        stretch={<>Could you replace field attention with hand-engineered crosses?</>}
+        trap={<>(a) blames the dimensionality, not the design. (c) is false (sinusoidal works for many sequences when gaps ARE uniform). (d) is a learning-doesn't-conjure-missing-info confusion — the input never carried elapsed time, so no amount of training reveals it.</>}
+        lens={<>Sinusoidal PE = order signal; delta-t PE = velocity signal. Fraud often hinges on velocity. The PE must carry what the model is supposed to learn from.</>}
+        stretch={<>What's the cheapest hand-engineered substitute on a vanilla transformer? Hint: a delta-t feature concatenated to each row token recovers most of the lift.</>}
       />
 
+      {/* P4 — log vs linear buckets */}
       <VIS.TrapProblem
         id="fata-p4"
         difficulty="hard"
-        multiSelect
-        title="P4 — Symptoms of broken time encoding"
-        scenario={<>Production recall on bursty users (lots of fast transactions) is lower than on smooth-cadence users by 10 points. Which symptoms point to a time-encoding bug? Select all that apply.</>}
+        title="P4 — Bucket delta-t into 32 buckets covering seconds to months. Log or linear spacing?"
+        scenario={<><em>Discriminating insight: linear spacing burns most buckets on long deltas (or sub-second resolution if you flip it), losing the information density mid-range. Log spacing puts roughly equal information per bucket across orders of magnitude — which matches how fraud patterns themselves are scale-free across time.</em><br/><br/>Pick the bucket spacing for delta-t in FATA-Trans.</>}
         options={[
-          {key:"a", text:"Recall stratified by transactions-per-day shows a step drop at high cadence.", correct:true},
-          {key:"b", text:"Recall is uniform across user cadence."},
-          {key:"c", text:"Attention weights at adjacent tokens are similar whether delta-t is one minute or one month.", correct:true},
-          {key:"d", text:"Probing the model with two synthetic sequences that differ only in delta-t produces nearly identical scores.", correct:true},
-          {key:"e", text:"Training loss is flat."},
-          {key:"f", text:"Bursty users with confirmed fraud are scored lower than smooth-cadence users with confirmed fraud.", correct:true},
+          {key:"a", text:"Linear with 32 evenly spaced buckets from 0s to 30 days."},
+          {key:"b", text:"Log-spaced buckets: roughly &lt;1m, 1-5m, 5-30m, 30m-2h, 2h-12h, 12h-1d, 1-3d, 3-7d, 7-30d, 30d+ — covering ~10 orders of magnitude with ~equal information per bucket. Linear spacing puts 99% of buckets on the long-delta side (a 30-day span split into 32 linear buckets means ~22h per bucket — useless sub-day resolution); fraud signal is concentrated in seconds-to-hours (card-testing bursts) AND hours-to-days (lost-then-tested). Log buckets give the model resolution where the signal lives and where the population variability lives.", correct:true},
+          {key:"c", text:"No buckets — feed raw delta-t as a continuous float."},
+          {key:"d", text:"Random 32 bucket boundaries."},
         ]}
-        trap={<>(b) and (e) are the absence of the bug or unrelated.</>}
-        lens={<>(a), (c), (d), (f) are the diagnostic stack for a time-encoding leak or collapse.</>}
-        stretch={<>Which test runs without retraining?</>}
+        trap={<>(a) burns the embedding table on uninformative ranges. (c) loses the learned-embedding-per-bucket structure; raw float can't be looked up. (d) is the absurd option.</>}
+        lens={<>Log buckets are the right inductive bias when the signal scale spans orders of magnitude. Linear is correct ONLY when the signal is uniform-density across the range.</>}
+        stretch={<>How many buckets is enough — 16, 32, or 64? Hint: information per bucket vs embedding-table sparsity tradeoff.</>}
       />
 
+      {/* P5 — wrong field-type tag */}
       <VIS.TrapProblem
         id="fata-p5"
         difficulty="hard"
-        title="P5 — Long sequence stability. What breaks at length two thousand?"
-        scenario={<>You extend the model from sequence length two hundred to two thousand. Training is fine but val loss spikes. What breaks?</>}
+        title="P5 — Engineer tags <code>amount_bucket</code> (discretized log-amount) as CATEGORICAL. Diagnose."
+        scenario={<><em>Discriminating insight: the field-type taxonomy is INPUT to the partition. Tagging a discretized numerical feature as categorical sends it to the wrong attention sub-space — categorical-categorical attention learns co-occurrence lookups, not magnitude comparisons. Amount-vs-MCC stops being a cross-type interaction.</em><br/><br/>A new engineer pre-processes amount into 16 log-bins and tags the field as categorical. Production recall drops 3pt on high-amount fraud. Diagnose.</>}
         options={[
-          {key:"a", text:"Two failure modes compound at length two thousand. First, attention is quadratic — memory and time blow up. Second, the learned delta-t PE drifts out of distribution when summed-up deltas cover many years; the embeddings extrapolate poorly. Fix: use a more scalable attention variant (linear attention or windowed) plus bucket delta-t with a hard upper cap so PE never extrapolates.", correct:true},
-          {key:"b", text:"Sinusoidal PE always wins at length two thousand."},
-          {key:"c", text:"Transformers cannot handle length greater than five hundred."},
-          {key:"d", text:"The model is overfitting."},
+          {key:"a", text:"Categorical is always safer than numerical."},
+          {key:"b", text:"Tagging <code>amount_bucket</code> as categorical routes it through the categorical attention sub-space, whose Q/K/V projection is optimized for co-occurrence-lookup operations (merchant_id × MCC). But the inductive bias the model needs is MAGNITUDE-comparison (is this amount unusual for this merchant?). The amount-bucket field carries ordered magnitude information that the categorical sub-space cannot exploit — the bin indices look like nominal labels. Numerical-vs-categorical cross-attention also degrades because amount is now tagged categorical, so the cross-type bias that would activate becomes intra-categorical attention. Tag amount-bucket as numerical (with bucket index as an ordered embed) OR keep raw amount and let the numerical sub-space process it.", correct:true},
+          {key:"c", text:"Categorical fields converge faster."},
+          {key:"d", text:"The bucketization itself dropped information."},
         ]}
-        trap={<>(b) avoids the diagnosis. (c) is over-general. (d) is misleading.</>}
-        lens={<>(a) is the production read. Long sequences need both attention-efficiency and a PE that does not extrapolate.</>}
-        stretch={<>Would Mamba help here?</>}
+        trap={<>(a)(c) are generic categorical-vs-numerical takes. (d) blames bucketization but a 16-bin log discretization preserves most magnitude signal — the loss is from the WRONG SUB-SPACE.</>}
+        lens={<>The field-type taxonomy is a design input, not a triviality. Wrong tag → wrong attention sub-space → wrong inductive bias → silent regression.</>}
+        stretch={<>If you must discretize amount, how do you preserve ordering for the numerical sub-space? Hint: order-preserving embedding init or sinusoidal-of-bucket-index.</>}
       />
 
+      {/* P6 — irregular cadence ablation */}
       <VIS.TrapProblem
         id="fata-p6"
-        difficulty="hard"
-        title="P6 — Pretraining helps FATA-Trans more than vanilla. Why?"
-        scenario={<>You run an ablation: TabBERT-style masked-field pretraining gives +2 points on vanilla transformer and +5 points on FATA-Trans. Why the bigger lift?</>}
+        difficulty="medium"
+        title="P6 — Ablation: removing delta-t PE costs 4pt on bursty users but only 0.5pt on uniform-cadence users. Why?"
+        scenario={<><em>Discriminating insight: delta-t PE matters ONLY when the cadence varies — for users with uniform daily cadence, sinusoidal PE on integer position is approximately equivalent (each position increments ~1 day of real time). The lift concentrates on irregular subsets where order != elapsed time.</em><br/><br/>Diagnose the stratified ablation pattern.</>}
         options={[
-          {key:"a", text:"FATA-Trans has more parameters than a vanilla transformer at equal depth — the extra field-attention layer plus the learned time PE add capacity. More capacity needs more signal to train well; masked-field pretraining on unlabeled transactions supplies that signal. The vanilla model can train end-to-end on labels alone but FATA-Trans benefits more from the pretraining boost.", correct:true},
-          {key:"b", text:"FATA-Trans is smaller and therefore easier to pretrain."},
-          {key:"c", text:"Pretraining always gives a bigger lift on bigger models."},
-          {key:"d", text:"The lift is random and would not replicate."},
+          {key:"a", text:"The ablation is buggy."},
+          {key:"b", text:"For uniform-cadence users (e.g., a subscriber who transacts daily), integer position is approximately a linear function of real elapsed time, so sinusoidal-of-position is a near-equivalent representation of delta-t. The delta-t PE adds little. For bursty users, integer position decouples from real time — position 5 might be 10 seconds after position 4 or 30 days after — and sinusoidal-of-position is now uninformative about velocity. Delta-t PE recovers velocity information that sinusoidal silently throws away. The 4pt vs 0.5pt split is exactly the prediction: the lift is concentrated on the population segment where the inductive bias actually fires.", correct:true},
+          {key:"c", text:"Bursty users have more labels."},
+          {key:"d", text:"The model is overfitting bursty users."},
         ]}
-        trap={<>(b) is backwards. (c) is over-general. (d) is dismissive without evidence.</>}
-        lens={<>(a) is right. Capacity-data tradeoff: more capacity demands more (often unlabeled) data.</>}
-        stretch={<>How much unlabeled data is enough to make pretraining pay off?</>}
+        trap={<>(a) dodges the question. (c)(d) confound the diagnosis with population effects.</>}
+        lens={<>Ablation lifts concentrate where the inductive bias is binding. Uniform cadence → sinusoidal works → delta-t PE is redundant. Bursty → sinusoidal collapses → delta-t PE saves recall.</>}
+        stretch={<>If 95% of your users are uniform-cadence, is FATA-Trans worth the 1.4x latency cost?</>}
       />
 
+      {/* P7 — bucket boundary adversarial */}
       <VIS.TrapProblem
         id="fata-p7"
         difficulty="hard"
-        title="P7 — Cold-user with three transactions. Does FATA-Trans degrade gracefully?"
-        scenario={<>A new user has only three transactions in history. The sequence model has almost no context. Does FATA-Trans handle this gracefully out of the box?</>}
+        title="P7 — Adversary discovers two adjacent delta-t buckets produce very different risk scores. What's the attack and defense?"
+        scenario={<><em>Discriminating insight: any quantization the model exposes is a probe target. The adversary times transactions to land in the lower-risk side of a bucket boundary. Defense: interpolate between adjacent buckets at inference (smoothed embedding) and rotate boundaries quarterly.</em><br/><br/>Adversary attacks the discretization.</>}
         options={[
-          {key:"a", text:"Not on its own. The field-level attention still works on each row, so per-transaction representations are rich, but the sequence model has nothing temporal to chew on. Mitigations: pad the sequence with a learned BEGIN-OF-USER token, supplement with user-level static features as a side input, and lower the confidence threshold for short-history users until more transactions accumulate.", correct:true},
-          {key:"b", text:"Yes — field attention solves cold-start."},
-          {key:"c", text:"No — the model fails completely."},
-          {key:"d", text:"Cold-start does not affect FATA-Trans."},
+          {key:"a", text:"Adversary cannot exploit bucket boundaries."},
+          {key:"b", text:"Adversary submits probe transactions at increasing delta-t and observes scores; they detect that bucket boundary at, say, 30min separates a high-risk and low-risk regime. They time real fraud transactions to land just past the boundary (delta-t = 31min instead of 29min). Defense (1): SOFTEN the embedding lookup at inference — interpolate between the two nearest bucket embeds by fractional log-distance to the boundary, so a 31-min and a 29-min event produce nearly identical embeddings (no cliff). Defense (2): ROTATE bucket boundaries on a quarterly schedule so a probe campaign expires before it pays off. Defense (3): MONITOR bucket-boundary-adjacent transactions for over-representation in flagged-but-approved volume.", correct:true},
+          {key:"c", text:"Block all transactions with delta-t in the suspicious range."},
+          {key:"d", text:"Encrypt the bucket boundaries."},
         ]}
-        trap={<>(b) overclaims. (c) overclaims the other way. (d) ignores the problem.</>}
-        lens={<>(a) is the honest answer. Field attention helps per-row, but you still need a cold-start path.</>}
-        stretch={<>How many transactions before the sequence model contributes more than user-level features?</>}
+        trap={<>(a) is wishful. (c) destroys CX for benign users with the same delta-t. (d) is irrelevant — the boundaries are inferable from black-box probing regardless of encryption.</>}
+        lens={<>Quantization in a deployed model is an attack surface. Smooth + rotate + monitor is the three-layer defense.</>}
+        stretch={<>What's the rotation cadence that beats a typical card-testing ring's probe-to-execute lag?</>}
       />
 
+      {/* P8 — diagnostic battery for time-encoding bug */}
       <VIS.TrapProblem
         id="fata-p8"
         difficulty="hard"
-        title="P8 — Production tradeoff: FATA-Trans or vanilla on tight latency?"
-        scenario={<>Authorization-path latency budget is twenty milliseconds for model inference. Which do you ship — vanilla sequence transformer or FATA-Trans — given equal training data?</>}
+        multiSelect
+        title="P8 — Suspect delta-t PE is silently broken (e.g., all buckets clamped to the same embed). Diagnostic battery — select all symptoms that confirm."
+        scenario={<><em>Discriminating insight: a delta-t PE collapse is silent — train loss looks fine but stratified recall fails on bursty users. The diagnostic battery: stratified recall by cadence, attention pattern probe, synthetic-probe invariance, embed-distance check on bucket embeddings.</em><br/><br/>Symptoms that point to broken delta-t PE.</>}
         options={[
-          {key:"a", text:"Profile and decide. FATA-Trans adds field attention plus delta-t lookup; that overhead is small but not free. If the bursty-user population is large and recall lift over vanilla is greater than two points at fixed precision, ship FATA-Trans and engineer the latency budget (smaller hidden dim, shorter sequence, quantization). If the latency margin is razor-thin, ship vanilla with a hand-engineered delta-t feature and revisit.", correct:true},
-          {key:"b", text:"Always ship vanilla — it is faster."},
-          {key:"c", text:"Always ship FATA-Trans — it is more accurate."},
-          {key:"d", text:"Run both and pick at inference time."},
+          {key:"a", text:"Recall stratified by transactions-per-day shows a step drop above 50 tx/day.", correct:true},
+          {key:"b", text:"Recall is uniform across cadence."},
+          {key:"c", text:"Attention from current row to prior rows ignores delta-t — same weights whether the prior row is 1 minute ago or 30 days ago.", correct:true},
+          {key:"d", text:"Two synthetic sequences differing ONLY in delta-t (everything else identical) produce nearly identical risk scores.", correct:true},
+          {key:"e", text:"Training loss is flat from epoch 1."},
+          {key:"f", text:"Pairwise L2 distance between learned bucket embeddings is near-zero across all bucket pairs.", correct:true},
+          {key:"g", text:"Bursty users with confirmed fraud are scored similarly to bursty users without fraud.", correct:true},
         ]}
-        trap={<>(b) and (c) are dogmatic. (d) doubles latency.</>}
-        lens={<>(a) is the senior framing. Measure cost, measure lift, decide.</>}
-        stretch={<>What is the cheapest way to recover most of FATA's lift on a vanilla model?</>}
+        trap={<>(b) is the absence of the bug; (e) is an LR or optimizer bug, not specifically delta-t.</>}
+        lens={<>Run the full battery — any one alone is ambiguous. (f) is the cheapest pre-deploy check: just inspect the embedding table.</>}
+        stretch={<>Which of (a)-(g) is cheapest to run without retraining?</>}
       />
 
+      {/* P9 — field-attention bypass via concat */}
       <VIS.TrapProblem
         id="fata-p9"
         difficulty="hard"
-        title="P9 — Adversary discovers your time-PE buckets. What is the attack?"
-        scenario={<>You log-bucket delta-t into thirty two buckets. An adversary can submit transactions and observe the score. What attack does the bucketing enable?</>}
+        title="P9 — Engineer proposes dropping per-row field-attention and just concatenating field embeds — 'attention will recover the interactions.' Diagnose."
+        scenario={<><em>Discriminating insight: with concatenation, intra-row interactions must be reconstructed by the sequence-level attention from the same combined token — but sequence-level attention is across-rows, not within-row. The model would have to allocate sequence attention to reconstructing within-row crosses that field-attention encodes directly. Capacity bleeds.</em><br/><br/>Engineer's proposal.</>}
         options={[
-          {key:"a", text:"The adversary searches for sweet-spot delta-t bucket boundaries. If two adjacent buckets produce very different risk scores, the adversary times transactions to land in the lower-risk bucket. Mitigation: smooth across buckets at inference (e.g., interpolate the two nearest bucket embeddings by fractional distance), or rotate / re-fit the bucket boundaries periodically so the adversary cannot pin them down.", correct:true},
-          {key:"b", text:"The adversary cannot exploit bucketing."},
-          {key:"c", text:"Bucketing is always safer than continuous PE."},
-          {key:"d", text:"The attack requires breaking encryption."},
+          {key:"a", text:"Good idea — concat + sequence attention is equivalent."},
+          {key:"b", text:"The sequence transformer above operates ACROSS rows; it doesn't have a within-row layer. With concat, intra-row interaction signal (amount × MCC × country) is packed into one composite token and the sequence layer must implicitly re-derive interactions from across-row aggregation — which is fundamentally a different operation. Field-attention computes intra-row interactions EXPLICITLY before the row is summarized, so the sequence transformer can focus on temporal patterns. Dropping field-attention forces the sequence transformer to do two jobs with one set of parameters; capacity bleeds and recall on cross-field-interaction fraud drops 2-3pt in the paper's ablation.", correct:true},
+          {key:"c", text:"Field-attention is just regularization."},
+          {key:"d", text:"Concatenation works for short sequences but not long ones."},
         ]}
-        trap={<>(b) is wishful. (c) is over-general. (d) is irrelevant.</>}
-        lens={<>(a) is the adversarial-ML mindset. Any quantization the model exposes is a probe target.</>}
-        stretch={<>What is the right rotation cadence for bucket boundaries?</>}
+        trap={<>(a) confuses the across-row sequence transformer with a within-row mixer. (c) is wrong — it's a representation layer, not regularization. (d) misses the within-vs-across-row distinction.</>}
+        lens={<>Two-tier attention separates two jobs: tier-1 = within-row interactions; tier-2 = across-row temporal patterns. Collapsing tiers makes one layer do both with shared params.</>}
+        stretch={<>What's the cheapest hand-engineered substitute for field-attention if you must collapse to one tier? Hint: enumerate the top-K crosses as additional features.</>}
       />
 
+      {/* P10 — vs TabBERT */}
       <VIS.TrapProblem
         id="fata-p10"
         difficulty="hard"
-        multiSelect
-        title="P10 — Where does FATA-Trans most clearly beat vanilla? Pick all that apply."
-        scenario={<>Across your population, where does FATA-Trans most clearly beat a well-tuned vanilla sequence transformer?</>}
+        title="P10 — A peer says 'FATA-Trans and TabBERT are the same thing.' Where do they differ?"
+        scenario={<><em>Discriminating insight: TabBERT is a PRETRAINING objective (masked-cell MLM) on tabular sequences; FATA-Trans is an ARCHITECTURAL change (field-type partition + delta-t PE). Orthogonal — you can combine them. TabBERT-pretrain a FATA-Trans backbone.</em><br/><br/>Compare and contrast.</>}
         options={[
-          {key:"a", text:"Users with very irregular cadence (bursts followed by long quiet).", correct:true},
-          {key:"b", text:"Users with extremely uniform daily cadence."},
-          {key:"c", text:"Fraud patterns that depend on cross-field combinations (large amount times rare MCC times foreign country).", correct:true},
-          {key:"d", text:"Pure text-based fraud detection."},
-          {key:"e", text:"Cases where intra-row interactions matter more than temporal ordering.", correct:true},
-          {key:"f", text:"Cases where delta-t carries strong velocity signal.", correct:true},
+          {key:"a", text:"Same architecture, different names."},
+          {key:"b", text:"Different axes of contribution. <strong>TabBERT</strong> (Padhi et al., ICASSP 2021): a pretraining recipe — mask cells in a tabular sequence and predict them, BERT-style. The backbone is a flat self-attention transformer; the contribution is the MLM-on-tabular-cells objective. <strong>FATA-Trans</strong> (Sun et al., CIKM 2023): an architecture — per-field-TYPE attention sub-spaces + delta-t positional encoding. No new pretraining objective. They are ORTHOGONAL: you can TabBERT-pretrain a FATA-Trans backbone, getting MLM's data efficiency AND field-type / delta-t inductive biases. Calling them 'the same' confuses an objective with an architecture.", correct:true},
+          {key:"c", text:"TabBERT replaces FATA-Trans's delta-t PE."},
+          {key:"d", text:"FATA-Trans is TabBERT scaled up."},
         ]}
-        trap={<>(b) and (d) — vanilla is already fine on uniform cadence and text is not the use case.</>}
-        lens={<>(a), (c), (e), (f) are the FATA-Trans sweet spots. If your population mostly looks like (b), you do not need FATA-Trans.</>}
-        stretch={<>What single stratified metric most clearly shows the lift?</>}
+        trap={<>(a) collapses the distinction. (c)(d) misread the relationship.</>}
+        lens={<>Architecture vs objective is the cleanest split. TabBERT = objective. FATA-Trans = architecture. Stack them.</>}
+        stretch={<>What's the right pretraining objective FOR FATA-Trans — vanilla MLM, or something delta-t-aware?</>}
       />
 
+      {/* P11 — vs TabTransformer */}
       <VIS.TrapProblem
         id="fata-p11"
         difficulty="hard"
-        title="P11 — End-to-end design: which knob first?"
-        scenario={<>You are deploying a sequence model for a mid-tier issuer with mixed-cadence users, billions of unlabeled transactions, and tight latency. What is your first design move?</>}
+        title="P11 — TabTransformer (Huang 2020) uses attention on categorical + MLP on numerical. What does FATA-Trans add?"
+        scenario={<><em>Discriminating insight: TabTransformer's "attention on cat, MLP on num" split prevents numerical-to-categorical attention from existing at all — they're processed in separate paths and concatenated. FATA-Trans's per-type sub-spaces still allow numerical-categorical attention via the cross-type bias, AND it adds the temporal field-type and sequence modeling.</em><br/><br/>Where FATA-Trans extends TabTransformer.</>}
         options={[
-          {key:"a", text:"Adopt FATA-Trans-style time-aware PE, but start with vanilla field representation (concatenation) and a moderate sequence length around 64. Pretrain on unlabeled transactions with masked-field objective. Fine-tune for fraud. After production validation, add field-level attention if ablation shows lift on cross-field-interaction subpopulations, and only then push sequence length up. Skip every component you have not justified on data.", correct:true},
-          {key:"b", text:"Adopt every component on day one."},
-          {key:"c", text:"Stick with GBDT and skip all this."},
-          {key:"d", text:"Adopt Mamba instead because it is newer."},
+          {key:"a", text:"FATA-Trans just renames TabTransformer."},
+          {key:"b", text:"Three concrete extensions. (1) TabTransformer SEPARATES the paths (attention on cat, MLP on num, then concat) — numerical-to-categorical attention literally cannot exist because they never share a layer. FATA-Trans's per-type SUB-SPACES still let numerical and categorical attend via a cross-type bias term — the inductive bias is preserved, but cross-type interactions are not blocked. (2) FATA-Trans adds a temporal field-type with the delta-t PE — TabTransformer doesn't model time at all. (3) FATA-Trans operates on a SEQUENCE of rows (transactions over time); TabTransformer operates on a single row. So FATA-Trans = (per-type partition that allows cross-type) + (temporal type) + (sequence layer on top of within-row).", correct:true},
+          {key:"c", text:"FATA-Trans drops categorical fields entirely."},
+          {key:"d", text:"TabTransformer is a successor of FATA-Trans."},
         ]}
-        trap={<>(b) bloats the model. (c) leaves recall on the table. (d) changes the architecture for the wrong reason.</>}
-        lens={<>(a) is the staged rollout. Time-aware PE is the single highest-leverage piece; field attention and longer sequences are second-order.</>}
-        stretch={<>What is the cheapest ablation that justifies adding field attention?</>}
+        trap={<>(a) collapses. (c) is false. (d) is reversed chronology.</>}
+        lens={<>TabTransformer = single-row, blocks numerical-cat attention. FATA-Trans = sequence, partitions but allows cross-type, adds temporal.</>}
+        stretch={<>Why is "blocking numerical-cat attention" a bad inductive bias for fraud where amount × MCC is a top signal?</>}
+      />
+
+      {/* P12 — long sequence stability */}
+      <VIS.TrapProblem
+        id="fata-p12"
+        difficulty="hard"
+        title="P12 — You extend sequence length from 200 to 2000. Training is fine but val loss spikes. What breaks specifically?"
+        scenario={<><em>Discriminating insight: two failure modes compound — tier-2 attention is quadratic so memory and time blow up, AND the learned delta-t bucket embeddings drift out of distribution when cumulative time covers many years. Vanilla transformer has only the first problem.</em><br/><br/>Diagnose the length-2000 regression.</>}
+        options={[
+          {key:"a", text:"Transformers can't handle length 2000."},
+          {key:"b", text:"Two compounding failure modes. (1) Tier-2 attention is quadratic in length: memory and time blow up at 2000 (~100x the 200-length compute). Fix: windowed or linear-attention variants for tier-2. (2) FATA-specific: the learned delta-t bucket embeddings extrapolate poorly when sequences span many years — the 30d+ bucket's embedding was learned on the short-sequence training distribution where 30d+ was rare; at length 2000 most events fall in the long-tail bucket and its embedding is undertrained. Fix: hard-cap the largest bucket (anything past 30d → 30d+ bucket) AND ensure the long-tail bucket gets enough gradient at training time (curriculum or class-balanced sampling). Note: vanilla transformer has only the quadratic-attention problem, not the delta-t-embed-drift problem.", correct:true},
+          {key:"c", text:"Overfitting."},
+          {key:"d", text:"Sinusoidal PE always wins at length 2000."},
+        ]}
+        trap={<>(a) is over-general. (c) is generic — doesn't explain the length-specific spike. (d) ignores that sinusoidal loses velocity entirely.</>}
+        lens={<>Long sequences in FATA-Trans face TWO problems: standard quadratic attention AND learned-embedding extrapolation. Both must be addressed.</>}
+        stretch={<>Would Mamba (linear-time SSM) help here? Hint: it solves problem (1) but not problem (2) — you'd still need the bucket cap.</>}
+      />
+
+      {/* P13 — cold-user handling */}
+      <VIS.TrapProblem
+        id="fata-p13"
+        difficulty="medium"
+        title="P13 — A new user has 3 transactions. The sequence is mostly padding. How does FATA-Trans degrade?"
+        scenario={<><em>Discriminating insight: tier-1 (per-row field-attention) still produces a rich representation for each of the 3 rows; tier-2 (across-row sequence attention) has almost no signal. The graceful path is to weight the per-row representation higher and pad with a learned BEGIN-OF-USER token + lower confidence threshold.</em><br/><br/>Cold-user scoring.</>}
+        options={[
+          {key:"a", text:"FATA-Trans fails completely on cold users."},
+          {key:"b", text:"FATA-Trans degrades asymmetrically — tier-1 (per-row field-attention) still produces a rich representation for each of the 3 rows because intra-row interactions don't need history. Tier-2 (across-row sequence attention) has almost no signal — there's nothing temporal to chew on. Mitigations: (1) pad with a learned BEGIN-OF-USER token so the sequence layer has an anchor, (2) supply user-level static features as a side input concatenated to each row token, (3) raise the manual-review threshold for short-history users until ~20-30 events accumulate. The tier-1 lift survives cold-start; the tier-2 lift requires history.", correct:true},
+          {key:"c", text:"FATA-Trans handles cold-start out of the box because of field attention."},
+          {key:"d", text:"Cold-start is unrelated to FATA-Trans."},
+        ]}
+        trap={<>(a) over-claims failure. (c) over-claims success — tier-2 still needs history. (d) ignores the issue.</>}
+        lens={<>Tier-1 = per-row, history-free. Tier-2 = across-row, history-dependent. Cold-start kills tier-2 but not tier-1.</>}
+        stretch={<>How many events before tier-2 contributes more risk signal than user-level static features?</>}
+      />
+
+      {/* P14 — ordered ranking of components */}
+      <VIS.TrapProblem
+        id="fata-p14"
+        difficulty="hard"
+        title="P14 — Order the FATA-Trans components by lift on a mixed-cadence population, smallest first."
+        scenario={<><em>Discriminating insight: from the paper's ablation, delta-t PE is the largest lift (especially on bursty users), then field-type partition (cross-type interactions), then the tier-2 sequence layer (vs single-row baseline). Cross-type bias is the smallest of the three.</em><br/><br/>Rank by AUPRC lift on mixed cadence.</>}
+        options={[
+          {key:"a", text:"Cross-type bias &lt; field-type partition &lt; sequence layer &lt; delta-t PE", correct:true},
+          {key:"b", text:"Delta-t PE &lt; field-type partition &lt; sequence layer &lt; cross-type bias"},
+          {key:"c", text:"All four contribute equally."},
+          {key:"d", text:"Sequence layer dominates everything."},
+        ]}
+        trap={<>(b) reverses the empirical pattern. (c) is dogmatic. (d) misses that within-row pieces matter on top of a sequence layer.</>}
+        lens={<>If you must ablate to save latency, drop in reverse: cross-type bias first, then field-type partition. Keep delta-t PE and the sequence layer.</>}
+        stretch={<>If your population is 100% uniform cadence, does the ordering change? Hint: delta-t PE lift collapses and field-type partition rises.</>}
+      />
+
+      {/* P15 — fill in the blank: delta-t bucket lookup */}
+      <VIS.TrapProblem
+        id="fata-p15"
+        difficulty="medium"
+        title="P15 — Code for delta-t bucket lookup at inference. Fill the blanks."
+        scenario={<><em>Discriminating insight: log-bucket by computing log of clamped delta-t, then bucketize, then embedding lookup. Pre-compute and cache during serving. The clamp at both ends matters — raw 0s or 10-year-old data otherwise blow up the log or index out of range.</em><br/><br/>Pseudo-code skeleton.</>}
+        options={[
+          {key:"a", text:"<code>delta_t = clip(delta_t, MIN_SEC, MAX_SEC); idx = floor(log2(delta_t / MIN_SEC) * BUCKETS_PER_DECADE); emb = bucket_embedding_table[idx]</code> — clip both ends (avoid log(0) and out-of-range for ancient events), log-transform (decades-of-magnitude → linear bucket index), lookup. At serving time, this is one float op + one int op + one table lookup per row, well under 1us per token.", correct:true},
+          {key:"b", text:"<code>delta_t / MAX_SEC * NUM_BUCKETS</code> — linear bucketing, no log."},
+          {key:"c", text:"<code>sin(delta_t / 10000.0)</code> — sinusoidal of delta-t."},
+          {key:"d", text:"<code>delta_t as raw float feature</code> — no bucketing."},
+        ]}
+        trap={<>(b) burns the buckets (see P4). (c) misuses sinusoidal — at least it carries continuous info but loses learned per-bucket-embed structure. (d) skips the embedding-table mechanism FATA-Trans uses.</>}
+        lens={<>The clamp + log + floor + lookup is the canonical pattern. Don't skip the clamps — both extremes cause real bugs in production.</>}
+        stretch={<>What's MIN_SEC for fraud data? Hint: ~1 second (below that is replay / clock-skew).</>}
+      />
+
+      {/* P16 — eval contamination */}
+      <VIS.TrapProblem
+        id="fata-p16"
+        difficulty="hard"
+        title="P16 — Offline: FATA-Trans beats vanilla by 5pt recall. Production: 1pt. Diagnose."
+        scenario={<><em>Discriminating insight: random-split on transactions leaks future-from-same-user into train. FATA-Trans (more capacity, especially delta-t-aware) exploits the leak more than vanilla; honest user-stratified TEMPORAL split closes the gap to the truthful 1-2pt lift.</em><br/><br/>Offline-vs-prod gap.</>}
+        options={[
+          {key:"a", text:"Production is buggy."},
+          {key:"b", text:"Eval-time data leakage. A random row-level split puts some of User X's tx in train and some in eval — FATA-Trans's delta-t-aware sequence attention can exploit a pattern like 'this user's burst started in train, so the eval-time tx is high-risk by association.' Vanilla transformer has less capacity to exploit that leak. After switching to USER-stratified TEMPORAL split (no user appears in both train and eval, and eval is strictly after train cutoff), the offline lift drops to ~1-2pt — matching production. The lift is real but smaller than the leaked-split number suggested. The systematic version: time-respecting eval that also respects chargeback resolution lag (chargebacks join only when resolved as of the eval cutoff).", correct:true},
+          {key:"c", text:"FATA-Trans is over-claimed."},
+          {key:"d", text:"Production has bad data."},
+        ]}
+        trap={<>(a)(c)(d) deflect to easier explanations.</>}
+        lens={<>Random-row split + per-user labels = future leakage. Use user-stratified temporal split. Capacity-heavy models exploit the leak more.</>}
+        stretch={<>What's the right train cutoff for an eval that respects chargeback resolution lag?</>}
+      />
+
+      {/* P17 — when NOT to use FATA-Trans */}
+      <VIS.TrapProblem
+        id="fata-p17"
+        difficulty="medium"
+        title="P17 — Where is FATA-Trans NOT the right tool?"
+        scenario={<><em>Discriminating insight: uniform-cadence populations (subscription billing, payroll, daily snapshots), single-row classification (no sequence), or purely-numerical features all collapse FATA's lift. The 1.4x latency cost isn't paid back.</em><br/><br/>Diagnose where to skip FATA.</>}
+        options={[
+          {key:"a", text:"FATA-Trans is always better."},
+          {key:"b", text:"Three populations where FATA-Trans is NOT worth it. (1) Uniform-cadence streams (daily subscription billing, weekly payroll) — sinusoidal PE is approximately delta-t PE because position = real time; delta-t lift collapses. (2) Single-row tasks (one tx → one decision, no sequence) — there's no tier-2 layer and the field-type partition alone is closer to TabTransformer. (3) Purely-numerical or purely-categorical feature sets — the field-type partition has nothing to partition (only one type), so the inductive bias is vacuous. In all three, the 1.4x latency cost isn't paid back. Default to vanilla or TabTransformer.", correct:true},
+          {key:"c", text:"FATA-Trans is wrong for fraud."},
+          {key:"d", text:"FATA-Trans is only for text data."},
+        ]}
+        trap={<>(a) is dogmatic; (c)(d) are false.</>}
+        lens={<>Inductive biases only pay off when they fire. Uniform cadence, single-row, single-type populations don't fire FATA's biases.</>}
+        stretch={<>Which fraud surface in retail banking IS uniform-cadence? Hint: ACH bill-pay rails.</>}
+      />
+
+      {/* P18 — cross-type bias mechanism */}
+      <VIS.TrapProblem
+        id="fata-p18"
+        difficulty="hard"
+        title="P18 — After per-type sub-spaces, how does the cross-type bias term let numerical attend to categorical without sharing parameters?"
+        scenario={<><em>Discriminating insight: each type pools its own attention output to a per-type summary; the cross-type bias is a learned scalar/matrix that MIXES per-type summaries without sharing Q/K/V. So amount-summary can influence the merchant-summary via the bias, but the Q/K/V projections themselves stay type-specific. This avoids the "shared head averages across types" failure while still allowing cross-type signal.</em><br/><br/>Pick the mechanism.</>}
+        options={[
+          {key:"a", text:"Each type produces a per-type pooled summary using its own Q/K/V projections. A learned cross-type bias matrix B[type_i, type_j] mixes per-type summaries: row_token = sum over types of (B[i, j] * summary_j). The Q/K/V projections stay type-specific (no parameter sharing across types), but the bias term routes information between type summaries. This is closer to a learned mixture-of-experts than to vanilla attention — the experts are the per-type sub-spaces.", correct:true},
+          {key:"b", text:"Numerical and categorical share Q/K/V projections after pooling."},
+          {key:"c", text:"Cross-type bias = dropout."},
+          {key:"d", text:"It's a residual connection."},
+        ]}
+        trap={<>(b) breaks the partition — exactly what FATA-Trans avoids. (c)(d) are unrelated.</>}
+        lens={<>Per-type Q/K/V (no sharing) + cross-type bias matrix (mixes summaries). Two layers — one type-private, one type-public.</>}
+        stretch={<>Why not just use multi-head attention with one head per type? Hint: heads still share the output projection.</>}
+      />
+
+      {/* P19 — production rollout staging */}
+      <VIS.TrapProblem
+        id="fata-p19"
+        difficulty="hard"
+        title="P19 — Order the FATA-Trans rollout stages from vanilla baseline → full FATA. Highest-leverage first."
+        scenario={<><em>Discriminating insight: highest-leverage single change is delta-t PE. Stage 1 = swap PE only; Stage 2 = add field-type partition; Stage 3 = add cross-type bias; Stage 4 = tune sequence length and tier-2 depth. Each stage A/B-tested before the next.</em><br/><br/>Pick the rollout sequence.</>}
+        options={[
+          {key:"a", text:"Ship full FATA-Trans on day 1."},
+          {key:"b", text:"Staged rollout. <strong>Stage 1:</strong> swap sinusoidal PE for delta-t bucket embed on the existing vanilla transformer — keep architecture, change only the PE input. A/B test; this captures most of the lift. <strong>Stage 2:</strong> add per-field-type Q/K/V projections at the per-row attention layer. A/B test. <strong>Stage 3:</strong> add the cross-type bias term (typically a small additional lift). A/B test. <strong>Stage 4:</strong> tune sequence length + tier-2 depth. Each stage is a binary architectural change, easy to roll back. Compare against (a): shipping full FATA-Trans on day 1 mixes 4 changes and forfeits the ability to attribute lift / regressions.", correct:true},
+          {key:"c", text:"Skip vanilla baseline."},
+          {key:"d", text:"Ship cross-type bias first."},
+        ]}
+        trap={<>(a) loses attribution; (c)(d) reverse the leverage order.</>}
+        lens={<>Stage by independent architectural change in order of expected lift. Delta-t PE first; cross-type bias last.</>}
+        stretch={<>If Stage 1's lift is &lt;0.5pt, do you proceed? Hint: yes — the larger lifts are at Stage 2 for some populations.</>}
+      />
+
+      {/* P20 — wrong-assumption cascade */}
+      <VIS.TrapProblem
+        id="fata-p20"
+        difficulty="hard"
+        title="P20 — Engineer says 'FATA-Trans is just a transformer with a fancy PE.' Which downstream beliefs follow that are wrong?"
+        scenario={<><em>Discriminating insight: under that assumption the engineer drops field-type partition, doesn't think about the field-type taxonomy, and ignores the two-tier structure. Each break is specific and silent.</em><br/><br/>Trace the cascade.</>}
+        options={[
+          {key:"a", text:"Nothing follows."},
+          {key:"b", text:"At least three things break. (1) 'Skip field-type partition' → numerical-vs-categorical interactions collapse to averaged-head behavior, cross-type fraud signal degrades. (2) 'Don't bother with the field-type taxonomy' → all fields go to one attention sub-space and the partition is vacuous (same as #1, but from a different starting point — wrong input vs missing layer). (3) 'Treat the architecture as one-tier' → engineer puts the delta-t embed at the across-rows layer only, missing that the per-row tier-1 is also load-bearing. (4) 'PE is the only differentiator' → ablations don't include field-type-removal and the team can't diagnose regressions later. All four cascade from the wrong reduction.", correct:true},
+          {key:"c", text:"Only PE breaks."},
+          {key:"d", text:"Only the sequence layer breaks."},
+        ]}
+        trap={<>(a)(c)(d) understate the cascade.</>}
+        lens={<>FATA-Trans = (field-type partition) + (delta-t PE) + (two-tier structure). Reducing to one piece collapses the other two silently.</>}
+        stretch={<>Which of the four failure modes is hardest to diagnose post-hoc?</>}
+      />
+
+      {/* P21 — latency engineering */}
+      <VIS.TrapProblem
+        id="fata-p21"
+        difficulty="hard"
+        title="P21 — 20ms model-inference budget on the auth path. Vanilla transformer takes 12ms; FATA-Trans takes 17ms. Ship which?"
+        scenario={<><em>Discriminating insight: it's a population-dependent profile. If the bursty-user segment is large and the FATA lift &gt;2pt at fixed precision on THAT segment, ship FATA and engineer the latency back (smaller hidden dim, shorter sequence, INT8 + FlashAttention). If the bursty segment is small, ship vanilla with a delta-t feature added.</em><br/><br/>Decide.</>}
+        options={[
+          {key:"a", text:"Always ship vanilla — it's faster."},
+          {key:"b", text:"Profile and decide on data. If the bursty / irregular-cadence segment is, say, &gt;15% of authorization volume AND the FATA lift over vanilla on that segment is &gt;2pt at fixed precision, ship FATA-Trans and recover the 5ms via: (i) reduce hidden dim 256 → 192 (~30% time saving), (ii) shorten tier-2 sequence length from 64 → 48 (recall-vs-length curve flattens past 32), (iii) INT8 + FlashAttention on tier-2. If the bursty segment is small or the lift is &lt;1pt there, ship vanilla with a delta-t bucket FEATURE concatenated to each token — captures ~70% of FATA's delta-t lift at zero architectural cost. Decision is population + lift + latency, not architecture-as-religion.", correct:true},
+          {key:"c", text:"Always ship FATA — accuracy first."},
+          {key:"d", text:"Run both ensembled."},
+        ]}
+        trap={<>(a)(c) are dogmatic; (d) doubles latency.</>}
+        lens={<>Senior framing: measure lift PER SEGMENT against the latency cost. Population-conditional architectural choice.</>}
+        stretch={<>What single hand-engineered feature on vanilla recovers most of FATA's delta-t lift?</>}
+      />
+
+      {/* P22 — reproducibility */}
+      <VIS.TrapProblem
+        id="fata-p22"
+        difficulty="medium"
+        title="P22 — A paper claims to reproduce FATA-Trans's lift on public credit-card data but doesn't release the field-type taxonomy. Why is the result suspect?"
+        scenario={<><em>Discriminating insight: the field-type taxonomy is INPUT to the partition. Tag amount as categorical, you get TabTransformer-ish; tag everything as one type, you get vanilla. Public credit-card datasets (Kaggle, IEEE-CIS) don't ship with a canonical taxonomy. Different taxonomies → different ablation curves.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"They probably reproduced it correctly — peer review is rigorous."},
+          {key:"b", text:"Field-type taxonomy is a hidden hyperparameter that determines which attention sub-space each column lives in. Different taxonomies (treating amount-bucket as numerical vs categorical, treating hour-of-day as categorical vs temporal) give meaningfully different ablation curves. Without the taxonomy published, a 'reproduction' is reproducing a specific implicit choice, not the paper's specific architecture. The lift number depends on the taxonomy. To make any reproduction comparable, the paper must publish the taxonomy AND the discretization scheme for any continuous fields that were bucketized. This is a documentation gap the field hasn't fixed yet.", correct:true},
+          {key:"c", text:"Public datasets are always wrong."},
+          {key:"d", text:"FATA-Trans is not reproducible."},
+        ]}
+        trap={<>(a) is over-trusting. (c)(d) over-general.</>}
+        lens={<>The field-type taxonomy IS a hyperparameter. Reproducibility requires publishing the choice.</>}
+        stretch={<>What's the canonical taxonomy for the Kaggle Credit Card Fraud dataset?</>}
+      />
+
+      {/* P23 — what FATA can NOT do */}
+      <VIS.TrapProblem
+        id="fata-p23"
+        difficulty="hard"
+        title="P23 — Which fraud pattern does FATA-Trans NOT capture better than vanilla, even when delta-t PE and field-type partition fire?"
+        scenario={<><em>Discriminating insight: cross-CARDHOLDER patterns (coordinated rings across 200 cards) are invisible to any per-card sequence model — FATA-Trans included. The architecture is per-card; rings need a graph/network layer above it.</em><br/><br/>Edge case.</>}
+        options={[
+          {key:"a", text:"FATA-Trans captures all fraud patterns."},
+          {key:"b", text:"Coordinated cross-cardholder ring patterns (200 cards each making a small probe at the same merchant within 5 minutes) are invisible to FATA-Trans. The architecture is PER-CARD: tier-1 attends within a row, tier-2 attends within a card's history. Neither layer sees other cards' sequences. The delta-t PE helps within a single card; field-type partition helps within a single row. Ring detection requires a graph or aggregation layer ABOVE FATA-Trans (e.g., a per-merchant velocity counter, or a GNN over the card-merchant bipartite graph). FATA-Trans + an upstream cross-card detector is the right composite, not FATA-Trans alone.", correct:true},
+          {key:"c", text:"FATA-Trans is only for cross-card fraud."},
+          {key:"d", text:"Rings are not real."},
+        ]}
+        trap={<>(a) overclaims; (c) is backwards; (d) is absurd.</>}
+        lens={<>Per-card sequence model = per-card fraud. Cross-card patterns need a different layer.</>}
+        stretch={<>What's the cheapest upstream cross-card signal that complements FATA-Trans?</>}
+      />
+
+      {/* P24 — debug: NaNs at training */}
+      <VIS.TrapProblem
+        id="fata-p24"
+        difficulty="hard"
+        title="P24 — Training NaNs when a user's first two transactions are 5 seconds apart. The clamp at MIN_SEC is set to 60. What's wrong?"
+        scenario={<><em>Discriminating insight: MIN_SEC = 60 means delta-t below 60 is CLAMPED to 60 in the log lookup — but the engineer is computing log(delta_t / MIN_SEC) which for a 5-second gap with NO clamp gives log(5/60) = negative, and the floor index is negative — out-of-bounds embedding lookup → NaN. Fix: clamp BEFORE the log, not the other way.</em><br/><br/>Debug.</>}
+        options={[
+          {key:"a", text:"Lower the learning rate."},
+          {key:"b", text:"Order of operations bug. The intended pipeline is: clamp delta-t to [MIN_SEC, MAX_SEC], THEN compute log, THEN bucketize. If the clamp is missing or applied AFTER the log, a 5-second gap with MIN_SEC = 60 produces log(5/60) ≈ -2.48, floor → negative bucket index, out-of-bounds embedding lookup. Some frameworks silently return zero embeddings on negative indices (silent recall drop); others return NaN (training crash). Fix: <code>delta_t = clip(delta_t, MIN_SEC, MAX_SEC)</code> BEFORE the log. Add an assertion that bucket indices are in [0, NUM_BUCKETS) — fails loudly at training time, not silently in production.", correct:true},
+          {key:"c", text:"Use float64 instead of float16."},
+          {key:"d", text:"The 5-second gap is real fraud — exclude it from training."},
+        ]}
+        trap={<>(a) is generic — wrong tool. (c) doesn't fix the index logic. (d) discards real signal.</>}
+        lens={<>Clamp + log + floor is the canonical pattern; the clamp is the first step. Always assert bucket indices in [0, NUM_BUCKETS).</>}
+        stretch={<>What's the silent-failure analog if the framework returns zero on negative index?</>}
+      />
+
+      {/* P25 — TabBERT-pretrain a FATA-Trans backbone */}
+      <VIS.TrapProblem
+        id="fata-p25"
+        difficulty="hard"
+        title="P25 — You have billions of unlabeled transactions. Should you TabBERT-pretrain a FATA-Trans backbone, or skip pretraining?"
+        scenario={<><em>Discriminating insight: TabBERT (MLM objective) and FATA-Trans (architecture) are orthogonal — you can stack them. A FATA-Trans backbone has MORE parameters (per-type Q/K/V) than vanilla, so it benefits MORE from MLM pretraining. The lift compounds.</em><br/><br/>Decide.</>}
+        options={[
+          {key:"a", text:"Skip pretraining — FATA-Trans is supervised."},
+          {key:"b", text:"Pretrain. FATA-Trans's architecture is orthogonal to the TabBERT objective: TabBERT supplies the recipe (mask cells, predict them on unlabeled tx) and FATA-Trans is the BACKBONE that gets pretrained under that recipe. Because FATA-Trans has more parameters than vanilla (per-field-type Q/K/V projections add capacity), the marginal MLM pretraining lift is LARGER than for vanilla — capacity-data tradeoff. Production pattern: stage 1 MLM-pretrain on a year of unlabeled tx; stage 2 fine-tune for fraud with labels. Paper ablations and downstream production reports both show TabBERT-pretrain + FATA-Trans-arch &gt; either alone.", correct:true},
+          {key:"c", text:"Pretrain with a different objective."},
+          {key:"d", text:"Use FATA-Trans as a teacher to distill TabBERT."},
+        ]}
+        trap={<>(a) misses that the two are orthogonal. (c) is non-specific. (d) inverts the architecture/objective relationship.</>}
+        lens={<>FATA-Trans is the backbone; TabBERT is the recipe. Stack them.</>}
+        stretch={<>How much unlabeled data before MLM pretraining starts to lift FATA-Trans? Hint: ~50-100M rows.</>}
+      />
+
+      {/* P26 — temporal field-type vs delta-t PE */}
+      <VIS.TrapProblem
+        id="fata-p26"
+        difficulty="hard"
+        title="P26 — A reviewer asks: 'Why have a temporal field-type AND a delta-t PE? Isn't one redundant?'"
+        scenario={<><em>Discriminating insight: they operate at different tiers. The temporal field-type (e.g., hour-of-day-as-column) sits in the per-ROW tier-1 attention sub-space partition. The delta-t PE is the positional signal between ROWS at tier-2. One is "this row happened at noon"; the other is "this row happened 5 minutes after the previous row." Both are temporal, neither is redundant.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Yes — drop the temporal field-type."},
+          {key:"b", text:"They are NOT redundant — they operate at different tiers and encode different temporal axes. The temporal field-TYPE (hour-of-day, day-of-week, etc. as columns within a row) lives in tier-1 (within-row attention sub-spaces), letting the row representation know 'this transaction happened at 3am on a Sunday' as an intra-row feature. The delta-t PE lives between tier-1 and tier-2, encoding 'this row happened 5 minutes after the previous row in this user's sequence.' One is ABSOLUTE-time-within-row; the other is RELATIVE-time-between-rows. Dropping either loses a distinct signal: a 3am-Sunday tx and a 3pm-Tuesday tx might have identical delta-t but different absolute-time signals.", correct:true},
+          {key:"c", text:"Drop delta-t PE — temporal field-type is enough."},
+          {key:"d", text:"Both are redundant — drop both."},
+        ]}
+        trap={<>(a)(c)(d) collapse the absolute-vs-relative distinction.</>}
+        lens={<>Two temporal axes: absolute (within-row) and relative (between-rows). FATA-Trans encodes both.</>}
+        stretch={<>If you could only keep one, which matters more for card-testing burst detection? Hint: relative — bursts hinge on delta-t.</>}
       />
     </VIS.Section>
 
@@ -1708,35 +2009,42 @@ flowchart TB
             <strong>Sun et al. — FATA-Trans: Field And Time-Aware Transformer for Sequential Tabular Data</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, CIKM 2023)</span>
-          <br/>The reference paper. Sections on time-aware PE and field-level attention are the keepers.
+          <br/>The reference paper. Sections on per-field-type attention and delta-t-bucketed positional encoding are the keepers; appendix has the ablation table that drives P14.
         </li>
         <li>
           <a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">
             <strong>Jay Alammar — The Illustrated Transformer</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Worth re-reading before reading FATA-Trans — the field-attention layer is straightforward once you have internalized self-attention.
+          <br/>The clearest visual intro to self-attention. Re-read before reasoning about per-field-type Q/K/V projections vs shared projections.
+        </li>
+        <li>
+          <a href="https://kazemnejad.com/blog/transformer_architecture_positional_encoding/" target="_blank" rel="noopener">
+            <strong>Amirhossein Kazemnejad — Transformer Architecture: Positional Encoding</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
+          <br/>Deep dive on why sinusoidal PE works and where it breaks. The post to read before designing a delta-t embedding — explains the inductive biases that delta-t PE replaces.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2012.06678" target="_blank" rel="noopener">
+            <strong>Huang et al. — TabTransformer: Tabular Data Modeling Using Contextual Embeddings</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, 2020)</span>
+          <br/>The single-row predecessor. P11 turns on understanding why TabTransformer's "attention on categorical + MLP on numerical" split is a stricter version of FATA-Trans's per-type partition.
         </li>
         <li>
           <a href="https://arxiv.org/abs/2011.01843" target="_blank" rel="noopener">
             <strong>Padhi et al. — Tabular Transformers (TabBERT)</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, ICASSP 2021)</span>
-          <br/>The predecessor: BERT-style masked-field pretraining on transactions. Pairs naturally with FATA-Trans for fine-tuning.
-        </li>
-        <li>
-          <a href="https://kazemnejad.com/blog/transformer_architecture_positional_encoding/" target="_blank" rel="noopener">
-            <strong>Amirhossein Kazemnejad — Transformer architecture: positional encoding</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Deep dive on why sinusoidal PE works and where it breaks. The blog post to read before designing your own PE.
+          <br/>The MLM-on-tabular-cells pretraining objective. Sibling visual covers it in depth; required reading for P10 and P25 (stack TabBERT objective on FATA-Trans architecture).
         </li>
         <li>
           <a href="https://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">
             <strong>Andrej Karpathy — A Recipe for Training Neural Networks</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Field guide for debugging the kinds of representation bugs that bite FATA-Trans (time-encoding collapse, attention saturation).
+          <br/>Field guide for the silent representation bugs that bite FATA-Trans — delta-t embedding collapse (P8), field-type tag errors (P5), and bucket-index off-by-ones (P24) all match the silent-bug catalog in this post.
         </li>
       </ul>
     </VIS.Section>

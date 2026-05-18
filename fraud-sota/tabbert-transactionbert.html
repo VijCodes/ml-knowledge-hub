@@ -1414,287 +1414,580 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// TabBERT / TransactionBERT — masked-field BERT pretraining on transaction logs,
-// fine-tuned for fraud. Padhi et al. (ICASSP 2021); productionized 2024.
+// TabBERT / TransactionBERT (Padhi et al., ICASSP 2021) — masked-language-model
+// pretraining on TABULAR transaction sequences. Load-bearing distinctions:
+//   (1) per-CELL MLM — mask individual (row, column) cells and predict them
+//       from surrounding cells AND adjacent rows. Not per-row, not per-token.
+//   (2) the contribution is the OBJECTIVE (MLM on tabular), not the backbone.
+//       The backbone is a fairly standard flat self-attention transformer.
+//   (3) continuous-amount tokenization is the unsolved hard problem; choice
+//       of scheme dominates the result.
+// Strip "mask cells / MLM / unlabeled tx" and answers should not still work.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Transaction sequence transformers"
       title="TabBERT / TransactionBERT"
-      subtitle="BERT-style masked-field pretraining on transaction logs, then fine-tuned for fraud — exploiting massive unlabeled card history."
+      subtitle="Masked-language-model pretraining on tabular transaction sequences — mask individual cells, predict from context. Fine-tune for fraud after billions of unlabeled tx have shaped the representation."
       byline={[
-        {label: "Source", value: "Padhi et al., ICASSP 2021 — Tabular Transformers"},
-        {label: "Year", value: "2024 (productionized)"},
-        {label: "L3", value: "Transaction sequence transformers"},
+        {label: "Source", value: "Padhi et al., ICASSP 2021; productionized at IBM / Capital One ~2024"},
+        {label: "L3", value: "Tabular MLM pretraining"},
+        {label: "Anchor", value: "Per-cell masked-cell prediction on (row × column) tabular tape"},
       ]}/>
 
     <VIS.TLDR>
-      Card issuers have billions of unlabeled transactions but very few confirmed-fraud labels (often less than 0.1 percent). TabBERT pretrains a{" "}
-      <VIS.Term def="Bidirectional Encoder Representations from Transformers — a self-supervised pretraining method where you randomly mask tokens in a sequence and train the model to predict them.">BERT</VIS.Term>{" "}
-      on the unlabeled transactions using a masked-field objective: hide some fields of some transactions, predict them. The resulting encoder learns the structure of normal transactions. A small labeled-fraud head fine-tuned on top consistently outperforms supervised-only models when labels are scarce.
+      Supervised tabular fraud models (XGBoost, vanilla transformer) need a label per example. An issuer has, say, 5 billion authorizations per year but only ~5 million confirmed-fraud labels (~0.1%). TabBERT exploits the asymmetry: <strong>mask individual CELLS (a specific column-value in a specific row) of unlabeled transactions and train the backbone to predict the masked cell from the rest of the row + adjacent rows</strong>. The model learns what a "typical" transaction looks like for this user / merchant / time-of-day combo. Fine-tune the same backbone on the small labeled set, and anomalies relative to the learned representation become highly discriminative. The contribution is the OBJECTIVE (BERT-style masked-cell prediction adapted to a 2-D row-by-column tape), not the architecture. <strong>The hardest unsolved piece is tokenizing continuous amounts</strong> — log-bucket, quantile-bucket, or learned numerical embedding — and the choice of scheme dominates the lift more than the MLM itself.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — masked-cell pretraining on a 2-D table">
       <ol>
-        <li><strong>Tokenize each transaction:</strong> represent merchant, MCC, amount, time, channel, geography as discrete tokens (categorical fields are already discrete; amount and time need bucketing).</li>
-        <li><strong>Mask-and-predict pretraining:</strong> randomly mask roughly 15 percent of field positions across the sequence. The model predicts the masked field given the rest of the sequence. No fraud labels needed.</li>
-        <li><strong>Fine-tune for fraud:</strong> add a classifier head on the pretrained encoder. Train on the small fraud-labeled dataset. The pretrained representation transfers; the head learns the task.</li>
+        <li><strong>Input tape:</strong> a 2-D table where rows are transactions and columns are fields (amount, merchant_id, MCC, country, timestamp, channel). Each cell is tokenized into a discrete or learned vector — amount via bucketing or a small MLP, categorical via embedding lookup.</li>
+        <li><strong>Two positional encodings:</strong> a row-position (which transaction in the user's sequence) AND a column-position (which field within the row). Cells share row-PE with their row, and column-PE with their column.</li>
+        <li><strong>MLM objective:</strong> on each training step, randomly mask ~15% of CELLS (not rows). The model must predict the masked cell from all surrounding cells — same row, other rows. Cross-entropy on the masked-cell target.</li>
+        <li><strong>Pretrain on unlabeled tx:</strong> billions of rows, no fraud labels needed. The objective creates the learning signal.</li>
+        <li><strong>Fine-tune:</strong> add a fraud-classifier head on a pooled representation of the last row; fine-tune the backbone with labels.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  U["Billions of unlabeled tx"]
-  U --> M["Mask 15 percent of fields"]
-  M --> P["Pretrain encoder"]
-  P --> F["Fine-tune fraud head"]
-  L["Small labeled fraud set"] --> F
+  T["2-D tape: rows are tx, cols are fields"]
+  T --> M["Random per-cell mask 15 percent"]
+  M --> X["Flat self-attention over all cells"]
+  X --> P["Predict masked cells - cross entropy"]
+  P --> R["Pretrained backbone"]
+  R --> F["Fine-tune head with fraud labels"]
   F --> Y["Risk score"]
-  style P fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style F fill:#fef3c7,stroke:#d97706,stroke-width:2px
-      `} />
-      <p>Blue is the self-supervised stage that uses all the unlabeled volume. Yellow is the supervised fine-tune that uses the (small) labeled fraud set.</p>
+  style M fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style P fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style F fill:#dcfce7,stroke:#16a34a,stroke-width:2px
+      `}/>
+      <p>Blue = the per-cell mask (the load-bearing piece). Yellow = MLM cross-entropy on the masked cells (zero fraud labels at this stage). Green = supervised fine-tune.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="How it differs from BERT / supervised tabular / FATA-Trans">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Supervised-only transformer</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>BERT (text)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Supervised tabular</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>FATA-Trans</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>TabBERT</th>
           </tr>
         </thead>
         <tbody>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Data used</td>
-            <td style={{padding:"8px 10px"}}>Labeled fraud only</td>
-            <td style={{padding:"8px 10px"}}>All transactions plus labels</td>
+            <td style={{padding:"6px 10px"}}>Input structure</td>
+            <td style={{padding:"6px 10px"}}>1-D token stream</td>
+            <td style={{padding:"6px 10px"}}>Flat row or sequence of rows</td>
+            <td style={{padding:"6px 10px"}}>Sequence of rows</td>
+            <td style={{padding:"6px 10px"}}><strong>2-D (row × column) tape</strong></td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Best when labels are</td>
-            <td style={{padding:"8px 10px"}}>Plentiful</td>
-            <td style={{padding:"8px 10px"}}>Scarce</td>
+            <td style={{padding:"6px 10px"}}>Pretraining objective</td>
+            <td style={{padding:"6px 10px"}}>MLM on tokens</td>
+            <td style={{padding:"6px 10px"}}>None (label-supervised)</td>
+            <td style={{padding:"6px 10px"}}>None by default (orthogonal)</td>
+            <td style={{padding:"6px 10px"}}><strong>MLM on cells</strong></td>
           </tr>
           <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Training cost</td>
-            <td style={{padding:"8px 10px"}}>Moderate</td>
-            <td style={{padding:"8px 10px"}}>Large pretrain plus small fine-tune</td>
+            <td style={{padding:"6px 10px"}}>Mask granularity</td>
+            <td style={{padding:"6px 10px"}}>Token</td>
+            <td style={{padding:"6px 10px"}}>N/A</td>
+            <td style={{padding:"6px 10px"}}>N/A</td>
+            <td style={{padding:"6px 10px"}}>Per-cell (column-value in a specific row)</td>
           </tr>
           <tr>
-            <td style={{padding:"8px 10px"}}>Transfer to new tasks</td>
-            <td style={{padding:"8px 10px"}}>Retrain from scratch</td>
-            <td style={{padding:"8px 10px"}}>Reuse encoder, swap head</td>
+            <td style={{padding:"6px 10px"}}>Uses unlabeled tx</td>
+            <td style={{padding:"6px 10px"}}>Massively</td>
+            <td style={{padding:"6px 10px"}}>Not at all</td>
+            <td style={{padding:"6px 10px"}}>Not by default</td>
+            <td style={{padding:"6px 10px"}}>Massively (the core lever)</td>
+          </tr>
+          <tr style={{background:"#e8f0fa"}}>
+            <td style={{padding:"6px 10px"}}>Hardest design choice</td>
+            <td style={{padding:"6px 10px"}}>WordPiece vocab</td>
+            <td style={{padding:"6px 10px"}}>Feature eng</td>
+            <td style={{padding:"6px 10px"}}>Delta-t bucketing + field-type taxonomy</td>
+            <td style={{padding:"6px 10px"}}><strong>Continuous-amount tokenization</strong></td>
           </tr>
         </tbody>
       </table>
+      <p style={{marginTop:10}}>Redaction litmus: strip "MLM" and "unlabeled-tx" — does the answer still win? If yes, the problem isn't testing TabBERT, it's testing transformers-on-transactions.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Issuer with billions of unlabeled transactions</strong> and a small confirmed-fraud set.</li>
-        <li><strong>Multiple downstream tasks</strong> — fraud, dispute, AML — that can share one pretrained encoder.</li>
-        <li><strong>You can afford the pretraining cost once</strong> and amortize it across many fine-tunes.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Pretraining is expensive">
-        Pretraining on billions of transactions takes thousands of GPU-hours. Budget accordingly. The payoff is amortized — one pretrain, many fine-tunes.
+    <VIS.Section id="sec-limits" title="Limits and gotchas — the TabBERT-specific ones">
+      <VIS.Callout kind="gotcha" title="Continuous-amount tokenization is the unsolved problem">
+        Amount is a continuous field with magnitude that spans 6+ orders ($0.01 to $50000+). Three tokenization strategies all have known failure modes: (a) <strong>log-bucket</strong> loses sub-bucket magnitude resolution (small card-test probes $0.99 vs $1.00 collide); (b) <strong>quantile-bucket</strong> loses extreme-tail resolution (top 0.01% is one bucket); (c) <strong>learned numerical embedding</strong> (amount → small MLP → vector) preserves magnitude but breaks the MLM target distribution (MSE instead of cross-entropy on a different head). Most paper-to-paper lift variance comes from this choice.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Tokenizing continuous amounts is non-trivial">
-        Amount has wide dynamic range (one cent to one million). Naive linear buckets give one bucket for ninety nine percent of transactions. Log-buckets are better; quantile-buckets are better still — each bucket has equal probability mass.
+      <VIS.Callout kind="warn" title="MLM trains 'common-vs-rare', not 'benign-vs-fraud'">
+        The MLM pretrained representation distinguishes typical from atypical, not benign from fraudulent. Atypical-but-benign (your first wedding-ring purchase) gets high anomaly. Fine-tuning bridges the gap, but if your labeled set is too small to teach the bridge, you'll have FPRs on atypical-benign events.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Time encoding interacts with masking">
-        If you mask the time field, the model loses positional information for that token. Either keep time unmasked, or bucket time and treat it like other categoricals — but understand that masked-time tokens are now learning a temporal-imputation task on top of fraud.
+      <VIS.Callout kind="warn" title="Adversary mimics common cells">
+        A fraudster's optimal strategy under TabBERT is to mimic the user's most-frequent merchants and amounts. The MLM scores those as in-distribution. Defense: ensemble with a supervised model that sees fraud labels, and explicit velocity counters that see ring behavior cross-card.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Fraud distribution shifts during fine-tuning">
-        The pretrained encoder learned the distribution of all transactions, which is dominated by non-fraud. Fine-tuning on heavily imbalanced fraud data shifts the head fast, but if you fine-tune the full encoder too long it can forget its pretraining. Freeze early layers or use low LR on the encoder.
+      <VIS.Callout kind="warn" title="Pretrain compute is huge">
+        MLM on billions of cells is expensive — typically the dominant compute. Same-compute supervised baselines (with data augmentation) close more of the gap than naive reports suggest. Always compute-match comparisons.
+      </VIS.Callout>
+      <VIS.Callout kind="gotcha" title="Tokenizer drift silently invalidates the pretrained backbone">
+        If you re-bucket amounts after pretraining (e.g., add a new amount range), the embedding-table lookups now point to wrong rows. Lock the tokenizer when the backbone is pretrained; version-control as code.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Trap problems on tokenization, masking strategy, fine-tuning, and the limits of self-supervised pretraining on transactions.
+        Every problem turns on something that ONLY TabBERT does: the per-cell mask granularity, the 2-D (row × column) tape structure, the MLM-on-tabular objective, the continuous-amount tokenization choice, or the unlabeled-tx exploitation pattern. Strip "mask cells" / "MLM" / "unlabeled-tx" and the option must no longer win.
       </p>
 
+      {/* P1 — B3 pitch */}
       <VIS.TrapProblem
-        id="tbb-p1"
+        id="tabbert-p1"
         difficulty="hard"
-        title="P1 — Tokenize amount. Linear, log, or quantile buckets?"
-        scenario={<>You bucket the amount field to make it tokenizable for BERT-style masked-field prediction. Amounts in your data span one cent to one million dollars. Which bucketing scheme preserves the magnitude signal best?</>}
+        title="P1 — Director asks: 'We have 5B unlabeled tx and 50k fraud labels. Why pretrain with TabBERT instead of training XGBoost on the 50k?'"
+        scenario={<><em>Discriminating insight: the pitch must name the MLM-on-tabular OBJECTIVE as the lever — what makes TabBERT possible is masked-cell prediction on unlabeled tx, creating supervision signal from the 5B without needing fraud labels. Strip "MLM on cells" and the pitch collapses to "more data is better." It must also name continuous-amount tokenization as the load-bearing engineering choice.</em><br/><br/>Pick the pitch.</>}
         options={[
-          {key:"a", text:"Quantile buckets — each bucket holds equal probability mass. Sub-dollar and very-large transactions each get their own buckets even though they are rare. The model can predict and recognize unusual amounts because the rare ones are not crammed into one bucket. Log buckets are a defensible second choice (good when distribution is roughly log-normal); linear buckets are wrong because ninety nine percent of transactions land in the smallest one.", correct:true},
-          {key:"b", text:"Linear buckets with one hundred evenly spaced buckets."},
-          {key:"c", text:"No bucketing — feed amount as a single float embedded with a linear layer."},
-          {key:"d", text:"A single token for amount-greater-than-zero."},
+          {key:"a", text:"Transformers are better than XGBoost, so we should switch."},
+          {key:"b", text:"Two-stage approach. (1) <strong>MLM-pretrain</strong>: randomly mask ~15% of CELLS (a specific column-value in a specific row) across the 5B unlabeled tx and train the backbone to predict the masked cell from surrounding context — the objective creates supervision signal from unlabeled data. The model learns what 'typical' looks like for this user / merchant / time-of-day combo. (2) <strong>Fine-tune</strong> the same backbone on the 50k fraud labels with a classifier head. The 50k labels are now learning a DECISION BOUNDARY on top of a rich representation, not a model from scratch. XGBoost can't use the 5B at all. The lever is the OBJECTIVE — masked-cell prediction — not the architecture. The hardest engineering choice is how to tokenize continuous AMOUNTS so the MLM target distribution is meaningful (log-bucket vs quantile vs learned embedding).", correct:true},
+          {key:"c", text:"Transformers have more parameters, so they'll learn fraud patterns better."},
+          {key:"d", text:"BERT is the SOTA for NLP, so adapting it to tx will give SOTA fraud detection."},
         ]}
-        trap={<>(b) wastes resolution on the long tail. (c) breaks the masked-LM framing (you cannot predict a continuous float with cross-entropy). (d) discards the signal.</>}
-        lens={<>(a) is the standard tabular-transformer choice. Quantile bucketing equalizes information per bucket.</>}
-        stretch={<>How many buckets is enough — sixty four, two hundred fifty six, or one thousand twenty four?</>}
+        trap={<>(a)(c) reduce to "transformers good" — fails the MLM-redaction test. (d) confuses "BERT is good for NLP" with "MLM transfers to tabular" — the contribution is the adaptation to tabular cells, not the transfer of BERT directly.</>}
+        lens={<>Pitch must name (1) MLM as the objective creating supervision from unlabeled data and (2) per-cell mask granularity on a 2-D table. Tokenization is the engineering gotcha.</>}
+        stretch={<>If you only have 100M unlabeled tx instead of 5B, is TabBERT still worth it? Hint: the data efficiency of MLM scales with unlabeled volume.</>}
       />
 
+      {/* P2 — per-cell vs per-row mask granularity */}
       <VIS.TrapProblem
-        id="tbb-p2"
+        id="tabbert-p2"
         difficulty="hard"
-        title="P2 — What fraction of fields should you mask?"
-        scenario={<>Original BERT masks fifteen percent of tokens. For transaction logs, is fifteen percent right, or should you go higher / lower?</>}
+        title="P2 — Why per-CELL mask, not per-ROW mask? Diagnose the difference."
+        scenario={<><em>Discriminating insight: per-cell mask preserves the within-row context — the model must predict the masked AMOUNT from this row's other cells (merchant, MCC, country, time) and from adjacent rows. Per-row mask removes the entire row, leaving only cross-row context — the model only learns inter-tx patterns, not intra-row co-occurrence (amount × MCC × country joints).</em><br/><br/>Pick the mechanism.</>}
         options={[
-          {key:"a", text:"Around fifteen to twenty percent is usually right for TabBERT, sometimes a bit higher. Higher masking forces the model to use more context — strong learning signal — but if you push past forty percent, individual examples become so corrupted that the model cannot recover signal. Tune on a held-out next-field-prediction objective rather than picking a number from a paper.", correct:true},
-          {key:"b", text:"Always fifty percent — more masking is better."},
-          {key:"c", text:"Always one percent — corruption hurts."},
-          {key:"d", text:"Mask all fields in one row."},
+          {key:"a", text:"Per-cell and per-row are equivalent."},
+          {key:"b", text:"Per-cell mask removes a SINGLE column-value (e.g., 'amount' field in row 7) while leaving the row's other cells (merchant_id, MCC, country, time) visible. The model must predict the masked AMOUNT from (i) other cells in the SAME row and (ii) cells across other rows. This teaches the model the joint distribution of within-row fields (P(amount | merchant, MCC, country)) AND across-row patterns. Per-row mask removes the entire row, so the model only sees neighboring rows — it can learn 'after this user pays rent on the 1st, they buy groceries' but not 'this MCC + this country usually means amount &lt; $100'. The within-row joint is most of the fraud signal, and per-cell mask is the granularity that exposes it.", correct:true},
+          {key:"c", text:"Per-cell mask is faster to compute."},
+          {key:"d", text:"Per-row mask is more BERT-like."},
         ]}
-        trap={<>(b) destroys context. (c) underuses the masking signal. (d) is degenerate.</>}
-        lens={<>(a) is the empirical answer. Mask rate is a hyperparameter; tune on a self-supervised metric.</>}
-        stretch={<>Would you mask fields uniformly or weight by entropy?</>}
+        trap={<>(a) collapses the distinction. (c) is incidental. (d) is wrong — BERT masks per-token, and the closer analog for tabular is per-cell.</>}
+        lens={<>Mask granularity controls what joint distribution the model learns. Per-cell = within-row + across-row joints. Per-row = across-row only.</>}
+        stretch={<>What does per-COLUMN mask (mask the same field across all rows) teach? Hint: column-level marginals, not joints — bad.</>}
       />
 
+      {/* P3 — continuous amount tokenization */}
       <VIS.TrapProblem
-        id="tbb-p3"
+        id="tabbert-p3"
         difficulty="hard"
-        title="P3 — Should you mask the time field?"
-        scenario={<>You can mask any of (merchant, MCC, amount, time, channel, country). Masking time would teach the model to predict time. But time is also positional. Mask it or not?</>}
+        title="P3 — Continuous-amount tokenization: log-bucket, quantile-bucket, or learned numerical embedding?"
+        scenario={<><em>Discriminating insight: each has a known failure mode. Log-bucket loses sub-bucket magnitude resolution (card-test probes $0.99 vs $1.00 collide). Quantile-bucket loses extreme-tail resolution (top 0.01% is one bucket). Learned numerical embedding preserves magnitude but breaks the MLM target distribution (cross-entropy on a discrete vocab no longer applies). Senior answer: production typically uses hybrid (log-bucket for tokens + per-bucket continuous offset) or a separate numerical head.</em><br/><br/>Pick the tokenization.</>}
         options={[
-          {key:"a", text:"Keep time unmasked or mask very rarely. Time doubles as positional signal — masking it injects uncertainty into where in the sequence the transaction sits, which destabilizes attention. If you do mask, treat time as bucketed categorical (so prediction is well-defined) and keep mask rate low (well under five percent). The cleanest design uses time as an unmasked positional input.", correct:true},
-          {key:"b", text:"Mask time at the standard fifteen percent."},
-          {key:"c", text:"Always mask time — it is a strong learning target."},
-          {key:"d", text:"Time cannot be masked because it is continuous."},
+          {key:"a", text:"Log-bucket with 1024 buckets — fastest."},
+          {key:"b", text:"Each scheme has a known failure mode. <strong>Log-bucket</strong>: simple discrete vocab; cross-entropy MLM works; loses sub-bucket magnitude — $0.99 and $1.00 collide which destroys signal on card-testing probes. <strong>Quantile-bucket</strong>: each bucket has equal training mass; extreme tail collapses to one bucket; high-value fraud is unresolved. <strong>Learned numerical embedding</strong>: amount → small MLP → vector preserves magnitude exactly; but MLM target is no longer a discrete distribution, so cross-entropy doesn't apply — you need a separate regression head (MSE on amount) or quantized residual. <strong>Production hybrid</strong>: log-bucket for the discrete-token MLM target + per-bucket continuous residual head for fine-grained recovery. Pick by which failure mode matters: small-amount card-testing → preserve sub-bucket; large-amount fraud → preserve extreme tail; both → hybrid.", correct:true},
+          {key:"c", text:"Round to nearest dollar — simplest."},
+          {key:"d", text:"Tokenize amount as a string of digits."},
         ]}
-        trap={<>(b) destabilizes positional signal. (c) is overaggressive. (d) is false — bucket and mask is fine.</>}
-        lens={<>(a) is the senior choice. Time is special because it carries the position; treat it differently from generic fields.</>}
-        stretch={<>What is the cleanest alternative — separate time-prediction head?</>}
+        trap={<>(a) ignores the tradeoffs and silently fails on small-amount fraud. (c) destroys sub-dollar resolution. (d) is a curiosity but explodes the vocab.</>}
+        lens={<>The tokenization scheme dominates the result. No clean winner; pick by failure mode you can tolerate.</>}
+        stretch={<>What's the right hybrid for an issuer whose largest fraud loss is $50k card-not-present?</>}
       />
 
+      {/* P4 — MLM ≠ benign vs fraud */}
       <VIS.TrapProblem
-        id="tbb-p4"
+        id="tabbert-p4"
+        difficulty="hard"
+        title="P4 — Junior says: 'After MLM pretrain, the model knows what fraud looks like.' Diagnose."
+        scenario={<><em>Discriminating insight: MLM pretrain has NEVER SEEN A FRAUD LABEL. It learns "common vs rare," not "benign vs fraud." A first wedding-ring purchase is high-anomaly under MLM but benign. The fine-tune is what teaches the benign-vs-fraud boundary, on top of the common-vs-rare representation.</em><br/><br/>Diagnose the junior's claim.</>}
+        options={[
+          {key:"a", text:"Correct — MLM learns fraud."},
+          {key:"b", text:"Wrong. MLM pretraining has never seen a fraud label — it learns a representation of WHAT IS COMMON for this user / merchant / MCC / time-of-day, by predicting masked cells. The signal it provides is 'common vs rare' (anomaly proxy), not 'benign vs fraud' (the fraud label distinction). Many atypical events are perfectly benign: a first wedding-ring purchase, a first international trip, a switch to a new gym subscription — all are atypical under the user's history and MLM will flag them. The fine-tuning step is what teaches the benign-vs-fraud distinction on top of the common-vs-rare representation. Without enough labels in fine-tune, you get false positives on atypical-benign events. Ship the MLM-pretrained backbone with a calibrated head, not as a fraud detector raw.", correct:true},
+          {key:"c", text:"MLM detects all fraud."},
+          {key:"d", text:"MLM is irrelevant to fraud detection."},
+        ]}
+        trap={<>(a)(c) overclaim what MLM does. (d) underclaims — MLM is the representation foundation.</>}
+        lens={<>Two distinctions: common-vs-rare (MLM gives this) and benign-vs-fraud (fine-tune teaches this). They are NOT the same axis.</>}
+        stretch={<>How many labeled fraud examples are needed for the fine-tune to bridge MLM-anomaly to fraud-decision? Hint: depends on label sparsity per representation cell.</>}
+      />
+
+      {/* P5 — vs FATA-Trans */}
+      <VIS.TrapProblem
+        id="tabbert-p5"
+        difficulty="hard"
+        title="P5 — Engineer claims 'TabBERT and FATA-Trans are competitors — pick one.' Diagnose."
+        scenario={<><em>Discriminating insight: TabBERT = OBJECTIVE (MLM on cells); FATA-Trans = ARCHITECTURE (field-type partition + delta-t PE). They are ORTHOGONAL — you can MLM-pretrain a FATA-Trans backbone. The "pick one" framing is a category error.</em><br/><br/>Compare and contrast.</>}
+        options={[
+          {key:"a", text:"They're competitors — pick FATA-Trans."},
+          {key:"b", text:"Category error in the question. <strong>TabBERT</strong> is a pretraining OBJECTIVE — mask cells, predict them — and is silent on the backbone architecture (the paper uses a flat self-attention transformer but you can swap the backbone). <strong>FATA-Trans</strong> is an ARCHITECTURE — per-field-type attention sub-spaces + delta-t PE — and is silent on the pretraining objective (paper is supervised). They operate on different axes and STACK: pretrain a FATA-Trans backbone with the TabBERT MLM objective. You get the MLM data efficiency (works on unlabeled tx) AND the field-type / delta-t inductive biases (works on irregular tabular sequences). Picking one as a competitor to the other forfeits the compound benefit.", correct:true},
+          {key:"c", text:"They're competitors — pick TabBERT."},
+          {key:"d", text:"They're identical."},
+        ]}
+        trap={<>(a)(c) treat them as competitors; (d) collapses them.</>}
+        lens={<>Objective vs architecture is the cleanest split. Stack them.</>}
+        stretch={<>If you also have GBDT as a supervised baseline, what's the right ensemble?</>}
+      />
+
+      {/* P6 — mask ratio */}
+      <VIS.TrapProblem
+        id="tabbert-p6"
+        difficulty="medium"
+        title="P6 — Mask ratio: BERT uses 15%. For TabBERT, what changes the choice?"
+        scenario={<><em>Discriminating insight: TabBERT has FEWER cells per row than BERT has tokens per sentence, so 15% of cells is a smaller absolute count. Higher mask ratio (25-40%) is often better — too few masked cells means each gradient step provides little signal. But too high (&gt;50%) destroys the within-row context.</em><br/><br/>Pick mask ratio.</>}
+        options={[
+          {key:"a", text:"15% always — BERT default."},
+          {key:"b", text:"Tune empirically, typically 25-40% for tabular. The TabBERT row has fewer cells (say 8-12 columns) than a BERT sentence (~100+ tokens), so 15% of cells is just 1-2 cells per row — each gradient step provides little signal. Raising to 25-40% (say 3-5 cells per row of 12) provides more learning per step. Too high (&gt;50%) destroys the within-row joint context the model needs to predict any single masked cell. Sweep mask ratio on a held-out tx slice; the optimal is task and column-count dependent.", correct:true},
+          {key:"c", text:"50% — more masking is more learning."},
+          {key:"d", text:"5% — keep most context."},
+        ]}
+        trap={<>(a) defaults to BERT; (c) over-masks; (d) under-masks.</>}
+        lens={<>Mask ratio scales with tokens-per-sequence — fewer tokens, higher ratio.</>}
+        stretch={<>What's the limit as columns → 1? Hint: trivially the model has no within-row context.</>}
+      />
+
+      {/* P7 — adversary mimics common cells */}
+      <VIS.TrapProblem
+        id="tabbert-p7"
+        difficulty="hard"
+        title="P7 — Adversary studies TabBERT and crafts a fraud transaction with cells matching the user's most common merchants and amounts. Defense?"
+        scenario={<><em>Discriminating insight: MLM scores common cells as in-distribution; an adversary mimicking common cells gets low anomaly. Defense: ensemble with a supervised model that has seen fraud labels (and learned that "common cells in suspicious sequences" is still fraud), plus upstream cross-card velocity counters that catch ring behavior MLM can't see.</em><br/><br/>Defense.</>}
+        options={[
+          {key:"a", text:"Raise the anomaly threshold."},
+          {key:"b", text:"Three-layer defense. (1) Ensemble TabBERT's MLM-derived anomaly score with a SUPERVISED classifier that has seen fraud labels — the supervised model has learned 'common cells in suspicious sequences' is still fraud (the MLM has not). (2) Add an upstream cross-card velocity counter — 200 cards each making a $5 probe at the same merchant within 5 minutes is invisible to a per-user MLM but obvious cross-card. (3) Monitor MLM anomaly score DISTRIBUTION over time: an adversary successfully mimicking common cells will shift the score distribution downward — alert on the shift. The single MLM score is bounded by what MLM can see (per-user common-vs-rare); the defense layers see what MLM doesn't.", correct:true},
+          {key:"c", text:"Train TabBERT for longer."},
+          {key:"d", text:"Don't use TabBERT for fraud."},
+        ]}
+        trap={<>(a) is blunt; (c) doesn't fix the architectural limit; (d) overclaims.</>}
+        lens={<>MLM can only see what's in the per-user tape. Ring behavior + supervised label needs other layers.</>}
+        stretch={<>How fast can an adversary learn the user's common cells from a stolen card's recent statement? Hint: minutes.</>}
+      />
+
+      {/* P8 — compute matching */}
+      <VIS.TrapProblem
+        id="tabbert-p8"
+        difficulty="hard"
+        title="P8 — A 2024 paper reports TabBERT beats XGBoost by 8pt. A community follow-up matches compute and gets 1.5pt. Diagnose."
+        scenario={<><em>Discriminating insight: TabBERT's reported lift over XGBoost often includes the disparity in compute — MLM pretrain is expensive (days on a cluster), supervised XGBoost typically uses far less. Same-compute supervised baseline (data augmentation, larger ensemble, hyperparameter sweep) closes much of the gap. The honest lift is real but smaller.</em><br/><br/>Diagnose the gap.</>}
+        options={[
+          {key:"a", text:"The follow-up paper is wrong."},
+          {key:"b", text:"Compute-matching reveals that part of TabBERT's lift comes from MASSIVELY more compute, not just from MLM-as-objective. TabBERT's MLM pretrain might use 10x-100x the compute of the XGBoost baseline (multi-day pretrain on a cluster vs minutes on one box). Match the compute budget: give XGBoost the same wall-clock budget — broader hyperparameter sweep, larger ensemble, data augmentation, even pre-training a smaller supervised model. The honest lift of MLM-as-objective shrinks to ~1.5-2pt. Both numbers are real; the bigger one bundles compute disparity with objective change. Senior framing: always compute-match comparisons.", correct:true},
+          {key:"c", text:"XGBoost can't compete with transformers."},
+          {key:"d", text:"The 2024 paper is wrong."},
+        ]}
+        trap={<>(a)(d) deflect by blaming a paper; (c) is dogmatic.</>}
+        lens={<>Compute is a confounder in benchmarks. Match it before attributing lift to the objective.</>}
+        stretch={<>What's the right compute-match protocol? Hint: FLOPs, not wall-clock.</>}
+      />
+
+      {/* P9 — tokenizer drift */}
+      <VIS.TrapProblem
+        id="tabbert-p9"
+        difficulty="hard"
+        title="P9 — Pretrained backbone shipped. 3 months later you add a new payment rail with much higher amounts. What breaks?"
+        scenario={<><em>Discriminating insight: amount tokenizer was frozen at pretrain. New amounts fall outside the trained bucket range — they map to the OOV bucket or wrap to an unused bucket whose embedding is random. Recall on the new rail collapses; pretrained backbone must be re-pretrained on a new amount range.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"The pretrained backbone is fine."},
+          {key:"b", text:"Amount tokenizer drift. The tokenizer was frozen at pretrain with a fixed amount range (e.g., $0.01 - $10k). The new rail introduces amounts up to $250k. All amounts above $10k map to the OOV bucket whose embedding was barely trained (rare in pretrain data). The MLM-derived representation for new-rail transactions is essentially random. Even the fine-tuned head can't compensate because the underlying representation is broken. Fixes: (a) re-pretrain MLM on the extended amount range (expensive but correct), (b) hybrid: route new-rail tx to a fallback supervised model until re-pretrain completes, (c) extend the tokenizer with new buckets and selectively re-pretrain only the affected embedding rows.", correct:true},
+          {key:"c", text:"Just retrain the fine-tune head."},
+          {key:"d", text:"The new rail is fine — backbones generalize."},
+        ]}
+        trap={<>(a)(d) ignore the tokenizer dependency; (c) doesn't fix the backbone-level break.</>}
+        lens={<>Tokenizer + backbone are a unit. Tokenizer drift breaks the backbone.</>}
+        stretch={<>What versioning discipline prevents this? Hint: tokenizer hash as part of model artifact.</>}
+      />
+
+      {/* P10 — diagnostic battery for MLM */}
+      <VIS.TrapProblem
+        id="tabbert-p10"
         difficulty="hard"
         multiSelect
-        title="P4 — Fine-tuning. Which steps stabilize transfer to fraud?"
-        scenario={<>You fine-tune the pretrained encoder on the small fraud-labeled set. Which steps stabilize transfer? Select all that apply.</>}
+        title="P10 — Symptoms that TabBERT MLM pretrain failed (vs supervised-only baseline being equal). Select all that apply."
+        scenario={<><em>Discriminating insight: signs MLM didn't pretrain well: high MLM cross-entropy on val (model can't predict masked cells), tiny gap between random-init and pretrained fine-tune performance, embedding-table rows for rare buckets are near-zero, anomaly scores have collapsed dynamic range.</em><br/><br/>Pick symptoms.</>}
         options={[
-          {key:"a", text:"Freeze the lower encoder layers; only train the top few plus the head.", correct:true},
-          {key:"b", text:"Train the whole encoder at the same learning rate as the head."},
-          {key:"c", text:"Use a much lower learning rate on the encoder than on the head.", correct:true},
-          {key:"d", text:"Use warmup followed by linear decay.", correct:true},
-          {key:"e", text:"Apply heavy data augmentation that violates the pretraining distribution."},
-          {key:"f", text:"Use class-imbalance-aware loss (focal or weighted cross-entropy).", correct:true},
+          {key:"a", text:"MLM cross-entropy on val cells is barely below random-token entropy.", correct:true},
+          {key:"b", text:"MLM cross-entropy is significantly below random."},
+          {key:"c", text:"Random-init fine-tune AUPRC is within 0.5pt of pretrained-init fine-tune AUPRC.", correct:true},
+          {key:"d", text:"Pretrained-init fine-tune is 3pt better than random-init."},
+          {key:"e", text:"Embedding-table rows for rare bucket indices have near-zero norms vs common buckets.", correct:true},
+          {key:"f", text:"All bucket embeddings have similar norms."},
+          {key:"g", text:"Anomaly score (negative log-likelihood of observed cells) has nearly zero variance across tx.", correct:true},
         ]}
-        trap={<>(b) overwrites pretraining. (e) destroys the transfer.</>}
-        lens={<>(a), (c), (d), (f) are the production fine-tuning stack for any BERT-style transfer.</>}
-        stretch={<>Which step gives the biggest stability win in a one-pass ablation?</>}
+        trap={<>(b)(d)(f) describe a healthy MLM, not a failure.</>}
+        lens={<>Diagnose MLM independently of fine-tune. High val cross-entropy + tiny pretrain-vs-random gap = MLM didn't learn.</>}
+        stretch={<>Cheapest pre-deploy check?</>}
       />
 
+      {/* P11 — vs supervised on label-rich */}
       <VIS.TrapProblem
-        id="tbb-p5"
-        difficulty="hard"
-        title="P5 — Pretraining is expensive. When is it worth it?"
-        scenario={<>Pretraining takes a thousand GPU-hours. A supervised-only model trains in fifty GPU-hours. When is the cost worth it?</>}
+        id="tabbert-p11"
+        difficulty="medium"
+        title="P11 — Issuer has 500k fraud labels (label-rich). Should they use TabBERT?"
+        scenario={<><em>Discriminating insight: TabBERT's edge is biggest when labels are scarce. At 500k labels, supervised XGBoost or supervised transformer is competitive. TabBERT might still add 1-2pt but the engineering cost is large.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"When labels are scarce relative to unlabeled data, and you have multiple downstream tasks (fraud, dispute, AML, application risk) that share the same encoder. Amortize the pretrain cost across many fine-tunes. If you have only one task and abundant labels, supervised-only is more efficient. The break-even depends on label scarcity and downstream task count.", correct:true},
-          {key:"b", text:"Always — pretraining is always better."},
-          {key:"c", text:"Never — it is too expensive."},
-          {key:"d", text:"Only for academic publications."},
+          {key:"a", text:"Yes — TabBERT always wins."},
+          {key:"b", text:"Marginal. TabBERT's data-efficiency advantage is largest when fraud labels are scarce (~0.01-0.1% of tx) and unlabeled tx are abundant. At 500k labels, supervised baselines (XGBoost with engineered features, supervised transformer with the same backbone) have enough data to learn directly. TabBERT might add 1-2pt over a well-tuned supervised transformer but the engineering cost (MLM infrastructure, tokenizer versioning, fine-tune pipeline) is significant. Sane default for label-rich issuers: start with supervised; add TabBERT MLM if a clear AUPRC gap remains after tuning the supervised baseline.", correct:true},
+          {key:"c", text:"No — TabBERT is only useful for NLP."},
+          {key:"d", text:"Always use TabBERT for any fraud problem."},
         ]}
-        trap={<>(b) and (c) are dogmatic. (d) is dismissive.</>}
-        lens={<>(a) is the senior framing. Pretraining is an investment that pays off when shared.</>}
-        stretch={<>At what label-to-unlabel ratio does pretraining stop paying off?</>}
+        trap={<>(a)(d) are dogmatic; (c) is false.</>}
+        lens={<>TabBERT lift is conditional on label scarcity. Label-rich → supervised baseline. Label-scarce → TabBERT.</>}
+        stretch={<>What's the label-count threshold where TabBERT stops winning? Hint: depends on feature complexity.</>}
       />
 
+      {/* P12 — D2 cascade */}
       <VIS.TrapProblem
-        id="tbb-p6"
+        id="tabbert-p12"
         difficulty="hard"
-        title="P6 — Coding question — tokenize amount end-to-end"
-        scenario={<>You implement amount tokenization. Pick the strategy that maps a continuous amount to a categorical token for TabBERT.</>}
+        title="P12 — Team rounds amounts to nearest dollar before tokenization. Recall on card-testing rings drops 4pt. Trace the cascade."
+        scenario={<><em>Discriminating insight: card-testing probes use $0.99 / $1.00 / $1.50 - small dollar amounts that distinguish probe-test from real purchase. Rounding to nearest dollar collides them all to $1. MLM learns "small-amount tx are common" because the unique-fingerprint of card-testing is gone. Fine-tune can't recover what tokenization destroyed.</em><br/><br/>Cascade.</>}
         options={[
-          {key:"a", text:"Compute quantile boundaries on the training set (say two hundred fifty six quantiles), persist them as a lookup table, then at inference assign each amount to the bucket whose boundary it falls below. Embed bucket id with a learned embedding layer of the same dim as other categorical fields. Persist boundaries with model artifacts so train-serve skew cannot creep in.", correct:true},
-          {key:"b", text:"Round amount to nearest integer; use the integer as token id."},
-          {key:"c", text:"Multiply amount by one hundred; cast to int; use as token id."},
-          {key:"d", text:"Hash amount; mod by vocab size."},
+          {key:"a", text:"Card-testing rings don't matter."},
+          {key:"b", text:"Rounding to nearest dollar collapses $0.99, $1.00, $1.50 all into $1 — but card-testing rings specifically use SMALL DISTINCT amounts ($0.99 probe, $1.00 verify, $1.50 small-purchase) as a probe pattern; the distinction is the fingerprint. After rounding, MLM sees 'small-amount tx are common' (subscriptions, small purchases) and learns no anomaly. Fine-tune inherits the broken representation — there's nothing in the embeddings that distinguishes probe-fingerprint from benign small purchase. Recall on ring-pattern fraud drops 4pt. Fix: keep sub-dollar resolution in the tokenizer (log-bucket with finer granularity at small amounts, or learned numerical embedding) and re-pretrain.", correct:true},
+          {key:"c", text:"Use a bigger transformer."},
+          {key:"d", text:"Train longer."},
         ]}
-        trap={<>(b) and (c) explode vocab. (d) destroys ordinal signal.</>}
-        lens={<>(a) is the production tokenizer. Quantile bucket plus learned embedding plus boundary persistence prevents train-serve skew.</>}
-        stretch={<>Should the boundaries be recomputed at retrain time?</>}
+        trap={<>(a) dismisses the use case; (c)(d) don't fix the tokenization.</>}
+        lens={<>Tokenization destroys signal that no amount of model capacity can recover.</>}
+        stretch={<>What's the minimum sub-dollar resolution needed for card-testing detection?</>}
       />
 
+      {/* P13 — D1 BERT analog */}
       <VIS.TrapProblem
-        id="tbb-p7"
-        difficulty="hard"
-        title="P7 — One encoder, three tasks. What changes?"
-        scenario={<>You pretrain once and fine-tune for fraud, dispute, and AML. What architectural assumption breaks across tasks?</>}
+        id="tabbert-p13"
+        difficulty="medium"
+        title="P13 — 'TabBERT is just BERT applied to transactions.' What's the load-bearing difference?"
+        scenario={<><em>Discriminating insight: BERT masks tokens in a 1-D text stream; TabBERT masks CELLS in a 2-D (row × column) tape. The mask granularity and the 2-D structure (column positional encoding, row positional encoding) are the adaptations. Calling it "just BERT" misses both.</em><br/><br/>Pick the adaptation.</>}
         options={[
-          {key:"a", text:"Sequence length and aggregation strategy differ across tasks. Fraud needs the latest-N transactions in real-time. Dispute is per-transaction post-hoc. AML aggregates across an account over months. The shared encoder works at the per-transaction representation level, but the head and the pooling differ — fraud uses the final hidden state, AML uses a mean or attention pool over a longer window, dispute uses a per-token classifier. Plan the encoder for the longest needed sequence, then crop or pool for shorter tasks.", correct:true},
-          {key:"b", text:"All three tasks use identical fine-tune setups."},
-          {key:"c", text:"You need a separate encoder for each task."},
-          {key:"d", text:"AML is the same as fraud."},
+          {key:"a", text:"It's literally BERT."},
+          {key:"b", text:"Two adaptations make TabBERT a different model. (1) <strong>2-D input structure</strong>: BERT operates on a 1-D token stream; TabBERT operates on a (row × column) tape with row-positional-encoding AND column-positional-encoding. Cells share row-PE within their row, column-PE within their column — so the model knows 'this cell is amount, not merchant'. (2) <strong>Per-cell mask granularity</strong>: BERT masks individual tokens; TabBERT masks individual CELLS (a specific column-value in a specific row). The cell is a unit of meaning, not a sub-word piece. Predicting a masked AMOUNT cell from the rest of the row's cells + adjacent rows teaches a different joint distribution than BERT's next-token prediction. The backbone (flat self-attention) is similar; the input structure and mask granularity are NOT.", correct:true},
+          {key:"c", text:"TabBERT has more parameters than BERT."},
+          {key:"d", text:"TabBERT uses different optimization."},
         ]}
-        trap={<>(b) is naive. (c) defeats the point of pretraining. (d) misreads the task.</>}
-        lens={<>(a) is the senior multi-task design.</>}
-        stretch={<>What is the cheapest way to add a new task on top of the shared encoder?</>}
+        trap={<>(a) collapses; (c)(d) are incidental.</>}
+        lens={<>Input structure (1-D vs 2-D) + mask granularity (token vs cell) are the load-bearing adaptations.</>}
+        stretch={<>Could you just flatten the table to 1-D and use BERT raw? Hint: yes but you lose column-PE; the 'amount' cell becomes indistinguishable from 'merchant' cell.</>}
       />
 
+      {/* P14 — eval contamination */}
       <VIS.TrapProblem
-        id="tbb-p8"
+        id="tabbert-p14"
         difficulty="hard"
-        title="P8 — TabBERT vs supervised — when does supervised actually win?"
-        scenario={<>Your team runs a head-to-head on the same encoder size, same data. Supervised wins on AUC by half a point. What happened?</>}
+        title="P14 — Offline TabBERT beats supervised by 6pt. Production: 2pt. What hides the gap?"
+        scenario={<><em>Discriminating insight: random-row split leaks future-from-same-user; TabBERT (more capacity, MLM-pretrained representation) exploits the leak more than the supervised baseline. User-stratified TEMPORAL split closes the gap to honest 2pt.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"When labeled data is abundant (millions of fraud labels), supervised end-to-end can match or beat masked-LM pretraining because the supervised signal is more aligned with the target task. Pretraining shines when labels are scarce. If your data has millions of confirmed-fraud labels, the marginal value of unlabeled pretraining drops sharply. Check label volume and decide.", correct:true},
-          {key:"b", text:"TabBERT must have been buggy."},
-          {key:"c", text:"Supervised always wins."},
-          {key:"d", text:"Pretraining hurts the model."},
+          {key:"a", text:"Production is buggy."},
+          {key:"b", text:"Eval-time leakage. A random-row train/eval split puts some of User X's tx in train and some in eval. The MLM-pretrained TabBERT representation has SEEN User X's general pattern during pretraining (recall MLM was on the unlabeled tape including pretrain examples that may be near-duplicates of test); the supervised baseline only sees what's in the train fold. The capacity-heavy TabBERT exploits the leak more. Switch to USER-STRATIFIED TEMPORAL split: no user appears in both train and eval; eval is strictly after train cutoff; chargeback labels for eval are joined as of the eval cutoff (so no future-fraud-info leaks). Honest lift drops to ~2pt — matching production. The honest lift is real; the inflated number was confounded by leakage.", correct:true},
+          {key:"c", text:"TabBERT is over-claimed."},
+          {key:"d", text:"Production has bad data."},
         ]}
-        trap={<>(b) attributes to bugs without evidence. (c) and (d) are over-general.</>}
-        lens={<>(a) is the honest answer. Pretraining-vs-supervised depends on label volume.</>}
-        stretch={<>At what label count does the curve cross?</>}
+        trap={<>(a)(c)(d) deflect to easier explanations.</>}
+        lens={<>User-stratified temporal split is mandatory when the model has memorized per-user patterns during pretrain.</>}
+        stretch={<>Does TabBERT need a user-stratified PRETRAIN split too, or only fine-tune? Hint: pretraining is unsupervised so cross-user leakage during pretrain doesn't directly leak labels.</>}
       />
 
+      {/* P15 — vs FT-Transformer */}
       <VIS.TrapProblem
-        id="tbb-p9"
+        id="tabbert-p15"
         difficulty="hard"
-        title="P9 — Adversary knows you are running TabBERT. How exploit?"
-        scenario={<>Fraudsters know your model is a BERT pretrained on normal transactions. How would they exploit that knowledge?</>}
+        title="P15 — FT-Transformer (Gorishniy 2021) tokenizes every cell, runs flat attention — sounds the same as TabBERT. Where do they differ?"
+        scenario={<><em>Discriminating insight: same backbone-style but FT-Transformer is SUPERVISED by default. TabBERT adds the MLM objective. FT-Transformer is also typically single-row (one row at a time); TabBERT is multi-row tape.</em><br/><br/>Compare.</>}
         options={[
-          {key:"a", text:"They engineer fraud that looks distributionally identical to normal transactions — small amounts, common merchants, plausible velocity — because masked-LM models a normal distribution and high-likelihood transactions get low risk. The fix is to ensemble with a discriminative model (GBDT or a supervised transformer) that is trained specifically to separate fraud from non-fraud rather than to model the normal distribution.", correct:true},
-          {key:"b", text:"They cannot exploit a pretrained model."},
-          {key:"c", text:"They flood the system with random data."},
-          {key:"d", text:"They reverse engineer the masking ratio."},
+          {key:"a", text:"They are the same."},
+          {key:"b", text:"Two differences. (1) <strong>Objective</strong>: FT-Transformer is supervised by default (requires labels for every example); TabBERT adds MLM pretraining on unlabeled tx as the load-bearing contribution. You can MLM-pretrain an FT-Transformer backbone — that gives you TabBERT-on-FT-Transformer. (2) <strong>Tape vs single row</strong>: FT-Transformer typically operates on a single row (one tx → one decision) with flat attention over its tokenized cells; TabBERT operates on a multi-row tape (a user's sequence of tx) with both within-row attention AND across-row attention. So FT-Transformer is closer to a per-row classifier; TabBERT is closer to a per-user sequence classifier. The architectural overlap is the cell-tokenization; the objective and tape structure differ.", correct:true},
+          {key:"c", text:"FT-Transformer is supervised; TabBERT is supervised too."},
+          {key:"d", text:"FT-Transformer is older than TabBERT."},
         ]}
-        trap={<>(b) is wishful. (c) is detected easily. (d) is irrelevant to the attack.</>}
-        lens={<>(a) is the adversarial-ML lens. Likelihood-based scoring rewards in-distribution fraud; ensembling fixes it.</>}
-        stretch={<>What discriminative partner makes the best ensemble?</>}
+        trap={<>(a) collapses; (c) misses the MLM contribution; (d) is incidental.</>}
+        lens={<>Objective + scope (single row vs tape) are the two differences. Same tokenization-of-cells idea otherwise.</>}
+        stretch={<>What's the right baseline ablation to attribute TabBERT's lift — vs FT-Transformer + MLM, or vs FT-Transformer alone?</>}
       />
 
+      {/* P16 — what NOT to mask */}
       <VIS.TrapProblem
-        id="tbb-p10"
+        id="tabbert-p16"
         difficulty="hard"
-        title="P10 — Catastrophic forgetting on fine-tune"
-        scenario={<>You fine-tune the full encoder for too long on the fraud set. Recall on a held-out validation set drops over epochs. What is happening?</>}
+        title="P16 — Engineer proposes masking the TIMESTAMP cell. Diagnose."
+        scenario={<><em>Discriminating insight: timestamp is deterministic given position (cumulative delta-t) — masking it teaches the model to predict a deterministic value from context, which is uninformative. Mask cells that have genuine uncertainty given context (amount, merchant_id), not deterministic ones.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"The encoder is being pulled toward the imbalanced fraud distribution and forgetting the rich representations from pretraining. Mitigations: freeze the early layers, use a much lower learning rate on the encoder than on the head, apply early stopping based on validation recall-at-precision, mix a small fraction of self-supervised loss back into fine-tuning to anchor the encoder, or use parameter-efficient methods (LoRA, adapters) so most of the encoder stays frozen.", correct:true},
-          {key:"b", text:"The model is overfitting to noise."},
-          {key:"c", text:"The validation set is broken."},
-          {key:"d", text:"Pretraining was wasted."},
+          {key:"a", text:"Good idea — mask timestamp."},
+          {key:"b", text:"Bad mask choice. Timestamp is approximately deterministic given the row's position in the sequence (or given an explicit row-PE that encodes time) — the model would learn 'timestamp = previous timestamp + delta-t' which is trivially recoverable from context. The MLM objective produces no useful representation signal from predicting deterministic cells. Mask cells with genuine uncertainty given context: AMOUNT (given merchant + MCC + time-of-day, what's the typical amount?), MERCHANT (given amount + MCC + country, which merchant?), MCC (given amount + merchant, which MCC?). These are the joint distributions worth learning. Production rule: mask only fields where the conditional distribution P(field | context) has high entropy.", correct:true},
+          {key:"c", text:"Mask only timestamps."},
+          {key:"d", text:"Mask everything equally."},
         ]}
-        trap={<>(b) is partial; (c) is unsupported; (d) is dismissive.</>}
-        lens={<>(a) names catastrophic forgetting and the standard remedies.</>}
-        stretch={<>Would you choose freezing or LoRA in production?</>}
+        trap={<>(a)(c)(d) ignore the entropy-of-target criterion.</>}
+        lens={<>Mask high-entropy targets; skip deterministic ones.</>}
+        stretch={<>Which fields have HIGHEST conditional entropy in card transactions? Hint: amount, given merchant + MCC.</>}
       />
 
+      {/* P17 — when MLM is wasted */}
       <VIS.TrapProblem
-        id="tbb-p11"
-        difficulty="hard"
-        title="P11 — End-to-end design: deploy TabBERT for a top-10 issuer"
-        scenario={<>You lead the fraud ML team. Pretrain TabBERT, fine-tune for fraud authorization. Which production pattern is right?</>}
+        id="tabbert-p17"
+        difficulty="medium"
+        title="P17 — Issuer has 1M unlabeled tx + 50k labels. Is MLM pretrain worth it?"
+        scenario={<><em>Discriminating insight: with 1M unlabeled tx, MLM pretrain doesn't have enough data to learn rich representations. The 20:1 unlabeled-to-labeled ratio is too small — MLM data efficiency wins at 1000:1+ ratios. Use supervised with regularization.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"Pretrain a moderate encoder (6-12 layers, 256 hidden) on one to two billion unlabeled transactions with quantile-bucketed amount and unmasked time. Fine-tune for fraud with frozen lower layers, low LR on the encoder, focal loss on the head. Ensemble with the existing GBDT champion for low-threshold borderline cases. Reuse the encoder for dispute and AML fine-tunes — amortize the pretrain cost. Daily champion-challenger eval with auto-rollback. Quantize for sub-50ms inference.", correct:true},
-          {key:"b", text:"Pretrain a giant model on unlabeled tx and ship it without ensembling."},
-          {key:"c", text:"Skip pretraining; train supervised-only."},
-          {key:"d", text:"Pretrain and never fine-tune."},
+          {key:"a", text:"Yes — always pretrain."},
+          {key:"b", text:"Marginal at best. MLM's lever is using HUGE unlabeled tx to learn a representation. With only 1M unlabeled and 50k labels (20:1 ratio), the unlabeled pool isn't big enough for MLM to learn priors the labels couldn't directly. The compute cost of pretraining 1M tx is poorly amortized — same compute spent on supervised training with augmentation likely matches. Production rule of thumb: MLM-pretrain when unlabeled:labeled ratio is &gt;1000:1 (e.g., 5B unlabeled / 50k labels). At 20:1, default to supervised with feature engineering + regularization.", correct:true},
+          {key:"c", text:"No — never pretrain."},
+          {key:"d", text:"Always pretrain."},
         ]}
-        trap={<>(b) skips the discriminative partner and the staged rollout. (c) leaves recall on the table. (d) skips the supervised head.</>}
-        lens={<>(a) is the senior production design. Pretrain once, fine-tune many, ensemble with the discriminative baseline.</>}
-        stretch={<>What single metric tells you the pretraining is paying off?</>}
+        trap={<>(a)(d) are dogmatic; (c) overclaims.</>}
+        lens={<>MLM pays off at high unlabeled:labeled ratios. Small unlabeled pool → supervised wins.</>}
+        stretch={<>What's the inflection ratio? Hint: ~100:1 for marginal lift, ~1000:1 for clear lift.</>}
+      />
+
+      {/* P18 — fine-tune lr */}
+      <VIS.TrapProblem
+        id="tabbert-p18"
+        difficulty="medium"
+        title="P18 — Fine-tune learning rate: pretrained backbone needs what relative to a random-init transformer of equal size?"
+        scenario={<><em>Discriminating insight: pretrained backbones are sensitive — too-high lr destroys the pretrained representation (catastrophic forgetting). Standard rule: pretrained backbone lr ~10x smaller than random-init lr; or use LoRA / adapter layers and freeze the backbone.</em><br/><br/>Pick the lr policy.</>}
+        options={[
+          {key:"a", text:"Same lr as random-init."},
+          {key:"b", text:"Pretrained backbone needs ~10x SMALLER learning rate than a random-init transformer of equal size, or use LoRA / adapter layers with the backbone frozen. The pretrained backbone has accumulated representation knowledge during MLM; large updates during fine-tune overwrite it (catastrophic forgetting). Standard recipes: (i) lr 1e-5 to 5e-5 on backbone; lr 1e-4 to 1e-3 on the classifier head; (ii) layer-wise lr decay (top layers higher lr, lower layers tiny lr); (iii) LoRA / adapter — freeze backbone entirely, learn small low-rank updates. Choice depends on fine-tune label count: tiny labels → freeze + LoRA; medium → low lr; large → discriminative lr per layer.", correct:true},
+          {key:"c", text:"10x larger lr."},
+          {key:"d", text:"lr doesn't matter."},
+        ]}
+        trap={<>(a)(c)(d) ignore catastrophic forgetting.</>}
+        lens={<>Pretrained backbone fine-tune lr ~10x smaller than random-init equivalent. Or freeze entirely.</>}
+        stretch={<>When does LoRA beat low-lr full fine-tune? Hint: small label sets.</>}
+      />
+
+      {/* P19 — fine-tune can't fix tokenization */}
+      <VIS.TrapProblem
+        id="tabbert-p19"
+        difficulty="hard"
+        title="P19 — Fine-tune AUPRC plateaus 3pt below state-of-the-art. The amount tokenizer is round-to-dollar. What can't fine-tune recover?"
+        scenario={<><em>Discriminating insight: fine-tune adapts the head and (lightly) the backbone, but it cannot recreate information destroyed by tokenization. If sub-dollar fraud signal was tokenized away, no fine-tune lr / head architecture / data quantity recovers it. Fix the tokenizer and re-pretrain.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Train fine-tune longer."},
+          {key:"b", text:"Fine-tune cannot recover information that was destroyed in tokenization before pretraining. The round-to-dollar tokenizer collapsed $0.99, $1.00, $1.50 into one bucket; the MLM-pretrained backbone has no embedding distinguishing them; the fine-tune head sees only the collapsed representation. No fine-tune objective, learning rate, or architecture choice can recover the sub-dollar resolution because the input has been quantized below the relevant grain. Fix the tokenizer (e.g., log-bucket with fine resolution below $10) AND re-pretrain (MLM must learn the new embeddings). Fine-tune compute is the wrong knob; tokenizer + re-pretrain is the right knob.", correct:true},
+          {key:"c", text:"Use a bigger head."},
+          {key:"d", text:"The 3pt gap is fundamental — accept it."},
+        ]}
+        trap={<>(a)(c) tune the wrong knob; (d) gives up.</>}
+        lens={<>Tokenization is upstream of everything. Information destroyed there is unrecoverable downstream.</>}
+        stretch={<>Could a learned numerical embedding patched onto the pretrained backbone fix this without full re-pretrain? Hint: partially — but it sits outside the MLM that shaped the rest of the backbone.</>}
+      />
+
+      {/* P20 — wrong-assumption cascade */}
+      <VIS.TrapProblem
+        id="tabbert-p20"
+        difficulty="hard"
+        title="P20 — Engineer says 'TabBERT is a supervised transformer with extra steps.' Which downstream beliefs follow that are wrong?"
+        scenario={<><em>Discriminating insight: under that assumption the engineer skips MLM pretrain, uses labels-only, ignores the tokenizer-as-load-bearing-piece, and may flatten the 2-D tape to 1-D. Each break is specific.</em><br/><br/>Cascade.</>}
+        options={[
+          {key:"a", text:"Nothing follows."},
+          {key:"b", text:"At least four things break. (1) 'Skip MLM, train supervised only' → leaves the 5B unlabeled tx unused; the supervised model with 50k labels underperforms. (2) 'Tokenizer is just preprocessing, don't think about it' → continuous-amount tokenization choice is silently default (often round-to-dollar) → sub-dollar fraud signal destroyed. (3) 'Flatten the 2-D tape to a 1-D stream' → loses column-PE so 'amount' becomes indistinguishable from 'merchant' → MLM cross-entropy targets the wrong field-aware distribution. (4) 'Per-cell vs per-row mask is the same' → if you happen to pick per-row, within-row joint signal is lost (P2). All four cascade from the wrong reduction.", correct:true},
+          {key:"c", text:"Only MLM breaks."},
+          {key:"d", text:"Only tokenization breaks."},
+        ]}
+        trap={<>(a)(c)(d) understate.</>}
+        lens={<>TabBERT = (MLM objective) + (2-D tape structure) + (per-cell mask) + (continuous-amount tokenization). Reducing collapses all four.</>}
+        stretch={<>Which break shows up first in production?</>}
+      />
+
+      {/* P21 — rollout staging */}
+      <VIS.TrapProblem
+        id="tabbert-p21"
+        difficulty="medium"
+        title="P21 — Order the TabBERT rollout stages from supervised baseline → full TabBERT, highest-leverage first."
+        scenario={<><em>Discriminating insight: stage 1 = supervised XGBoost baseline; stage 2 = supervised transformer (closes "transformer vs GBDT" gap); stage 3 = MLM-pretrain with a sensible amount tokenizer; stage 4 = tune amount tokenizer; stage 5 = scale unlabeled-tx volume. Each A/B-tested.</em><br/><br/>Pick the rollout.</>}
+        options={[
+          {key:"a", text:"Ship full TabBERT day 1."},
+          {key:"b", text:"Five stages, each A/B tested. <strong>Stage 1</strong>: supervised XGBoost baseline (mandatory — establishes 'is the data even right?'). <strong>Stage 2</strong>: supervised transformer with the SAME tokenization (closes the 'transformer vs GBDT' question independent of MLM). <strong>Stage 3</strong>: add MLM pretrain on unlabeled tx with a sensible amount tokenizer (log-bucket + sub-dollar resolution). <strong>Stage 4</strong>: tune the amount tokenizer — log-bucket vs quantile vs learned numerical (the biggest variance lever, see P3). <strong>Stage 5</strong>: scale unlabeled-tx volume to see where MLM data efficiency plateaus. Skipping stage 1-2 forfeits the ability to attribute lift to MLM; skipping stage 4 leaves the largest knob untuned.", correct:true},
+          {key:"c", text:"Skip the supervised baseline."},
+          {key:"d", text:"Tune the tokenizer first, before MLM exists."},
+        ]}
+        trap={<>(a)(c) lose attribution; (d) is premature without MLM downstream.</>}
+        lens={<>Staged rollout. Establish supervised baseline → swap to transformer → add MLM → tune tokenizer → scale data.</>}
+        stretch={<>At which stage do you decide TabBERT isn't worth shipping?</>}
+      />
+
+      {/* P22 — operator-friendly */}
+      <VIS.TrapProblem
+        id="tabbert-p22"
+        difficulty="medium"
+        title="P22 — Anomaly-score from MLM is high on a normal tx. Which check first?"
+        scenario={<><em>Discriminating insight: MLM anomaly is "common-vs-rare," not fraud. A first international trip is high-anomaly under MLM but benign. The check: is the user's history short? Is this a known life-event class? Is the supervised head also high-risk? Don't act on MLM anomaly alone.</em><br/><br/>Operator triage.</>}
+        options={[
+          {key:"a", text:"Block — anomaly is high."},
+          {key:"b", text:"Three checks before any action. (1) Is the user's history short (cold-user) — the MLM-derived representation is uncertain by construction for short-history users. (2) Is the tx pattern a known life-event signature (first international trip, first car purchase, address-change-then-furniture) — these are atypical-benign and MLM cannot distinguish them from fraud. (3) Is the SUPERVISED HEAD also high-risk — the supervised head has seen fraud labels and learned the benign-vs-fraud boundary; MLM alone is anomaly, supervised alone is calibrated-fraud-risk, and the conjunction is the actual signal. Block only on supervised + MLM agreement, or escalate to manual review.", correct:true},
+          {key:"c", text:"Approve — MLM is unreliable."},
+          {key:"d", text:"Always trust MLM."},
+        ]}
+        trap={<>(a)(d) over-trust MLM; (c) under-trusts.</>}
+        lens={<>MLM = common-vs-rare. Supervised = benign-vs-fraud. Block on agreement.</>}
+        stretch={<>What's the cheapest "life event" signature to encode? Hint: travel + new merchant category.</>}
+      />
+
+      {/* P23 — reproducibility */}
+      <VIS.TrapProblem
+        id="tabbert-p23"
+        difficulty="medium"
+        title="P23 — A reproduction on Kaggle Credit Card Fraud reports TabBERT matches a supervised baseline. Why is the result suspect?"
+        scenario={<><em>Discriminating insight: Kaggle CCF has only ~285k tx and ~500 fraud labels — far too small for TabBERT's data efficiency to matter. The dataset doesn't probe the lever (unlabeled-rich, label-scarce). The reproduction is testing TabBERT in the wrong regime.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"The reproduction is wrong."},
+          {key:"b", text:"Wrong regime, not wrong reproduction. Kaggle CCF (~285k tx, ~500 frauds) is in the 'small unlabeled' regime where MLM's data efficiency lever doesn't fire — supervised baselines have nearly the same effective data. TabBERT was DESIGNED for the 'billions unlabeled, thousands labeled' regime where supervised cannot use the unlabeled at all. Reproducing on Kaggle CCF tests whether MLM helps with 285k unlabeled tx — and predictably it doesn't help much. A faithful reproduction needs a corpus with 100M+ unlabeled tx and ~0.1% label density. Public corpora of that size and structure don't exist; the IBM / Capital One production reports use proprietary data. So Kaggle reproductions are systematically negative on TabBERT, not because TabBERT doesn't work, but because the dataset is in the wrong regime.", correct:true},
+          {key:"c", text:"Kaggle data is always wrong."},
+          {key:"d", text:"TabBERT doesn't work."},
+        ]}
+        trap={<>(a)(c)(d) deflect or over-claim.</>}
+        lens={<>Reproducibility requires the right regime. Kaggle CCF is too small to test TabBERT's lever.</>}
+        stretch={<>What's the smallest public corpus where TabBERT could plausibly show lift? Hint: none that exist today — proprietary issuer data is required.</>}
+      />
+
+      {/* P24 — sanity checks */}
+      <VIS.TrapProblem
+        id="tabbert-p24"
+        difficulty="medium"
+        multiSelect
+        title="P24 — Sanity checks for TabBERT pretrain quality, BEFORE running expensive fine-tune. Pick all that apply."
+        scenario={<><em>Discriminating insight: cheap checks: (a) MLM val cross-entropy vs random baseline, (b) bucket embedding norms (zero for rare buckets = broken), (c) probing — train a small linear head on frozen representation to predict known auxiliary labels (merchant category), (d) reconstruction sanity (mask 1 cell at inference; check predicted vs ground truth distribution).</em><br/><br/>Which checks?</>}
+        options={[
+          {key:"a", text:"MLM val cross-entropy significantly below random-token entropy.", correct:true},
+          {key:"b", text:"Fine-tune AUPRC."},
+          {key:"c", text:"Embedding-norm distribution across bucket indices — flag near-zero rows for rare buckets.", correct:true},
+          {key:"d", text:"Linear probe: train a small linear head on frozen representation to predict known auxiliary labels (merchant category, MCC). Probe accuracy should be high.", correct:true},
+          {key:"e", text:"Random initialization comparison — fine-tune with random vs pretrained init; pretrained should be meaningfully better.", correct:true},
+          {key:"f", text:"Pretraining wall-clock time."},
+          {key:"g", text:"MLM reconstruction sanity: mask one cell at inference; predicted distribution over the vocab should concentrate around plausible values, not uniform.", correct:true},
+        ]}
+        trap={<>(b) is the expensive test you're trying to short-circuit; (f) is incidental.</>}
+        lens={<>Cheap pre-fine-tune checks: val CE, embedding norms, linear probe, random-vs-pretrained init, reconstruction.</>}
+        stretch={<>Cheapest to run?</>}
+      />
+
+      {/* P25 — context length */}
+      <VIS.TrapProblem
+        id="tabbert-p25"
+        difficulty="hard"
+        title="P25 — Sequence length: TabBERT defaults to 100 rows per user. What changes at 1000?"
+        scenario={<><em>Discriminating insight: flat self-attention is O(N²) over all cells. With 100 rows × 10 cols = 1000 cells, attention is on 1M ops. At 1000 rows × 10 cols = 10000 cells, attention is 100M ops — 100x slower. Need windowed / sparse attention, OR restrict mask to be within a local window.</em><br/><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Just use length 1000."},
+          {key:"b", text:"Compute scales quadratically with TOTAL CELLS (not just rows): attention is O((rows × cols)²). At 100 rows × 10 cols = 1000 cells: ~1M attention ops. At 1000 rows × 10 cols = 10000 cells: ~100M ops — 100x slower. Fixes: (i) windowed attention — each cell attends only to a local window of rows (e.g., the last 50 rows); (ii) sparse attention patterns (e.g., longformer-style global + local); (iii) restrict the MLM mask to be within a local window (predict the masked cell from nearby rows only, not all 1000). Production rule: scale unlabeled tx volume by expanding pretrain DATA, not by expanding context length per example.", correct:true},
+          {key:"c", text:"Use Mamba."},
+          {key:"d", text:"Length 1000 always wins."},
+        ]}
+        trap={<>(a) blows up compute; (c) changes architecture entirely (different visual); (d) is dogmatic.</>}
+        lens={<>Length scales quadratically in cells, not rows. Long sequences need windowed/sparse attention.</>}
+        stretch={<>Does Mamba help here? Hint: yes — see the sibling visual.</>}
+      />
+
+      {/* P26 — interpretability */}
+      <VIS.TrapProblem
+        id="tabbert-p26"
+        difficulty="hard"
+        title="P26 — A regulator asks 'why did your TabBERT model decline this tx?' Diagnose."
+        scenario={<><em>Discriminating insight: MLM-pretrained representations are notoriously hard to interpret cell-by-cell. The honest answer: TabBERT is not directly interpretable; explanations come from the supervised HEAD via SHAP-on-attention or counterfactual probing. Don't claim interpretability you don't have.</em><br/><br/>Operator answer.</>}
+        options={[
+          {key:"a", text:"Just show the attention weights."},
+          {key:"b", text:"TabBERT is not directly interpretable cell-by-cell. The MLM-pretrained backbone produces a high-dimensional representation that doesn't have clean 'this cell drove the decision' attribution. Practical compromises: (i) SHAP / integrated gradients on the supervised HEAD (gradient attribution back to input cells — gives 'which cell most influenced this decision'); (ii) counterfactual probing — re-score the tx with one cell changed (amount, merchant) and quantify the score change; (iii) attention-weight visualization is misleading because TabBERT has many layers and the attention mass is distributed. For regulatory explanations, supplement TabBERT with a co-deployed interpretable model (logistic regression on hand-engineered features); use TabBERT for the score, the interpretable model for the reason. Don't claim attention-weight = explanation.", correct:true},
+          {key:"c", text:"TabBERT is fully interpretable — show the embeddings."},
+          {key:"d", text:"Decline reasons don't matter."},
+        ]}
+        trap={<>(a) is the cargo-cult answer; (c) overclaims; (d) is wrong (Reg B requires reasons).</>}
+        lens={<>Interpretability for deep tabular models = SHAP/IG + counterfactual + co-deployed simple model. Attention weights ≠ explanation.</>}
+        stretch={<>What's the right co-deployed simple model for fraud declines? Hint: WoE-logistic or a small tree.</>}
       />
     </VIS.Section>
 
@@ -1702,38 +1995,45 @@ flowchart TB
       <ul>
         <li>
           <a href="https://arxiv.org/abs/2011.01843" target="_blank" rel="noopener">
-            <strong>Padhi et al. — Tabular Transformers for Modeling Multivariate Time Series</strong>
+            <strong>Padhi et al. — Tabular Transformers for Modeling Multivariate Time Series (TabBERT)</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, ICASSP 2021)</span>
-          <br/>The reference paper. Sections on field tokenization and masked-LM are the keepers.
+          <br/>The reference paper. Section on per-cell masking and the 2-D positional encoding scheme is the keeper; appendix has the amount-tokenization ablation that drives P3 and P12.
         </li>
         <li>
           <a href="https://jalammar.github.io/illustrated-bert/" target="_blank" rel="noopener">
-            <strong>Jay Alammar — The Illustrated BERT</strong>
+            <strong>Jay Alammar — The Illustrated BERT, ELMo, and Co.</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The canonical visual intro to BERT. Required reading before TabBERT.
+          <br/>Best visual intro to MLM as an objective. Required reading before reasoning about per-cell mask granularity in P2.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>Devlin et al. — BERT: Pre-training of Deep Bidirectional Transformers</strong>
+          <a href="https://arxiv.org/abs/2106.11959" target="_blank" rel="noopener">
+            <strong>Gorishniy et al. — Revisiting Deep Learning Models for Tabular Data (FT-Transformer)</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NAACL 2019)</span>
-          <br/>The original. Sections on masked-LM are directly relevant to TabBERT.
+          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2021)</span>
+          <br/>The supervised single-row counterpart. P15 turns on understanding where FT-Transformer ends and TabBERT begins.
         </li>
         <li>
-          <a href="https://ruder.io/transfer-learning/" target="_blank" rel="noopener">
-            <strong>Sebastian Ruder — Transfer Learning</strong>
+          <a href="https://huggingface.co/docs/transformers/main/en/tasks/masked_language_modeling" target="_blank" rel="noopener">
+            <strong>Hugging Face — Masked Language Modeling tutorial</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Best practitioner guide to fine-tuning, freezing, and learning-rate schedules — directly applies to TabBERT fine-tuning.
+          <span style={{color:"#64748b", fontSize:14}}>(docs)</span>
+          <br/>Practitioner walkthrough of MLM training. Useful for sanity checks like mask ratio (P6) and val cross-entropy (P10).
         </li>
         <li>
           <a href="https://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">
             <strong>Andrej Karpathy — A Recipe for Training Neural Networks</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Field guide for the catastrophic-forgetting and fine-tune-instability failure modes.
+          <br/>Field guide for the silent representation bugs that bite TabBERT — tokenizer drift (P9), embedding-norm anomalies (P10), and MLM-vs-fine-tune confusions.
+        </li>
+        <li>
+          <a href="https://lilianweng.github.io/posts/2019-01-31-lm/" target="_blank" rel="noopener">
+            <strong>Lilian Weng — Generalized Language Models</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
+          <br/>Deep dive on MLM vs autoregressive pretraining. Useful for thinking about whether TabBERT's MLM is the right pretraining recipe for tabular sequences (the answer isn't obvious).
         </li>
       </ul>
     </VIS.Section>
