@@ -1414,313 +1414,638 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// DGI / BGRL adapted to fraud — Fraud SOTA · Self-supervised / contrastive fraud
-// Negative-free self-supervised pretraining for transaction graphs.
+// DGI / BGRL adapted to fraud (Velickovic ICLR 2019 + Thakoor ICLR 2022)
+// v2 redo — 32 axis-cited trap problems across A-F.
+// Every problem hinges on negative-free SSL (DGI's local-vs-global MI or BGRL's
+// EMA-bootstrap) being the right tool *because unlabeled ≠ benign in fraud*.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · Self-supervised / contrastive fraud"
+      pill="Fraud SOTA · self-supervised / contrastive fraud"
       title="DGI / BGRL adapted to fraud"
-      subtitle="Maximize mutual information between node and graph summary (DGI) or bootstrap two encoders (BGRL) — pretrain fraud encoders without ever sampling negatives."
+      subtitle="Negative-free graph SSL — sidesteps the 'unlabeled ≠ benign' problem that breaks InfoNCE-based fraud pretraining. DGI maximizes local-vs-global mutual information; BGRL bootstraps an EMA target with no negatives at all."
       byline={[
-        {label: "Papers", value: "DGI (ICLR 2019) + BGRL (ICLR 2022)"},
-        {label: "Practitioner adoption", value: "Stripe / PayPal blog posts 2024"},
-        {label: "L3", value: "Negative-free SSL pretraining"},
+        {label: "Papers", value: "DGI: Velickovic 2019 · BGRL: Thakoor 2022"},
+        {label: "Adopted", value: "Stripe / PayPal blog posts 2024"},
+        {label: "Domain", value: "Negative-free graph SSL for fraud"},
       ]}/>
 
     <VIS.TLDR>
-      On a transaction graph, every &quot;benign-looking&quot; account is potentially unlabeled fraud. Standard contrastive losses (InfoNCE) need a negative pool, and your negatives are dirty. Two negative-free objectives sidestep this:{" "}
-      <VIS.Term def="Deep Graph Infomax (Velickovic 2019): maximize mutual information between a node embedding and a global graph summary vector; use a discriminator + a corrupted graph as the noise distribution.">DGI</VIS.Term>{" "}
-      pulls node embeddings toward a global graph summary;{" "}
-      <VIS.Term def="Bootstrapped Graph Latents (Thakoor 2022): two encoders (online + EMA target), each sees a different augmented view; predict the target&apos;s representation from the online&apos;s. No negatives, no contrastive loss.">BGRL</VIS.Term>{" "}
-      uses a BYOL-style online/target encoder pair. No negatives → no false-negative bias. You still need labeled data to train a head on top.
+      InfoNCE-based SSL (GraphCL, CL-Fraud) requires negative samples — but in fraud, every "unlabeled" node is potentially fraud, so you'd be pushing fraud away from fraud. <VIS.Term def="Deep Graph Infomax (Velickovic et al., ICLR 2019): maximize mutual information between a node's local representation and the global graph summary using a discriminator over the original vs corrupted graph.">DGI</VIS.Term> uses a single corrupted-graph BCE discriminator instead of a negative pool. <VIS.Term def="Bootstrapped Graph Latents (Thakoor et al., ICLR 2022): online encoder predicts an EMA-target encoder's view of the same node; no negatives, no contrastive loss, no risk of pushing apart same-class samples.">BGRL</VIS.Term> uses no negatives at all — an online encoder predicts an EMA-target encoder's view of the same node. Both pay a cost (DGI: degenerate global readout on huge graphs; BGRL: EMA-decay sensitivity and collapse risk).
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        DGI&apos;s objective: encode each node, encode a corrupted version of the graph, summarize the real graph into a single vector, then train a discriminator to tell real-node-from-real-summary apart from corrupted-node-from-real-summary. The discriminator&apos;s gradient flows back through the encoder.
-      </p>
-      <p>
-        BGRL&apos;s objective: build two augmented views of the graph, feed them through an online encoder and an EMA-updated target encoder respectively; predict the target&apos;s output from the online&apos;s with a cosine loss. The EMA prevents collapse the way BYOL does in vision.
+        Two negative-free SSL paradigms adapted to fraud. DGI contrasts a node's local embedding against the GLOBAL graph summary using a single corrupted-graph sample as the "negative." BGRL has NO explicit negative — two augmented views feed an online encoder and an EMA-target encoder; the online side predicts the target side's projection via a cosine loss.
       </p>
       <VIS.Mermaid chart={`
-flowchart LR
-  G["Tx graph"] --> V1["View 1"]
-  G --> V2["View 2"]
-  V1 --> Eo["Online encoder"]
-  V2 --> Et["Target encoder (EMA)"]
-  Eo --> Po["Predictor head"]
-  Po --> L["Cosine loss"]
-  Et --> L
-  L --> Eo
-  Eo -. EMA copy .-> Et
-  style Et fill:#fef3c7,stroke:#d97706,stroke-width:2px
-  style L fill:#dcfce7,stroke:#16a34a,stroke-width:2px
-      `} />
-      <p>BGRL flow. Yellow: target encoder is a slow EMA copy of online — no gradient flows through it.</p>
+flowchart TB
+  G["Tx graph"] --> A["DGI path"]
+  G --> B["BGRL path"]
+  A --> A1["Anchor node h_v"]
+  A --> A2["Global summary s = mean(H)"]
+  A --> A3["Corrupted graph h'_v"]
+  A1 --> D1["Discriminator(h_v, s) high"]
+  A3 --> D2["Discriminator(h'_v, s) low"]
+  B --> B1["View 1 → online encoder + predictor q"]
+  B --> B2["View 2 → target encoder (EMA, stop-grad)"]
+  B1 --> L["cosine(q(z_1), z_2)"]
+  B2 --> L
+  style L fill:#dcfce7,stroke:#16a34a
+  style D1 fill:#fef3c7,stroke:#d97706
+      `}/>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How DGI/BGRL differ from contrastive baselines">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="Beat 2 — How they differ from InfoNCE-based SSL">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>InfoNCE / GraphCL</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>DGI / BGRL</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Method</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Negatives</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Loss</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Collapse defense</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Negatives</td>
-            <td style={{padding:"8px 10px"}}>Required (in-batch or memory bank)</td>
-            <td style={{padding:"8px 10px"}}>None — DGI uses corrupted graph; BGRL uses EMA target</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>False-negative bias</td>
-            <td style={{padding:"8px 10px"}}>High when unlabeled ≠ benign</td>
-            <td style={{padding:"8px 10px"}}>Sidestepped by construction</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Collapse risk</td>
-            <td style={{padding:"8px 10px"}}>Low (negatives spread embeddings)</td>
-            <td style={{padding:"8px 10px"}}>Higher — must use EMA target / careful predictor</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Compute</td>
-            <td style={{padding:"8px 10px"}}>Hard-negative mining can be expensive</td>
-            <td style={{padding:"8px 10px"}}>No mining — usually cheaper</td>
-          </tr>
+          <tr><td style={{padding:"8px 10px"}}>GraphCL / CL-Fraud</td><td style={{padding:"8px 10px"}}>Batch pool (~256-2048)</td><td style={{padding:"8px 10px"}}>InfoNCE</td><td style={{padding:"8px 10px"}}>Negatives repel</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:"8px 10px"}}>DGI</td><td style={{padding:"8px 10px"}}>1 corrupted sample</td><td style={{padding:"8px 10px"}}>BCE discriminator</td><td style={{padding:"8px 10px"}}>Discriminator non-degeneracy</td></tr>
+          <tr><td style={{padding:"8px 10px"}}>BGRL</td><td style={{padding:"8px 10px"}}>None</td><td style={{padding:"8px 10px"}}>Cosine prediction</td><td style={{padding:"8px 10px"}}>EMA target + predictor + stop-grad</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Unlabeled-fraud-heavy graphs</strong> — when most negatives are unlabeled fraud, every contrastive negative is a coin flip; negative-free SSL is the cleaner default.</li>
-        <li><strong>Large graphs where hard-negative mining is expensive</strong> — DGI/BGRL skip the mining step entirely.</li>
-        <li><strong>You have downstream labels and a classifier head</strong> — these methods give you general-purpose embeddings, not predictions.</li>
-      </ul>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick them">
+      <p>
+        Pick DGI/BGRL when (a) unlabeled-≠-benign is a hard constraint, (b) graph structure carries signal beyond tabular features, (c) you want pretrained embeddings as features for a downstream classifier. Between the two: prefer BGRL when graph is large (global readout in DGI degenerates), prefer DGI when graph is small and you want a single-shot training signal.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  D["Need fraud SSL pretraining"] --> Q1{"Trustworthy benign pool?"}
+  Q1 -->|Yes| CLF["CL-Fraud (uses negatives)"]
+  Q1 -->|No| Q2{"Graph size > 1M nodes?"}
+  Q2 -->|No| DGI["DGI"]
+  Q2 -->|Yes| BGRL["BGRL"]
+  style DGI fill:#dcfce7,stroke:#16a34a
+  style BGRL fill:#dcfce7,stroke:#16a34a
+      `}/>
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations & gotchas">
-      <VIS.Callout kind="gotcha" title="Embeddings are general-purpose — you STILL need labels">
-        Pretraining gives you a nice geometry. It doesn&apos;t tell you which region is fraud. A linear probe on 1k labels often closes most of the supervised gap, but you cannot skip the labeled head.
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="BGRL representation collapse">
+        Without negatives, BGRL only avoids collapse via the EMA target + predictor + stop-gradient mechanism. Mis-tune the EMA decay (too high → target stops moving → collapse to constant), kill the predictor head, or skip stop-gradient and the encoder converges to a useless constant function.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="DGI&apos;s corruption = feature shuffle by default">
-        On heterogeneous fraud graphs, shuffling node features across node types creates nonsense corruptions; the discriminator&apos;s job becomes trivial and the encoder learns little. Use a type-aware shuffle.
+      <VIS.Callout kind="gotcha" title="DGI's global readout degenerates at scale">
+        DGI's global summary is typically mean(H) over all node embeddings. On graphs with 10M+ nodes, the mean is dominated by the majority class and carries no information specific to fraud rings — the discriminator has nothing to discriminate.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="BGRL collapse is silent">
-        If you forget the predictor or set EMA decay too high, both encoders converge to a constant and loss looks fine. Same diagnostics as P5 of CL-Fraud apply — watch effective rank.
+      <VIS.Callout kind="warn" title="GADBench reckoning">
+        On tabular-rich fraud, a tuned GBDT often beats DGI/BGRL embeddings + linear head. The negative-free SSL story is strong only when graph structure carries signal that tabular features genuinely miss.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on negative-free graph SSL, contrastive negative bias, and the pretrain-then-fine-tune playbook on fraud graphs.
+        Problems span the 6 taxonomy axes. Strip "DGI"/"BGRL" — each correct answer must hinge on negative-free contrastive learning (DGI's local-vs-global MI or BGRL's EMA-bootstrap).
       </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
       <VIS.TrapProblem
-        id="dgi-p1"
+        id="dgi-a1"
         difficulty="hard"
-        title="P1 — Why are InfoNCE negatives risky on a fraud graph?"
-        scenario={<>You apply standard InfoNCE pretraining to a 10M-node payments graph. Only 4,000 nodes are labeled (3,500 benign, 500 fraud). You sample negatives uniformly from the unlabeled pool. Linear-probe F1 on a held-out test set is 0.41 — worse than no pretraining at all. Primary mechanism?</>}
+        title="A1 — DGI vs BGRL: what actually differs"
+        scenario={<>Your lead asks "DGI and BGRL are both negative-free SSL — what's the real difference?" Pick the actual discriminator.</>}
         options={[
-          {key:"a", text:"Most uniformly sampled negatives are themselves unlabeled fraud; InfoNCE actively pushes fraud nodes apart in embedding space, the opposite of what you want.", correct:true},
-          {key:"b", text:"Class imbalance — 500 fraud labels is too few."},
-          {key:"c", text:"You needed a deeper encoder."},
-          {key:"d", text:"Linear probe is the wrong evaluation."},
+          {key:"a", text:"DGI has ONE negative per anchor — the corrupted-graph version of the same node — fed into a BCE discriminator against the global graph summary. BGRL has ZERO negatives — it uses an EMA target encoder and a cosine prediction loss, relying on architectural asymmetry (predictor head + stop-gradient) to prevent collapse. DGI = 1-negative MI maximization; BGRL = bootstrap with no negatives.", correct:true},
+          {key:"b", text:"They are the same algorithm."},
+          {key:"c", text:"BGRL uses InfoNCE; DGI does not."},
+          {key:"d", text:"DGI is supervised; BGRL is unsupervised."},
         ]}
-        trap={<>(b) confuses pretraining (label-free) with fine-tune. (c)(d) blame surface knobs. The structural issue is the negative pool, not the encoder or probe.</>}
-        lens={<>This is the false-negative trap that motivates DGI/BGRL adoption on fraud graphs. With 99.95% of the graph unlabeled and an unknown fraction of those being unlabeled fraud, sampled negatives are dirty by construction.</>}
-        stretch={<>If you had 10x more confirmed-benign labels, would InfoNCE become safer?</>}
+        trap={<>(b), (c), (d) all miss the 1-negative-vs-zero-negative distinction.</>}
+        lens={<>The methods sit on a spectrum: InfoNCE (many negatives) → DGI (1 negative) → BGRL (0 negatives). Each step trades sampling cost for collapse-defense complexity.</>}
+        stretch={<>Why does BGRL not collapse despite having no negatives?</>}
       />
 
       <VIS.TrapProblem
-        id="dgi-p2"
+        id="dgi-a2"
         difficulty="medium"
+        title="A2 — Definitional trap: 'is DGI's corrupted graph a negative?'"
+        scenario={<>A reviewer claims "DGI's corrupted graph is just one negative sample — DGI is degenerate InfoNCE with K=1." How does this miss the mechanism?</>}
+        options={[
+          {key:"a", text:"DGI uses BCE over (real, corrupted) pairs against the global summary — the loss form is binary cross-entropy on a discriminator, NOT InfoNCE's softmax over a negative pool. The corrupted graph functions as the 'fake' class in a binary classifier, not as one of K negatives in a contrastive ranking. The asymmetry matters for what the gradient pushes.", correct:true},
+          {key:"b", text:"DGI is genuinely InfoNCE with K=1."},
+          {key:"c", text:"There is no difference between BCE and InfoNCE."},
+          {key:"d", text:"DGI doesn't use a discriminator."},
+        ]}
+        trap={<>(b), (c), (d) miss the BCE-vs-InfoNCE distinction.</>}
+        lens={<>BCE-with-fake-class and InfoNCE-with-1-negative are mathematically related but produce different gradients and different optimization dynamics. Naming this distinguishes a careful reader.</>}
+        stretch={<>What's the relationship between BCE and InfoNCE in the limit?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-a3"
+        difficulty="hard"
+        title="A3 — Counterfactual: no negative-free SSL"
+        scenario={<>Without DGI/BGRL, how would you handle the "unlabeled ≠ benign" problem in fraud SSL?</>}
+        options={[
+          {key:"a", text:"Use CL-Fraud with a strict provenance benign pool (only rule-cleared or manually reviewed); or skip SSL and use supervised PC-GNN with explicit class-balancing. Both options pay a cost: provenance limits the benign pool (often <1% of nodes), and supervised forgoes the unlabeled signal entirely. Neither matches negative-free SSL's combination of full unlabeled use + zero false-negative risk.", correct:true},
+          {key:"b", text:"Cannot do SSL without negatives."},
+          {key:"c", text:"Use random negatives and accept the noise."},
+          {key:"d", text:"Just train a GBDT."},
+        ]}
+        trap={<>(b) is wrong (DGI/BGRL exist). (c) is the failure mode being avoided. (d) ignores graph signal.</>}
+        lens={<>The fallback is CL-Fraud + strict provenance OR supervised. Both lose something negative-free SSL specifically reduces.</>}
+        stretch={<>What's the marginal cost of strict-provenance benign sourcing?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-a4"
+        difficulty="hard"
+        title="A4 — Compose with CL-Fraud"
+        scenario={<>Could you compose BGRL pretraining with CL-Fraud's meta-path augmentations? Which statements hold?</>}
         multiSelect
-        title="P2 — Which negative-free SSL pieces are LOAD-BEARING for BGRL?"
-        scenario={<>You implement BGRL on a tx graph. Which of these design choices are essential to prevent representation collapse? Select all that apply.</>}
         options={[
-          {key:"a", text:"EMA target encoder updated with decay &gt; 0.99.", correct:true},
-          {key:"b", text:"Predictor MLP between online encoder and loss.", correct:true},
-          {key:"c", text:"Stop-gradient through the target encoder.", correct:true},
-          {key:"d", text:"Adding an InfoNCE negative term to BGRL&apos;s loss."},
-          {key:"e", text:"Increasing batch size to 4096."},
+          {key:"a", text:"Meta-path-preserving augmentations are augmentation policy — orthogonal to BGRL's loss design. You can use them as the view-generators for BGRL and gain the structural-fidelity benefit.", correct:true},
+          {key:"b", text:"BGRL is no longer negative-free if you do this — meta-path-aware perturbation introduces structural negatives."},
+          {key:"c", text:"The fraud-aware positive sampler from CL-Fraud is INCOMPATIBLE with BGRL — BGRL's positive is structurally the same node's two views, not same-ring neighbors.", correct:true},
+          {key:"d", text:"BGRL's EMA decay must be tuned more aggressively when the augmentation is stronger.", correct:true},
         ]}
-        trap={<>(d) reintroduces the problem BGRL is designed to avoid. (e) helps speed but is not load-bearing for collapse prevention.</>}
-        lens={<>EMA + predictor + stop-gradient is the BYOL recipe. Drop any one and the trivial constant-embedding solution becomes optimal. Lin et al.&apos;s &quot;Understanding the Behaviour of Contrastive Loss&quot; analysis applies.</>}
-        stretch={<>What is the minimal ablation to confirm the predictor is doing work?</>}
+        trap={<>(b) is wrong — augmentation choice doesn't create negatives.</>}
+        lens={<>You can swap BGRL's augmentation policy for meta-path-preserving; you cannot swap BGRL's positive design (same-node-two-views) for CL-Fraud's same-ring-neighbors (that's class-aware contrastive, requires negatives).</>}
+        stretch={<>Which of CL-Fraud's two innovations is BGRL-compatible?</>}
       />
 
       <VIS.TrapProblem
-        id="dgi-p3"
+        id="dgi-a5"
         difficulty="hard"
-        title="P3 — DGI corruption on heterogeneous graphs"
-        scenario={<>You implement DGI on a user–merchant–device graph by row-shuffling the entire feature matrix as the corruption. Discriminator loss drops to near-zero in 3 epochs. Encoder embeddings are essentially random. What happened?</>}
+        title="A5 — Boundary: when do negatives stop being a problem?"
+        scenario={<>At what point does the "unlabeled ≠ benign" risk vanish, making InfoNCE-based SSL safe again?</>}
         options={[
-          {key:"a", text:"Row-shuffling across heterogeneous node types creates type-impossible features (e.g. a user with merchant-only fields), making the corruption trivially detectable; the discriminator wins instantly with no useful gradient to the encoder.", correct:true},
-          {key:"b", text:"DGI doesn&apos;t work on heterogeneous graphs."},
-          {key:"c", text:"You needed 1000 epochs."},
-          {key:"d", text:"Discriminator was too small."},
+          {key:"a", text:"When you have a high-precision benign pool (>95% truly benign, verified via manual review or rule-engine clearing) AND its size exceeds the InfoNCE batch's negative count. Below that, the expected number of unlabeled-fraud negatives per batch exceeds 1, and gradients begin pushing fraud away from fraud. Above it, InfoNCE is safe and arguably better than negative-free (stronger gradient signal).", correct:true},
+          {key:"b", text:"Negatives are never a problem."},
+          {key:"c", text:"At any size."},
+          {key:"d", text:"When labeled fraud > 100M."},
         ]}
-        trap={<>(b) overclaims — DGI works fine with proper corruption. (c) wastes compute. (d) misses the structural issue.</>}
-        lens={<>Use type-aware shuffling: shuffle users among users, merchants among merchants. Or use edge-perturbation as the corruption instead of feature shuffle.</>}
-        stretch={<>What is the right balance between &quot;corruption is detectable&quot; and &quot;corruption is informative&quot;?</>}
+        trap={<>(b), (c), (d) miss the precision-AND-volume requirement.</>}
+        lens={<>The crossover depends on the benign pool's precision AND size relative to the InfoNCE batch. Both must clear thresholds.</>}
+        stretch={<>How would you measure your benign pool's precision?</>}
       />
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>B. Application</h3>
+
       <VIS.TrapProblem
-        id="dgi-p4"
+        id="dgi-b1"
         difficulty="medium"
-        title="P4 — Pretrain then what — linear probe or fine-tune?"
-        scenario={<>You finish BGRL pretraining and have 2,000 labeled fraud examples. Three options: (i) linear probe on frozen embeddings, (ii) fine-tune the encoder end-to-end, (iii) dump embeddings into a GBDT alongside tabular features. Which gives the strongest production signal first?</>}
+        title="B1 — Pick the right tool given the scenario"
+        scenario={<>Scenario: real-time payments, 50M user nodes, 200M tx/month, &lt;1k labeled fraud, NO confirmed-benign pool (everything is either flagged-suspicious or unflagged), graph has 5 relation types. Pick.</>}
         options={[
-          {key:"a", text:"Start with (iii) — GBDT-on-embeddings + tabular features as a strong baseline; if it loses to fine-tune by &gt;1 F1, try fine-tune next.", correct:true},
-          {key:"b", text:"Always fine-tune; pretraining is a starting point."},
-          {key:"c", text:"Linear probe — it&apos;s the standard SSL benchmark."},
-          {key:"d", text:"Fine-tune with a tiny LR (1e-6) to avoid overwriting pretraining."},
+          {key:"a", text:"BGRL — 50M nodes is too big for DGI's global readout (the mean carries no useful signal at that scale), and the lack of confirmed-benign rules out CL-Fraud (its fraud-aware sampler needs trustworthy negatives). BGRL's negative-free design exactly matches the constraint.", correct:true},
+          {key:"b", text:"DGI — works at any scale."},
+          {key:"c", text:"CL-Fraud — best SSL."},
+          {key:"d", text:"Supervised CARE-GNN on 1k labels."},
         ]}
-        trap={<>(b)(d) follow CV/NLP reflexes. (c) measures embedding quality but is not the production winner.</>}
-        lens={<>On fraud problems, GBDT-on-embeddings + tabular is the workhorse pattern — it composes pretrained structural signal with calibrated tabular features. Fine-tune is the second pass if needed.</>}
-        stretch={<>When does end-to-end fine-tune become worth the cost?</>}
+        trap={<>(b) misses DGI's scale problem. (c) misses the benign-pool requirement. (d) abandons the unlabeled 200M.</>}
+        lens={<>The "no benign pool" + "large graph" combination uniquely matches BGRL. Each absence rules out other methods.</>}
+        stretch={<>If you had a 5% manual-review benign pool, would your answer change?</>}
       />
 
       <VIS.TrapProblem
-        id="dgi-p5"
+        id="dgi-b2"
         difficulty="hard"
+        title="B2 — 'Sounds reasonable' — set EMA decay = 0.999"
+        scenario={<>A teammate copies BYOL's default EMA decay = 0.999 for BGRL on a fraud graph. Why might this fail specifically here?</>}
+        options={[
+          {key:"a", text:"BYOL's 0.999 was tuned on ImageNet, where the data distribution is static. Fraud graphs drift over weeks (new MOs, new merchants). With decay 0.999, the target encoder updates ~1000 steps behind online, so by the time online learns a new MO the target is still representing the old graph. Effective gradient signal collapses, and the encoder converges to a representation lagging the live distribution.", correct:true},
+          {key:"b", text:"0.999 is always optimal."},
+          {key:"c", text:"EMA decay has no effect."},
+          {key:"d", text:"Only learning rate matters."},
+        ]}
+        trap={<>(b), (c), (d) miss the drift-vs-lag interaction.</>}
+        lens={<>EMA decay must match the underlying distribution's drift speed. ImageNet defaults are wrong for drifting fraud graphs.</>}
+        stretch={<>What's the right EMA decay for a fraud graph drifting weekly?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-b3"
+        difficulty="hard"
+        title="B3 — Pitch BGRL to the AML team"
+        scenario={<>The AML lead asks "Why BGRL over our existing supervised GraphSAGE?" Pick the pitch that REQUIRES understanding BGRL's specific mechanism.</>}
+        options={[
+          {key:"a", text:"Most contrastive SSL methods need negative samples. In fraud, every unlabeled node is potentially fraud — sampling them as negatives explicitly trains the encoder that fraud ≈ fraud-but-different (pushing fraud away from fraud). BGRL has NO negatives by construction: it uses an EMA target encoder that the online side predicts. The wrong-negative pitfall is gone. The cost is collapse risk, defended by the predictor head + stop-gradient asymmetry, but that's a tuning problem, not a correctness problem.", correct:true},
+          {key:"b", text:"BGRL is the newer method."},
+          {key:"c", text:"Self-supervised learning helps."},
+          {key:"d", text:"Reduces false negatives."},
+        ]}
+        trap={<>(b), (c), (d) all fail the redaction litmus.</>}
+        lens={<>The B3 pitch must REQUIRE the listener to understand "no negatives" + "EMA bootstrap" + "predictor asymmetry prevents collapse." A generic SSL pitch is concept-as-costume.</>}
+        stretch={<>What's the AML team's follow-up about training stability?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use DGI/BGRL"
+        scenario={<>Which scenarios are anti-patterns for DGI/BGRL?</>}
         multiSelect
-        title="P5 — Detecting BGRL collapse"
-        scenario={<>You suspect BGRL is collapsing — embeddings drifting toward a single point. Which diagnostics would catch this?</>}
         options={[
-          {key:"a", text:"Effective rank of the embedding matrix.", correct:true},
-          {key:"b", text:"Cosine variance of embeddings on a held-out batch.", correct:true},
-          {key:"c", text:"Linear probe accuracy mid-pretraining.", correct:true},
-          {key:"d", text:"BGRL training loss alone."},
-          {key:"e", text:"Inspecting predictor weights only."},
+          {key:"a", text:"Trustworthy benign pool available — CL-Fraud's fraud-aware sampler is sharper.", correct:true},
+          {key:"b", text:"Graph too small (<10k nodes) — DGI's global readout degenerates, BGRL's EMA barely moves.", correct:true},
+          {key:"c", text:"Heavy tabular features carry most signal — GBDT on features beats GNN-SSL + linear head.", correct:true},
+          {key:"d", text:"Drifting graph with millions of unlabeled nodes and no benign provenance."},
         ]}
-        trap={<>(d) is the classic failure — a collapsed encoder still has the optimum cosine loss. (e) is incomplete; collapse is about output geometry, not predictor internals.</>}
-        lens={<>Same diagnostics as CL-Fraud P5. Effective rank is the cheapest single signal; cosine variance is intuitive; mid-training linear probe is the gold standard.</>}
-        stretch={<>What value of cosine variance would you set as an alarm threshold?</>}
+        trap={<>(d) is the regime DGI/BGRL were designed for.</>}
+        lens={<>Three anti-patterns: provenance available, graph too small, tabular features dominate. Each disables one of DGI/BGRL's prerequisites.</>}
+        stretch={<>How do you know if tabular features dominate?</>}
       />
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>C. Mechanism</h3>
+
       <VIS.TrapProblem
-        id="dgi-p6"
+        id="dgi-c1"
         difficulty="hard"
-        title="P6 — DGI vs BGRL on a 50M-node graph"
-        scenario={<>You have a 50M-node tx graph and limited GPU memory. DGI requires encoding the full graph for the summary vector; BGRL requires two augmented views. Which is more memory-friendly in practice?</>}
+        title="C1 — Why does BGRL not collapse without negatives?"
+        scenario={<>The intuition says "no negatives = collapse to constant." Why doesn't BGRL collapse?</>}
         options={[
-          {key:"a", text:"BGRL — it can be trained with sampled subgraphs without computing a global summary; DGI&apos;s summary requires either full-batch or a clever approximation.", correct:true},
-          {key:"b", text:"DGI — only one view per step."},
-          {key:"c", text:"Memory is identical."},
-          {key:"d", text:"BGRL is impossible on 50M nodes."},
+          {key:"a", text:"Three mechanisms work together: (i) the asymmetric architecture (online has a predictor head q, target does not), (ii) EMA-update of target from online (target lags but follows), (iii) stop-gradient on the target output. The predictor q must learn to map online's representation into target's space; if both encoders collapse to a constant, q has no work to do and its gradient is zero — but in practice the asymmetric optimization dynamics prevent reaching that fixed point.", correct:true},
+          {key:"b", text:"BGRL does collapse; the paper is wrong."},
+          {key:"c", text:"BGRL has a hidden negative term."},
+          {key:"d", text:"BGRL uses InfoNCE."},
         ]}
-        trap={<>(b) ignores the summary vector cost. (c) is wrong — they have different architectural footprints. (d) misreads BGRL — it works on subgraph batches.</>}
-        lens={<>BGRL composes with subgraph sampling (Cluster-GCN, GraphSAINT). DGI is fundamentally global because the summary vector mixes all nodes; approximations exist but lose information.</>}
-        stretch={<>How would you scale DGI to 50M nodes if you had to?</>}
+        trap={<>(b), (c), (d) all reject or misread the mechanism.</>}
+        lens={<>BGRL's anti-collapse defense is structural, not loss-based. The asymmetry (predictor + EMA + stop-grad) is the WHOLE design — strip any one and it collapses.</>}
+        stretch={<>What happens if you remove the predictor head?</>}
       />
 
       <VIS.TrapProblem
-        id="dgi-p7"
+        id="dgi-c2"
         difficulty="medium"
-        title="P7 — Freshness in production"
-        scenario={<>You deploy a BGRL-pretrained encoder. Three months later, recall on emerging fraud MOs drops. Pretraining is 12h. What is the minimum-viable refresh strategy?</>}
+        title="C2 — DGI's loss: why local-vs-global, not local-vs-local?"
+        scenario={<>Why does DGI maximize MI between local node and GLOBAL summary, not between two local nodes?</>}
         options={[
-          {key:"a", text:"Continued-pretraining on the last month of unlabeled data (2–4h), then re-fine-tune the head.", correct:true},
-          {key:"b", text:"Full pretrain restart every month."},
-          {key:"c", text:"Refresh only the classifier head."},
-          {key:"d", text:"Switch to supervised model."},
+          {key:"a", text:"Local-vs-local would require sampling related nodes (which 'related' means is unclear without labels) and unrelated nodes (which means random negatives — the same unlabeled ≠ benign problem). Local-vs-global sidesteps node-sampling entirely: there is exactly one summary, and the discriminator only needs to distinguish real-vs-corrupted on that single anchor. The objective is parameter-free in terms of negative sampling.", correct:true},
+          {key:"b", text:"Local-vs-global is computationally cheaper."},
+          {key:"c", text:"It's the only way DGI can run."},
+          {key:"d", text:"Local-vs-local is supervised."},
         ]}
-        trap={<>(b) is expensive. (c) ignores that the structural prior is stale. (d) discards the pretraining investment.</>}
-        lens={<>Continued-pretraining is the cheap freshness lever — same playbook as the language-model literature, adapted to graphs.</>}
-        stretch={<>What signal triggers a full restart instead of continued-pretraining?</>}
+        trap={<>(b), (c), (d) miss the no-negative-sampling design.</>}
+        lens={<>The local-vs-global formulation is a clever sidestep of the negative-sampling problem — the global summary is computable without choosing which nodes to relate to.</>}
+        stretch={<>What's the cost of this choice at scale?</>}
       />
 
       <VIS.TrapProblem
-        id="dgi-p8"
+        id="dgi-c3"
         difficulty="hard"
-        title="P8 — GBDT + pretrained embeddings beats fine-tune. Why?"
-        scenario={<>You compare: (i) BGRL pretrain → fine-tune end-to-end, vs (ii) BGRL pretrain → freeze, train GBDT on embeddings + 80 tabular features. (ii) wins by 2 F1 in production. What likely explains it?</>}
+        title="C3 — What's dropped vs InfoNCE-based SSL"
+        scenario={<>What do DGI and BGRL explicitly drop relative to InfoNCE-based SSL?</>}
+        multiSelect
         options={[
-          {key:"a", text:"GBDT&apos;s ability to exploit non-linear interactions between the 80 calibrated tabular features and the dense embedding dimensions outweighs the gradient signal from 2k labels.", correct:true},
-          {key:"b", text:"Fine-tune over-fit."},
-          {key:"c", text:"BGRL pretraining was bad."},
-          {key:"d", text:"GBDT is fundamentally better than neural networks."},
+          {key:"a", text:"Negative pool sampling (DGI: 1 corrupted; BGRL: 0 negatives).", correct:true},
+          {key:"b", text:"Softmax-over-negatives loss (replaced by BCE in DGI; cosine prediction in BGRL).", correct:true},
+          {key:"c", text:"The temperature hyperparameter τ.", correct:true},
+          {key:"d", text:"The GNN encoder."},
         ]}
-        trap={<>(b) is partially true but not the main driver. (c) contradicts the premise. (d) is hand-wavy folklore.</>}
-        lens={<>This is the GADBench / production-fintech pattern. Tabular features carry calibrated, hard-won signal; GBDT exploits interactions natively. Pretrained embeddings give structural prior, GBDT does the rest. Fine-tune cannot easily integrate 80 tabular features without a custom architecture.</>}
-        stretch={<>How would you build a fine-tune setup that consumes the 80 tabular features too?</>}
+        trap={<>(d) is retained.</>}
+        lens={<>Three drops, each tied to one consequence of negative-free design. Temperature τ disappears because there are no softmax-over-negatives to soften.</>}
+        stretch={<>What does BGRL keep that DGI drops?</>}
       />
 
       <VIS.TrapProblem
-        id="dgi-p9"
+        id="dgi-c4"
+        difficulty="hard"
+        title="C4 — Which knob, mis-set, breaks BGRL?"
+        scenario={<>Rank by production-breakage severity: (i) EMA decay rate, (ii) predictor head capacity, (iii) augmentation strength, (iv) embedding dim.</>}
+        options={[
+          {key:"a", text:"EMA decay > predictor capacity > augmentation strength > embedding dim. Decay is the collapse lever (too high → frozen target → collapse; too low → no bootstrap). Predictor capacity gates the asymmetry (too small → can't map online to target → collapse). Augmentation strength affects view diversity. Embedding dim is secondary.", correct:true},
+          {key:"b", text:"Embedding dim dominates."},
+          {key:"c", text:"All equal."},
+          {key:"d", text:"Augmentation strength dominates."},
+        ]}
+        trap={<>(b), (c), (d) miss the collapse-lever hierarchy.</>}
+        lens={<>For BGRL, the collapse-defense knobs (EMA decay, predictor capacity) dominate. Standard SSL intuition (augmentation matters most) is misleading here.</>}
+        stretch={<>How do EMA decay and predictor capacity interact?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-c5"
         difficulty="medium"
-        title="P9 — When does DGI BEAT BGRL?"
-        scenario={<>You run both on the same fraud graph. DGI wins by 1.5 F1 on a downstream linear probe. What property of the graph likely favors DGI?</>}
+        title="C5 — Data assumption: very small graph"
+        scenario={<>You apply DGI to a 5k-node fraud graph. What specifically happens?</>}
         options={[
-          {key:"a", text:"The graph has a strong global community structure where one summary vector meaningfully captures &quot;typical activity,&quot; making MI-to-summary a useful pretext.", correct:true},
-          {key:"b", text:"BGRL only works on homogeneous graphs."},
-          {key:"c", text:"DGI is always better than BGRL."},
-          {key:"d", text:"Random — they should be equivalent."},
+          {key:"a", text:"The global summary (mean of 5k node embeddings) is concentrated on whatever class dominates — the 'normal' class with thousands of members. The discriminator distinguishing real-vs-corrupted operates on tiny perturbations of the same dominant summary. Effective gradient signal is weak; representations converge to a near-MLP-on-features.", correct:true},
+          {key:"b", text:"DGI refuses to run on small graphs."},
+          {key:"c", text:"Performance is unchanged from large graphs."},
+          {key:"d", text:"It auto-replicates nodes."},
         ]}
-        trap={<>(b)(c) are overclaims. (d) ignores that the two methods have different inductive biases.</>}
-        lens={<>DGI&apos;s summary captures global structure; BGRL captures local invariances. If your fraud signal is &quot;deviation from a global typical-behavior vector,&quot; DGI&apos;s pretext aligns with the downstream. If the signal is local (ring-shape), BGRL aligns better.</>}
-        stretch={<>How would you decide a priori which inductive bias fits your graph?</>}
+        trap={<>(b), (c), (d) miss the global-readout-degenerates argument.</>}
+        lens={<>DGI's global summary needs sufficient diversity to be informative. Below ~50k nodes, it tends to be uninformative.</>}
+        stretch={<>What's the right SSL choice on a 5k-node fraud graph?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      <VIS.TrapProblem
+        id="dgi-d1"
+        difficulty="medium"
+        title="D1 — 'No negatives = collapse'"
+        scenario={<>A junior insists "no negatives = no force pushing samples apart = collapse to a constant. BGRL cannot work." Where does this break?</>}
+        options={[
+          {key:"a", text:"The intuition assumes the loss alone prevents collapse. BGRL's anti-collapse defense is structural: the predictor head q makes the loss ASYMMETRIC (online predicts target, but target doesn't predict online), and stop-gradient on the target plus EMA-update means online can never just copy target. The dynamics never reach the collapse fixed point even though the loss alone would permit it. This is the BYOL insight — empirically verified, theoretically debated (e.g., Tian 2021's analysis).", correct:true},
+          {key:"b", text:"BGRL does collapse; the paper is wrong."},
+          {key:"c", text:"BGRL has hidden negatives."},
+          {key:"d", text:"BGRL is supervised."},
+        ]}
+        trap={<>(b), (c), (d) are flat rejections rather than understanding the mechanism.</>}
+        lens={<>The structural-anti-collapse intuition is the load-bearing insight. Without it, no-negative SSL looks impossible.</>}
+        stretch={<>What does Tian 2021 say about why BYOL/BGRL doesn't collapse?</>}
       />
 
       <VIS.TrapProblem
-        id="dgi-p10"
+        id="dgi-d1b"
         difficulty="hard"
-        title="P10 — Stripe&apos;s 2024 blog says &quot;BGRL helped us.&quot; What evidence would you demand before adopting?"
-        scenario={<>A senior PM forwards you a Stripe blog post claiming BGRL improved their fraud model. Before you green-light a 4-engineer-quarter project, what is the highest-leverage question to ask?</>}
+        title="D1b — 'DGI's corrupted graph is a hard negative'"
+        scenario={<>A junior thinks "DGI's corrupted graph is a hard negative — making it harder helps." Why might harder corruption hurt?</>}
         options={[
-          {key:"a", text:"What is the comparison baseline — pure supervised GNN, or GBDT-with-structural-features? Without the GBDT baseline, the blog&apos;s claim is benchmark-fragile.", correct:true},
-          {key:"b", text:"Did they tune learning rate?"},
-          {key:"c", text:"What GPU did they use?"},
-          {key:"d", text:"How many engineers did it take them?"},
+          {key:"a", text:"DGI's corruption is feature-shuffle (permute features across nodes) — keeping graph structure but breaking feature-node alignment. Making corruption 'harder' (more realistic) collapses the discriminator's task: real-vs-corrupted becomes ambiguous, BCE saturates near 0.5, no gradient signal. Easy corruption gives a useful BCE gradient; impossibly-hard corruption gives no gradient.", correct:true},
+          {key:"b", text:"Harder corruption is always better."},
+          {key:"c", text:"Corruption strength has no effect."},
+          {key:"d", text:"DGI uses no corruption."},
         ]}
-        trap={<>(b)(c)(d) are operational, not load-bearing. The blog might be true and useless to you if their baseline was weak.</>}
-        lens={<>This is the GADBench lesson generalized. Industry blog wins frequently report against the prior in-house model, not the strongest possible baseline. Always ask for the GBDT-on-structural-features number before believing GNN wins.</>}
-        stretch={<>What would make you adopt BGRL even if GBDT-on-structural matches it?</>}
+        trap={<>(b), (c), (d) miss the discriminator-task-saturation dynamic.</>}
+        lens={<>DGI's corruption strength is bounded above by discriminator-saturation. Unlike InfoNCE, hard negatives are NOT always better.</>}
+        stretch={<>What's the canonical DGI corruption recipe?</>}
       />
+
+      <VIS.TrapProblem
+        id="dgi-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: 'BGRL is set-and-forget'"
+        scenario={<>You assume "BGRL trained once = production-ready forever." Trace the cascade as the fraud graph drifts.</>}
+        options={[
+          {key:"a", text:"Encoder weights are static after pretrain → graph drifts (new MOs, new merchants, structural changes) → target encoder's frozen view becomes increasingly stale → online encoder representing live data diverges from production-frozen weights → fine-tune head learns stale representations → AUPRC drifts down 0.05/month → team blames label noise → real fix is periodic re-pretraining (warm start) with current data.", correct:true},
+          {key:"b", text:"BGRL is robust to drift."},
+          {key:"c", text:"Just retrain the fine-tune head more often."},
+          {key:"d", text:"GPU OOM."},
+        ]}
+        trap={<>(b), (c) underestimate drift severity.</>}
+        lens={<>SSL encoder drift is silent: only the downstream metric reveals it. Schedule re-pretraining cadence to fraud-MO drift.</>}
+        stretch={<>What's the diagnostic for encoder staleness?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior diagnostic"
+        scenario={<>Junior reports DGI beats CL-Fraud by 2 AUPRC on the labeled fraud test set. What's the senior question?</>}
+        options={[
+          {key:"a", text:"'Did your CL-Fraud baseline use a TRUSTWORTHY benign pool (rule-cleared or manually reviewed) or just unflagged-as-negatives? If CL-Fraud was sampling unlabeled-fraud as negatives, you sandbagged it — DGI's win is artifactual, not a real advance. Re-run CL-Fraud with strict benign provenance; if DGI still wins, it's real.'", correct:true},
+          {key:"b", text:"'Try more EMA decay.'"},
+          {key:"c", text:"'Use FP16.'"},
+          {key:"d", text:"'Ship it.'"},
+        ]}
+        trap={<>(b), (c), (d) miss the baseline-sandbagging audit.</>}
+        lens={<>The negative-free SSL advantage is conditional: it wins when negative-sampling is corrupted; it shouldn't win when CL-Fraud's negative pool is clean.</>}
+        stretch={<>What's a fair CL-Fraud baseline configuration?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: latency spike"
+        scenario={<>BGRL-embeddings + GBDT classifier sees AUPRC drop 0.06 overnight. Possible causes: (i) GBDT staleness, (ii) BGRL encoder drift, (iii) production data shift. Which is most likely the lurking BGRL-specific cause?</>}
+        options={[
+          {key:"a", text:"(ii) BGRL encoder drift via EMA decay too high — target encoder is lagging the data by several weeks; online encoder (which is what's used in production) has continued updating, but the representations it produces have shifted relative to what the fine-tune classifier learned. AUPRC drops without any visible data shift or GBDT change.", correct:true},
+          {key:"b", text:"(i) GBDT staleness."},
+          {key:"c", text:"(iii) Data shift."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c), (d) are plausible but not BGRL-specific.</>}
+        lens={<>BGRL-specific drift signature: representation shift WITHOUT data shift. The EMA target stays close to past-data, online encoder doesn't.</>}
+        stretch={<>How do you measure representation shift?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>E. Operations</h3>
+
+      <VIS.TrapProblem
+        id="dgi-e1"
+        difficulty="hard"
+        title="E1 — DGI/BGRL-specific gotcha"
+        scenario={<>Pick the gotcha most specific to BGRL (would NOT bite DGI, CL-Fraud, supervised GNN):</>}
+        options={[
+          {key:"a", text:"Representation collapse is silent — pretraining loss converges normally (cosine approaches 1 between online and target's projections), but pairwise embedding cosine across DIFFERENT batch nodes also approaches 1. You only see it when the downstream classifier produces ~random output. Without monitoring inter-node cosine, you discover collapse via product-impact, not training metrics.", correct:true},
+          {key:"b", text:"GPU OOM."},
+          {key:"c", text:"Cold-start."},
+          {key:"d", text:"Training time."},
+        ]}
+        trap={<>(b), (c), (d) are generic.</>}
+        lens={<>BGRL's silent-collapse signature is unique to negative-free SSL — none of the InfoNCE/supervised methods have this exact telemetry blind spot.</>}
+        stretch={<>What's the minimal monitoring to detect collapse in production?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-e2"
+        difficulty="hard"
+        title="E2 — Friday: cosine = 1 across the batch"
+        scenario={<>Friday: BGRL training metric shows training cosine = 0.92 (great!), but inter-node pairwise cosine on a held-out batch is also 0.94. Diagnosis?</>}
+        options={[
+          {key:"a", text:"Representation collapse — the encoder is mapping all nodes to nearly the same point. Training cosine looks good because online and target both produce the same constant (cosine of constant with constant is 1). Inter-node cosine ≈ 1 is the smoking gun. Fix: restart with lower learning rate AND lower EMA decay, verify predictor head has non-trivial weights, confirm stop-gradient is in place.", correct:true},
+          {key:"b", text:"Pretraining is going well — ship."},
+          {key:"c", text:"Add more layers."},
+          {key:"d", text:"Increase batch size."},
+        ]}
+        trap={<>(b) misreads the metric (high cosine + high inter-node cosine = collapse). (c), (d) are unrelated.</>}
+        lens={<>The smoking gun for BGRL collapse is inter-node cosine, not training cosine. Always monitor both.</>}
+        stretch={<>Can you recover from a collapsed BGRL run without restarting?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-e3"
+        difficulty="hard"
+        title="E3 — Eval-protocol audit"
+        scenario={<>Which findings invalidate a BGRL fraud report?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"No inter-node cosine reported (collapse detection missing).", correct:true},
+          {key:"b", text:"Random split contaminates pretrain with test-node neighborhoods.", correct:true},
+          {key:"c", text:"Supervised baseline at less than matched compute (BGRL had 100 pretrain epochs + fine-tune; baseline had 20 supervised epochs).", correct:true},
+          {key:"d", text:"BGRL is too new to evaluate."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three audit failures: collapse-monitoring absent, split leakage, compute mismatch. Each detectable.</>}
+        stretch={<>What's a fair compute budget for matched supervised baseline?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-e4"
+        difficulty="medium"
+        title="E4 — Rollout sequence"
+        scenario={<>Order rollout steps for BGRL: (i) full ramp, (ii) shadow vs supervised, (iii) collapse monitoring instrumentation, (iv) hybrid score, (v) traffic ramp.</>}
+        options={[
+          {key:"a", text:"iii → ii → iv → v → i. Collapse monitoring MUST be deployed before any production load — collapse is silent without it. Then shadow, hybrid, ramp.", correct:true},
+          {key:"b", text:"i → ii → iii → iv → v."},
+          {key:"c", text:"Direct cutover."},
+          {key:"d", text:"ii → iii → iv → i → v."},
+        ]}
+        trap={<>(b), (c), (d) deploy without collapse monitoring.</>}
+        lens={<>Collapse-monitoring is BGRL's mandatory first deploy step. Skipping it means you discover collapse via revenue impact, not telemetry.</>}
+        stretch={<>What's the alerting threshold on inter-node cosine?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-e5"
+        difficulty="medium"
+        title="E5 — Reproducibility"
+        scenario={<>Which DGI/BGRL reproducibility issues are real in fraud adaptations?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"BGRL's EMA decay schedule (cosine ramp vs constant) is rarely disclosed in fraud blog adaptations.", correct:true},
+          {key:"b", text:"DGI's corruption function (feature shuffle vs feature replacement) is paper-specific and rarely stated in adoption reports.", correct:true},
+          {key:"c", text:"Inter-node-cosine collapse-monitoring code is almost never released.", correct:true},
+          {key:"d", text:"DGI cannot run on GPUs."},
+        ]}
+        trap={<>(d) is false.</>}
+        lens={<>The under-documented choices (EMA schedule, corruption function, collapse monitoring) are the high-leverage knobs.</>}
+        stretch={<>Which of the three is most impactful to reproduce?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination"
+        scenario={<>Which contamination paths inflate DGI/BGRL fraud claims?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Random split — pretraining sees test-node neighborhoods.", correct:true},
+          {key:"b", text:"Supervised baseline given fewer epochs than BGRL's pretrain + fine-tune total.", correct:true},
+          {key:"c", text:"No collapse-monitoring reported, so 'success' may include lucky non-collapsed runs without quantifying failure rate.", correct:true},
+          {key:"d", text:"BGRL is state-of-the-art so evaluation is unnecessary."},
+        ]}
+        trap={<>(d) is wrong by construction.</>}
+        lens={<>Three contamination paths. The "lucky run" issue is specific to negative-free SSL.</>}
+        stretch={<>How do you report a method that occasionally collapses?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>F. Failure modes & edge cases</h3>
+
+      <VIS.TrapProblem
+        id="dgi-f1"
+        difficulty="hard"
+        title="F1 — Smallest input that breaks BGRL's defense"
+        scenario={<>Construct the smallest configuration where BGRL provably collapses.</>}
+        options={[
+          {key:"a", text:"Remove the predictor head q (or set q = identity) and BGRL collapses immediately — the asymmetric architecture is gone, both encoders see the same loss, and the trivial fixed-point of 'both = constant' is now optimal. The EMA + stop-grad alone is not enough; the predictor is the load-bearing piece of the anti-collapse defense.", correct:true},
+          {key:"b", text:"Any graph with one node."},
+          {key:"c", text:"A bipartite graph."},
+          {key:"d", text:"A tree."},
+        ]}
+        trap={<>(b), (c), (d) miss the architectural-asymmetry argument.</>}
+        lens={<>BGRL's defense is architectural. Strip the predictor and the defense fails regardless of graph structure.</>}
+        stretch={<>What's the minimal predictor head that prevents collapse?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: pollute DGI's global summary"
+        scenario={<>Design an attack that exploits DGI's global readout.</>}
+        options={[
+          {key:"a", text:"Flood the graph with high-degree benign-looking 'commodity' nodes (e.g., fake customer accounts attached to many merchants). The mean-pooled global summary shifts toward those nodes' embeddings; the discriminator's 'real summary' becomes an average of mostly-attacker-controlled signal. Fraud nodes, whose representations were learned to be 'close to the legitimate summary,' now look benign because the summary itself has been hijacked.", correct:true},
+          {key:"b", text:"Feature perturbation."},
+          {key:"c", text:"No attack possible."},
+          {key:"d", text:"Increase the fraud rate."},
+        ]}
+        trap={<>(b), (c), (d) miss the global-readout attack surface.</>}
+        lens={<>DGI's global readout is an attack surface — anyone who can add nodes can shift the summary. BGRL doesn't have this surface (no global readout).</>}
+        stretch={<>How would you harden DGI against this attack?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-f3"
+        difficulty="hard"
+        title="F3 — Reverse-engineer the symptom"
+        scenario={<>Symptom: BGRL training cosine converges to 0.99 within 20 epochs; held-out inter-node cosine is 0.97; downstream fine-tune AUPRC is at random-baseline. Which BGRL choice is the cause?</>}
+        options={[
+          {key:"a", text:"EMA decay too high (close to 1.0) — the target encoder barely updates, so online's predictor q learns to map every input to the same near-constant target output. The training cosine looks fine (constant matches constant), but representations have collapsed. The signature is high-training-cosine AND high-inter-node-cosine simultaneously.", correct:true},
+          {key:"b", text:"Optimizer wrong."},
+          {key:"c", text:"Random seed."},
+          {key:"d", text:"Too few GPU cores."},
+        ]}
+        trap={<>(b), (c), (d) miss the EMA-too-high signature.</>}
+        lens={<>The smoking gun for "EMA too high" is training cosine ≈ inter-node cosine. Knowing this saves a week of debugging.</>}
+        stretch={<>How would you instrument an EMA-decay-too-high alarm?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-f4"
+        difficulty="medium"
+        title="F4 — Paper-admitted limitation (BGRL)"
+        scenario={<>Which limitation does the BGRL paper itself acknowledge?</>}
+        options={[
+          {key:"a", text:"Sensitivity to augmentation choice; the paper recommends edge-mask + feature-mask but does not characterize failures on graphs where edges encode the class label.", correct:true},
+          {key:"b", text:"BGRL works perfectly on any graph."},
+          {key:"c", text:"Only works on GPUs."},
+          {key:"d", text:"Cannot be deployed."},
+        ]}
+        trap={<>(b), (c), (d) are wrong.</>}
+        lens={<>The augmentation-sensitivity admission is the seed for fraud-specific failures (where edges DO encode labels).</>}
+        stretch={<>What does BGRL not predict that subsequent benchmarks expose?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-f5"
+        difficulty="hard"
+        title="F5 — Community-found: GraphSSL fair-eval"
+        scenario={<>What do GraphSSL fair-eval benchmarks (Hu et al. NeurIPS 2024) find about DGI on fraud-like imbalanced graphs?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"DGI's linear-probe AUPRC underperforms supervised baselines on imbalanced graphs unless paired with class-aware fine-tune.", correct:true},
+          {key:"b", text:"DGI's global summary biases toward the majority class, making fraud-node embeddings less discriminative.", correct:true},
+          {key:"c", text:"Re-running with class-balanced linear probing closes most of the gap, suggesting the encoder is fine but the standard evaluation isn't.", correct:true},
+          {key:"d", text:"DGI loses everywhere."},
+        ]}
+        trap={<>(d) overstates.</>}
+        lens={<>The community finding is regime-specific: DGI's encoder is usable; standard linear-probe evaluation is biased on imbalanced data. Use class-aware fine-tune.</>}
+        stretch={<>What's the right evaluation protocol for an imbalanced graph?</>}
+      />
+
+      <VIS.TrapProblem
+        id="dgi-f5b"
+        difficulty="hard"
+        title="F5b — Interview gold question"
+        scenario={<>Interviewer: "You championed BGRL for fraud. Walk me through the ablation that proves the win is from the negative-free design, not from incidental hyperparameter advantage."</>}
+        options={[
+          {key:"a", text:"Built four baselines under temporal split with matched compute: (i) CL-Fraud with strict benign provenance (clean negatives), (ii) CL-Fraud with naive unflagged-as-negative pool (corrupted negatives), (iii) DGI, (iv) BGRL. BGRL beat (ii) by 5.1 AUPRC (the corrupted-negatives case), tied (i) within 0.4 (the clean-negatives case), and beat (iii) by 0.8. The win source is exactly 'no corrupted negatives' — when CL-Fraud has clean negatives, the advantage disappears. The right call: pick BGRL specifically when benign provenance is impossible.", correct:true},
+          {key:"b", text:"Compared BGRL to default GraphSAGE; won by 4 points; shipped."},
+          {key:"c", text:"BGRL is newer — no ablation needed."},
+          {key:"d", text:"Compared to a 1-layer linear model."},
+        ]}
+        trap={<>(b), (c), (d) skip rigorous ablation.</>}
+        lens={<>The right ablation isolates the WHY: BGRL wins when negatives are corrupted, not categorically. Knowing this guides deployment decisions.</>}
+        stretch={<>If you had a clean benign pool, would you ship BGRL or CL-Fraud?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1809.10341" target="_blank" rel="noopener">
-            <strong>Velickovic et al. — Deep Graph Infomax</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/1809.10341" target="_blank" rel="noopener"><strong>Velickovic et al. — Deep Graph Infomax (DGI)</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2019)</span>
-          <br/>DGI original. Section 3 (objective) and the corruption-function discussion are the parts that matter for fraud adaptations.
+          <br/>The original local-vs-global MI maximization. Read Section 3 for the discriminator design.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2102.06514" target="_blank" rel="noopener">
-            <strong>Thakoor et al. — Bootstrapped Graph Latents (BGRL)</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2102.06514" target="_blank" rel="noopener"><strong>Thakoor et al. — BGRL</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2022)</span>
-          <br/>BGRL paper. Section 3 lays out the EMA + predictor + stop-gradient recipe — the load-bearing pieces from P2.
+          <br/>The negative-free graph SSL paper. Section 3 (architecture asymmetry) is the load-bearing contribution.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2006.07733" target="_blank" rel="noopener">
-            <strong>Grill et al. — BYOL: Bootstrap Your Own Latent</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2006.07733" target="_blank" rel="noopener"><strong>Grill et al. — BYOL (the image counterpart)</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2020)</span>
-          <br/>The vision-domain ancestor of BGRL. Useful for intuition on why EMA+predictor avoids collapse.
+          <br/>The original "no negatives" SSL paper. BGRL inherits the predictor + EMA + stop-grad design.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2306.12251" target="_blank" rel="noopener">
-            <strong>Tang et al. — GADBench</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2024)</span>
-          <br/>The reproducibility benchmark. Always run their GBDT baseline before adopting any graph SSL method.
-        </li>
-        <li>
-          <a href="https://github.com/Namkyeong/BGRL_Pytorch" target="_blank" rel="noopener">
-            <strong>BGRL PyTorch reference</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(repo)</span>
-          <br/>Cleanest unofficial implementation. Read <code>model.py</code> for the predictor + EMA pieces.
+          <a href="https://arxiv.org/abs/2010.10241" target="_blank" rel="noopener"><strong>Tian et al. — Understanding self-supervised learning dynamics without contrastive pairs</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2021)</span>
+          <br/>The "why doesn't BYOL collapse?" analysis. Read for the optimization-dynamics argument.
         </li>
       </ul>
     </VIS.Section>
