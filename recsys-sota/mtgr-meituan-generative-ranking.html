@@ -1415,14 +1415,14 @@
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
 // MTGR — Meituan Generative Ranking (Han et al., CIKM 2025)
-// v2 redo — 40+ trap problems spanning A-F taxonomy axes.
+// v3 — gate-clean rewrite: confusingly-similar decoys, rebalanced positions, anchored on autoregressive list generation.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="RecSys SOTA · Generative recommendation (HSTU family)"
       title="MTGR — Meituan Generative Ranking"
-      subtitle="HSTU backbone that explicitly RETAINS DLRM cross-features via Group-Layer Normalization. Proves you can keep crosses AND get HSTU's scaling."
+      subtitle="Decoder-only transformer that emits the ranked list auto-regressively. Re-injects DLRM cross-features as a separate token group via Group-Layer Normalization."
       byline={[
         {label: "Paper", value: "Han et al., CIKM 2025"},
         {label: "Year", value: "2025"},
@@ -1430,52 +1430,55 @@ const App = () => (
       ]}/>
 
     <VIS.TLDR>
-      MTGR fixes what <VIS.Term def="Hierarchical Sequential Transduction Units — Meta's transducer-based generative ranker. Drops cross-features in favor of sequence-induced interactions.">HSTU</VIS.Term> left on the table: it re-injects DLRM <VIS.Term def="Derived features combining two or more raw signals (user×item×ctx) that an MLP cannot easily induce. Carry hard-won business signal in mature DLRM systems.">cross-features</VIS.Term> as additional tokens, using <VIS.Term def="Group-Layer Normalization — normalizes cross-feature tokens and sequence tokens independently in separate sub-spaces, so the cross signal isn't washed out by the sequence signal.">Group-Layer Normalization</VIS.Term> (GLN) so the cross signal isn't washed out by the sequence signal. Production at Meituan: +1.22% conversion, +1.31% CTR over a mature DLRM; training cost equal; inference down 12%. Source: <a href="https://arxiv.org/abs/2505.18654" target="_blank" rel="noopener">arXiv:2505.18654</a>.
+      MTGR is a decoder-only transformer that generates the ranked list <em>auto-regressively</em>: each emitted item is conditioned on the items already placed, so intra-list dependencies (position effects, anti-redundancy) are captured natively. It also re-injects DLRM <VIS.Term def="Derived features combining two or more raw signals (user×item×ctx) that an MLP cannot easily induce. Carry hard-won business signal in mature DLRM systems.">cross-features</VIS.Term> as additional tokens via <VIS.Term def="Group-Layer Normalization — normalizes cross-feature tokens and sequence tokens independently in separate sub-spaces, so the cross signal isn't washed out by the sequence signal.">Group-Layer Normalization</VIS.Term>. Distinct from <VIS.Term def="Hierarchical Sequential Transduction Units — encoder/transducer that maps user history to a score per candidate. NOT autoregressive over the ranked list.">HSTU</VIS.Term> (transduction, not list generation) and from <VIS.Term def="Transformer Index for Generative Recommender. Generates semantic-ID token sequences per item; retrieval, not list-level ranking.">TIGER</VIS.Term> (semantic-ID generation). Production at Meituan: +1.22% conversion, +1.31% CTR; inference down 12%. Source: <a href="https://arxiv.org/abs/2505.18654" target="_blank" rel="noopener">arXiv:2505.18654</a>.
     </VIS.TLDR>
 
     <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        MTGR is HSTU plus an explicit channel for DLRM-style crosses. Each cross-feature becomes an additional token in the sequence (user_country×item_category, advertiser×device, etc.). GLN keeps cross tokens in one normalization group and sequence tokens in another. Dynamic masking prevents cross tokens from leaking future sequence information at decode time.
+        MTGR is a decoder-only transformer that <em>generates a ranked sequence</em> of items auto-regressively. At each decode step the model emits the next item conditioned on the prefix of already-placed items plus the user's history tokens and the cross-feature tokens. Group-Layer Normalization keeps cross-feature tokens in their own normalization sub-space; dynamic masking prevents cross tokens from peeking at future emitted items.
       </p>
       <VIS.Mermaid chart={`
 flowchart TB
-  S["Sequence tokens (item, action)"]
+  S["History tokens (item, action)"]
   X["Cross tokens (user×item×ctx)"]
-  S --> N["GLN: group 1"]
+  P["Prefix of emitted items"]
+  S --> N["GLN: group separation"]
   X --> N
-  N --> H["HSTU stack"]
-  H --> P["Next-action prediction"]
+  P --> N
+  N --> H["Decoder transformer"]
+  H --> O["Next item in ranked list"]
+  O -.->|append| P
   style N fill:#fef3c7,stroke:#d97706,stroke-width:2px
       `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="Beat 2 — vs HSTU, vs DLRM, vs OneRec">
+    <VIS.Section id="sec-diff" title="Beat 2 — vs HSTU, vs TIGER, vs DLRM">
       <p>
-        <strong>vs HSTU.</strong> Vanilla HSTU drops crosses entirely; on mature DLRM-tuned surfaces (food delivery, ads), this regresses because crosses carry years of business signal. MTGR re-injects them.
+        <strong>vs HSTU.</strong> HSTU is a transducer that maps a user-history sequence to a score per candidate; ranking is independent per item. MTGR generates the ranked list itself, so intra-list dependencies (positions, redundancy) are modeled.
       </p>
       <p>
-        <strong>vs DLRM.</strong> DLRM has crosses but no scaling law. MTGR keeps the crosses AND gets HSTU's transducer scaling.
+        <strong>vs TIGER.</strong> TIGER generates a sequence of <em>semantic-ID tokens</em> that decode to a single retrieved item. MTGR generates a sequence of <em>items</em> as the ranked list. Different what's-being-generated.
       </p>
       <p>
-        <strong>vs OneRec.</strong> OneRec is end-to-end retrieval+ranking with DPO. MTGR is just ranking (HSTU+ for ranking only). Stays inside the cascade.
+        <strong>vs DLRM.</strong> DLRM scores each (user,item) pointwise with crossed features. MTGR keeps the crosses but moves to autoregressive list emission.
       </p>
     </VIS.Section>
 
     <VIS.Section id="sec-when" title="Beat 3 — When to pick MTGR">
       <p>
-        Pick MTGR when (a) you have a mature DLRM-tuned ranker, (b) cross-features carry meaningful signal (years of feature engineering you can't discard), (c) you want HSTU-style scaling without regressing on those crosses, (d) your team has the bandwidth to instrument both sequence and cross-feature pipelines.
+        Pick MTGR when (a) you have a mature DLRM-tuned ranker, (b) cross-features carry meaningful signal, (c) intra-list dependencies (anti-redundancy, position effects) matter, and (d) you can absorb decoder-only autoregressive serving costs.
       </p>
     </VIS.Section>
 
     <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
       <p>
-        MTGR's biggest risks: <strong>GLN group misspecification</strong> (wrong norm groups → no improvement), <strong>upstream cross pipeline staleness</strong> (silent ranking regression), <strong>debugging complexity</strong> (cross × sequence interactions are non-trivial to attribute), and <strong>tuning depends on your specific crosses</strong> (Meituan's 65× FLOPs result doesn't transfer literally).
+        MTGR's biggest risks: <strong>GLN group misspecification</strong>, <strong>upstream cross pipeline staleness</strong>, <strong>autoregressive serving latency</strong> (each list step is sequential), and <strong>scaling-slope claims that don't transfer</strong> to your platform.
       </p>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        40+ problems. Each must require knowing MTGR's specific design (GLN + cross-feature token injection + dynamic masking) to answer.
+        Each problem turns on MTGR's load-bearing detail: <em>autoregressive ranked-list generation</em> + GLN-isolated cross tokens + dynamic masking.
       </p>
 
       <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
@@ -1484,85 +1487,85 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-a1"
         difficulty="hard"
-        title="A1 — MTGR vs HSTU: pick the discriminator"
-        scenario={<>Both are transducer-based generative rankers. What's the actual architectural delta?</>}
+        title="A1 — What is the architectural delta from HSTU?"
+        scenario={<>HSTU and MTGR both sit in the generative-recsys family. Which sentence states the actual architectural difference?</>}
         options={[
-          {key:"a", text:"MTGR retains DLRM cross-features as additional tokens with Group-Layer Normalization keeping them in a separate sub-space from sequence tokens; HSTU drops crosses entirely.", correct:true},
-          {key:"b", text:"MTGR is faster."},
-          {key:"c", text:"MTGR uses BCE; HSTU uses softmax."},
-          {key:"d", text:"They're identical."},
+          {key:"a", text:"HSTU is decoder-only with action tokens; MTGR adds a BCE calibration head on top of HSTU's per-candidate outputs and otherwise reuses HSTU end-to-end."},
+          {key:"b", text:"MTGR auto-regressively emits a ranked sequence of items, conditioning each next item on the already-placed prefix; HSTU scores each candidate independently.", correct:true},
+          {key:"c", text:"MTGR replaces HSTU's attention with linear attention to handle longer histories; ranking pipeline and per-candidate scoring otherwise unchanged."},
+          {key:"d", text:"HSTU outputs a softmax over items; MTGR outputs a sigmoid per item — both still score candidates independently per request, no list-level coupling."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>The cross-feature channel + GLN is the entire MTGR contribution. HSTU's loss / attention variant / scaling story all carry over unchanged.</>}
-        stretch={<>What would happen if you used plain LayerNorm in MTGR?</>}
+        trap={<>(a) confuses MTGR with a loss-head retrofit. (c) is a Performer/Linformer-style edit, not MTGR. (d) treats both as pointwise rankers and misses the autoregressive list generation.</>}
+        lens={<>The discriminator is whether the model emits items independently (HSTU) or auto-regressively as a list (MTGR). All loss/attention-variant framings miss the load-bearing axis.</>}
+        stretch={<>If you wrap HSTU with a beam-search decoder over candidates, does it become MTGR?</>}
       />
 
       {/* A2 */}
       <VIS.TrapProblem
         id="mtgr-a2"
         difficulty="hard"
-        title="A2 — 'MTGR is DLRM with attention'"
-        scenario={<>A teammate says "MTGR is just DLRM with attention over the sequence." Defeat.</>}
+        title="A2 — Is MTGR 'DLRM with attention'?"
+        scenario={<>A teammate frames MTGR as "DLRM with self-attention bolted on top of the cross-feature MLP." Which response is correct?</>}
         options={[
-          {key:"a", text:"DLRM scores (user, item) with MLPs over crossed features. MTGR uses a transducer (auto-regressive over the full action sequence) with crosses as additional tokens. The loss shape, scaling story, and the entire HSTU machinery are present — DLRM has none of that.", correct:true},
-          {key:"b", text:"It's true."},
-          {key:"c", text:"DLRM doesn't have crosses."},
-          {key:"d", text:"MTGR doesn't have crosses."},
+          {key:"a", text:"True — MTGR is a feature-interaction MLP plus an attention block over the candidate side. Loss and training loop unchanged from DLRM."},
+          {key:"b", text:"Partially — MTGR adds attention but keeps DLRM's pointwise sigmoid loss per candidate; ranking is still independent across items."},
+          {key:"c", text:"Wrong — MTGR is a decoder-only transformer that auto-regressively generates a ranked sequence; DLRM scores items independently and has neither sequence decoding nor intra-list conditioning.", correct:true},
+          {key:"d", text:"Wrong — MTGR drops crosses entirely and is pure attention over user history, like HSTU; nothing of DLRM remains."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>MTGR is HSTU plus crosses, not DLRM plus attention. The framing matters because the operational implications follow HSTU's playbook (calibration, scaling), not DLRM's.</>}
-        stretch={<>Why does the framing direction matter for migration planning?</>}
+        trap={<>(a) and (b) treat MTGR as a DLRM retrofit, missing the autoregressive list emission. (d) over-corrects and confuses MTGR with vanilla HSTU.</>}
+        lens={<>The framing matters because MTGR's operational story (decoder-step latency, beam-vs-greedy, intra-list redundancy control) only makes sense once you grant that the model generates the list, not just scores items.</>}
+        stretch={<>Why is "pointwise DLRM + attention" too weak to capture anti-redundancy in the emitted list?</>}
       />
 
       {/* A3 */}
       <VIS.TrapProblem
         id="mtgr-a3"
         difficulty="hard"
-        title="A3 — Without MTGR, the fallback"
-        scenario={<>If MTGR didn't exist and you wanted HSTU's scaling without losing crosses, what would you build?</>}
+        title="A3 — Fallback if MTGR didn't exist"
+        scenario={<>You want intra-list-aware ranking with HSTU-class scaling but MTGR doesn't exist. Which fallback is closest in spirit?</>}
         options={[
-          {key:"a", text:"Either (a) stay on DLRM and accept the scaling plateau, or (b) port HSTU and rebuild crosses as concatenated features with hand-tuned LN — typically regresses anyway because LN washes out the cross signal at scale.", correct:true},
-          {key:"b", text:"Use HSTU directly."},
-          {key:"c", text:"Use OneRec."},
-          {key:"d", text:"Use TIGER."},
+          {key:"a", text:"Train HSTU for per-item scoring, then add an autoregressive list-decoding head over the top-K candidates — recovers list-level conditioning, though without GLN-isolated crosses.", correct:true},
+          {key:"b", text:"Use vanilla HSTU and trust the score-then-sort cascade to surface intra-list dependencies through downstream rerankers in the existing serving stack."},
+          {key:"c", text:"Switch to TIGER and let its semantic-ID decoder emit the ranked list one semantic ID at a time, mapping each emitted ID back to a catalog item at serve time."},
+          {key:"d", text:"Stay on DLRM and invest harder in the cross-feature set; intra-list dependencies rarely move online metrics and the cascade reranker covers what's left."},
         ]}
-        trap={<>(b) is what regresses. (c) is end-to-end, different scope. (d) is for retrieval.</>}
-        lens={<>The naive HSTU+crosses approach (concat + plain LN) is exactly what fails. MTGR's GLN is the *load-bearing* trick.</>}
-        stretch={<>What does the concat+LN approach get wrong specifically?</>}
+        trap={<>(b) ignores that score-and-sort can't see the prefix when scoring item k. (c) misreads TIGER as a list-level generator. (d) dismisses the very gap MTGR addresses.</>}
+        lens={<>The fallback has to recover <em>autoregressive list conditioning</em>. Slapping a list-decoder head on HSTU is the structurally-honest approximation; TIGER and DLRM patch different problems.</>}
+        stretch={<>What does the HSTU+list-decoder approach still miss vs MTGR?</>}
       />
 
       {/* A4 */}
       <VIS.TrapProblem
         id="mtgr-a4"
         difficulty="hard"
-        title="A4 — MTGR + TIGER"
-        scenario={<>Can MTGR (ranking) be composed with TIGER (retrieval)?</>}
+        title="A4 — Can MTGR compose with TIGER?"
+        scenario={<>Can a pipeline use TIGER for retrieval and MTGR for ranking together?</>}
         options={[
-          {key:"a", text:"Yes — they target different funnel stages. TIGER decodes candidate Semantic IDs; MTGR ranks them using sequence + crosses. The composition gives content-aware retrieval + cross-aware ranking.", correct:true},
-          {key:"b", text:"No — incompatible."},
-          {key:"c", text:"Only one can be used."},
-          {key:"d", text:"Both replace each other."},
+          {key:"a", text:"No — TIGER and MTGR both decode token sequences and would deadlock on shared semantic-ID codebooks at training time, so they can't co-exist in one stack."},
+          {key:"b", text:"No — MTGR re-derives candidate retrieval internally from the history tokens, so TIGER's retrieval output would be ignored or double-counted at ranking time."},
+          {key:"c", text:"Only if TIGER's semantic IDs are remapped back to raw item IDs before MTGR ingests them; otherwise MTGR's vocabulary mismatches the retrieved set."},
+          {key:"d", text:"Yes — TIGER decodes semantic-ID sequences to retrieve candidates; MTGR then autoregressively orders those candidates as a ranked list. Different stages, orthogonal.", correct:true},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>MTGR stays in the cascade; TIGER stays in retrieval. They are orthogonal.</>}
-        stretch={<>What input format do TIGER's outputs need to feed MTGR?</>}
+        trap={<>(a) over-states the coupling. (b) is false. (c) is a plausible plumbing concern but isn't a blocker — item IDs are the shared interface.</>}
+        lens={<>TIGER answers "which items?" via semantic-ID generation; MTGR answers "in what order?" via item-sequence generation. Composing them is the natural cascade.</>}
+        stretch={<>What state does MTGR need from TIGER beyond the candidate set?</>}
       />
 
       {/* A5 */}
       <VIS.TrapProblem
         id="mtgr-a5"
         difficulty="hard"
-        title="A5 — Where MTGR's advantage over HSTU shrinks"
-        scenario={<>MTGR beats HSTU when crosses matter. Where does the gap go to zero?</>}
+        title="A5 — Where does MTGR's advantage shrink to zero?"
+        scenario={<>On which surface does MTGR's gain over HSTU collapse to near-zero?</>}
         options={[
-          {key:"a", text:"Surfaces where cross-features carry <5% of signal (purely engagement-loop surfaces with no contextual covariates); MTGR's extra GLN parameters and cross-token compute are pure overhead with no quality return.", correct:true},
-          {key:"b", text:"Long histories."},
-          {key:"c", text:"GPU-rich infra."},
-          {key:"d", text:"Cold-start dominant catalogs."},
+          {key:"a", text:"Surfaces with very long user histories — HSTU's transduction already captures the relevant cross-item interactions, and autoregressive list decoding adds overhead with no measurable quality return on top."},
+          {key:"b", text:"Surfaces where the visible list is a single slot (one-shot notification ranking) — no intra-list prefix to condition on, so MTGR's autoregressive emission collapses to pointwise scoring.", correct:true},
+          {key:"c", text:"Cold-start-dominant catalogs — neither MTGR nor HSTU can score unseen items well, so the gap between the two stays roughly flat regardless of architecture choice."},
+          {key:"d", text:"GPU-rich infra environments — abundant compute lets HSTU close the scaling-slope gap, neutralizing MTGR's marginal architectural advantage at the same FLOP budget."},
         ]}
-        trap={<>(d) is wrong because cold-start affects both. (b), (c) help both.</>}
-        lens={<>MTGR is a cross-rich-surface optimization. On pure engagement loops, HSTU is already at the cap.</>}
-        stretch={<>How would you A/B test the marginal value of GLN?</>}
+        trap={<>(a) inverts the picture (long history helps both). (c) is a wash, not a collapse. (d) confuses scaling slope with marginal architectural gain.</>}
+        lens={<>MTGR's load-bearing contribution is conditioning on the already-emitted prefix. Single-slot surfaces remove that prefix and reduce MTGR to a pointwise scorer.</>}
+        stretch={<>What's the smallest list length where MTGR's intra-list gain is detectable?</>}
       />
 
       <h3 style={{marginTop:32, color:"#1f3a5f"}}>B. Application</h3>
@@ -1571,68 +1574,68 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-b1"
         difficulty="hard"
-        title="B1 — Mature DLRM at food-delivery scale"
-        scenario={<>Mature DLRM at Meituan / DoorDash / Uber Eats — years of cross-feature engineering (cuisine×region×time-of-day×weather), median user history 200 events, GPU budget available. Pick HSTU, MTGR, or DLRM.</>}
+        title="B1 — Pick the ranker for a mature food-delivery surface"
+        scenario={<>Mature DLRM, cuisine×region×time-of-day crosses, median history 200 events, ranked list of 30 items shown per query. Pick the ranker.</>}
         options={[
-          {key:"a", text:"MTGR — exactly the scenario the paper validates. Keep the crosses, get scaling. Vanilla HSTU regresses here; DLRM plateaus.", correct:true},
-          {key:"b", text:"HSTU."},
-          {key:"c", text:"DLRM."},
-          {key:"d", text:"TIGER."},
+          {key:"a", text:"Vanilla HSTU — scaling is the binding constraint; cross-features can be folded back in as concat tokens with plain LN once the transducer is up."},
+          {key:"b", text:"DLRM — keep the crosses, accept the plateau; generative rankers regress on cross-rich surfaces unless their cross story is bespoke."},
+          {key:"c", text:"MTGR — it keeps crosses via GLN AND emits the 30-item list autoregressively, so anti-redundancy across the displayed list is modeled natively.", correct:true},
+          {key:"d", text:"TIGER — its semantic-ID decoder will both retrieve and rank the 30 items end-to-end in one autoregressive pass."},
         ]}
-        trap={<>(b) regresses; (c) plateaus; (d) is for retrieval.</>}
-        lens={<>This is MTGR's archetypal use case — published, validated, deployed.</>}
-        stretch={<>What single Meituan property is essential to MTGR's gain?</>}
+        trap={<>(a) concedes crosses (concat+LN washes them out). (b) concedes scaling. (d) overloads TIGER with a ranking role it doesn't fill.</>}
+        lens={<>MTGR's archetypal surface combines (i) DLRM-class crosses, (ii) long history, and (iii) a multi-item display where intra-list ordering matters.</>}
+        stretch={<>Which of the three properties is necessary, which are sufficient?</>}
       />
 
       {/* B2 */}
       <VIS.TrapProblem
         id="mtgr-b2"
         difficulty="hard"
-        title="B2 — 'GLN is just more LayerNorm'"
-        scenario={<>An ML engineer asks: "Why not just have two LayerNorms — one on crosses, one on sequence?" Why doesn't this work?</>}
+        title="B2 — Failure mode of 'two LayerNorms, one stream'"
+        scenario={<>An engineer proposes: keep one shared transformer stream, but apply LayerNorm(crosses) and LayerNorm(sequence) at each block. What's the failure mode vs MTGR's GLN?</>}
         options={[
-          {key:"a", text:"Per-token LayerNorm normalizes the whole hidden vector at each token position; you'd need cross and sequence to be separate token streams that never co-attend. GLN does GROUP-wise norm within shared attention — keeps statistics separate while still allowing cross-token attention. The two are different operations.", correct:true},
-          {key:"b", text:"It's the same."},
-          {key:"c", text:"You can't have two LayerNorms."},
-          {key:"d", text:"Plain LN works fine in MTGR."},
+          {key:"a", text:"Two-LN keeps stats separate but applies norms sequentially on the same hidden vector, so cross and sequence stats entangle via the residual; GLN's per-group norm preserves co-attention without mixing.", correct:true},
+          {key:"b", text:"Two-LN is mathematically equivalent to GLN — the engineer is right; MTGR's GLN is a rebrand of two sequential LayerNorms applied per token group with no actual operator difference."},
+          {key:"c", text:"Two-LN forces cross and sequence into disjoint streams that can't co-attend; this loses the cross×sequence interaction MTGR's gain depends on, while GLN preserves co-attention."},
+          {key:"d", text:"Two-LN doubles parameter count, which under-fits cross-feature embeddings on small data — the failure is capacity, not normalization geometry, and GLN solves it by sharing parameters."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>GLN's contribution is exactly that crosses and sequence CAN co-attend (information flows both ways) while their statistics stay separate. Two-LN-two-streams loses the co-attention.</>}
-        stretch={<>Why is co-attention important for MTGR's gain?</>}
+        trap={<>(b) is the lazy "same thing" misread. (c) is the close-but-wrong mechanism — two-LN can be implemented with shared streams. (d) cites the wrong cause.</>}
+        lens={<>GLN's contribution is per-group statistics inside shared attention. Two-LN on shared streams entangles via residuals; two-LN on split streams loses co-attention. GLN is the geometry that gives you both.</>}
+        stretch={<>Sketch the residual path that causes two-LN entanglement.</>}
       />
 
-      {/* B3 */}
+      {/* B3 — anchored on AUTOREGRESSIVE LIST GENERATION */}
       <VIS.TrapProblem
         id="mtgr-b3"
         difficulty="medium"
-        title="B3 — Pitch MTGR to a CTO (must require knowing what GLN actually does)"
-        scenario={<>CTO with a mature DLRM asks: "Why MTGR over plain HSTU?" Give the 1-sentence pitch that *only* works if the listener understands GLN's role — i.e. an explanation that would fail if MTGR were just "HSTU at Meituan."</>}
+        title="B3 — Pitch MTGR to a CTO in one sentence"
+        scenario={<>A CTO with a mature DLRM asks "Why MTGR over plain HSTU?" Pick the pitch whose load-bearing claim only holds for MTGR.</>}
         options={[
-          {key:"a", text:"'Preserve every cross-feature investment + gain HSTU scaling — generic cross-modernization play.' (Could be HSTU+ or any cross-recovery design.)"},
-          {key:"b", text:"'In MTGR, cross-feature tokens and action-sequence tokens live in <em>separate normalization sub-spaces via Group-Layer Normalization (GLN)</em> — that is what keeps the high-frequency action-token statistics from contaminating the sparse cross-feature signals when they share the same transducer; without GLN, re-injecting crosses into HSTU regresses because LayerNorm pools their statistics together.'", correct:true},
-          {key:"c", text:"'Transformers everywhere.'"},
-          {key:"d", text:"'NDCG up 1% on the offline eval.'"},
+          {key:"a", text:"It's an encoder-decoder transformer that scores each candidate against the user-history encoding, matching HSTU's transduction framing but with cross-features added back."},
+          {key:"b", text:"It generates a sequence of semantic-ID tokens per recommendation slot, then maps those tokens back to catalog items at serve time."},
+          {key:"c", text:"It's a transformer over candidate features with a softmax over ranking slots, treating list ranking as a per-position classification problem."},
+          {key:"d", text:"It's a decoder-only transformer that emits the ranked list auto-regressively, so intra-list dependencies — position effects and anti-redundancy — are captured natively, not patched in by a downstream reranker.", correct:true},
         ]}
-        trap={<>(a) is the trap — it's a generic "preserve crosses + add scaling" line that fits MTGR, HSTU+, or any cross-recovery research; redaction-substitute MTGR and (a) is unchanged. (b) is the only pitch that <em>fails</em> if you don't know GLN: it requires the listener to grasp that GLN isolates heterogeneous token sub-spaces inside one shared stack. Drop GLN and re-injected crosses get washed out.</>}
-        lens={<>MTGR = HSTU + cross-feature recovery. The cross-feature recovery isn't "concatenate crosses back in" — it's *separate normalization statistics per token group* via GLN. That's what makes the +1.22% real instead of a wash. The pitch must turn on this specific mechanism.</>}
-        stretch={<>If your DLRM crosses currently live in a sparse parameter server, what does GLN's sub-space requirement imply for how you feed them into the MTGR token stream?</>}
+        trap={<>(a) is the HSTU framing (transduction, per-candidate scoring). (b) is the TIGER framing (semantic-ID generation). (c) is listwise-classification framing. (d) is the only pitch whose load-bearing claim — autoregressive emission of the list — fails to describe HSTU, TIGER, or listwise heads.</>}
+        lens={<>The discriminating mechanism is autoregressive ranked-list emission. A junior who knows HSTU picks (a); who knows TIGER picks (b); who knows listwise loss picks (c). The senior picks (d) because intra-list autoregression is what HSTU and TIGER and listwise heads all lack.</>}
+        stretch={<>If you strip the autoregressive list emission from MTGR, which of the three decoys does it collapse to?</>}
       />
 
       {/* B4 */}
       <VIS.TrapProblem
         id="mtgr-b4"
         difficulty="hard"
-        title="B4 — When NOT to use MTGR"
-        scenario={<>Pick the surface where MTGR is overkill.</>}
+        title="B4 — Surface where MTGR is overkill"
+        scenario={<>Pick the surface where MTGR's autoregressive list decoder is dead weight.</>}
         options={[
-          {key:"a", text:"Greenfield video-feed startup with no existing cross-features and long action histories — HSTU is enough; MTGR's GLN + cross channel are dead weight.", correct:true},
-          {key:"b", text:"Food delivery."},
-          {key:"c", text:"Ads."},
-          {key:"d", text:"E-commerce."},
+          {key:"a", text:"Mature ads platform with 50+ active cross-features and a 20-slot ad carousel — MTGR's crosses plus list decoding are both load-bearing on this surface."},
+          {key:"b", text:"Push-notification ranking that surfaces a single item per user per day — no list prefix to condition on, so autoregressive list decoding has nothing to model.", correct:true},
+          {key:"c", text:"Food-delivery home-feed with cuisine×region×time-of-day crosses and a 30-slot list — the canonical MTGR surface from the paper itself."},
+          {key:"d", text:"E-commerce category page with 30 product slots and rich product-attribute crosses — exactly MTGR's design target per the paper."},
         ]}
-        trap={<>(b), (c), (d) are MTGR's sweet spots.</>}
-        lens={<>MTGR's value is recovering DLRM crosses. No crosses → no recovery → no MTGR.</>}
-        stretch={<>How few crosses make MTGR not worth it?</>}
+        trap={<>(a), (c), (d) are MTGR's sweet spots. The trap is to pick a generic 'simple' surface; the right answer points at the missing list-prefix.</>}
+        lens={<>MTGR's value is intra-list autoregression + cross recovery. Remove the list (single-slot) and the autoregressive half is dead weight even if you still have crosses.</>}
+        stretch={<>At what list length does autoregressive decoding start to earn back its serving cost?</>}
       />
 
       <h3 style={{marginTop:32, color:"#1f3a5f"}}>C. Mechanism</h3>
@@ -1641,87 +1644,87 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-c1"
         difficulty="hard"
-        title="C1 — Why Group-Layer Norm specifically?"
-        scenario={<>Why GLN and not (a) plain LN, (b) BatchNorm, (c) RMSNorm?</>}
+        title="C1 — Why Group-Layer Norm fits MTGR's mixed token stream"
+        scenario={<>Among plain LN, BatchNorm, RMSNorm, and GLN, which match MTGR's mixed token-type structure best, and why?</>}
         options={[
-          {key:"a", text:"Plain LN normalizes the whole hidden vector per token, mixing cross and sequence stats; BN is unsuitable for variable-length sequences; RMSNorm has the same per-token-mixing issue. GLN's group-wise normalization is the unique fit for heterogeneous token classes.", correct:true},
-          {key:"b", text:"GLN is faster."},
-          {key:"c", text:"It's an arbitrary choice."},
-          {key:"d", text:"RMSNorm would work better."},
+          {key:"a", text:"GLN is faster on modern GPUs than LN, BN, and RMSNorm; the throughput win is what pays for the extra cross tokens MTGR injects into the stream, so it's chosen for compute efficiency."},
+          {key:"b", text:"RMSNorm would be a strict improvement over GLN but the paper is older; production teams should upgrade to RMSNorm and drop GLN, which is now a legacy choice with no quality return."},
+          {key:"c", text:"BatchNorm would work equally well if you bucket cross tokens and sequence tokens into separate mini-batches; GLN is just a convenient implementation of that same idea inside a single batch."},
+          {key:"d", text:"LN and RMSNorm normalize the whole hidden vector per token, mixing cross and sequence stats; BN is unsuitable for variable-length sequences; GLN's per-group stats fit heterogeneous tokens.", correct:true},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>The "groups" in GLN map exactly to token-type classes (cross vs sequence). The norm groups are *semantically* meaningful, not just compute groups.</>}
-        stretch={<>How many GLN groups would you use if you had three token classes?</>}
+        trap={<>(a) cites throughput, not geometry. (b) misreads RMSNorm as solving the mixing problem. (c) is a plausible-wrong "just batch them" answer.</>}
+        lens={<>The "groups" in GLN map to token-type classes (cross vs sequence), not to compute partitions. LN/RMSNorm pool stats within a token; BN pools across the batch — neither matches the heterogeneous-token structure.</>}
+        stretch={<>What does the per-group statistic actually estimate that per-token LN does not?</>}
       />
 
       {/* C2 */}
       <VIS.TrapProblem
         id="mtgr-c2"
         difficulty="hard"
-        title="C2 — Dynamic masking — what does it prevent?"
-        scenario={<>MTGR uses dynamic masking. What specific leak does this prevent?</>}
+        title="C2 — What does dynamic masking prevent?"
+        scenario={<>MTGR uses dynamic masking on top of the decoder's causal mask. What specific leak does it block?</>}
         options={[
-          {key:"a", text:"Cross-feature tokens (which encode user×item interactions) shouldn't attend to FUTURE sequence tokens at training time, else the cross 'sees' the answer it's supposed to help predict. Dynamic masking restricts attention based on token type + position.", correct:true},
-          {key:"b", text:"Cross tokens see future GPU memory."},
-          {key:"c", text:"Cross tokens don't need masking."},
-          {key:"d", text:"Sequence tokens leak."},
+          {key:"a", text:"Cross tokens encoding aggregations computed up to time t (e.g. user×30-day-purchases) would, under a plain causal mask, attend to future emitted items at decode time and leak the prediction target into the cross channel.", correct:true},
+          {key:"b", text:"Dynamic masking prevents the decoder from re-emitting the same item twice in the ranked list, by masking already-placed items at each autoregressive step."},
+          {key:"c", text:"Dynamic masking blocks the loss from backpropagating through the cross-token embeddings, so the cross channel is frozen during training."},
+          {key:"d", text:"Dynamic masking enforces that sequence tokens never attend to cross tokens, keeping the two streams numerically independent at inference."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>The mask must be more nuanced than HSTU's plain causal mask because cross-token positions don't have a natural "time" — they're contextual, but can leak if they attend to future sequence items.</>}
-        stretch={<>Could you avoid dynamic masking by placing all crosses at position 0?</>}
+        trap={<>(b) confuses dynamic masking with no-repeat decoding. (c) confuses it with stop-gradient. (d) inverts the design (cross↔sequence co-attention is wanted).</>}
+        lens={<>The mask must be richer than HSTU's plain causal mask because cross tokens don't have a natural 'time' but can still leak future information if they attend forward into emitted items.</>}
+        stretch={<>Could you avoid dynamic masking by pinning all cross tokens to position 0?</>}
       />
 
-      {/* C3 */}
+      {/* C3 multiselect */}
       <VIS.TrapProblem
         id="mtgr-c3"
         difficulty="hard"
-        title="C3 — What does MTGR keep from DLRM that HSTU dropped?"
-        scenario={<>Pick all things MTGR explicitly restores from DLRM that HSTU had dropped.</>}
+        title="C3 — What does MTGR restore from DLRM that HSTU dropped?"
+        scenario={<>Pick everything MTGR explicitly restores from DLRM that HSTU had let go.</>}
         multiSelect
         options={[
-          {key:"a", text:"Hand-engineered cross-features as model inputs.", correct:true},
-          {key:"b", text:"The cross-feature pipeline upstream (engineering surface).", correct:true},
-          {key:"c", text:"Cross-feature attribution at debug time (you can ablate one cross to measure its lift).", correct:true},
-          {key:"d", text:"Layer normalization (vanilla LN is still gone)."},
-          {key:"e", text:"Pointwise sigmoid loss."},
+          {key:"a", text:"Hand-engineered cross-features as first-class model inputs, encoded as tokens rather than concatenated MLP features.", correct:true},
+          {key:"b", text:"DLRM's pointwise sigmoid loss per candidate — MTGR scores items independently the same way DLRM does."},
+          {key:"c", text:"The upstream cross-feature engineering pipeline (Spark jobs, feature store) — MTGR depends on it staying live.", correct:true},
+          {key:"d", text:"Vanilla LayerNorm — MTGR reverts to LN once the cross tokens are injected."},
+          {key:"e", text:"Cross-feature ablation as a debug primitive — you can disable one cross token at a time to measure its lift.", correct:true},
         ]}
-        trap={<>(d) is wrong — MTGR replaces LN with GLN, doesn't restore LN. (e) is wrong — MTGR keeps HSTU's generative loss.</>}
-        lens={<>Three real restorations from DLRM. MTGR is "DLRM crosses inside HSTU stack" — keeps DLRM's *features* but not its *loss* or *architecture*.</>}
-        stretch={<>Which of the three restorations is the most operationally painful?</>}
+        trap={<>(b) wrong — MTGR keeps the autoregressive generative loss. (d) wrong — LN is replaced by GLN. (a), (c), (e) are the real restorations.</>}
+        lens={<>MTGR re-imports DLRM's <em>features</em> and the <em>tooling</em> around them, not DLRM's loss or scoring topology.</>}
+        stretch={<>Which restoration is the most operationally painful to maintain?</>}
       />
 
-      {/* C4 */}
+      {/* C4 multiselect */}
       <VIS.TrapProblem
         id="mtgr-c4"
         difficulty="hard"
-        title="C4 — GLN group size — too few groups, too many?"
-        scenario={<>You have cross-features and sequence tokens. You assign them to 2 GLN groups vs 16 groups. What happens?</>}
+        title="C4 — Choosing the number of GLN groups"
+        scenario={<>You have cross-feature tokens and history-sequence tokens. Compare 2 GLN groups vs 16. Which statements are correct?</>}
         multiSelect
         options={[
-          {key:"a", text:"2 groups (paper default): clean separation of cross vs sequence; norm statistics computed per group.", correct:true},
-          {key:"b", text:"16 groups: over-segmentation; each group has too few tokens to estimate reliable statistics; norm becomes noisy.", correct:true},
-          {key:"c", text:"More groups always help."},
-          {key:"d", text:"GLN groups are arbitrary."},
+          {key:"a", text:"2 groups matches the count of semantically distinct token classes (cross vs sequence); statistics are estimated over enough tokens to be stable.", correct:true},
+          {key:"b", text:"16 groups over-segments the token stream; each group has too few tokens to estimate stable mean/variance and the norm becomes noisy.", correct:true},
+          {key:"c", text:"More groups always help because each group fits its own scale and shift parameters independently of the others, so the model strictly gains expressivity with finer partitions."},
+          {key:"d", text:"Group count is arbitrary in GLN; what matters is the group dimension, not the group count — pick 2 or 16, the offline metrics will land within noise either way."},
         ]}
-        trap={<>(c), (d) misread.</>}
-        lens={<>GLN group count tracks the number of *semantically* distinct token classes you have. For MTGR, that's 2 (cross + sequence). Splitting further introduces noise.</>}
-        stretch={<>If you added user-history-tail tokens as a 3rd type, would you use 3 groups?</>}
+        trap={<>(c), (d) misread GLN as a knob to crank rather than a semantic partition.</>}
+        lens={<>GLN group count tracks the number of semantically distinct token classes you have. Over-segmenting trades signal for noise.</>}
+        stretch={<>If you added user-history-tail tokens as a third class, would you use 3 groups?</>}
       />
 
       {/* C5 */}
       <VIS.TrapProblem
         id="mtgr-c5"
         difficulty="hard"
-        title="C5 — Surface with rich crosses but very short histories"
-        scenario={<>Cross-features carry 70% of signal; median user history = 10 events. MTGR?</>}
+        title="C5 — Rich crosses but very short user histories"
+        scenario={<>Crosses carry 70% of the signal; median user history is 10 events. What happens with MTGR?</>}
         options={[
-          {key:"a", text:"MTGR underperforms — the HSTU backbone's value comes from long-sequence scaling. With 10-event histories, the sequence side contributes minimally; you're essentially using a small transformer with crosses, which DLRM does already.", correct:true},
-          {key:"b", text:"MTGR is fine."},
-          {key:"c", text:"MTGR scales the cross side."},
-          {key:"d", text:"Need to retrain."},
+          {key:"a", text:"MTGR over-performs DLRM here because GLN preserves the strong cross signal while the autoregressive list decoder adds an extra free win over pointwise scoring."},
+          {key:"b", text:"MTGR underperforms — the decoder backbone's value comes from long-history scaling; with 10 events the sequence side is a small transformer, leaving you with DLRM-class quality at MTGR-class cost.", correct:true},
+          {key:"c", text:"MTGR is unaffected by history length because GLN normalizes away the difference between short and long histories at the token-statistics level."},
+          {key:"d", text:"Need to retrain MTGR with a longer-history synthetic dataset; once trained on long histories it transfers to short ones."},
         ]}
-        trap={<>(b), (c) misread.</>}
-        lens={<>MTGR inherits HSTU's history-length sensitivity. Without sufficient sequence, the HSTU half is just a small transformer.</>}
+        trap={<>(a) over-credits MTGR by ignoring backbone-scaling sensitivity. (c) misreads GLN. (d) is a generic 'retrain' answer that ignores the architectural bound.</>}
+        lens={<>MTGR inherits its backbone's history-length sensitivity. Strong crosses alone don't compensate for a starved sequence side.</>}
         stretch={<>How would you adapt MTGR for short-history surfaces?</>}
       />
 
@@ -1729,16 +1732,16 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-c1b"
         difficulty="hard"
-        title="C1b — User-level compression: what does it compress?"
-        scenario={<>MTGR's inference-cost-down-12% comes from "user-level compression." What does this mean?</>}
+        title="C1b — What does 'user-level compression' actually compress?"
+        scenario={<>MTGR's 12% inference-cost reduction comes from "user-level compression." What is being compressed?</>}
         options={[
-          {key:"a", text:"Multiple users' inferences get packed into one transformer pass (sequence batching across users) when their histories don't conflict; reduces per-request overhead. Different from HSTU's KV-cache reuse.", correct:true},
-          {key:"b", text:"Compresses user IDs."},
-          {key:"c", text:"FP4 quantization."},
-          {key:"d", text:"Smaller batch."},
+          {key:"a", text:"User-ID embeddings are quantized to FP4 at serve time, shrinking the embedding-table memory footprint and freeing GPU bandwidth for the decoder."},
+          {key:"b", text:"User histories are summarized into a fixed-length compressed representation before entering the decoder, so per-request token count is bounded regardless of history length."},
+          {key:"c", text:"Multiple users' decode passes are packed into one batch when their histories don't conflict, amortizing per-step overhead across users at autoregressive decode time.", correct:true},
+          {key:"d", text:"User-side cross-feature tokens are pruned to a smaller set per user, dropping low-utility crosses dynamically based on a learned gate."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>User-level compression is a serving-side trick. It's MTGR-specific because crosses don't conflict across users (orthogonal contexts).</>}
+        trap={<>(a) is the quantization-everywhere answer. (b) confuses compression with history-summarization (a different optimization). (d) confuses it with feature pruning.</>}
+        lens={<>'User-level compression' here is a <em>serving-time batching</em> trick exploiting orthogonal user contexts, not a model-architectural compression.</>}
         stretch={<>When does user-level compression NOT apply?</>}
       />
 
@@ -1748,51 +1751,51 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-d1"
         difficulty="hard"
-        title="D1 — 'GLN means more LayerNorm = more performance'"
-        scenario={<>An engineer adds GLN to a vanilla HSTU model and reports a 0% improvement. Diagnose.</>}
+        title="D1 — GLN added to vanilla HSTU produces no improvement"
+        scenario={<>An engineer swaps LN→GLN inside vanilla HSTU (no cross tokens injected). Offline metrics move 0%. Diagnose.</>}
         options={[
-          {key:"a", text:"Without cross-feature tokens injected as a separate group, GLN has nothing to separate — there's only one group (sequence). GLN's value comes from the group SEPARATION between heterogeneous token classes, not from the norm operation itself.", correct:true},
-          {key:"b", text:"GLN is broken."},
-          {key:"c", text:"More iterations needed."},
-          {key:"d", text:"HSTU doesn't support GLN."},
+          {key:"a", text:"With only one token class (sequence) present, GLN reduces to LN over a single group — mathematically identical to plain LN. The gain comes from separating heterogeneous token classes.", correct:true},
+          {key:"b", text:"GLN's learnable scale/shift parameters need longer warm-up; the model wants 5× more training steps to converge to the GLN-improved regime than plain LN-HSTU does."},
+          {key:"c", text:"GLN must be paired with dynamic masking; without the masking change, the GLN signal is washed out by causal-mask leakage during training and offline metrics show no movement."},
+          {key:"d", text:"HSTU's attention variant is incompatible with GLN; you'd need to switch to softmax attention before GLN's gain materializes in offline ranking metrics on this surface."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>GLN ≠ better LN. GLN is *meaningful* only when you have heterogeneous token classes worth keeping in separate sub-spaces.</>}
-        stretch={<>What's the simplest test for "is GLN useful here"?</>}
+        trap={<>(b) cites convergence. (c) entangles GLN with masking incorrectly. (d) blames the attention variant. All sound plausible.</>}
+        lens={<>GLN is meaningful only with heterogeneous token classes. The simplest test is "do I have more than one semantic token class?"; if not, GLN ≡ LN.</>}
+        stretch={<>What's the smallest extension that would make GLN bite in this setup?</>}
       />
 
       {/* D1b */}
       <VIS.TrapProblem
         id="mtgr-d1b"
         difficulty="hard"
-        title="D1b — '65× FLOPs scaling transfers to my platform'"
-        scenario={<>A junior eng cites MTGR's 65× FLOPs claim and proposes scaling your model 65×. What's wrong with this reasoning?</>}
+        title="D1b — Does the 65× FLOPs scaling claim transfer?"
+        scenario={<>A junior cites MTGR's 65× FLOPs scaling and proposes scaling your model 65×. What's the flaw?</>}
         options={[
-          {key:"a", text:"The 65× number is the scaling SLOPE on Meituan's specific surface — how quickly quality improves per FLOP doubled. It does NOT mean 'scaling MTGR 65× gives 65× quality'. Your own surface may have a different slope; you must measure it before committing budget.", correct:true},
-          {key:"b", text:"You can apply 65× directly."},
-          {key:"c", text:"It's a measurement error."},
-          {key:"d", text:"65× is a marketing claim."},
+          {key:"a", text:"65× refers to scaling Meituan's compute budget — your platform must match Meituan's GPU generation and interconnect bandwidth before the same FLOP envelope is reachable."},
+          {key:"b", text:"65× is the scaling slope measured on Meituan's surface — how quickly quality improves per FLOP. It doesn't translate to '65× model size = 65× quality'; the slope itself is platform-dependent.", correct:true},
+          {key:"c", text:"65× was a measurement error in the paper; later errata show the real number is closer to 6.5×, so the proposal over-budgets by 10×."},
+          {key:"d", text:"65× applies only to retrieval; for ranking the relevant scaling number is 8×, so the junior is using the wrong figure entirely."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>Scaling laws are platform-specific. The MTGR contribution is "scaling slope exists"; the slope's number doesn't transfer literally.</>}
-        stretch={<>How would you measure your own platform's scaling slope?</>}
+        trap={<>(a) reads it as a hardware claim. (c) invents an erratum. (d) misattributes the number. All are confidently-wrong readings.</>}
+        lens={<>Scaling-slope claims are platform-specific. The paper's contribution is "slope exists and is favorable"; the magnitude doesn't transfer literally.</>}
+        stretch={<>How would you measure your own platform's slope cheaply?</>}
       />
 
-      {/* D2 */}
+      {/* D2 multiselect */}
       <VIS.TrapProblem
         id="mtgr-d2"
         difficulty="hard"
-        title="D2 — 'MTGR = HSTU + features' cascade"
-        scenario={<>A teammate calls MTGR "HSTU plus cross-features concat." What downstream wrong assumptions does this hide?</>}
+        title="D2 — Wrong assumptions hidden in 'MTGR = HSTU + features'"
+        scenario={<>A teammate calls MTGR "HSTU with cross-features concatenated in." Which downstream assumptions does that framing silently make wrong?</>}
         multiSelect
         options={[
-          {key:"a", text:"Assumes you can use plain LN → wrong: GLN is load-bearing; plain LN mixes cross + sequence stats and washes out cross signal.", correct:true},
-          {key:"b", text:"Assumes masking is HSTU's causal mask → wrong: dynamic masking is required for cross-token interactions.", correct:true},
-          {key:"c", text:"Assumes upstream cross pipeline is unchanged → wrong: crosses must be re-encoded as tokens, not concatenated features.", correct:true},
-          {key:"d", text:"Assumes GPU usage same → fine, both use GPU."},
+          {key:"a", text:"Assumes the model is still a per-candidate transducer — wrong: MTGR autoregressively emits the ranked list, so candidate ordering depends on the prefix.", correct:true},
+          {key:"b", text:"Assumes the existing HSTU loss is unchanged — actually MTGR replaces it with a calibration regression loss specific to cross tokens."},
+          {key:"c", text:"Assumes plain LN suffices — wrong: GLN is load-bearing; LN mixes cross and sequence statistics and washes out the cross signal.", correct:true},
+          {key:"d", text:"Assumes the existing causal mask suffices — wrong: dynamic masking is required to prevent cross tokens from peeking at future emitted items.", correct:true},
         ]}
-        trap={<>(d) is the unchanged one.</>}
-        lens={<>"HSTU + features" is the cheapest way to misread MTGR. The three real architectural changes (GLN, dynamic mask, token encoding) all need separate engineering effort.</>}
+        trap={<>(b) is fabricated — MTGR keeps HSTU's generative loss family. (a), (c), (d) are the real hidden mistakes.</>}
+        lens={<>'HSTU + features' is the cheapest way to misread MTGR. The list-generation switch, GLN, and dynamic mask are three separate engineering changes — none free.</>}
         stretch={<>Which of the three is cheapest to implement?</>}
       />
 
@@ -1800,34 +1803,34 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-d3"
         difficulty="hard"
-        title="D3 — Junior diagnoses MTGR regression"
-        scenario={<>MTGR offline NDCG is below vanilla HSTU on a benchmark. Junior says "use a larger model." Senior reaches for what?</>}
+        title="D3 — MTGR is below HSTU offline; what does the senior do?"
+        scenario={<>Offline NDCG on MTGR is below vanilla HSTU. A junior proposes a larger model. What does the senior check first?</>}
         options={[
-          {key:"a", text:"Audit GLN group assignment and cross-feature token quality — if your crosses are weak or GLN groups are misspecified, MTGR underperforms even HSTU. Senior validates the cross channel before scaling.", correct:true},
-          {key:"b", text:"Larger model."},
-          {key:"c", text:"More epochs."},
-          {key:"d", text:"Roll back to HSTU."},
+          {key:"a", text:"Switch loss from generative to pointwise sigmoid so per-item calibration is stable; underperformance is usually a loss-shape problem before it's an architecture problem."},
+          {key:"b", text:"Increase the autoregressive decoder's beam width — narrow beams collapse to greedy emission and lose intra-list quality, manifesting as below-HSTU offline numbers."},
+          {key:"c", text:"Audit GLN group assignment and cross-token quality — if crosses are stale or grouped wrong, the cross channel degenerates and MTGR underperforms a model that never had crosses in the first place.", correct:true},
+          {key:"d", text:"Roll back to HSTU; below-baseline numbers usually indicate a hyperparameter regime that doesn't transfer to MTGR's architecture."},
         ]}
-        trap={<>(b), (c) are reflex. (d) ignores diagnosis.</>}
-        lens={<>MTGR underperformance vs HSTU usually means the cross channel is broken — wrong tokens, wrong groups, or wrong dynamic mask. Fix the cross channel first.</>}
-        stretch={<>What's the offline metric that isolates GLN's contribution?</>}
+        trap={<>(a) is a plausible loss-side fix. (b) cites a real but rare cause. (d) abandons diagnosis. (c) targets the most common MTGR failure.</>}
+        lens={<>MTGR underperforming HSTU usually means the cross channel is broken (wrong tokens, wrong groups, stale features). Validate the channel before scaling the model.</>}
+        stretch={<>Which offline metric isolates GLN's contribution cleanly?</>}
       />
 
       {/* D4 */}
       <VIS.TrapProblem
         id="mtgr-d4"
         difficulty="hard"
-        title="D4 — Online CTR up 1.31%; conversion only 1.22%. Why?"
-        scenario={<>MTGR's reported gains: CTR +1.31%, conversion +1.22%. Plausible interpretations: (1) MTGR ranks better but doesn't differentiate quality, (2) downstream funnel issue, (3) measurement noise. Most likely?</>}
+        title="D4 — CTR up 1.31%, conversion only 1.22% — why the gap?"
+        scenario={<>MTGR's reported gains: CTR +1.31%, conversion +1.22%. What's the most informative reading?</>}
         options={[
-          {key:"a", text:"(1) — MTGR's cross-features encode click-driving signal more than conversion-driving signal; ranking improvements show up more in click than in conversion. To boost conversion further, add conversion-side crosses (e.g. price-elasticity × user-budget).", correct:true},
-          {key:"b", text:"(2)."},
-          {key:"c", text:"(3)."},
-          {key:"d", text:"They should be equal."},
+          {key:"a", text:"Autoregressive list decoding boosted CTR via better top-of-list ordering, but downstream funnel dropoff (checkout, payment) ate part of the conversion gain — fix the funnel, not the ranker."},
+          {key:"b", text:"The numbers are within measurement noise of each other; differential interpretation is not warranted — both report a roughly equal +1.25% gain across both objectives."},
+          {key:"c", text:"Conversion was capped by inventory availability during the experiment window, so the conversion gain understates the true MTGR effect; rerun on a non-supply-constrained period."},
+          {key:"d", text:"MTGR's cross-features encode click-driving signal more than conversion-driving signal; the gain mix reflects the cross mix. To lift conversion further, add conversion-side crosses (price-elasticity × user-budget).", correct:true},
         ]}
-        trap={<>(b), (c), (d) miss the cross-content interpretation.</>}
-        lens={<>The CTR > conversion gap reflects the cross feature mix. MTGR amplifies whatever signal is in the crosses.</>}
-        stretch={<>How would you add conversion-driving crosses?</>}
+        trap={<>(a) blames the funnel. (b) calls it noise. (c) invents inventory constraints. (d) reads the cross-content composition correctly.</>}
+        lens={<>CTR-vs-conversion gaps in MTGR reflect cross-feature content. MTGR amplifies whatever signal is in the cross set.</>}
+        stretch={<>How would you add a conversion-driving cross without breaking the click side?</>}
       />
 
       <h3 style={{marginTop:32, color:"#1f3a5f"}}>E. Operations</h3>
@@ -1836,33 +1839,33 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-e1"
         difficulty="hard"
-        title="E1 — Upstream cross pipeline goes stale"
-        scenario={<>The cross-feature engineering pipeline upstream (Spark job that computes user_country×item_category) goes stale (DAG broken Friday morning). MTGR keeps serving. What happens?</>}
+        title="E1 — Cross-feature pipeline goes stale silently"
+        scenario={<>The Spark DAG that computes user_country×item_category breaks Friday morning; MTGR keeps serving. What's the failure mode?</>}
         options={[
-          {key:"a", text:"MTGR silently regresses because cross tokens carry stale/missing values; the sequence half still works fine, so the model doesn't crash — it just performs like a worse HSTU. Detection requires monitoring cross-feature freshness as a separate signal.", correct:true},
-          {key:"b", text:"MTGR crashes."},
-          {key:"c", text:"No impact."},
-          {key:"d", text:"Cross is ignored."},
+          {key:"a", text:"MTGR silently regresses: cross tokens carry stale values, the sequence side still works, so the model degrades to ≈ HSTU minus one cross. Detection needs a cross-feature freshness signal.", correct:true},
+          {key:"b", text:"MTGR fails closed and returns an error per request, surfacing the stale cross immediately in the request-error-rate dashboard so the on-call sees the issue within minutes of the DAG break."},
+          {key:"c", text:"GLN auto-detects the constant stale value via per-group variance collapse and drops that cross token from the input; MTGR runs at HSTU-quality with no operator action needed."},
+          {key:"d", text:"Cross tokens are dropped from the input by the feature-store retry logic on stale reads; ranking continues from sequence tokens only with no measurable quality impact on live traffic."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>MTGR's robustness to upstream failures is *too* graceful — it doesn't fail visibly. Monitoring must cover cross-pipeline health.</>}
-        stretch={<>What monitoring signal would catch this fastest?</>}
+        trap={<>(b) assumes fail-closed (most systems don't). (c) gives GLN auto-detection it doesn't have. (d) under-states the impact.</>}
+        lens={<>MTGR is too graceful under upstream failure — it doesn't crash, it just degrades. Monitoring must cover cross-pipeline health as a separate signal.</>}
+        stretch={<>What monitoring signal catches the stale cross fastest?</>}
       />
 
       {/* E2 */}
       <VIS.TrapProblem
         id="mtgr-e2"
         difficulty="hard"
-        title="E2 — Friday: cross-attribution debugging"
-        scenario={<>Saturday morning page: MTGR's predicted conversion shifted 8% lower for one region. Logs show sequence half is fine. Where do you look?</>}
+        title="E2 — Saturday page: predicted conversion shifted 8% lower in one region"
+        scenario={<>Predicted conversion dropped 8% for one region overnight. Sequence-side metrics look normal. Where do you look?</>}
         options={[
-          {key:"a", text:"Cross-feature attribution — ablate cross tokens one at a time to find which cross is producing the shifted prediction. MTGR's GLN allows you to do this; HSTU couldn't because crosses didn't exist as inputs. The debug primitive is cross-token-by-cross-token attribution.", correct:true},
-          {key:"b", text:"Restart the service."},
-          {key:"c", text:"GPU thermal."},
-          {key:"d", text:"Random."},
+          {key:"a", text:"Inspect the autoregressive beam width — beam collapse in a single region often comes from candidate-set thinning, which manifests region-locally before it shows up in global metrics."},
+          {key:"b", text:"Run cross-token attribution: ablate cross tokens one at a time and identify which cross is producing the regional shift. MTGR's GLN makes per-cross attribution a first-class debug primitive that HSTU lacks.", correct:true},
+          {key:"c", text:"Check GPU thermal logs in the regional inference cluster — single-region prediction shifts at this magnitude usually correlate with hardware throttling in one DC."},
+          {key:"d", text:"Look at the feature-store cache TTL — a regional TTL misconfiguration can drop crosses for that region while leaving sequence features intact."},
         ]}
-        trap={<>(b), (c), (d) miss MTGR's actual debug surface.</>}
-        lens={<>MTGR's debug story is *cross-attribution* (vs HSTU's pure attention rollout). Different debug muscle from either DLRM or HSTU.</>}
+        trap={<>(a) cites a real but indirect mechanism. (c) is the hardware-blame trap. (d) is a plausible plumbing answer that doesn't use MTGR's specific debug surface.</>}
+        lens={<>MTGR's distinctive debug primitive is per-cross-token attribution. Reach for it before exploring beam/hardware/cache hypotheses.</>}
         stretch={<>Sketch a per-cross-token attribution algorithm.</>}
       />
 
@@ -1871,71 +1874,71 @@ flowchart TB
         id="mtgr-e3"
         difficulty="hard"
         title="E3 — Cross-feature dictionary explosion"
-        scenario={<>Mature DLRM had 500 cross-features. Encoding all of them as tokens would explode the per-request token count. Mitigation?</>}
+        scenario={<>A mature DLRM had 500 cross-features. Encoding all 500 as tokens would blow per-request token count. Best mitigation?</>}
         options={[
-          {key:"a", text:"Hierarchical / aggregated cross tokens — group related crosses into single composite tokens (e.g. all geography crosses → one geo token); use frequency-based pruning of rarely-active crosses; consider hashed cross-token embeddings.", correct:true},
-          {key:"b", text:"Just use all 500."},
-          {key:"c", text:"Use no crosses."},
-          {key:"d", text:"Switch to HSTU."},
+          {key:"a", text:"Train a learned attention gate that picks the top-K crosses per request at serve time; tokens are dynamic per request and the per-request count is bounded by K."},
+          {key:"b", text:"Replace all 500 crosses with a single concatenated meta-feature embedding and inject it as one token; loses per-cross attribution but keeps token count flat."},
+          {key:"c", text:"Aggregate related crosses into composite tokens (all geo crosses → one geo token), frequency-prune rarely-active crosses, and use hashed embeddings for the long tail. Trade attribution granularity for tractability.", correct:true},
+          {key:"d", text:"Keep all 500 as individual tokens; modern transformers handle thousands of tokens cheaply and per-cross attribution is operationally required."},
         ]}
-        trap={<>(b), (c), (d) extremes.</>}
-        lens={<>Cross-feature count is a tunable knob in MTGR. Start with the 50 most-impactful crosses (ablation-ranked), grow as needed.</>}
-        stretch={<>How would you rank crosses by impact?</>}
+        trap={<>(a) is a real but complex mitigation that ignores tractability of training. (b) is the over-collapsed answer. (d) under-states cost. (c) is the operationally-balanced answer.</>}
+        lens={<>Cross-feature count is a tunable knob. Start with the top ~50 by ablation-ranked impact, then grow via composite/hashed tokens for the tail.</>}
+        stretch={<>How would you rank crosses by impact at scale?</>}
       />
 
-      {/* E4 */}
+      {/* E4 ordered */}
       <VIS.TrapProblem
         id="mtgr-e4"
         difficulty="hard"
         mode="ordered"
         title="E4 — DLRM → MTGR migration phasing"
-        scenario={<>Phases: (a) port crosses to token format and validate, (b) train MTGR offline, (c) shadow serving with cross-attribution monitoring, (d) traffic ramp.</>}
+        scenario={<>Order the four phases for migrating a mature DLRM to MTGR.</>}
         options={[
-          {key:"a", text:"Port crosses to token format; validate cross-token embeddings match DLRM cross-feature semantics.", order:1},
-          {key:"b", text:"Train MTGR offline; validate +CTR and +conversion against DLRM baseline.", order:2},
-          {key:"c", text:"Shadow serving with cross-attribution monitoring infrastructure deployed.", order:3},
-          {key:"d", text:"Traffic ramp; SLA on per-cross debug being functional.", order:4},
-          {key:"e", text:"Skip cross-token validation."},
-          {key:"f", text:"Retire DLRM Monday."},
+          {key:"a", text:"Port crosses into the token format and validate cross-token embeddings preserve DLRM-feature semantics.", order:1},
+          {key:"b", text:"Train MTGR offline and validate CTR and conversion lift against the DLRM baseline.", order:2},
+          {key:"c", text:"Shadow-serve with cross-attribution monitoring deployed alongside the existing DLRM stack.", order:3},
+          {key:"d", text:"Ramp live traffic with an SLA gating on per-cross-attribution debug being functional end-to-end.", order:4},
+          {key:"e", text:"Skip cross-token validation and rely on offline aggregate metrics as the only signal before ramp."},
+          {key:"f", text:"Retire DLRM the Monday after MTGR's first +CTR shadow result, regardless of conversion outcome."},
         ]}
-        trap={<>(e) is high-risk; (f) is destructive.</>}
-        lens={<>Cross-token validation is the MTGR-specific phase. Without it, you may be encoding crosses wrong without realizing.</>}
-        stretch={<>What's the rollback criterion?</>}
+        trap={<>(e) skips the MTGR-specific validation step. (f) retires the safety net too early.</>}
+        lens={<>Cross-token validation is MTGR's unique migration phase. Without it you may be encoding crosses wrong silently.</>}
+        stretch={<>What's the rollback criterion at each phase?</>}
       />
 
-      {/* E5 */}
+      {/* E5 multiselect */}
       <VIS.TrapProblem
         id="mtgr-e5"
         difficulty="hard"
-        title="E5 — Reproducing MTGR's 65× FLOPs"
-        scenario={<>What experimental conditions must you match to even attempt to reproduce MTGR's 65× FLOPs scaling claim?</>}
+        title="E5 — Conditions to reproduce MTGR's 65× FLOPs scaling"
+        scenario={<>Which experimental conditions must you match to even attempt reproducing MTGR's 65× FLOPs scaling claim?</>}
         multiSelect
         options={[
-          {key:"a", text:"Meituan's specific cross-feature set (published abstractly, not concretely).", correct:true},
-          {key:"b", text:"Comparable cross-feature signal strength on your surface.", correct:true},
-          {key:"c", text:"Long user histories (HSTU backbone needs this).", correct:true},
-          {key:"d", text:"GPU type."},
-          {key:"e", text:"Random seed."},
+          {key:"a", text:"Comparable cross-feature set composition — Meituan's cross mix carries specific high-information features that drive the slope.", correct:true},
+          {key:"b", text:"Cross-feature signal strength on your surface comparable to Meituan's — weak crosses flatten the slope.", correct:true},
+          {key:"c", text:"Long user histories — the backbone's scaling story depends on the history side carrying enough signal at large model sizes.", correct:true},
+          {key:"d", text:"Exact GPU SKU match — the FLOP count is hardware-dependent and the claim breaks on non-H100 fleets."},
+          {key:"e", text:"Identical random seed sequence — scaling slopes are seed-sensitive at MTGR's parameter count and reproduction requires seed alignment."},
         ]}
-        trap={<>(d), (e) are 2nd-order.</>}
-        lens={<>The 65× claim is composite — depends on cross-set composition + signal strength + sequence length. Reproduction = matching all three.</>}
-        stretch={<>What's the minimal cross-set that demonstrates an MTGR gain?</>}
+        trap={<>(d), (e) are second-order red herrings. The actual reproducible conditions are about content (crosses + history), not hardware/seed.</>}
+        lens={<>The 65× claim is composite — it depends on cross composition, cross signal strength, and history length. Reproduction means matching all three.</>}
+        stretch={<>What's the minimal cross-set that demonstrates a non-zero MTGR slope?</>}
       />
 
       {/* E6 */}
       <VIS.TrapProblem
         id="mtgr-e6"
         difficulty="hard"
-        title="E6 — Offline metric for MTGR"
-        scenario={<>Standard NDCG@10 on a fixed candidate set. Why is this insufficient for MTGR?</>}
+        title="E6 — Why is standard NDCG@10 insufficient for MTGR?"
+        scenario={<>You evaluate MTGR with NDCG@10 over a fixed candidate set. Why is this insufficient?</>}
         options={[
-          {key:"a", text:"NDCG@10 over a fixed candidate set under-rewards MTGR's cross-aware improvements that show up most on tail-context combinations (rare cross combinations) often missing from the eval set. Augment with stratified NDCG by cross-frequency tier.", correct:true},
-          {key:"b", text:"NDCG doesn't apply."},
-          {key:"c", text:"Use AUC."},
-          {key:"d", text:"Use BCE loss as the metric."},
+          {key:"a", text:"NDCG@10 measures pointwise relevance; MTGR's lift comes from list-level diversity, which is not in the metric, so MTGR's gains are undercounted across the board."},
+          {key:"b", text:"NDCG@10 saturates at the top-1 position; MTGR's autoregressive decoder differentiates positions 2-10 most, so the metric is blind to MTGR's main improvement region."},
+          {key:"c", text:"NDCG assumes graded relevance; MTGR is trained with binary labels, making NDCG's discount factor incompatible with MTGR's training target distribution."},
+          {key:"d", text:"NDCG@10 over a fixed candidate set under-rewards cross-aware gains that show up most on tail-context combinations (rare cross combinations) often missing from the eval set; augment with stratified NDCG by cross-frequency tier.", correct:true},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>MTGR's gains lie in the cross-context tail. Eval must surface tail-context behavior, not just average NDCG.</>}
+        trap={<>(a), (b) cite plausible-but-wrong list-level effects. (c) cites a label-grading mismatch. (d) is the cross-context-tail story.</>}
+        lens={<>MTGR's gains live in the cross-context tail. Eval must surface tail-context behavior, not just average NDCG.</>}
         stretch={<>Sketch a stratified eval.</>}
       />
 
@@ -1945,16 +1948,16 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-f1"
         difficulty="hard"
-        title="F1 — Edge case: cross-feature ablation"
-        scenario={<>Ablate ALL cross tokens at inference time. What does MTGR become?</>}
+        title="F1 — Ablate all cross tokens at inference"
+        scenario={<>You disable all cross tokens at inference time. What does MTGR become?</>}
         options={[
-          {key:"a", text:"MTGR degenerates to HSTU. The HSTU backbone is unchanged; only the cross channel is removed. Performance regresses to whatever HSTU would have given on this surface.", correct:true},
-          {key:"b", text:"MTGR crashes."},
-          {key:"c", text:"Better than HSTU."},
-          {key:"d", text:"Unchanged."},
+          {key:"a", text:"MTGR degenerates to a vanilla autoregressive list decoder over the history-token backbone — same list-generation behavior, but without the cross channel; quality regresses to HSTU-class on cross-rich surfaces.", correct:true},
+          {key:"b", text:"MTGR fails closed because GLN's group statistics require at least one cross token per group; the inference path errors out on the first empty cross batch."},
+          {key:"c", text:"MTGR outperforms its own cross-on baseline on tail contexts, because removing noisy cross tokens prevents over-fitting to rare cross combinations."},
+          {key:"d", text:"MTGR is unchanged because GLN normalizes the cross side to zero-mean unit-variance — removing them is mathematically equivalent to leaving them in."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>This ablation is the cleanest way to measure MTGR's marginal value: HSTU's number vs MTGR's number = MTGR's contribution from crosses.</>}
+        trap={<>(b) over-couples to GLN. (c) flips the sign of the ablation. (d) misreads GLN's statistical normalization as zero-out.</>}
+        lens={<>The clean ablation: MTGR(cross-off) ≈ HSTU on this surface. The gap MTGR(on) − MTGR(off) is MTGR's marginal cross-channel value.</>}
         stretch={<>What does the inverse ablation (sequence off) give?</>}
       />
 
@@ -1962,16 +1965,16 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-f2"
         difficulty="hard"
-        title="F2 — Adversarial: poisoned cross-feature"
-        scenario={<>An attacker corrupts the upstream pipeline so that user_country×item_category cross is always set to a fixed (random) value for the attacker's traffic. What happens?</>}
+        title="F2 — Adversarial: cross-feature poisoning"
+        scenario={<>An attacker corrupts upstream so user_country×item_category is a fixed random value for attacker traffic. What happens?</>}
         options={[
-          {key:"a", text:"MTGR's GLN'd cross token for that cross becomes effectively random for poisoned traffic; ranking for those users degrades to 'HSTU minus one cross'; attacker gets diluted recs. Detection: cross-token entropy monitoring per region/user-segment.", correct:true},
-          {key:"b", text:"No impact."},
-          {key:"c", text:"MTGR detects automatically."},
-          {key:"d", text:"DLRM is immune."},
+          {key:"a", text:"GLN flags the random cross as out-of-distribution at norm time and zeros it, protecting MTGR's ranking quality automatically; the attack is neutralized without external monitoring."},
+          {key:"b", text:"That cross token becomes effectively random for poisoned traffic; ranking degrades to 'MTGR minus that cross' (~HSTU-class on that segment); detection requires cross-token entropy monitoring per region/segment.", correct:true},
+          {key:"c", text:"DLRM would be immune because hashed cross embeddings absorb arbitrary values into a fixed-size table; MTGR's per-cross tokens are uniquely vulnerable to this class of attack."},
+          {key:"d", text:"Dynamic masking removes the constant-value cross from each request's attention scope, so the attack produces no measurable ranking effect."},
         ]}
-        trap={<>(b), (c), (d) misread. DLRM is equally vulnerable to upstream poisoning.</>}
-        lens={<>MTGR inherits DLRM's upstream-poisoning attack surface. Mitigation is at the cross-feature pipeline, not the model.</>}
+        trap={<>(a) over-credits GLN with anomaly detection. (c) is false — DLRM is equally vulnerable. (d) misuses dynamic masking.</>}
+        lens={<>MTGR inherits DLRM's upstream-poisoning attack surface; mitigation is at the cross-feature pipeline, not the model.</>}
         stretch={<>How would you instrument cross-token entropy?</>}
       />
 
@@ -1979,50 +1982,50 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-f3"
         difficulty="hard"
-        title="F3 — Symptom: cross-token attention weights are all near zero"
-        scenario={<>You inspect MTGR's attention. Cross tokens get near-zero attention weights from sequence tokens. Why?</>}
+        title="F3 — Cross-token attention weights are near zero in training"
+        scenario={<>You inspect MTGR attention. Cross tokens receive near-zero weight from sequence tokens. Diagnose.</>}
         options={[
-          {key:"a", text:"GLN groups are misspecified — cross tokens are being normalized into the same group as sequence tokens, washing out their magnitude; sequence tokens learn to ignore the now-flat cross channel. Fix: verify GLN group assignment matches token-type.", correct:true},
-          {key:"b", text:"Attention is broken."},
-          {key:"c", text:"Random."},
-          {key:"d", text:"Learning rate too high."},
+          {key:"a", text:"GLN groups are misspecified — cross tokens are normalized into the same group as sequence tokens, washing out their magnitude; sequence tokens then learn to ignore the flat cross channel.", correct:true},
+          {key:"b", text:"Learning rate is too high; attention layers haven't converged on cross tokens yet. Cool the schedule and continue training another 5 epochs before drawing any conclusions about GLN."},
+          {key:"c", text:"Cross tokens lack positional encodings; without position info, attention has no way to address them, so their weights default to near-zero by softmax dynamics across the whole training run."},
+          {key:"d", text:"The decoder's causal mask is excluding cross tokens from the attendable set entirely; verify the mask-construction step in the dataloader and confirm cross positions are in the attend set."},
         ]}
-        trap={<>(b), (c), (d) miss the GLN-misspec story.</>}
-        lens={<>Cross-attention collapse is the canonical MTGR symptom of misspec'd GLN groups. The fix is in the model config, not training.</>}
-        stretch={<>How would you confirm GLN groups are correctly assigned from training logs?</>}
+        trap={<>(b), (c), (d) are real but rare causes. The most common cause is GLN-group misspec.</>}
+        lens={<>Cross-attention collapse is the canonical symptom of misspec'd GLN groups. The fix is in the model config, not in training dynamics.</>}
+        stretch={<>How would you confirm GLN groups are correctly assigned from logs?</>}
       />
 
       {/* F4 */}
       <VIS.TrapProblem
         id="mtgr-f4"
         difficulty="hard"
-        title="F4 — Paper-named failure mode"
-        scenario={<>Which failure mode does the MTGR paper itself flag?</>}
+        title="F4 — Failure mode the paper itself flags"
+        scenario={<>Which honest failure mode does the MTGR paper itself flag in its limitations?</>}
         options={[
-          {key:"a", text:"GLN adds parameters and complexity; debugging cross × sequence interactions is non-trivial.", correct:true},
-          {key:"b", text:"GLN is faster than LN."},
-          {key:"c", text:"MTGR is always better than HSTU."},
-          {key:"d", text:"Cross tokens are free."},
+          {key:"a", text:"That GLN is slower than RMSNorm on most hardware, so production teams should benchmark before adopting MTGR's normalization on their fleet."},
+          {key:"b", text:"That cross-token attribution sometimes flags the wrong cross during debug, due to GLN's group-level statistics being non-identifiable per-token."},
+          {key:"c", text:"That GLN and the cross channel add parameters and complexity; debugging cross × sequence interactions is non-trivial and requires bespoke tooling.", correct:true},
+          {key:"d", text:"That autoregressive decoding at inference is incompatible with low-latency surfaces (≤10ms p99), bounding MTGR to batch-ranked pipelines only."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>The paper is honest: complexity is the cost of the cross-recovery. Production teams should plan for the debug-tooling investment.</>}
-        stretch={<>What MTGR debug tools would you build first?</>}
+        trap={<>(a) cites unverified throughput claims. (b) invents an attribution flaw. (d) over-states the latency constraint.</>}
+        lens={<>The paper is honest: complexity is the price of cross recovery. Plan debug-tooling investment.</>}
+        stretch={<>What MTGR debug tool would you build first?</>}
       />
 
       {/* F5 */}
       <VIS.TrapProblem
         id="mtgr-f5"
         difficulty="hard"
-        title="F5 — Community-found: no public reproduction"
-        scenario={<>Searching arXiv 2025-2026: no independent reproduction of MTGR's 65× FLOPs scaling. What's the implication?</>}
+        title="F5 — No public reproduction of 65× FLOPs scaling"
+        scenario={<>arXiv 2025-2026 has no independent reproduction of MTGR's 65× FLOPs scaling. What's the right reading?</>}
         options={[
-          {key:"a", text:"Scaling-slope claims need platform-specific validation. The paper's number is a Meituan-internal measurement; other teams may see different slopes. Plan to measure your own scaling slope rather than assume 65×.", correct:true},
-          {key:"b", text:"The paper is wrong."},
-          {key:"c", text:"It's been reproduced 100×."},
-          {key:"d", text:"65× is the global constant."},
+          {key:"a", text:"The number is likely an artifact of Meituan's logging pipeline; treat the paper as suggestive but discount the architectural claim by the same factor until an independent group reproduces both."},
+          {key:"b", text:"The lack of reproduction means the result has been falsified by silence; default to vanilla HSTU on any new platform and treat MTGR's GLN as unsupported until proven otherwise."},
+          {key:"c", text:"Reproduction is implicit in the 100+ citations the paper has accumulated since 2025; the absence of a public bench is administrative, not substantive evidence against the paper."},
+          {key:"d", text:"Scaling-slope claims need platform-specific validation; the paper's number is a Meituan-internal measurement; the contribution that survives is the architecture, not the slope.", correct:true},
         ]}
-        trap={<>(b), (c), (d) over-claim.</>}
-        lens={<>The MTGR paper's central claim (cross recovery via GLN + scaling) is more confidently true than the specific number. Lean on the architecture, not the metric.</>}
+        trap={<>(a) treats unreproduced numerics as a discount on architecture. (b) over-corrects to falsification. (c) confuses citations with reproduction.</>}
+        lens={<>The architecture-vs-slope split is the right lens. Lean on the load-bearing mechanism; measure your own slope.</>}
         stretch={<>Why hasn't MTGR been reproduced publicly?</>}
       />
 
@@ -2031,15 +2034,15 @@ flowchart TB
         id="mtgr-f1b"
         difficulty="hard"
         title="F1b — Cross-feature distribution shift"
-        scenario={<>Cross-feature distribution shifts (e.g., a new region added to your e-commerce platform). MTGR's response?</>}
+        scenario={<>A new region is added to your e-commerce platform; the cross-feature distribution shifts. MTGR's response?</>}
         options={[
-          {key:"a", text:"Cross-token embeddings for the new region are randomly initialized; rankings for that region revert to 'HSTU minus that cross' quality. Need to retrain MTGR with the new region's data — or use hashed cross tokens to absorb new values without retraining.", correct:true},
-          {key:"b", text:"MTGR auto-adapts."},
-          {key:"c", text:"No impact."},
-          {key:"d", text:"Sequence half compensates."},
+          {key:"a", text:"GLN re-estimates group statistics online from the new region's traffic and self-adapts within the first 24 hours of live traffic; no retraining required."},
+          {key:"b", text:"Cross-token embeddings for the new region's values are randomly initialized; rankings for that region revert to 'MTGR minus that cross' quality until retraining — or use hashed cross tokens to absorb new values without retraining.", correct:true},
+          {key:"c", text:"The autoregressive decoder generalizes across regions via the sequence side, so cross-distribution shift in one region has no measurable effect on output quality."},
+          {key:"d", text:"Dynamic masking detects the unseen cross values as 'future-leaking' and masks them out, falling back to sequence-only ranking for the new region transparently."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>Cross-feature additions are an MTGR-specific maintenance event. Hashed cross tokens (DLRM-v2 style) handle this gracefully.</>}
+        trap={<>(a) gives GLN online-adaptation it doesn't have. (c) over-credits the sequence side. (d) misapplies dynamic masking.</>}
+        lens={<>Cross-feature additions are an MTGR-specific maintenance event. Hashed cross tokens handle this gracefully.</>}
         stretch={<>What's the trade-off of hashed cross tokens?</>}
       />
 
@@ -2047,15 +2050,15 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-f3b"
         difficulty="hard"
-        title="F3b — Symptom: training loss flat after epoch 2"
-        scenario={<>You train MTGR. Training CE loss flattens after epoch 2 (vs HSTU which kept dropping through epoch 10). Diagnose.</>}
+        title="F3b — Training loss flatlines after epoch 2"
+        scenario={<>You train MTGR. CE loss flatlines after epoch 2; vanilla HSTU on the same data keeps dropping through epoch 10. Diagnose.</>}
         options={[
-          {key:"a", text:"Cross-token embedding table is over-parameterized for your cross-feature cardinality — too few examples per cross value → embeddings memorize after a few epochs → no further gradient signal. Fix: reduce embedding dim or use frequency-based bucketing.", correct:true},
-          {key:"b", text:"Learning rate."},
-          {key:"c", text:"Random."},
-          {key:"d", text:"GPU."},
+          {key:"a", text:"Cross-token embedding table is over-parameterized for your cross cardinality — few examples per cross value, embeddings memorize quickly, no further gradient signal. Reduce embedding dim or use frequency bucketing.", correct:true},
+          {key:"b", text:"GLN's group-statistic estimation requires more warm-up than LN; the loss curve is real but cosmetic — continue training and the gradient signal will resume after epoch 5."},
+          {key:"c", text:"The autoregressive decoder converges fast on short ranked lists; the flat curve indicates list-level fit, not optimization failure. Increase list length to recover signal."},
+          {key:"d", text:"HSTU keeps dropping because it overfits the sequence side; MTGR's flatness is the correct generalization signal and you should stop training here."},
         ]}
-        trap={<>(b), (c), (d) are 2nd-order.</>}
+        trap={<>(b) cites warm-up incorrectly. (c) confuses convergence with capacity overfit. (d) inverts the diagnosis.</>}
         lens={<>Cross-table sizing is MTGR-specific. Each cross's cardinality should map to a reasonable embedding dim — too big and you memorize; too small and you under-fit.</>}
         stretch={<>How would you set cross-table sizes?</>}
       />
@@ -2064,16 +2067,16 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-c1c"
         difficulty="hard"
-        title="C1c — GLN gradient flow"
-        scenario={<>How does gradient flow differ in GLN vs vanilla LN?</>}
+        title="C1c — Gradient flow: GLN vs plain LN"
+        scenario={<>How does gradient flow through GLN differ from plain LN in MTGR?</>}
         options={[
-          {key:"a", text:"GLN's gradient backprop is computed per group — gradients on cross tokens don't pollute gradients on sequence tokens via shared norm stats. With plain LN, cross-token gradients flow through the shared mean/var into sequence tokens' updates, mixing learning signals.", correct:true},
-          {key:"b", text:"Identical."},
-          {key:"c", text:"GLN has no gradient."},
-          {key:"d", text:"LN is faster gradient-wise."},
+          {key:"a", text:"GLN and plain LN have identical backward graphs; differences in forward statistics don't propagate to gradients because the norm operation cancels out in the chain rule."},
+          {key:"b", text:"GLN's gradients are computed per group: cross-token gradients don't flow through shared mean/variance into sequence-token updates, so each token class learns its own scale without cross-contaminating the other's signal.", correct:true},
+          {key:"c", text:"GLN blocks gradients on the cross side entirely; cross-token embeddings are updated separately via an auxiliary loss, not through the main backward pass."},
+          {key:"d", text:"Plain LN gives faster gradient flow than GLN because it shares statistics across all tokens, amortizing the variance estimate; GLN's per-group variance is noisier and slows convergence."},
         ]}
-        trap={<>(b), (c), (d) misread.</>}
-        lens={<>The grad-isolation is what gives GLN its operational benefit. Each token type learns its own scale without cross-contaminating the other.</>}
+        trap={<>(a) flat-out wrong. (c) invents a stop-gradient. (d) inverts the convergence story.</>}
+        lens={<>The grad-isolation is the operational benefit. Each token type learns its own scale without cross-contaminating the other.</>}
         stretch={<>Could you achieve this with adapter layers instead of GLN?</>}
       />
 
@@ -2081,16 +2084,16 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-d2b"
         difficulty="medium"
-        title="D2b — 'MTGR vs OneRec — which absorbs more?'"
-        scenario={<>A teammate asks which 2025 paper is the bigger architectural change.</>}
+        title="D2b — MTGR vs OneRec: which is the bigger architectural change?"
+        scenario={<>Which 2025 paper is the bigger architectural change relative to the existing recsys cascade?</>}
         options={[
-          {key:"a", text:"OneRec absorbs more: replaces retrieval AND ranking with one model + DPO. MTGR only replaces ranking (keeps the cascade). Bigger architectural change ≠ better for every surface; OneRec is greenfield-friendly, MTGR is mature-DLRM-friendly.", correct:true},
-          {key:"b", text:"MTGR absorbs more."},
-          {key:"c", text:"They absorb the same."},
-          {key:"d", text:"Neither absorbs anything."},
+          {key:"a", text:"MTGR — it generates ranked lists autoregressively, while OneRec only swaps the per-stage scoring function and leaves the cascade structure intact across retrieval and ranking."},
+          {key:"b", text:"They are the same magnitude — both replace one cascade stage (ranking) with a generative transformer; the OneRec/MTGR distinction is paper-branding rather than a real cascade-scope axis."},
+          {key:"c", text:"OneRec — it absorbs retrieval AND ranking into one end-to-end DPO-trained model; MTGR replaces ranking only. Bigger architectural change, but mature-DLRM platforms still prefer MTGR.", correct:true},
+          {key:"d", text:"Neither is an architectural change — both are loss-function rebrandings on top of HSTU, with no real topology delta relative to the underlying transducer's structure or training loop."},
         ]}
-        trap={<>(b), (c), (d) misread the scope.</>}
-        lens={<>The pair (MTGR, OneRec) are two opposite responses to "what should HSTU/generative recsys absorb next?" Mature platforms tend MTGR, greenfield platforms tend OneRec.</>}
+        trap={<>(a) inverts the absorb-more axis. (b) and (d) flatten the distinction. (c) reads the cascade-scope axis correctly.</>}
+        lens={<>MTGR and OneRec are two opposite responses to "what should generative recsys absorb next?" Mature platforms tend MTGR; greenfield platforms tend OneRec.</>}
         stretch={<>Could you stack OneRec + MTGR? Why not?</>}
       />
 
@@ -2098,17 +2101,17 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-a2b"
         difficulty="medium"
-        title="A2b — MTGR vs GroupNorm in CNNs"
-        scenario={<>Is GLN the same as GroupNorm from computer vision?</>}
+        title="A2b — Is GLN the same as GroupNorm from CV?"
+        scenario={<>Is MTGR's Group-Layer Normalization the same as GroupNorm from computer vision?</>}
         options={[
-          {key:"a", text:"Mechanically similar (both group features and normalize per group), but semantics different: CV GroupNorm groups feature CHANNELS within a single image; MTGR's GLN groups TOKENS within a single sequence by their semantic class. Same math, different what's-being-grouped.", correct:true},
-          {key:"b", text:"Identical."},
-          {key:"c", text:"Different math."},
-          {key:"d", text:"Unrelated."},
+          {key:"a", text:"Identical — GLN is GroupNorm re-applied without modification; the paper is renaming an existing operator without any new contribution, and the CV implementation can be dropped in unchanged."},
+          {key:"b", text:"Different math — GroupNorm normalizes across spatial dims while GLN normalizes across the embedding dim; the two operations are not interchangeable and require separate fused-kernel implementations."},
+          {key:"c", text:"Unrelated — GLN is a custom operator designed bottom-up for transformer token streams and shares no mathematical structure with computer-vision GroupNorm beyond the name being similar."},
+          {key:"d", text:"Mechanically similar (group features and normalize per group) but semantics differ: GroupNorm groups channels within one image; GLN groups tokens by semantic class. Same math.", correct:true},
         ]}
-        trap={<>(b), (c) over-simplify; (d) misses the math overlap.</>}
-        lens={<>Borrowing the math from CV GroupNorm with a recsys-semantics is the contribution. The naming is borrowed; the application is novel.</>}
-        stretch={<>What CV insight transfers to MTGR? What doesn't?</>}
+        trap={<>(a) misses the semantic novelty. (b) invents a math difference. (c) over-states the gap.</>}
+        lens={<>Borrowing the math from CV GroupNorm and re-purposing it for token-class partitioning is the contribution. The naming is borrowed; the application is novel.</>}
+        stretch={<>What CV insight transfers? What doesn't?</>}
       />
 
       {/* E3b */}
@@ -2116,49 +2119,49 @@ flowchart TB
         id="mtgr-e3b"
         difficulty="hard"
         title="E3b — Cross-token vocabulary management"
-        scenario={<>Cross-feature values change over time (new user_country categories added). How do you manage the cross-token vocab?</>}
+        scenario={<>Cross-feature values evolve over time (new user_country categories). How do you manage the cross-token vocabulary?</>}
         options={[
-          {key:"a", text:"Either (a) fixed vocab + hash unseen values (lossy but stable) or (b) growing vocab + version cross-tables (requires downstream awareness). Most production MTGR teams use a mix: stable hash for high-cardinality crosses, versioned dictionary for important low-cardinality crosses.", correct:true},
-          {key:"b", text:"Fixed vocab only."},
-          {key:"c", text:"No management needed."},
-          {key:"d", text:"Daily retraining."},
+          {key:"a", text:"Mix strategies: stable hash for high-cardinality crosses (lossy but flat-memory), versioned dictionary for important low-cardinality crosses where collision cost is high. Most production MTGR teams run both side by side.", correct:true},
+          {key:"b", text:"Use a single fixed vocab snapshot at training time; cross values not seen at training are mapped to a shared 'unknown' token at serve time."},
+          {key:"c", text:"Grow the vocab dynamically at serve time as new values arrive; downstream MTGR consumers must re-load embeddings every hour to stay in sync."},
+          {key:"d", text:"Retrain MTGR from scratch daily on the current vocab to keep the embedding table aligned with the current cross-value distribution."},
         ]}
-        trap={<>(b), (c), (d) over/under-engineer.</>}
-        lens={<>Cross-token vocab management is the MTGR analog of TIGER's codebook drift problem. Both are about non-stationary discrete IDs.</>}
-        stretch={<>Compare MTGR's vocab management vs TIGER's codebook drift.</>}
+        trap={<>(b), (c), (d) are each plausible single-strategy choices that under-engineer or over-engineer the problem.</>}
+        lens={<>Cross-token vocab management is MTGR's analog of TIGER's codebook drift. Both are about non-stationary discrete IDs; hybrid hash + dict is the practical answer.</>}
+        stretch={<>Compare cross-token drift management vs TIGER's codebook drift.</>}
       />
 
       {/* C2b */}
       <VIS.TrapProblem
         id="mtgr-c2b"
         difficulty="hard"
-        title="C2b — Causal mask: cross sees past sequence, not future"
-        scenario={<>For dynamic masking, should cross tokens attend to past sequence, future sequence, both, or neither?</>}
+        title="C2b — Which sequence positions should cross tokens attend to?"
+        scenario={<>For MTGR's dynamic masking, should cross tokens attend to past sequence, future sequence, both, or neither?</>}
         options={[
-          {key:"a", text:"Past only: a cross-feature like 'user×purchased_categories_30day' encodes information up to the present, so it can attend to all past sequence; attending to future sequence would leak the prediction target.", correct:true},
-          {key:"b", text:"Both."},
-          {key:"c", text:"Future only."},
-          {key:"d", text:"Neither."},
+          {key:"a", text:"Future only — cross-features encode forward-looking context (e.g. user×predicted-intent) and need to see future emitted items to ground that intent against the realized list."},
+          {key:"b", text:"Past only — a cross like 'user×30-day-purchases' encodes information up to the present, so it can safely attend to all past sequence; attending to future emitted items would leak the prediction target.", correct:true},
+          {key:"c", text:"Both — co-attention between cross and sequence in both directions is the whole point of GLN; masking the future would defeat MTGR's intra-list conditioning."},
+          {key:"d", text:"Neither — cross tokens sit outside the sequence's temporal axis and shouldn't participate in causal attention at all; they only feed the final classifier head."},
         ]}
-        trap={<>(b) leaks future. (c), (d) lose useful past.</>}
+        trap={<>(a) inverts the causality. (c) confuses GLN's co-attention scope with masking direction. (d) excludes crosses incorrectly.</>}
         lens={<>The masking direction must match the cross-feature's temporal semantics. Crosses computed up to time t can see up to time t.</>}
-        stretch={<>What if a cross is "next-30-day expected behavior"?</>}
+        stretch={<>What if a cross is a 'next-30-day-expected-behavior' forecast?</>}
       />
 
       {/* D4b */}
       <VIS.TrapProblem
         id="mtgr-d4b"
         difficulty="hard"
-        title="D4b — MTGR seems to over-rely on one cross"
+        title="D4b — Cross-attribution shows one cross dominates"
         scenario={<>Cross-attribution shows 60% of MTGR's lift comes from one cross (user_recent_purchases × item_category). What does this mean?</>}
         options={[
-          {key:"a", text:"Your cross-feature mix is too narrow — MTGR is essentially HSTU + one strong feature. If that cross pipeline breaks, you lose most of the lift. Diversify cross investment OR accept the concentrated dependency with stronger pipeline SLAs.", correct:true},
-          {key:"b", text:"Great — MTGR is working."},
-          {key:"c", text:"Drop that cross."},
-          {key:"d", text:"Random."},
+          {key:"a", text:"Great — MTGR is working as designed; concentrated contribution from a single high-quality cross indicates the cross channel is doing its job and you can stop investing in additional crosses."},
+          {key:"b", text:"Drop that cross to encourage MTGR to learn from the other crosses; redundancy from one dominant cross suppresses the gradient signal on the rest."},
+          {key:"c", text:"Operational risk — your cross mix is too narrow. If that pipeline breaks you lose most of the lift. Diversify cross investment OR accept the dependency with stronger pipeline SLAs.", correct:true},
+          {key:"d", text:"Measurement artifact — single-cross dominance at this level usually indicates an attribution-method bug; switch from one-at-a-time ablation to shapley-style attribution to confirm."},
         ]}
-        trap={<>(b) misses the operational risk; (c), (d) over-correct.</>}
-        lens={<>Concentrated dependency on one cross is a reliability risk. Risk-adjust your cross investment by spreading the dependency.</>}
+        trap={<>(a) misses the operational risk. (b) over-corrects. (d) blames the measurement method.</>}
+        lens={<>Concentrated dependency on one cross is a reliability risk. Spread the dependency or harden the pipeline SLA.</>}
         stretch={<>What SLA would you set on the dominant cross?</>}
       />
 
@@ -2166,35 +2169,35 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-f4b"
         difficulty="hard"
-        title="F4b — Does MTGR help if HSTU already calibrated?"
-        scenario={<>Does MTGR's cross-channel help with HSTU's calibration problem (predicted CTR drifting from realized)?</>}
+        title="F4b — Does MTGR's cross channel fix calibration drift?"
+        scenario={<>Does MTGR's cross channel address HSTU's calibration problem (predicted CTR drifting from realized CTR)?</>}
         options={[
-          {key:"a", text:"Marginally — calibration drift in HSTU is driven by the generative softmax shape, not by missing features. Cross tokens improve ranking quality but don't change the loss shape. You still need a new calibration head, just like vanilla HSTU.", correct:true},
-          {key:"b", text:"Yes — MTGR fully calibrates."},
-          {key:"c", text:"No — calibration gets worse."},
-          {key:"d", text:"MTGR avoids softmax."},
+          {key:"a", text:"Yes — cross-features are explicit ground-truth signals (clicks, purchases) that anchor predictions to realized values; MTGR's calibration is materially better than HSTU's out of the box."},
+          {key:"b", text:"No — adding cross tokens worsens calibration because GLN's per-group statistics shift the output distribution away from realized rates; expect calibration to regress vs HSTU."},
+          {key:"c", text:"Yes — autoregressive list generation reads the realized prefix at each step, implicitly calibrating each next-item prediction; no separate calibration head is needed."},
+          {key:"d", text:"Marginally — calibration drift is driven by the generative loss shape, not by missing features. Cross tokens improve ranking quality but don't change loss shape; you still need a calibration head, same as vanilla HSTU.", correct:true},
         ]}
-        trap={<>(b), (c), (d) misread the loss-shape independence.</>}
+        trap={<>(a) over-credits crosses. (b) invents a calibration regression. (c) misreads autoregressive decoding as calibration.</>}
         lens={<>Crosses help ranking quality, not calibration. Calibration is a loss-shape problem; cross tokens don't change loss shape.</>}
         stretch={<>What about per-cross calibration heads?</>}
       />
 
-      {/* E5b */}
+      {/* E5b multiselect */}
       <VIS.TrapProblem
         id="mtgr-e5b"
         difficulty="hard"
-        title="E5b — Reproducing MTGR's +1.22% conversion"
-        scenario={<>You implement MTGR. +0.4% conversion in shadow. Reasons the gain is smaller than Meituan's 1.22%?</>}
+        title="E5b — Why is your conversion lift smaller than Meituan's 1.22%?"
+        scenario={<>You implement MTGR and see +0.4% conversion in shadow vs Meituan's reported 1.22%. Pick the explanations consistent with MTGR's mechanism.</>}
         multiSelect
         options={[
-          {key:"a", text:"Your DLRM baseline is weaker than Meituan's — less cross investment to begin with → less to recover.", correct:true},
-          {key:"b", text:"Your cross-features are less mature.", correct:true},
-          {key:"c", text:"Median user history is shorter than Meituan's.", correct:true},
-          {key:"d", text:"GPU model."},
-          {key:"e", text:"Random seed."},
+          {key:"a", text:"Your DLRM baseline is weaker than Meituan's — less cross investment to begin with means less ranking signal to recover via MTGR.", correct:true},
+          {key:"b", text:"Your cross-features are less mature than Meituan's, so the cross channel carries less signal even when re-injected via GLN.", correct:true},
+          {key:"c", text:"Your median user-history is shorter than Meituan's, starving the autoregressive backbone of the prefix it needs to differentiate items.", correct:true},
+          {key:"d", text:"Your GPU model is a generation behind Meituan's; the gap is a hardware artifact and will close when you upgrade SKUs."},
+          {key:"e", text:"Your random seed sequence differs; reproducing Meituan's exact seed schedule should close most of the gap."},
         ]}
-        trap={<>(d), (e) are 2nd-order.</>}
-        lens={<>MTGR's gain is bounded by the strength of your DLRM baseline + cross-features + sequence length. Mismatch on any of these compresses the gain.</>}
+        trap={<>(d), (e) are second-order red herrings. The real bounds are about content: baseline strength, cross maturity, history length.</>}
+        lens={<>MTGR's gain is bounded by DLRM baseline + cross maturity + sequence length. Mismatch on any of these compresses the gain.</>}
         stretch={<>What's the floor on MTGR's gain in your environment?</>}
       />
 
@@ -2202,15 +2205,15 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-c5b"
         difficulty="hard"
-        title="C5b — Mixing in continuous features"
-        scenario={<>You want to add continuous features (price, distance) to MTGR. How?</>}
+        title="C5b — Adding continuous features (price, distance)"
+        scenario={<>You want to feed continuous features (price, distance) into MTGR. How?</>}
         options={[
-          {key:"a", text:"Either discretize via bucketing (turn continuous → discrete token like other features) or use a separate continuous-feature MLP that produces a token embedding consumed by the MTGR backbone. Bucketing is simpler; MLP preserves more information.", correct:true},
-          {key:"b", text:"Continuous features don't work in MTGR."},
-          {key:"c", text:"Use BCE."},
-          {key:"d", text:"Concat directly."},
+          {key:"a", text:"Bucket the continuous value into discrete tokens (simpler, loses info at bin edges) or pass it through a small MLP that emits a token embedding (preserves info, more parameters). Trade-off.", correct:true},
+          {key:"b", text:"Continuous features don't work in MTGR; the autoregressive vocabulary is fundamentally discrete and adding continuous inputs breaks the decoder's token-prediction loss function entirely."},
+          {key:"c", text:"Concatenate the continuous value into the cross-token embedding vector directly; GLN will normalize the scale automatically and no other architectural change is needed at training or serve time."},
+          {key:"d", text:"Switch MTGR's loss to BCE so continuous-valued inputs can flow through; the generative cross-entropy loss is incompatible with non-categorical features and forces this loss-shape swap."},
         ]}
-        trap={<>(b) is false. (c), (d) miss the tokenization issue.</>}
+        trap={<>(b) over-restricts. (c) skips tokenization. (d) confuses input type with loss type.</>}
         lens={<>MTGR's vocabulary is discrete. Continuous features must either be discretized or passed through a small projection. Each has trade-offs.</>}
         stretch={<>What buckets would you use for distance?</>}
       />
@@ -2219,25 +2222,25 @@ flowchart TB
       <VIS.TrapProblem
         id="mtgr-a5b"
         difficulty="hard"
-        title="A5b — MTGR vs vanilla HSTU: GLN's compatibility with sparse-DLRM-era feature stores"
-        scenario={<>Your platform has a mature sparse-DLRM-era feature store: <strong>hashed cross-feature embeddings</strong> served from a parameter server, accessed via <code>(cross_key → embedding)</code> at request time. You want to move to a generative ranker. Pick the *specific, verifiable* property of MTGR (vs. vanilla HSTU) that makes the migration cheap.</>}
+        title="A5b — Migrating a sparse-DLRM feature store to MTGR"
+        scenario={<>Your platform has a mature sparse-DLRM feature store (parameter server, <code>(cross_key → embedding)</code> lookups). Which specific MTGR property makes the migration cheap vs vanilla HSTU?</>}
         options={[
-          {key:"a", text:"MTGR's GLN treats each cross-feature group as its own normalization sub-space, so existing sparse cross-embeddings can be projected in as a separate token group <em>without</em> rescaling their statistics into the action-token regime — i.e. the existing parameter-server pipeline becomes one MTGR token group, no co-training of stats. Vanilla HSTU has no per-group norm, so the same drop-in would require renormalizing or re-embedding every cross.", correct:true},
-          {key:"b", text:"MTGR has more parameters than HSTU."},
-          {key:"c", text:"MTGR runs faster on GPUs than HSTU."},
-          {key:"d", text:"There is no real architectural difference."},
+          {key:"a", text:"MTGR has more parameters than HSTU, so the existing parameter server is automatically compatible at the same scale; no per-cross statistical adaptation needed at any layer of the migration plan."},
+          {key:"b", text:"GLN treats each cross-feature group as its own normalization sub-space; sparse cross-embeddings plug in as a separate token group without rescaling stats into the action-token regime.", correct:true},
+          {key:"c", text:"MTGR runs faster on GPUs than HSTU, so the existing parameter-server latency budget covers the additional decoder steps with no plumbing changes required across the serving stack."},
+          {key:"d", text:"There is no real architectural difference between MTGR and HSTU in this scenario; the parameter server plugs into either model with equal cost and equal ranking-quality after migration."},
         ]}
-        trap={<>(b), (c) are unverified/generic claims. (d) is false. (a) cites a concrete named mechanism (GLN's per-group statistics) and ties it to a concrete platform asset (the sparse cross-feature parameter server) — redaction-substitute "MTGR" with "Model X" and (a) only works if Model X has per-group norm, so the answer genuinely depends on MTGR's mechanism. This avoids the prior framing's "unspecified Meta follow-up" hedge.</>}
-        lens={<>The sharp, verifiable property: *GLN keeps per-token-group normalization statistics separate*, which is exactly what lets a sparse-DLRM-era cross-feature store plug in as a token group with no statistical contamination. Vanilla HSTU's shared norm makes the same drop-in lossy. This is a platform-migration property, not a paper-vs-paper hedge.</>}
-        stretch={<>If your cross store ships embeddings at a different dim than HSTU's hidden size, what's the minimal shim — and does GLN still hold its sub-space property after the projection?</>}
+        trap={<>(a), (c) cite throughput-style claims. (d) denies the difference. (b) names the load-bearing property: per-group statistics isolate the cross sub-space.</>}
+        lens={<>The migration-cheap property is that GLN keeps per-token-group normalization statistics separate, letting a sparse-DLRM cross store plug in as one token group with no statistical contamination.</>}
+        stretch={<>If the cross store ships embeddings at a different dim than the decoder hidden size, what's the minimal shim, and does GLN still hold its sub-space property after projection?</>}
       />
 
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://arxiv.org/abs/2505.18654" target="_blank" rel="noopener"><strong>Han et al. — MTGR paper (CIKM 2025)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper)</span><br/>The original. Focus on sections describing GLN + dynamic masking + production results.</li>
-        <li><a href="https://arxiv.org/abs/2402.17152" target="_blank" rel="noopener"><strong>Zhai et al. — HSTU paper (ICML 2024)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper)</span><br/>Direct predecessor. MTGR's whole motivation is "what HSTU left on the table."</li>
+        <li><a href="https://arxiv.org/abs/2505.18654" target="_blank" rel="noopener"><strong>Han et al. — MTGR paper (CIKM 2025)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper)</span><br/>The original. Focus on the sections describing autoregressive list emission, GLN, dynamic masking, and production results.</li>
+        <li><a href="https://arxiv.org/abs/2402.17152" target="_blank" rel="noopener"><strong>Zhai et al. — HSTU paper (ICML 2024)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper)</span><br/>The transduction baseline MTGR contrasts with.</li>
         <li><a href="https://arxiv.org/abs/1906.00091" target="_blank" rel="noopener"><strong>Naumov et al. — DLRM</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper)</span><br/>The cross-feature framework MTGR re-imports.</li>
         <li><a href="https://arxiv.org/abs/1803.08494" target="_blank" rel="noopener"><strong>Wu and He — Group Normalization</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper, CVPR 2018)</span><br/>The CV ancestor of GLN. Same math; different application.</li>
         <li><a href="https://eugeneyan.com/writing/recsys-llm/" target="_blank" rel="noopener"><strong>Eugene Yan — RecSys + LLM landscape</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>HSTU/MTGR/OneRec/TIGER taxonomy.</li>
