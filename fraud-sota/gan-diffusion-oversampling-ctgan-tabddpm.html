@@ -1414,333 +1414,453 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// GAN / Diffusion oversampling (CTGAN, TabDDPM) — Fraud SOTA · Class imbalance / rare-event learning
-// Generative oversampling that preserves cat-cat correlations.
+// CTGAN / TabDDPM — Fraud SOTA · Class imbalance / rare-event learning.
+// CONCEPT ANCHOR (B3): a GENERATIVE MODEL trained on minority-class rows, then sampled
+// to SYNTHESIZE NEW rows that preserve joint feature distributions (incl. cat-cat
+// correlations). Distinct from SMOTE (linear interpolation in feature space, breaks cats)
+// and from SimFraud (in-distribution perturbation of EXISTING rows, no generative model).
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Class imbalance / rare-event learning"
-      title="GAN / Diffusion oversampling (CTGAN, TabDDPM)"
-      subtitle="Generate synthetic fraud rows with a conditional generator so feature correlations survive — unlike SMOTE which breaks them."
+      title="CTGAN / TabDDPM — generative oversampling for tabular fraud"
+      subtitle="Train a GAN (CTGAN) or diffusion model (TabDDPM) on minority-class rows; sample new rows that preserve the joint distribution of categorical and continuous columns."
       byline={[
-        {label: "Source", value: "Xu et al. CTGAN (NeurIPS 2019); Kotelnikov TabDDPM (ICML 2023)"},
-        {label: "Year", value: "2024 (fraud applications, KDD)"},
-        {label: "L3", value: "Generative oversampling"},
+        {label: "Papers", value: "Xu et al. CTGAN (NeurIPS 2019); Kotelnikov et al. TabDDPM (ICML 2023)"},
+        {label: "L3", value: "Generative synthesis of NEW minority rows"},
+        {label: "Anchor", value: "A trained generator G(z) produces x_synth in feature space; not interpolation, not perturbation"},
       ]}/>
 
     <VIS.TLDR>
-      Plain{" "}
-      <VIS.Term def="Synthetic Minority Over-sampling: generate new positives by linear interpolation between an existing positive and one of its k nearest positive neighbors in feature space.">SMOTE</VIS.Term>{" "}
-      linearly interpolates between rare positives — fine for continuous features but it produces nonsense one-hots and breaks cat-cat correlations.{" "}
-      <VIS.Term def="Conditional Tabular GAN: a generative adversarial network for tabular data that conditions on each categorical column to preserve marginal distributions and uses mode-specific normalization for numeric columns.">CTGAN</VIS.Term>{" "}
-      and{" "}
-      <VIS.Term def="Tabular Denoising Diffusion Probabilistic Model: applies the diffusion paradigm (gradually denoise from Gaussian noise to a tabular sample) to mixed categorical and numeric columns. Tends to beat CTGAN on density-estimation quality.">TabDDPM</VIS.Term>{" "}
-      learn the joint distribution and sample from it. Mode collapse is the silent killer — generated fraud can look too much like the training fraud.
+      SMOTE oversamples by linearly interpolating between existing fraud rows — fine for continuous features, but it produces nonsensical combinations on categoricals ("country = 0.3 US + 0.7 UK") and breaks cat-cat correlations the downstream model relies on. CTGAN trains a{" "}
+      <VIS.Term def="Generative Adversarial Network: a generator G and discriminator D trained in a minimax game so G's samples become indistinguishable from real data to D.">GAN</VIS.Term>{" "}
+      on tabular data with mode-specific normalization on continuous columns and a conditional generator that samples each categorical column from its empirical marginal. TabDDPM does the same job with a{" "}
+      <VIS.Term def="A diffusion model adds Gaussian noise to data over T steps then trains a neural net to reverse that noise step by step; sampling iterates the reverse from pure noise.">diffusion model</VIS.Term>{" "}
+      using a multinomial diffusion for categoricals and Gaussian diffusion for continuous columns. The defining property is <strong>generative</strong> — you can sample fresh rows that were not in the training set but live on the minority manifold. This is what distinguishes CTGAN/TabDDPM from SMOTE (interpolation, no model of the distribution) and from SimFraud-style augmentation (perturb existing rows in place, no generative model).
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — a generative model of the fraud rows">
       <p>
-        Fraud is rare. A model trained on a 0.1 percent positive rate sees one fraud per 1000 transactions, and the gradient is dominated by negatives. Oversampling the positives is one fix, but how you generate the synthetic positives matters.
-      </p>
-      <p>
-        Three generations of oversampling:
+        Imagine you have 2 million transactions, 2,000 of them fraud. SMOTE picks a fraud row, picks a nearest fraud neighbor, draws a random point on the line segment between them, and calls that a new fraud. If two fields are "country" (one-hot of 200 codes) and "merchant_category" (one-hot of 1000 codes), the interpolated row has fractional one-hots that no real transaction would ever have. The downstream{" "}
+        <VIS.Term def="Gradient Boosted Decision Tree: an ensemble of shallow trees trained sequentially where each new tree fits the residual error of the prior ensemble (XGBoost, LightGBM, CatBoost).">GBDT</VIS.Term>{" "}
+        either rounds them (losing variety) or splits on fractional values (learning ghost rules). CTGAN replaces this with a small neural generator G(z) where z is a noise vector. G is trained against a discriminator D that tries to tell real fraud rows from G's outputs. At convergence, samples from G look like fraud at the joint-distribution level, including the cat-cat correlations.
       </p>
       <ol>
-        <li><strong>SMOTE family</strong> — linear interpolation between a real positive and a positive neighbor. Cheap and easy. Fails when features include categoricals (interpolating between merchant codes 7011 and 4111 gives 5561, which corresponds to no real merchant) and when feature correlations matter.</li>
-        <li><strong>CTGAN</strong> — train a conditional GAN. The generator conditions on each categorical column so categorical marginals match real data. Mode-specific normalization handles multi-modal numeric features (a transaction amount distribution with a peak at small purchases plus a peak at salary deposits).</li>
-        <li><strong>TabDDPM</strong> — train a diffusion model on the mixed-type tabular row. Denoise step-by-step from pure noise back to a coherent row. Better density estimation than CTGAN in most benchmarks at the cost of slower sampling.</li>
+        <li><strong>CTGAN — mode-specific normalization</strong>: each continuous column is fit to a Gaussian mixture; G outputs (mode_id, residual) instead of a raw value. Captures multi-modal distributions like transaction_amount (cluster at $20, cluster at $500, cluster at $5000).</li>
+        <li><strong>CTGAN — conditional generator</strong>: each step picks a categorical column and a value from its empirical marginal, conditions G on that, then trains G to match. Forces G to cover rare categories that random z would miss.</li>
+        <li><strong>TabDDPM — joint multinomial+Gaussian diffusion</strong>: categorical columns undergo multinomial diffusion (uniform mixing over categories); continuous columns undergo standard Gaussian diffusion. A single denoiser handles both. Samples by iterating reverse diffusion from pure noise.</li>
+        <li><strong>Train only on minority</strong>: you typically train CTGAN/TabDDPM on the fraud rows alone (or with class conditioning), so samples come from the rare-class manifold. Then you append synthesized fraud rows to the training data before fitting your downstream model.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  R["Rare positives (fraud)"]
-  R --> S["SMOTE: linear interp"]
-  R --> C["CTGAN: conditional GAN"]
-  R --> D["TabDDPM: diffusion"]
-  S --> SB["Breaks cat-cat correlations"]
-  C --> CB["Preserves marginals; risk mode collapse"]
-  D --> DB["Best density; slow to sample"]
-  style SB fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style CB fill:#fef3c7,stroke:#d97706,stroke-width:2px
-  style DB fill:#dcfce7,stroke:#16a34a,stroke-width:2px
+  R["Real fraud rows (2K)"]
+  R --> T["Train generator on fraud manifold"]
+  T --> G["CTGAN: GAN with mode-specific norm"]
+  T --> D["TabDDPM: multinomial + Gaussian diffusion"]
+  G --> S["Sample synthetic fraud rows"]
+  D --> S
+  S --> A["Append to training set, fit downstream GBDT"]
+  style T fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+  style S fill:#dcfce7,stroke:#16a34a,stroke-width:2px
       `} />
 
-      <VIS.Equation display tex={`\\hat{X}_{\\text{fraud}} \\sim p_{\\theta}(X \\mid y = 1)`} />
-      <p>The conditional generator samples synthetic positives from the learned conditional density. The training objective is whatever the family prescribes — GAN min-max for CTGAN, denoising score matching for TabDDPM.</p>
+      <VIS.Equation display tex={`\\text{CTGAN: } \\min_G \\max_D \\; \\mathbb{E}_{x \\sim p_{\\text{fraud}}}[\\log D(x)] + \\mathbb{E}_{z, c}[\\log(1 - D(G(z, c)))]`} />
+      <p>c is the conditional vector — a one-hot over (column, value) pairs sampled from each categorical's empirical marginal. This is the trick that makes CTGAN cover rare categorical values instead of mode-collapsing on the common ones.</p>
+
+      <VIS.Equation display tex={`\\text{TabDDPM: } \\mathcal{L} = \\mathbb{E}_{t, x_0, \\epsilon}\\big[ \\| \\epsilon - \\epsilon_\\theta(x_t, t) \\|^2 \\big] + \\mathcal{L}_{\\text{multinomial}}`} />
+      <p>The Gaussian-noise prediction term handles continuous columns; the multinomial term handles categorical columns. Both are summed and trained jointly so the denoiser learns the joint distribution.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from SMOTE and class weighting">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="How CTGAN/TabDDPM differ from the rest of the oversampling toolbox">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>SMOTE</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>SimFraud (in-dist aug)</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>CTGAN</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>TabDDPM</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Handles categoricals</td>
-            <td style={{padding:"8px 10px"}}>Poorly</td>
-            <td style={{padding:"8px 10px"}}>Yes, via conditioning</td>
-            <td style={{padding:"8px 10px"}}>Yes, via embedding</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Preserves cat-cat corr</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Mostly</td>
-            <td style={{padding:"8px 10px"}}>Best</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Risk of mode collapse</td>
-            <td style={{padding:"8px 10px"}}>None (no learning)</td>
-            <td style={{padding:"8px 10px"}}>High</td>
-            <td style={{padding:"8px 10px"}}>Lower than GAN</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Training cost</td>
-            <td style={{padding:"8px 10px"}}>Trivial</td>
-            <td style={{padding:"8px 10px"}}>Moderate</td>
-            <td style={{padding:"8px 10px"}}>High</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Sampling speed</td>
-            <td style={{padding:"8px 10px"}}>Instant</td>
-            <td style={{padding:"8px 10px"}}>Fast</td>
-            <td style={{padding:"8px 10px"}}>Slow (T denoise steps)</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Mechanism</td><td style={{padding:"6px 10px"}}>Linear interp in feature space</td><td style={{padding:"6px 10px"}}>Perturb existing rows in-place</td><td style={{padding:"6px 10px"}}>GAN with conditional sampler</td><td style={{padding:"6px 10px"}}>Joint diffusion model</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Generates NEW rows?</td><td style={{padding:"6px 10px"}}>Interpolated, not new</td><td style={{padding:"6px 10px"}}>No — same row jittered</td><td style={{padding:"6px 10px"}}>Yes — from G(z)</td><td style={{padding:"6px 10px"}}>Yes — from reverse diffusion</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Handles categoricals?</td><td style={{padding:"6px 10px"}}>Breaks (fractional one-hots)</td><td style={{padding:"6px 10px"}}>Yes — leaves them alone</td><td style={{padding:"6px 10px"}}>Yes — conditional sampling</td><td style={{padding:"6px 10px"}}>Yes — multinomial diffusion</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Preserves cat-cat correlations?</td><td style={{padding:"6px 10px"}}>No</td><td style={{padding:"6px 10px"}}>Yes (by construction)</td><td style={{padding:"6px 10px"}}>Yes (learned)</td><td style={{padding:"6px 10px"}}>Yes (learned)</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Risk of OOD samples</td><td style={{padding:"6px 10px"}}>Low (within convex hull)</td><td style={{padding:"6px 10px"}}>Very low</td><td style={{padding:"6px 10px"}}>Medium (mode collapse / leakage)</td><td style={{padding:"6px 10px"}}>Low-medium</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Mixed-type tabular fraud</strong> — categorical merchant codes, country, device fingerprint plus numeric amount, velocity features. SMOTE underperforms here.</li>
-        <li><strong>Strong cat-cat correlations</strong> — e.g., country and merchant category jointly determine the fraud signal. Generative methods preserve the joint.</li>
-        <li><strong>Enough training fraud to learn from</strong> — typically a few thousand positives minimum, otherwise the generator memorizes.</li>
-        <li><strong>Budget for downstream validation</strong> — you must verify the synthetic positives don't degrade test performance vs no oversampling.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Mode collapse: synthetic fraud looks too much like training fraud">
-        The GAN settles on a narrow neighborhood of the real positives and generates near-duplicates. Your model sees many "different" rows that are actually one cluster, learns the cluster's shortcut, and fails on a new fraud pattern. Detection: hold out a temporal slice and check that the generator's samples cover the slice (e.g., precision-recall of a discriminator trained on real vs synthetic).
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Don't generate more than 5 to 10x the original positive count">
-        Beyond that, you're amplifying the generator's biases instead of fixing imbalance. The marginal benefit drops sharply after the loss is no longer dominated by negatives.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="TabDDPM is slow to sample at production scale">
-        Diffusion needs T forward passes per sample. Train offline, batch-generate, and cache the synthetic set on disk. Online generation is not viable.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — 22 trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on generative oversampling, the SMOTE vs CTGAN vs TabDDPM tradeoff, and mode collapse diagnosis.
+        Every problem hinges on the GENERATIVE-MODEL anchor — a learned distribution over fraud rows that produces NEW samples. Strip the generator and the answer collapses to SMOTE or SimFraud.
       </p>
 
       <VIS.TrapProblem
         id="ctgan-p1"
         difficulty="hard"
-        title="P1 — SMOTE breaks one-hots; CTGAN does not. Why?"
-        scenario={<>You ship SMOTE on fraud data with a one-hot-encoded merchant_category feature. Test AUC drops by 1 point vs no oversampling. Diagnose.</>}
+        title="P1 — Risk PM: 'We already use SMOTE. Why CTGAN?'"
+        scenario={<><em>Discriminating insight: SMOTE interpolates linearly between two real rows. On categoricals (one-hot country, merchant_category), that produces fractional values no real row has, and the GBDT either rounds or splits on garbage. CTGAN models the joint distribution including categorical marginals, then SAMPLES new rows — categoricals come out as clean one-hots from the empirical distribution.</em><br/><br/>Pitch the lever SMOTE cannot give you.</>}
         options={[
-          {key:"a", text:"SMOTE linearly interpolates between two positive rows. For a one-hot column where positive A has merchant 7011 (one-hot 1 in position 12) and positive B has merchant 4111 (one-hot 1 in position 8), the interpolated row has 0.5 in positions 8 and 12 — a fractional one-hot that no real merchant produces. The model treats this as a new category and learns spurious patterns. CTGAN conditions on the categorical column so the generated row has a clean one-hot.", correct:true},
-          {key:"b", text:"SMOTE is fundamentally broken; never use it."},
-          {key:"c", text:"AUC is the wrong metric here."},
-          {key:"d", text:"The drop is random noise; rerun."},
+          {key:"a", text:"CTGAN is newer."},
+          {key:"b", text:"SMOTE picks a fraud row x_i, picks a fraud neighbor x_j, returns a random point on the line segment between them. For categorical one-hot fields, that point has fractional values (country = 0.3 US + 0.7 UK) that no real transaction has. The downstream GBDT either rounds (loses the variety SMOTE tried to add) or splits on the fractional value (learns ghost rules that don't transfer). CTGAN trains a generator G(z, c) where c is a conditional vector that picks a categorical column and a value from its empirical marginal; G then outputs a row whose categoricals are clean one-hots and whose continuous columns match the joint distribution learned by the GAN. The result is NEW rows that preserve cat-cat correlations (e.g., country=NG correlates with merchant_cat=crypto) that SMOTE destroys.", correct:true},
+          {key:"c", text:"CTGAN does the same thing as SMOTE."},
+          {key:"d", text:"CTGAN replaces the GBDT entirely."},
         ]}
-        trap={<>(b) is overstated; SMOTE works on continuous features. (c) and (d) duck the question.</>}
-        lens={<>(a) — interpolation on one-hots produces invalid categorical states. CTGAN's conditioning resolves this by sampling discrete categories instead of interpolating them.</>}
-        stretch={<>What does SMOTE-NC change about this picture?</>}
+        trap={<>(a) recency; (c) collapses the distinction; (d) CTGAN is a data step, not a model replacement.</>}
+        lens={<>SMOTE interpolates (breaks cats). CTGAN samples from a learned joint distribution (clean cats).</>}
+        stretch={<>What if you only have 50 fraud rows — does CTGAN still work?</>}
       />
 
       <VIS.TrapProblem
         id="ctgan-p2"
         difficulty="hard"
-        title="P2 — Detecting mode collapse"
-        scenario={<>You train CTGAN. Validation AUC looks great. How do you detect mode collapse before shipping?</>}
+        title="P2 — Mode-specific normalization: why not just standardize continuous columns?"
+        scenario={<><em>Discriminating insight: transaction_amount is multi-modal — a cluster at micro-payments, a cluster at retail, a cluster at high-ticket. Plain standardization collapses these into one Gaussian-looking vector, and the GAN learns the mean (boring) instead of the modes (interesting). Mode-specific normalization fits a Gaussian mixture per column and lets G output (mode_id, residual) so each mode is reachable.</em><br/><br/>Explain the mechanism.</>}
         options={[
-          {key:"a", text:"Train a binary discriminator on real positives vs synthetic positives. If it achieves AUC near 1.0, the synthetic rows are easily distinguishable — generator collapsed. If AUC is near 0.5, samples are indistinguishable. Also check whether synthetic samples cover the marginal distribution of EACH feature (KS test per column) and the JOINT distribution (correlation matrix distance, or coverage of held-out temporal positives).", correct:true},
-          {key:"b", text:"Look at validation AUC of the downstream fraud model."},
-          {key:"c", text:"Inspect 10 random synthetic rows by hand."},
-          {key:"d", text:"Compute the generator's loss curve."},
+          {key:"a", text:"Standardization is fine."},
+          {key:"b", text:"Tabular continuous columns in fraud are multi-modal: transaction_amount peaks around micro-payments ($2), retail ($50), and high-ticket ($5K). Standardizing (subtract mean / divide by std) maps all three modes onto a single bell-curve-shaped axis; gradient descent collapses to producing the central mode and ignores the tails. Mode-specific normalization in CTGAN fits a variational Gaussian mixture per continuous column, assigns each value to a mode component, and represents the value as (one-hot mode_id, scaled residual). G then outputs both pieces. Each mode is now a discrete target G can hit, so sampling spans all clusters instead of mode-collapsing on the mean.", correct:true},
+          {key:"c", text:"Mode-specific normalization just means min-max scaling."},
+          {key:"d", text:"It's only for categoricals."},
         ]}
-        trap={<>(b) AUC can be inflated by the collapse itself — the model overfits to the narrow synthetic cluster and looks great on validation drawn from the same distribution. (c) is too small a sample. (d) GAN losses don't predict collapse.</>}
-        lens={<>(a) — discriminator AUC, per-column KS, and joint coverage are the three diagnostics. Production teams maintain a synthetic-quality dashboard with these three.</>}
-        stretch={<>What's the equivalent diagnostic for TabDDPM?</>}
+        trap={<>(a) misses multi-modality; (c) wrong technique; (d) inverted (it's for continuous).</>}
+        lens={<>Multi-modal continuous columns need per-mode encoding so the generator can hit each mode.</>}
+        stretch={<>What happens if you set the number of mixture components too low?</>}
       />
 
       <VIS.TrapProblem
         id="ctgan-p3"
-        difficulty="medium"
-        title="P3 — Why TabDDPM often beats CTGAN"
-        scenario={<>Benchmarks consistently show TabDDPM beating CTGAN on tabular density estimation. Why?</>}
+        difficulty="hard"
+        title="P3 — CTGAN vs TabDDPM: where does the mechanism differ?"
+        scenario={<><em>Discriminating insight: CTGAN = GAN (minimax G vs D, conditional on column-value pairs, mode-specific norm). TabDDPM = diffusion (forward noise process + learned reverse denoiser, multinomial diffusion on cats, Gaussian on continuous). Same goal — sample new rows — different training regime and different failure modes (CTGAN: mode collapse; TabDDPM: slow sampling, but better coverage).</em><br/><br/>Map the mechanisms.</>}
         options={[
-          {key:"a", text:"Diffusion models are trained on a much easier objective (denoising score matching, equivalent to MSE prediction at each noise level) compared to GAN's adversarial min-max. The training is more stable, doesn't suffer mode collapse the same way, and benchmarks consistently show better marginals and joints. The price is slower sampling — T denoising steps per row.", correct:true},
-          {key:"b", text:"TabDDPM uses more parameters."},
-          {key:"c", text:"TabDDPM only works on synthetic data."},
-          {key:"d", text:"CTGAN is deprecated."},
+          {key:"a", text:"They're identical."},
+          {key:"b", text:"Different training regimes. CTGAN is a GAN: a generator G and discriminator D play a minimax game; G learns implicitly by fooling D. CTGAN-specific tricks: mode-specific normalization on continuous columns, training-by-sampling that conditions on (column, value) pairs from each categorical's marginal. Failure mode: mode collapse — G learns to generate a narrow slice of the manifold that fools D, missing rare categories. TabDDPM is a diffusion model: a forward process adds noise (Gaussian on continuous, multinomial on categorical) for T steps; a neural denoiser is trained to reverse one step; sampling iterates the reverse from pure noise. Failure mode: slow sampling (T iterations per sample) and tuning T per dataset. Empirically TabDDPM matches or beats CTGAN on most tabular benchmarks because diffusion explicitly covers all modes by construction.", correct:true},
+          {key:"c", text:"CTGAN uses a transformer."},
+          {key:"d", text:"TabDDPM doesn't handle categoricals."},
         ]}
-        trap={<>(b) misses the training-objective difference. (c) and (d) are wrong.</>}
-        lens={<>(a) — diffusion's training stability is the structural advantage. The slow sampling is the cost.</>}
-        stretch={<>Can you accelerate TabDDPM sampling with DDIM-style tricks?</>}
+        trap={<>(a) collapses; (c) wrong (it's a GAN); (d) inverted (multinomial diffusion handles cats).</>}
+        lens={<>GAN (minimax, mode-collapse risk) vs diffusion (denoiser, slow but mode-covering).</>}
+        stretch={<>When would you pick CTGAN over TabDDPM despite the better benchmarks?</>}
       />
 
       <VIS.TrapProblem
         id="ctgan-p4"
         difficulty="hard"
-        title="P4 — How much synthetic data to add"
-        scenario={<>You have 5000 real positives and 50M negatives. You train CTGAN. How many synthetic positives do you generate?</>}
+        multiSelect
+        title="P4 — Failure modes of CTGAN on fraud data: select all that apply"
+        scenario={<><em>Discriminating insight: GAN failure modes are well-catalogued — mode collapse (G generates a narrow slice), discriminator overpowers generator (training stalls), memorization (G outputs near-copies of training rows, privacy leak). All apply to CTGAN; in fraud they translate to "synthetic fraud looks like 2-3 fraud rings repeated".</em><br/><br/>Select the failure modes.</>}
         options={[
-          {key:"a", text:"Sweep oversampling ratios on a held-out validation set. Common choices: 1x (5k synthetic for 5k real, total 10k positives), 5x (25k), 10x (50k). Diminishing returns past ~10x and amplifies generator bias. Validate downstream AUC at each ratio; pick the smallest ratio that captures most of the benefit. Do NOT match the negative count (50M) — that's overkill and the generator can't produce that much real diversity.", correct:true},
-          {key:"b", text:"Generate 50M synthetic positives to perfectly balance the classes."},
-          {key:"c", text:"Generate exactly 1 synthetic per real positive."},
-          {key:"d", text:"Always 100x."},
+          {key:"a", text:"Mode collapse — G generates a narrow slice of fraud (one fraud-ring archetype) and ignores the rest.", correct:true},
+          {key:"b", text:"Memorization — G outputs near-copies of training fraud rows, which leaks PII and offers no new signal.", correct:true},
+          {key:"c", text:"Discriminator wins — D becomes too strong, G's gradient vanishes, training stalls.", correct:true},
+          {key:"d", text:"CTGAN automatically fixes label noise."},
+          {key:"e", text:"Cat-cat correlations are learned for free without conditional sampling."},
         ]}
-        trap={<>(b) is the seductive "fully balance" answer — wrong because the generator has finite distinct samples; you're amplifying mode collapse. (c) and (d) are arbitrary.</>}
-        lens={<>(a) — sweep on validation and pick the smallest ratio that captures the benefit. Most fraud teams settle in the 3x to 10x range.</>}
-        stretch={<>Why does the optimal ratio depend on negative count?</>}
+        trap={<>(d) inverted; (e) the whole POINT of conditional sampling is that cat-cat correlations need explicit help.</>}
+        lens={<>Three classic GAN failure modes plus the tabular-specific cat-marginal coverage problem.</>}
+        stretch={<>How would you detect mode collapse on a fraud dataset where you don't know the fraud archetypes?</>}
       />
 
       <VIS.TrapProblem
         id="ctgan-p5"
         difficulty="medium"
-        multiSelect
-        title="P5 — When generative oversampling FAILS"
-        scenario={<>Which conditions make CTGAN or TabDDPM unhelpful or harmful for fraud? Select all that apply.</>}
+        title="P5 — Conditional generator in CTGAN — what does it condition on?"
+        scenario={<><em>Discriminating insight: c is a one-hot over (categorical column, value) sampled from that column's empirical marginal — NOT the class label. The point: ensure G covers rare categorical values that random z would miss.</em><br/><br/>Pin the condition.</>}
         options={[
-          {key:"a", text:"Very few real positives (under 500) — generator memorizes and synthetic rows are near-duplicates of training rows. Test performance suffers.", correct:true},
-          {key:"b", text:"Fraud distribution drifts fast — generator was trained on last month's fraud patterns; this month's fraud looks different. Synthetic data is stale.", correct:true},
-          {key:"c", text:"Strong cat-num interactions (e.g., country times amount creates fraud) — generative models may smooth over these.", correct:true},
-          {key:"d", text:"You have a GPU.", correct:false},
-          {key:"e", text:"You're using cross-validation.", correct:false},
+          {key:"a", text:"On the class label (fraud vs not)."},
+          {key:"b", text:"On a randomly sampled (categorical_column, value) pair. At each training step, pick one categorical column uniformly, sample a value from its empirical marginal (so rare values are picked proportionally), and pass a one-hot encoding of that pair to G. G is then trained to produce a row matching that condition. This trick forces G to learn how to generate rows that have, say, country=NG even though it's a rare category — random z alone would mode-collapse to the common categories. The class label can additionally be appended in class-conditional variants, but the canonical CTGAN conditioning is on column-value pairs.", correct:true},
+          {key:"c", text:"On a continuous column."},
+          {key:"d", text:"On the time of day."},
         ]}
-        trap={<>(d) and (e) are nonsense distractors. The three real failure modes are sample-size, drift, and structural interactions.</>}
-        lens={<>(a)-(c) are the practitioner-known failure modes. The drift one in (b) is the most common silent killer in production fraud teams.</>}
-        stretch={<>How do you retrain CTGAN incrementally as drift happens?</>}
+        trap={<>(a) common confusion — CTGAN's named "conditional" is about column-value, not class label; (c)(d) irrelevant.</>}
+        lens={<>Condition on (cat_col, value) sampled from empirical marginal so G covers rare categories.</>}
+        stretch={<>Can you also condition on the class label? Yes — see CTAB-GAN+ / TabDDPM class-conditional variant.</>}
       />
 
       <VIS.TrapProblem
         id="ctgan-p6"
         difficulty="hard"
-        title="P6 — Train-test contamination from synthetic"
-        scenario={<>You train CTGAN on the full training set, generate synthetic positives, and add them to training. Where can leakage sneak in?</>}
+        title="P6 — You generate 100K synthetic fraud rows. Downstream AUC drops. Diagnose."
+        scenario={<><em>Discriminating insight: classic CTGAN trap — at 100K synthetic vs 2K real, the downstream model fits the GENERATOR's manifold, not the real fraud manifold. Anything G under-covers (rare ring archetypes, drift edges) is now under-represented in the training set. Cap synthetic at 5-20x real or use sample weights.</em><br/><br/>Why more synthetic hurts.</>}
         options={[
-          {key:"a", text:"If CTGAN is trained on rows that ALSO appear in validation or test, the generator has memorized those rows; synthetic rows near them artificially boost downstream performance. Fix: train CTGAN ONLY on the training split. Never let it see validation or test data, even indirectly via shared engineering pipelines.", correct:true},
-          {key:"b", text:"There's no leakage risk; synthetic data is by definition new."},
-          {key:"c", text:"Leakage only happens in deep learning."},
-          {key:"d", text:"Leakage cannot happen with diffusion."},
+          {key:"a", text:"Synthetic data is always bad."},
+          {key:"b", text:"At 100K synthetic vs 2K real, the downstream GBDT learns the generator's distribution, not the real fraud distribution. If G mode-collapsed onto 2-3 fraud archetypes, the GBDT now thinks fraud is 'whatever G produces' and misses real fraud rings that G under-covers. Worse, the 2K real rows are drowned out — their unique signal is diluted by 50x synthetic rows that look similar to each other but not exactly like real fraud. Mitigations: (1) cap synthetic at 5-20x real, (2) use sample weights so real rows count for k per row, (3) validate downstream on a HELD-OUT set of REAL fraud (synthetic data must never enter validation), (4) inspect feature-marginal divergence between real and synthetic with KS or chi-square per column.", correct:true},
+          {key:"c", text:"You need more real data."},
+          {key:"d", text:"Use SMOTE instead, always."},
         ]}
-        trap={<>(b) is the seductive wrong answer — synthetic data inherits the generator's view of the training set. (c) and (d) are wrong specifics.</>}
-        lens={<>(a) — train the generator on TRAIN ONLY. Same rule applies to TabDDPM. This is the most common production bug for generative oversampling.</>}
-        stretch={<>What if the validation set drifts and you need to re-tune the oversampling ratio?</>}
+        trap={<>(a)(d) absolutist; (c) trivially true but not the diagnosis.</>}
+        lens={<>Too much synthetic means the downstream fits the generator, not reality.</>}
+        stretch={<>What's a principled way to pick the synthetic:real ratio?</>}
       />
 
       <VIS.TrapProblem
         id="ctgan-p7"
         difficulty="hard"
-        title="P7 — CTGAN vs in-distribution augmentation"
-        scenario={<>A colleague suggests SimFraud-style in-distribution perturbation (small amount or time jitter on real positives) instead of CTGAN. Compare.</>}
+        title="P7 — Teammate: 'CTGAN is just a fancier SMOTE'. Diagnose."
+        scenario={<><em>Discriminating insight: SMOTE has NO model of the distribution — it interpolates between pairs. CTGAN learns p(x) parametrically with a neural generator. Consequence: CTGAN can sample points NOT on the convex hull of training fraud (extending the manifold), while SMOTE cannot leave the convex hull. Also CTGAN handles categoricals natively, SMOTE doesn't.</em><br/><br/>Refute the claim.</>}
         options={[
-          {key:"a", text:"In-distribution augmentation is safer — every augmented row is provably close to a real fraud, no OOD risk. It produces less variety than CTGAN. Pick augmentation when the dominant failure mode is OOD synthetic samples or when you have a known structural perturbation (time-of-day jitter, amount rounding). Pick CTGAN when you need to fill in distributional gaps the augmentation can't reach.", correct:true},
-          {key:"b", text:"CTGAN is universally better."},
-          {key:"c", text:"In-distribution augmentation is universally better."},
-          {key:"d", text:"They're equivalent."},
+          {key:"a", text:"Correct — same thing."},
+          {key:"b", text:"Wrong on two counts. (1) Mechanism: SMOTE has no model — it picks two existing fraud rows and outputs a convex combination. The output is therefore restricted to the convex hull of the training fraud. CTGAN learns a parametric generator G(z) for the joint distribution; samples can lie outside the convex hull (in the support of p(x)) and can produce values absent from any training row. (2) Categorical handling: SMOTE's linear interpolation produces fractional one-hots on categoricals that the downstream model can't use meaningfully; CTGAN's conditional sampler produces clean one-hots drawn from each column's empirical marginal. The two methods solve different problems — SMOTE is a cheap density-free heuristic; CTGAN is a learned density model.", correct:true},
+          {key:"c", text:"They're equivalent under linearity."},
+          {key:"d", text:"SMOTE is strictly better."},
         ]}
-        trap={<>(b)-(d) are absolutist. The right answer is conditional.</>}
-        lens={<>(a) — augmentation is safer but lower variety; generation is more powerful but riskier. Many teams ship augmentation first then escalate to CTGAN if augmentation plateaus.</>}
-        stretch={<>Can you stack augmentation on top of CTGAN?</>}
+        trap={<>(a)(c)(d) all collapse the model-vs-heuristic distinction.</>}
+        lens={<>SMOTE = interpolation in convex hull. CTGAN = learned p(x). Different surgical layers.</>}
+        stretch={<>Are there fraud regimes where SMOTE actually wins over CTGAN?</>}
       />
 
       <VIS.TrapProblem
         id="ctgan-p8"
         difficulty="hard"
-        title="P8 — Privacy implications"
-        scenario={<>Risk team asks if synthetic positives leak real customer data. How do you answer?</>}
+        title="P8 — Privacy & PII: a generator trained on raw card numbers — risk?"
+        scenario={<><em>Discriminating insight: GANs and diffusion models can memorize training rows, especially with small training sets (under 2K fraud is typical). Synthetic outputs may contain near-copies of real card numbers/PII. Always train on de-identified features, or use DP-SGD for the generator.</em><br/><br/>Privacy gotcha.</>}
         options={[
-          {key:"a", text:"Generative models CAN memorize training rows, especially with few positives (under 1000) or over-trained generators. Membership inference attacks have shown CTGAN and TabDDPM both memorize. Mitigations: train with differential privacy (DP-SGD on the generator); audit by running a membership-inference attack; cap the generator's training epochs; ensure synthetic rows aren't published verbatim externally. Privacy is NOT automatic with synthetic data.", correct:true},
-          {key:"b", text:"Synthetic data is automatically private."},
-          {key:"c", text:"Only TabDDPM memorizes."},
-          {key:"d", text:"Privacy only matters for federated learning."},
+          {key:"a", text:"No risk — outputs are synthetic by definition."},
+          {key:"b", text:"Significant risk. With small training sets (under 2K fraud, typical), CTGAN and TabDDPM can MEMORIZE rather than generalize — the generator effectively outputs near-copies of training rows. If those rows contain card numbers, names, addresses, or any quasi-identifier, your 'synthetic' fraud rows leak real customer PII to anyone who consumes the synthetic dataset. Mitigations: (1) train only on de-identified, hashed, or aggregated features; (2) use DP-SGD (differentially private SGD) when training the generator so memorization is bounded by a privacy budget epsilon; (3) run a memorization audit — for each synthetic row, find its nearest real row by Hamming/L2 and flag if distance is below a threshold; (4) for regulated data, treat synthetic outputs as same-classification as the training data until you've audited.", correct:true},
+          {key:"c", text:"Use SMOTE — it's safer."},
+          {key:"d", text:"Privacy is the security team's problem."},
         ]}
-        trap={<>(b) is the common misconception that risk teams need correcting on. (c) and (d) are wrong.</>}
-        lens={<>(a) — memorization is real and documented. DP-SGD on the generator plus membership inference audits are the engineering controls.</>}
-        stretch={<>What is the privacy-utility tradeoff for DP-CTGAN?</>}
+        trap={<>(a) wrong (memorization is real); (c) SMOTE also leaks (outputs depend linearly on real rows); (d) dodge.</>}
+        lens={<>Small training set + powerful generator = memorization risk. DP-SGD or audit.</>}
+        stretch={<>How would you set the DP-SGD epsilon for a fraud-generation task?</>}
       />
 
       <VIS.TrapProblem
         id="ctgan-p9"
         difficulty="medium"
-        title="P9 — Combining with class weighting"
-        scenario={<>Can you use CTGAN oversampling AND class weighting in the same training run?</>}
+        title="P9 — TabDDPM forward process: what does it do to a categorical column?"
+        scenario={<><em>Discriminating insight: continuous columns get Gaussian noise added each step; categorical columns get multinomial diffusion — at each step there's a probability of replacing the current category with a uniform sample over categories. After T steps the categorical is uniform. The denoiser learns to reverse both.</em><br/><br/>Forward process on cats.</>}
         options={[
-          {key:"a", text:"Yes, and it often helps. Generative oversampling shrinks the imbalance ratio (say 1 in 1000 becomes 1 in 100). Class weighting on the new ratio further amplifies positives if the loss is still negative-dominated. Tune both jointly — over-stacking causes positive-class memorization. Common practical recipe: oversample 5x via CTGAN, then class-weight positives 2 to 5x in BCE.", correct:true},
-          {key:"b", text:"No, never stack."},
-          {key:"c", text:"Yes, but only with focal loss."},
-          {key:"d", text:"Yes, but it always hurts AUC."},
+          {key:"a", text:"Adds Gaussian noise to the one-hot."},
+          {key:"b", text:"Multinomial diffusion: at each step t, with probability beta_t the category value is resampled uniformly from all K categories of that column; with probability 1-beta_t it stays. beta_t is increased on a schedule from near 0 at t=1 to near 1 at t=T, so after T steps the categorical is uniform over its categories (information destroyed). Continuous columns simultaneously get Gaussian noise added on a schedule. A single denoiser network takes (x_t, t) and predicts (x_0 or noise) for both types of columns jointly. Sampling: start from a uniform categorical plus pure-noise continuous, iterate reverse for T steps. The unified design — multinomial for cats, Gaussian for continuous, one denoiser — is what makes TabDDPM 'joint'.", correct:true},
+          {key:"c", text:"Multiplies the one-hot by t."},
+          {key:"d", text:"Replaces it with the mode of the column."},
         ]}
-        trap={<>(b)-(d) are wrong absolutes.</>}
-        lens={<>(a) — stacking is fine when tuned jointly. The two interventions target different layers (data-level and loss-level).</>}
-        stretch={<>What's the failure mode when you stack TOO aggressively?</>}
+        trap={<>(a) wrong type of noise; (c)(d) absurd.</>}
+        lens={<>Multinomial diffusion = category-resampling-with-probability schedule. Gaussian for continuous.</>}
+        stretch={<>What's T typically set to for tabular? (Often 100-1000, less than image diffusion's 1000-4000.)</>}
       />
 
       <VIS.TrapProblem
         id="ctgan-p10"
         difficulty="hard"
-        title="P10 — Senior framing of generative oversampling"
-        scenario={<>Frame generative oversampling in the broader imbalance-intervention landscape for a senior interview.</>}
+        title="P10 — Validation discipline: where do you put the synthetic rows?"
+        scenario={<><em>Discriminating insight: ONLY in training. Never in validation, never in test, never in calibration. The synthetic distribution may not match real; if you validate on synthetic, you're scoring against your own generator's biases. Standard pattern: train_real + train_synth fit model; validate_real tune; test_real report.</em><br/><br/>Where do synth rows go.</>}
         options={[
-          {key:"a", text:"Imbalance interventions split across three layers: data-level (under-sample negatives, over-sample positives via SMOTE / CTGAN / TabDDPM, in-distribution augmentation), loss-level (class weights, focal, logit-adjusted), and decision-level (calibrate plus threshold-tune). Generative oversampling sits at the data layer and is the strongest option when feature correlations matter — but it's the most expensive in compute and engineering complexity (training the generator, monitoring for mode collapse, privacy auditing). In a senior design, you'd default to SMOTE plus class weights, escalate to CTGAN when SMOTE's correlation breakage hurts, escalate to TabDDPM when you need state-of-the-art density and have the GPU budget.", correct:true},
-          {key:"b", text:"CTGAN is the only good answer."},
-          {key:"c", text:"Just balance the classes."},
-          {key:"d", text:"Imbalance is a solved problem."},
+          {key:"a", text:"Add to both training and validation."},
+          {key:"b", text:"Synthetic rows enter the training set only. Validation and test must remain 100% REAL because the synthetic distribution is, at best, an approximation of the true fraud distribution — at worst, it reflects the generator's mode collapse or memorization. Validating on synthetic data scores your downstream model against your generator, not against reality. The right pipeline: (1) split real data into train_real / val_real / test_real first; (2) train CTGAN/TabDDPM on train_real fraud rows only; (3) sample N synthetic fraud, append to train_real to form train_combined; (4) fit downstream model on train_combined; (5) tune on val_real, report on test_real. Tracking generator quality is a separate exercise (column-marginal divergence, PCA visualization of real vs synth) and uses the train_real fraud as reference.", correct:true},
+          {key:"c", text:"Add to all splits."},
+          {key:"d", text:"Add only to validation."},
         ]}
-        trap={<>(b)-(d) lack the layered landscape.</>}
-        lens={<>(a) — the senior framing names three layers and explains the cost-quality ladder within the data layer.</>}
-        stretch={<>How would you A/B test CTGAN vs TabDDPM in production?</>}
+        trap={<>(a)(c) contaminate the metric; (d) inverted.</>}
+        lens={<>Synthetic to train only. Validate and test on real, always.</>}
+        stretch={<>What about calibration set — real or synth?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p11"
+        difficulty="hard"
+        title="P11 — Generator hyperparameter sweep — what to vary?"
+        scenario={<><em>Discriminating insight: for CTGAN, the levers are batch size, embedding dim of G/D, conditional vector PAC size, number of training epochs. For TabDDPM, the levers are T (diffusion steps), beta schedule (linear vs cosine), denoiser depth, and class-conditioning weight. Measure quality with column-marginal divergence (KS, chi-square) and a downstream-AUC proxy.</em><br/><br/>What to sweep.</>}
+        options={[
+          {key:"a", text:"Only the learning rate."},
+          {key:"b", text:"For CTGAN: batch size (256-1024), G/D embedding dims (128-512), training epochs (300-1000), and the PAC parameter (group size for pacGAN-style discrimination, helps mode coverage). For TabDDPM: T (diffusion steps; 100-1000), the beta schedule (linear, cosine, quadratic), denoiser MLP depth (3-6 layers), hidden dim (256-1024), and class-conditioning dropout when using class-conditional sampling. Quality metrics: (1) per-column KS-test (continuous) / chi-square (categorical) divergence between real and synthetic; (2) joint quality via PCA scatter overlay; (3) downstream proxy — fit a downstream GBDT on synth+real, score on val_real, vs the baseline of fitting on real alone. The downstream metric is the gold standard.", correct:true},
+          {key:"c", text:"Only the gamma parameter."},
+          {key:"d", text:"Nothing to sweep — defaults are fine."},
+        ]}
+        trap={<>(a)(c)(d) miss the multi-axis tuning surface.</>}
+        lens={<>Per-column marginal divergence plus downstream-AUC proxy. Sweep T, schedule, depth (TabDDPM); batch, embedding, PAC, epochs (CTGAN).</>}
+        stretch={<>What's PAC? (Pack-GAN trick: discriminator sees groups of m samples and judges if the group looks real — discourages mode collapse.)</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p12"
+        difficulty="medium"
+        title="P12 — You have 50 fraud rows total. Should you train CTGAN?"
+        scenario={<><em>Discriminating insight: at 50 rows the generator will memorize. The 'synthetic' rows will be near-copies of training rows, providing no new signal and leaking PII. Threshold rule of thumb: need 500-1000+ minority rows for CTGAN to generalize. Below that, prefer SimFraud-style in-distribution augmentation or label-noise-aware loss.</em><br/><br/>Lower bound on data.</>}
+        options={[
+          {key:"a", text:"Yes, CTGAN works with any data."},
+          {key:"b", text:"No — at 50 rows the generator is in the memorization regime. CTGAN/TabDDPM have on the order of 1M-10M parameters; with 50 training rows there's no way for the generator to learn the manifold rather than memorize. Synthetic outputs will be near-copies of the 50 real rows, providing zero new signal and creating a PII leak. Rules of thumb: need 500-1000+ minority rows for the generator to generalize meaningfully; below 500 rows prefer (1) SimFraud-style in-distribution augmentation (perturb existing rows, no generative model needed), (2) class-weighted loss, (3) one-class anomaly detectors (Deep SVDD, isolation forest) trained on the majority. Adding generative oversampling on top of 50 rows hurts more than it helps.", correct:true},
+          {key:"c", text:"Yes but only TabDDPM."},
+          {key:"d", text:"Use a transformer."},
+        ]}
+        trap={<>(a)(c)(d) ignore the parameter-count vs row-count mismatch.</>}
+        lens={<>Need 500-1000+ minority rows for CTGAN/TabDDPM. Below: prefer SimFraud or class weights.</>}
+        stretch={<>What's the smallest fraud sample size where CTGAN beats SMOTE in published benchmarks?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p13"
+        difficulty="medium"
+        title="P13 — Drift hits production. Should you re-train CTGAN?"
+        scenario={<><em>Discriminating insight: yes — the generator is a snapshot of the fraud distribution at training time. As fraud rings evolve, the generator's samples become OOD relative to current fraud. Cadence: re-train CTGAN with the same cadence as the downstream model (weekly/monthly typical), using a rolling window of recent real fraud.</em><br/><br/>Re-train cadence.</>}
+        options={[
+          {key:"a", text:"Never re-train CTGAN."},
+          {key:"b", text:"Re-train CTGAN/TabDDPM with the same cadence as the downstream model — weekly or monthly is typical, depending on fraud-ring volatility. The generator is a snapshot of fraud at training time; as new fraud ring archetypes emerge, the old generator's samples become OOD relative to current fraud, and using them as oversampling actively pulls the downstream model toward yesterday's threats. Use a rolling window of recent real fraud (e.g., last 90 days) as CTGAN training data, monitor column-marginal drift between consecutive generators, and alert when divergence spikes (often signals a new ring archetype the previous generator didn't cover).", correct:true},
+          {key:"c", text:"Re-train once a year."},
+          {key:"d", text:"CTGAN doesn't drift."},
+        ]}
+        trap={<>(a)(c)(d) ignore the snapshot-vs-rolling nature of the generator.</>}
+        lens={<>Generator equals snapshot. Re-train at downstream cadence with rolling window.</>}
+        stretch={<>Could you use incremental/continual training instead of full retrain?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p14"
+        difficulty="hard"
+        title="P14 — Mode collapse symptom: how do you spot it?"
+        scenario={<><em>Discriminating insight: per-column marginal divergence + nearest-neighbor diversity. If 10K synthetic rows collapse to ~100 unique categorical combinations, or the synthetic 2D PCA scatter is a tight cluster while real is spread, you have mode collapse. Per-column chi-square divergence on rare categorical values is a sensitive detector.</em><br/><br/>Detection recipe.</>}
+        options={[
+          {key:"a", text:"Look at the generator loss curve."},
+          {key:"b", text:"Generator loss alone is a poor detector — it can be low while mode-collapsed. Better diagnostics: (1) per-column marginal divergence — chi-square between empirical category frequencies in real vs synthetic; spikes on RARE categories indicate the generator skipped them. (2) Nearest-neighbor diversity: for each pair of synthetic rows, distance; if mean inter-synth distance is much less than mean inter-real distance, mode collapse. (3) Unique-row count: bucket categorical-combo + binned continuous; if 10K synthetic rows collapse to ~100 unique buckets while 10K real rows show ~9000, mode collapse. (4) PCA visualization: project real + synthetic onto first two PCs, overlay scatter — collapse looks like a tight cluster against a spread real-data cloud. Use these together; loss is unreliable.", correct:true},
+          {key:"c", text:"Just use Brier score."},
+          {key:"d", text:"Trust the generator."},
+        ]}
+        trap={<>(a) misleading; (c) wrong metric (Brier is for predictors); (d) abdicates.</>}
+        lens={<>Marginal divergence plus NN diversity plus unique-row count plus PCA overlay. Not loss alone.</>}
+        stretch={<>Which of these is most sensitive to rare-category collapse?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p15"
+        difficulty="medium"
+        title="P15 — Should CTGAN be class-conditional or trained on fraud only?"
+        scenario={<><em>Discriminating insight: training on fraud only is the canonical recipe (you want minority samples). Class-conditional CTGAN trained on the full dataset allows sampling from either class but adds a hyperparameter — the conditioning weight — and risks generator capacity going to majority. For fraud, train on fraud-only.</em><br/><br/>Pick the variant.</>}
+        options={[
+          {key:"a", text:"Always class-conditional."},
+          {key:"b", text:"Train on fraud rows only — the canonical CTGAN recipe for oversampling. The whole point is to generate minority-class samples; training on the full dataset (99.9% legit) splits the generator's capacity across both classes, and class-conditional sampling requires a weight that's hard to tune (too low and the generator favors the majority; too high and the generator collapses on a few fraud archetypes). Fraud-only training keeps the generator focused on the manifold you actually need. Caveat: with under 500 fraud rows, you may need class-conditional with the full dataset just to have enough total training signal, but accept the trade-off explicitly.", correct:true},
+          {key:"c", text:"Never train on fraud only."},
+          {key:"d", text:"Use the entire dataset always."},
+        ]}
+        trap={<>(a)(c)(d) absolutist.</>}
+        lens={<>Default: train on fraud only. Class-conditional is the fallback for tiny minority counts.</>}
+        stretch={<>What's the threshold below which class-conditional becomes mandatory?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p16"
+        difficulty="hard"
+        title="P16 — Downstream evaluation: synthetic + real outperforms real alone on AUC, but recall@1%FPR is flat. Diagnose."
+        scenario={<><em>Discriminating insight: synthetic rows usually sit on the AVERAGE of the fraud manifold — they improve mid-distribution ranking (AUC) but don't help the top-of-distribution operating point where the rare, hard fraud sits. To move recall@1%FPR you need rare-archetype coverage, which CTGAN's conditional sampler may not provide if the rare archetype was sparse in training.</em><br/><br/>AUC up, recall@FPR flat.</>}
+        options={[
+          {key:"a", text:"Synthetic data is broken."},
+          {key:"b", text:"Synthetic rows from a learned generator typically populate the average/dense region of the fraud manifold, not its tail. AUC — a global ranking metric over all positive-negative pairs — improves because the mid-distribution is reshaped by the extra data. Recall@1%FPR depends on the TOP of the score distribution: the worst-ranked positives above the 1%-FPR threshold. If the rare fraud archetypes that get scored near the operating point were sparse in training (fewer than the generator could learn from), CTGAN under-covers them, synthetic samples don't help the operating point, and recall@FPR stays flat. Fixes: (1) class-conditional generation by archetype label (cluster fraud first, then condition); (2) train multiple specialist generators per archetype and union the synthetic data; (3) supplement with SimFraud-style in-dist perturbations on the rare archetypes.", correct:true},
+          {key:"c", text:"AUC is wrong."},
+          {key:"d", text:"Increase the synth ratio."},
+        ]}
+        trap={<>(a) dismisses; (c) dismisses; (d) makes it worse (more average-mass dilution).</>}
+        lens={<>AUC equals global ranking. Recall at FPR equals tail of score. Generators help the former, not always the latter.</>}
+        stretch={<>How would you cluster fraud archetypes for class-conditional generation?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p17"
+        difficulty="medium"
+        title="P17 — Encoding rules for CTGAN input: do you one-hot the categoricals?"
+        scenario={<><em>Discriminating insight: yes — CTGAN expects categorical columns as one-hot (or category-id with embedding); the conditional generator and discriminator both rely on per-column representation. Continuous columns get mode-specific normalization. Mixed columns must be flagged in the metadata so each receives the right encoding.</em><br/><br/>Encoding contract.</>}
+        options={[
+          {key:"a", text:"Encode everything as continuous."},
+          {key:"b", text:"CTGAN expects a metadata schema that tags each column as continuous or categorical. Continuous columns get mode-specific normalization automatically — fit a variational GMM, encode each value as (mode_id one-hot, scaled residual). Categorical columns get one-hot encoded — the discriminator and conditional generator both rely on the per-column one-hot structure for the (column, value) conditioning. Ordinal columns can be encoded as continuous OR categorical depending on cardinality (under 10 categorical; over 10 continuous with care for the GMM). Datetime should be decomposed into (year, month, day, hour) categorical pieces, not passed as a raw timestamp. Free-text fields don't belong in CTGAN — embed them externally first.", correct:true},
+          {key:"c", text:"Drop the categoricals."},
+          {key:"d", text:"Hash everything."},
+        ]}
+        trap={<>(a) loses the categorical structure; (c)(d) destroy signal.</>}
+        lens={<>Metadata schema drives per-column encoder. Continuous: GMM. Categorical: one-hot.</>}
+        stretch={<>How does CTGAN handle high-cardinality categoricals (e.g., merchant_id with 100K values)?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p18"
+        difficulty="hard"
+        title="P18 — Generator memorization audit: design the test."
+        scenario={<><em>Discriminating insight: for each synthetic row, find the nearest real row by L2 (continuous, after normalization) + Hamming (categorical). Flag synthetic rows whose distance to nearest real is below a small threshold (e.g., the 5th percentile of real-real distances). Report the memorization rate. Tighten with DCR (distance-to-closest-record) metric standard in synthetic-data benchmarks.</em><br/><br/>Audit recipe.</>}
+        options={[
+          {key:"a", text:"Audits don't matter."},
+          {key:"b", text:"Distance-to-closest-record (DCR) audit: for each synthetic row x_s, compute distance to its nearest real row in the training set, using a hybrid metric — L2 on standardized continuous columns plus Hamming on one-hot categoricals (weighted so each column contributes proportionally). Compute the distribution of nearest-real distances for synthetic rows; compare to the distribution of nearest-real-to-real distances within the training set (the within-real baseline). If synthetic distances skew SMALLER than within-real distances, the generator is memorizing. Common threshold: flag any synthetic row whose nearest-real distance is below the 5th percentile of within-real distances; the fraction flagged is the 'memorization rate'. Report it alongside utility metrics. SDV and Syndata-Vault both implement this.", correct:true},
+          {key:"c", text:"Just look at the loss."},
+          {key:"d", text:"Use cosine similarity only."},
+        ]}
+        trap={<>(a) abdicates; (c) loss doesn't tell memorization; (d) wrong metric for one-hot.</>}
+        lens={<>DCR: nearest-real distance distribution, compared to within-real baseline.</>}
+        stretch={<>How does DP-SGD interact with the DCR metric?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p19"
+        difficulty="hard"
+        title="P19 — CTGAN converged but synthetic AUC is much worse than real. What's the immediate diagnostic?"
+        scenario={<><em>Discriminating insight: 'train on synthetic, test on real' (TSTR) score vs 'train on real, test on real' (TRTR) score. If TSTR is much less than TRTR, the generator under-covers the discriminative signal the downstream model needs — typically mode collapse on rare ring archetypes or breakdown of cat-cat correlations.</em><br/><br/>TSTR vs TRTR.</>}
+        options={[
+          {key:"a", text:"Add more layers."},
+          {key:"b", text:"Run the TSTR/TRTR comparison: (1) TRTR — train downstream GBDT on real_train, test on real_test, this is the baseline AUC. (2) TSTR — train downstream GBDT on synthetic_only, test on real_test, this is the utility AUC. A large gap (TSTR much less than TRTR) means the synthetic data does not carry the discriminative signal. Diagnose by: column-marginal divergence (find columns where synth and real differ most) and feature-importance comparison (does the GBDT trained on synth use different features than GBDT trained on real?). Common causes: mode collapse on rare archetypes that carry signal, broken cat-cat correlations (specific country times merchant pairs that signal a ring), and overfit conditional generator that only generates common categorical values.", correct:true},
+          {key:"c", text:"AUC is wrong."},
+          {key:"d", text:"Synthetic data always loses."},
+        ]}
+        trap={<>(a) blind; (c) dismisses metric; (d) too strong.</>}
+        lens={<>TSTR vs TRTR gap. Diagnose with marginal divergence plus feature-importance comparison.</>}
+        stretch={<>What's a 'good' TSTR/TRTR ratio in published tabular benchmarks?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p20"
+        difficulty="medium"
+        title="P20 — When NOT to use CTGAN/TabDDPM."
+        scenario={<><em>Discriminating insight: tiny minority (under 500 rows, memorization), strict privacy without DP-SGD budget, very high cardinality categoricals (merchant_id with 100K values blows up the one-hot space), or when SimFraud-style in-distribution augmentation suffices structurally.</em><br/><br/>Skip-generative scenarios.</>}
+        options={[
+          {key:"a", text:"Always use CTGAN."},
+          {key:"b", text:"Skip generative oversampling when: (1) minority count is too small (under 500 fraud rows) — generator memorizes, no new signal; (2) strict privacy regime without budget for DP-SGD — memorized rows are PII leak; (3) very high cardinality categoricals (merchant_id with 100K values) — one-hot blows up, conditional sampler can't cover marginals; (4) the natural augmentation is structural (e.g., sequence-level time/amount jitter in SimFraud) and stays in-distribution by construction — generative model adds risk without benefit; (5) downstream model already handles imbalance well (focal loss, LDAM, balanced batch sampler) and adding synthetic rows is incremental at best. The default should be 'try class-weighting + threshold tuning first; reach for CTGAN only when those plateau and you have at least 1K minority rows'.", correct:true},
+          {key:"c", text:"Never use CTGAN."},
+          {key:"d", text:"Always use SMOTE."},
+        ]}
+        trap={<>(a)(c)(d) absolutist.</>}
+        lens={<>At least 1K minority plus tolerable privacy plus manageable cardinality means CTGAN/TabDDPM is justified. Otherwise: simpler levers.</>}
+        stretch={<>How to A/B CTGAN vs no-oversampling in production?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p21"
+        difficulty="hard"
+        title="P21 — Junior: 'TabDDPM is just CTGAN with extra steps'. Diagnose."
+        scenario={<><em>Discriminating insight: different probabilistic model. CTGAN learns implicitly via minimax (no explicit p(x), known mode-collapse risk). TabDDPM learns an explicit reverse process; sampling traverses the full chain, mode coverage is built in. Different sample-time cost (1-step vs T-step) and different failure modes.</em><br/><br/>Refute.</>}
+        options={[
+          {key:"a", text:"Correct — same thing."},
+          {key:"b", text:"Wrong. Different probabilistic model class. CTGAN is an implicit generative model: G(z) is trained adversarially against D; there's no explicit density p_G(x), and the training objective is a minimax saddle point that can mode-collapse. Sample cost: O(1) forward pass. TabDDPM is an explicit generative model: the forward noise process q(x_t | x_0) is fixed and analytically known; the denoiser p_theta(x_{t-1} | x_t) is trained by maximum likelihood (variational lower bound) — a well-defined optimization. Sample cost: O(T) forward passes, T typically 100-1000. Failure modes diverge: CTGAN can mode-collapse and stall; TabDDPM is slow at sample time and sensitive to noise-schedule choice. Empirically TabDDPM matches or beats CTGAN on tabular benchmarks precisely because mode coverage is structural, not adversarial.", correct:true},
+          {key:"c", text:"TabDDPM is a transformer."},
+          {key:"d", text:"CTGAN uses diffusion internally."},
+        ]}
+        trap={<>(a) collapses; (c)(d) factually wrong.</>}
+        lens={<>Implicit GAN vs explicit diffusion: different objectives, different failure modes.</>}
+        stretch={<>Is the slow sampling of TabDDPM a deployment blocker?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ctgan-p22"
+        difficulty="hard"
+        title="P22 — In one sentence, what is THE unique mechanism of CTGAN/TabDDPM (vs SMOTE, vs SimFraud)?"
+        scenario={<><em>Discriminating insight: a LEARNED GENERATIVE MODEL of the fraud feature distribution, used to SAMPLE NEW rows that lie on the fraud manifold. Strip "learned generative model" and you have SMOTE (interpolation) or SimFraud (perturbation).</em><br/><br/>State the anchor.</>}
+        options={[
+          {key:"a", text:"They use cross-entropy."},
+          {key:"b", text:"A LEARNED GENERATIVE MODEL — neural generator G(z) for CTGAN, denoiser epsilon_theta for TabDDPM — trained on minority-class rows to capture the JOINT distribution including cat-cat correlations and continuous multi-modality. New rows are SAMPLED (not interpolated, not perturbed) from this learned distribution. This distinguishes them from SMOTE (linear interpolation between existing rows, no model) and from SimFraud (in-place perturbation of existing rows, no model). Trade-offs: better cat handling and richer samples vs new failure modes (mode collapse, memorization, drift relative to deployed time).", correct:true},
+          {key:"c", text:"They re-weight classes."},
+          {key:"d", text:"They move the threshold."},
+        ]}
+        trap={<>(a)(c)(d) describe other levers entirely.</>}
+        lens={<>The anchor: learned generative model produces sampled new rows on the fraud manifold.</>}
+        stretch={<>Of generative oversamplers, why have GAN/diffusion overtaken VAEs for tabular?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li>
-          <a href="https://arxiv.org/abs/1907.00503" target="_blank" rel="noopener">
-            <strong>Xu et al. — Modeling Tabular Data using Conditional GAN (CTGAN, paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2019)</span>
-          <br/>The original CTGAN paper. Sections on conditional generator and mode-specific normalization are the clearest exposition.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2209.15421" target="_blank" rel="noopener">
-            <strong>Kotelnikov et al. — TabDDPM: Modelling Tabular Data with Diffusion Models (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2023)</span>
-          <br/>The TabDDPM paper. Read the benchmarks section comparing TabDDPM to CTGAN across density-estimation tasks.
-        </li>
-        <li>
-          <a href="https://docs.sdv.dev/sdv/single-table-data/modeling/synthesizers/ctgansynthesizer" target="_blank" rel="noopener">
-            <strong>SDV documentation — CTGANSynthesizer (practitioner docs)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(library docs)</span>
-          <br/>Practical guide with code. Shows the hyperparameters you actually need to tune (epochs, batch_size, embedding_dim).
-        </li>
-        <li>
-          <a href="https://www.synthetic-data-vault.org/blog/posts/2023-06-29-evaluating-synthetic-data.html" target="_blank" rel="noopener">
-            <strong>SDV team — Evaluating Synthetic Data Quality (blog)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(practitioner blog)</span>
-          <br/>How to measure synthetic data quality: marginals, correlations, ML utility. The blog you need before shipping generative oversampling.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2402.13012" target="_blank" rel="noopener">
-            <strong>Li et al. — A Survey on Synthetic Data Generation for Tabular Data (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(survey, 2024)</span>
-          <br/>Comprehensive comparison of SMOTE, CTGAN, TabDDPM, and other tabular synthesizers. Read the failure-mode taxonomy.
-        </li>
+        <li><a href="https://arxiv.org/abs/1907.00503" target="_blank" rel="noopener"><strong>Xu et al. — Modeling Tabular Data using Conditional GAN (CTGAN)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(NeurIPS 2019, paper)</span><br/>The CTGAN paper. Sections 4 (mode-specific normalization) and 5 (conditional generator) are the load-bearing tricks; skim the rest.</li>
+        <li><a href="https://arxiv.org/abs/2209.15421" target="_blank" rel="noopener"><strong>Kotelnikov et al. — TabDDPM: Modelling Tabular Data with Diffusion Models</strong></a> <span style={{color:"#64748b", fontSize:14}}>(ICML 2023, paper)</span><br/>The TabDDPM paper. Sections 3 (joint multinomial+Gaussian diffusion) and the benchmarks vs CTGAN are the key reads.</li>
+        <li><a href="https://docs.sdv.dev/sdv/single-table-data/modeling/synthesizers/ctgansynthesizer" target="_blank" rel="noopener"><strong>Synthetic Data Vault — CTGAN user guide</strong></a> <span style={{color:"#64748b", fontSize:14}}>(library docs)</span><br/>The most-used open-source library for tabular synthesis. Read the metadata schema, conditional sampling, and DCR memorization audit pages before rolling your own.</li>
+        <li><a href="https://github.com/rotot0/tab-ddpm" target="_blank" rel="noopener"><strong>TabDDPM reference implementation</strong></a> <span style={{color:"#64748b", fontSize:14}}>(repo)</span><br/>The official PyTorch implementation. Read the denoiser definition and the multinomial diffusion module — the joint design is clearer in code than prose.</li>
+        <li><a href="https://gretel.ai/blog/practitioners-guide-to-synthetic-data-quality" target="_blank" rel="noopener"><strong>Gretel — Practitioner's guide to synthetic data quality (blog)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>How to actually evaluate synthetic data: marginal divergence, TSTR/TRTR, DCR memorization, downstream-AUC proxy. The metrics matter more than the model choice.</li>
       </ul>
     </VIS.Section>
   </main>

@@ -1414,324 +1414,452 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Isotonic regression / Platt scaling — Fraud SOTA · Calibration for risk policies
-// Post-hoc score-to-probability mapping.
+// Isotonic + Platt — Fraud SOTA · Calibration for risk policies.
+// CONCEPT ANCHOR (B3): POST-HOC, MONOTONIC remapping of model SCORES to PROBABILITIES.
+// Platt fits a single-parameter SIGMOID on a held-out set; isotonic fits ANY monotone
+// step function. Distinct from beta calibration (3-parameter beta family, more flexible
+// than Platt), from conformal prediction (distribution-free PREDICTION SETS, not
+// probabilities), and from threshold moving (keeps probabilities, moves the cutoff).
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Calibration for risk policies"
-      title="Isotonic regression / Platt scaling"
-      subtitle="Post-hoc maps from model scores to honest probabilities. Platt fits a sigmoid; isotonic fits any monotone shape."
+      title="Isotonic regression and Platt scaling — post-hoc probability calibration"
+      subtitle="Take a trained model's raw scores, fit a monotonic remapping on held-out data, and emit honest probabilities. Platt = sigmoid fit (2 parameters). Isotonic = any monotone step function (non-parametric)."
       byline={[
-        {label: "Source", value: "Niculescu-Mizil and Caruana, ICML 2005"},
-        {label: "Year", value: "2005 (standard since)"},
-        {label: "L3", value: "Score-to-probability mapping"},
+        {label: "Paper", value: "Platt 1999; Zadrozny & Elkan 2002; Niculescu-Mizil & Caruana, ICML 2005"},
+        {label: "L3", value: "Monotonic remapping of scores to probabilities"},
+        {label: "Anchor", value: "p_cal = f(s) where f is monotone non-decreasing, fit on held-out (s, y)"},
       ]}/>
 
     <VIS.TLDR>
-      A fraud{" "}
-      <VIS.Term def="Gradient-Boosted Decision Trees: an ensemble of shallow trees trained sequentially to fit residuals. XGBoost, LightGBM, and CatBoost are common implementations.">GBDT</VIS.Term>{" "}
-      after class rebalancing produces well-ranked scores but mis-calibrated probabilities — predicted p of 0.8 corresponds to actual frequency of maybe 0.3.{" "}
-      <VIS.Term def="A 1999 method by John Platt: fit a logistic regression (one slope, one intercept) mapping the model's raw scores to probabilities. Two parameters; works when the calibration curve is roughly sigmoidal.">Platt scaling</VIS.Term>{" "}
-      fits a sigmoid;{" "}
-      <VIS.Term def="A non-parametric monotonic regression that fits any monotone curve to the calibration data. More flexible than Platt's sigmoid but needs more calibration data (about 1000+ positives) to not overfit.">isotonic regression</VIS.Term>{" "}
-      fits any monotone curve. Pick isotonic when the curve is non-sigmoidal and you have at least about 1000 positives.
+      A fraud model trained with class imbalance (or with focal loss, or with SMOTE) produces SCORES that rank well but don't match true P(fraud | x). For pricing, expected-loss policies, or any decision that uses the probability VALUE (not just rank), you need calibration. Platt scaling fits a 1-parameter logistic regression on the model's scores to map them to probabilities. Isotonic regression fits ANY non-decreasing step function via pool-adjacent-violators — non-parametric, more flexible, but needs more held-out data. Both are{" "}
+      <VIS.Term def="A calibration that applies AFTER the model is trained, using a held-out set never seen by the model. Does not change the model's weights or scores' RANKING — only remaps scores to probabilities monotonically.">post-hoc</VIS.Term>{" "}
+      and{" "}
+      <VIS.Term def="A monotone non-decreasing function: if s_1 lt s_2 then f(s_1) le f(s_2). Calibration must be monotone — otherwise it would re-rank predictions, undoing the model's learned ranking.">monotonic</VIS.Term>{" "}
+      — they don't change the ranking (so AUC is preserved exactly). What they DO change: the probability VALUE, which is what pricing, expected-loss policies, and Brier-driven decisions consume. This distinguishes them from beta calibration (a 3-parameter beta family, more flexible curve shapes than Platt's sigmoid), from conformal prediction (distribution-free prediction sets, not probability remapping), and from threshold moving (probabilities untouched, decision cutoff moves).
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — fit a monotonic mapping on held-out (score, label) pairs">
       <p>
-        Imagine your fraud model outputs a score s. Sort all transactions by s and bin them. In each bin, compute the average score and the actual fraud rate. Plot one against the other — that's the calibration curve. For a well-calibrated model, the curve is the y equals x diagonal. For a class-rebalanced model, it's typically above the diagonal: predicted probability is systematically higher than the empirical frequency.
-      </p>
-      <p>
-        Two repair techniques:
+        Imagine your XGBoost fraud model outputs scores in [0, 1] that look like probabilities but aren't. A score of 0.9 might mean 70% true fraud rate (over-confident) or 95% (under-confident). For a decision like 'reject if expected loss greater than $50', you need the actual probability. Calibration works on a held-out set the model never trained on: collect (score_i, label_i) pairs, then fit a monotone function f such that f(score) approximates P(label=1 | score). Two canonical choices:
       </p>
       <ol>
-        <li><strong>Platt scaling</strong> — fit a logistic regression p of s equals sigma of A times s plus B on a held-out calibration set. Two parameters. Robust on small calibration sets but assumes the calibration curve is sigmoidal. Common for SVMs.</li>
-        <li><strong>Isotonic regression</strong> — fit a non-decreasing step function via pool-adjacent-violators. Non-parametric: can fit any monotone shape including double-S or step-like curves. Needs more calibration data to avoid overfitting; rule of thumb is at least about 1000 positives.</li>
+        <li><strong>Platt scaling</strong> — fit a 2-parameter logistic regression on the scores: f(s) = sigmoid(A s + B). Assumes the miscalibration has SIGMOID shape. Cheap, needs little data, fragile if shape is wrong.</li>
+        <li><strong>Isotonic regression</strong> — fit ANY monotone step function via the pool-adjacent-violators (PAV) algorithm. Non-parametric, very flexible. Needs more data (rule of thumb: at least 1K positives) to avoid step-function overfitting.</li>
+        <li><strong>Calibration set discipline</strong> — fit on a held-out set DISJOINT from training. Common pattern: 70/15/15 train/calibration/test, or use cross-validation with out-of-fold predictions on the training set.</li>
+        <li><strong>Monotonic ranking preserved</strong> — both methods are monotone non-decreasing, so the AUC of the calibrated model EQUALS the AUC of the raw model. They affect Brier score, log-loss, and reliability — not ranking metrics.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  M["Trained model"]
-  M --> S["Raw scores on holdout"]
-  S --> P["Platt: fit sigmoid"]
-  S --> I["Isotonic: fit step function"]
-  P --> C["Calibrated probabilities"]
-  I --> C
-  C --> D["Threshold-tune for policy"]
-  style C fill:#dcfce7,stroke:#16a34a,stroke-width:2px
+  M["Trained model produces score s"]
+  M --> H["Held-out (s, y) pairs"]
+  H --> P["Platt: fit sigmoid(A*s + B)"]
+  H --> I["Isotonic: fit monotone step f via PAV"]
+  P --> O["p_cal = f(s)"]
+  I --> O
+  O --> D["Decision: expected-loss policy uses p_cal"]
+  style H fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+  style O fill:#dcfce7,stroke:#16a34a,stroke-width:2px
       `} />
 
-      <VIS.Equation display tex={`p_{\\text{Platt}}(s) = \\sigma(A \\cdot s + B), \\quad p_{\\text{Iso}}(s) = \\text{non-decreasing step}(s)`} />
-      <p>Platt has two parameters (A, B) fit by maximum likelihood. Isotonic has as many parameters as there are bins after pool-adjacent-violators merging.</p>
+      <VIS.Equation display tex={`\\text{Platt: } p_{\\text{cal}}(s) = \\sigma(A s + B), \\quad (A, B) = \\arg\\min_{A,B} \\sum_i -y_i \\log \\sigma(A s_i + B) - (1 - y_i) \\log(1 - \\sigma(A s_i + B))`} />
+      <p>Platt fits two parameters (A, B) by maximum likelihood on the held-out (s, y) pairs. With the labels Platt's original paper used y_+ = (N_+ + 1) / (N_+ + 2) and y_- = 1 / (N_- + 2) (Bayesian smoothing) to avoid overfit to the held-out probabilities.</p>
+
+      <VIS.Equation display tex={`\\text{Isotonic: } f^* = \\arg\\min_{f \\text{ monotone}} \\sum_i (f(s_i) - y_i)^2, \\quad \\text{solved by Pool-Adjacent-Violators in } O(N \\log N)`} />
+      <p>Isotonic finds the best-fitting monotone non-decreasing step function via pool-adjacent-violators: sort by score, walk through pools that violate monotonicity and merge them, repeat. Output is a piecewise-constant function with steps at observed score values.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How Platt differs from isotonic">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="How isotonic and Platt differ from related calibration tools">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Platt scaling</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Isotonic regression</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Platt</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Isotonic</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Beta</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Conformal</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Parametric form</td>
-            <td style={{padding:"8px 10px"}}>Sigmoid (2 parameters)</td>
-            <td style={{padding:"8px 10px"}}>Any monotone step function</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Calibration data needed</td>
-            <td style={{padding:"8px 10px"}}>Small (under 200 positives ok)</td>
-            <td style={{padding:"8px 10px"}}>Moderate (about 1000+ positives)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Robust to non-sigmoid curves</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Yes</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Overfit risk</td>
-            <td style={{padding:"8px 10px"}}>Low</td>
-            <td style={{padding:"8px 10px"}}>Higher on small data</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Best for</td>
-            <td style={{padding:"8px 10px"}}>SVM, neural net logits</td>
-            <td style={{padding:"8px 10px"}}>GBDT, random forest</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Output</td><td style={{padding:"6px 10px"}}>Calibrated probability</td><td style={{padding:"6px 10px"}}>Calibrated probability</td><td style={{padding:"6px 10px"}}>Calibrated probability</td><td style={{padding:"6px 10px"}}>Prediction set with coverage</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Functional form</td><td style={{padding:"6px 10px"}}>Sigmoid, 2 params (A, B)</td><td style={{padding:"6px 10px"}}>Monotone step, non-parametric</td><td style={{padding:"6px 10px"}}>Beta family, 3 params (a, b, c)</td><td style={{padding:"6px 10px"}}>Threshold from score quantile</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Data needed</td><td style={{padding:"6px 10px"}}>Low (hundreds OK)</td><td style={{padding:"6px 10px"}}>High (1K+ positives)</td><td style={{padding:"6px 10px"}}>Medium</td><td style={{padding:"6px 10px"}}>Medium-high (depends on alpha)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>AUC preserved?</td><td style={{padding:"6px 10px"}}>Yes (monotone)</td><td style={{padding:"6px 10px"}}>Yes (monotone)</td><td style={{padding:"6px 10px"}}>Yes (monotone)</td><td style={{padding:"6px 10px"}}>N/A (different output type)</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Best when</td><td style={{padding:"6px 10px"}}>Miscalibration is sigmoid-shaped</td><td style={{padding:"6px 10px"}}>Arbitrary monotone shape, enough data</td><td style={{padding:"6px 10px"}}>S-curve / GBDT outputs</td><td style={{padding:"6px 10px"}}>Need finite-sample coverage guarantee</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Use Platt</strong> when calibration data is small (under 1000 positives) and the calibration curve looks roughly sigmoidal — common for SVM, neural net logits before sigmoid.</li>
-        <li><strong>Use isotonic</strong> when calibration data is moderate (about 1000+ positives) and the calibration curve is non-sigmoidal — common for GBDT and random forest where the curve can be step-like or double-S.</li>
-        <li><strong>Apply after class rebalancing</strong> — class weights, oversampling, focal loss all distort calibration; post-hoc calibration recovers honest probabilities.</li>
-        <li><strong>Hold out the calibration set</strong> from both training AND validation used for HPO. Fit Platt or isotonic on the held-out set only.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Isotonic overfits on small calibration sets">
-        With under 500 positives, isotonic produces a jagged step function that captures sampling noise. Test calibration error gets worse, not better. Rule of thumb: use Platt below about 1000 positives; isotonic above. If unsure, cross-validate the calibration step.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Calibration breaks under distribution drift">
-        Platt and isotonic are point-in-time fits. If fraud patterns drift, the calibration curve drifts too. Re-fit on rolling calibration windows; monitor the calibration curve in production.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Don't fit calibration on the training set">
-        The model is overconfident on its training set; calibration fit there will be biased. Always use a held-out set never seen during training or HPO.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — 22 trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on post-hoc calibration, the Platt-vs-isotonic choice, and calibration under drift.
+        Every problem hinges on POST-HOC MONOTONIC REMAPPING of scores to probabilities. Strip "monotonic remapping" and the answer collapses to threshold-moving or to conformal (different output type).
       </p>
 
       <VIS.TrapProblem
-        id="iso-p1"
+        id="cal-p1"
         difficulty="hard"
-        title="P1 — Post-SMOTE GBDT mis-calibrated. Pick a method."
-        scenario={<>You trained an XGBoost fraud model. You used SMOTE 5x and class weights 2x. The model ranks well (AUC 0.92) but predicted probabilities are systematically too high (predicted 0.8 corresponds to actual 0.3). You have 50k held-out transactions with 2k positives. Pick Platt or isotonic and justify.</>}
+        title="P1 — Risk PM: 'We already class-weight; why also calibrate?'"
+        scenario={<><em>Discriminating insight: class weighting changes WHAT the model learns; calibration changes how the LEARNED scores map to probabilities. After class-weighted training (or focal loss, or SMOTE), scores rank well but the probability VALUE is systematically biased upward. Pricing and expected-loss policies need the VALUE; ranking is not enough.</em><br/><br/>Defend calibration.</>}
         options={[
-          {key:"a", text:"Pick isotonic. GBDT calibration curves are typically non-sigmoidal — often step-like or with plateaus where many trees vote together. Platt's sigmoid won't fit this shape. With 2k positives on the calibration set, isotonic has enough data to fit a stable step function without overfitting. The post-SMOTE upward bias is also non-uniform across the score range, which isotonic handles naturally.", correct:true},
-          {key:"b", text:"Pick Platt — always pick the parametric option first."},
-          {key:"c", text:"Pick neither; retrain without SMOTE."},
-          {key:"d", text:"Pick both and average."},
+          {key:"a", text:"Calibration is optional."},
+          {key:"b", text:"Class weighting / SMOTE / focal loss change the model's decision boundary by emphasizing minority loss; AUC improves, ranking improves, recall at fixed FPR improves — but the probability VALUE is systematically biased. A score of 0.9 from a focal-trained model might correspond to a true fraud rate of 0.6, not 0.9. For decisions that consume the rank only (top-K review queue), the bias doesn't matter. For decisions that consume the probability VALUE — expected-loss policies ($cost = p * loss_amount), pricing-by-risk, Bayesian downstream merging with other signals, regulatory reporting — the bias does. Calibration fixes this with a post-hoc monotone remap fit on a held-out set: the rank stays the same (AUC preserved) but the VALUE now matches the empirical rate of positives at that score. Two different surgical layers — class weighting and calibration are complementary, not alternatives.", correct:true},
+          {key:"c", text:"Class weights are calibration."},
+          {key:"d", text:"Skip calibration entirely."},
         ]}
-        trap={<>(b) overuses the default. (c) ignores the question (the imbalance is real). (d) is undisciplined.</>}
-        lens={<>(a) — GBDT plus enough calibration data plus non-sigmoidal curve equals isotonic. The 2k positives are comfortably above the 1k threshold for stable isotonic.</>}
-        stretch={<>What if you only had 300 positives on the calibration set?</>}
+        trap={<>(a)(c)(d) collapse the rank-vs-value distinction.</>}
+        lens={<>Class weighting changes WHAT model learns. Calibration changes how scores map to probabilities.</>}
+        stretch={<>When can you legitimately skip calibration?</>}
       />
 
       <VIS.TrapProblem
-        id="iso-p2"
+        id="cal-p2"
         difficulty="hard"
-        title="P2 — Calibration set placement"
-        scenario={<>Where do you carve out the calibration set in the data pipeline?</>}
+        title="P2 — Platt vs Isotonic: which and when?"
+        scenario={<><em>Discriminating insight: Platt assumes the miscalibration curve has SIGMOID shape — fine for SVM or logistic models. Isotonic fits any monotone shape (non-parametric) — needed when GBDT/RF produce S-curve or step-shaped miscalibration. Trade-off: isotonic flexibility costs data (needs 1K+ positives) and over-fits step-by-step on small sets.</em><br/><br/>Pick the method.</>}
         options={[
-          {key:"a", text:"Hold out a calibration split from BOTH the training set AND the validation set used for HPO. Three-way split: train, val (HPO), calibration. Fit Platt or isotonic on the calibration split only, after the final model and HPO are frozen. Optionally use a fourth held-out test set to verify calibration improved.", correct:true},
-          {key:"b", text:"Use the training set — more data is better."},
-          {key:"c", text:"Use the validation set — it's already held out."},
-          {key:"d", text:"No need to hold out; just calibrate on all data."},
+          {key:"a", text:"Always isotonic."},
+          {key:"b", text:"Pick by the SHAPE of the reliability diagram on your held-out data, modulated by data volume. (1) Plot reliability — bucket the model's scores into 10-20 bins, plot mean predicted prob vs empirical positive rate. If the curve is a clean sigmoid (typical for SVM, neural nets with cross-entropy), Platt's 2-parameter sigmoid fits it well and generalizes with little data. (2) If the curve is S-shaped, has flat regions, or arbitrary monotone bumps (typical for GBDT, Random Forest, focal-trained nets), isotonic's non-parametric step function captures it; Platt would be under-fit. (3) Data volume: isotonic needs at least 1K positives in the calibration set to avoid step-function overfitting; below that, Platt is more robust. Default recipe: GBDT/RF and 1K+ positives use isotonic; small data, or sigmoid-shaped diagram, use Platt; consider beta calibration as a flexible middle ground for boosting outputs.", correct:true},
+          {key:"c", text:"Always Platt."},
+          {key:"d", text:"Random choice."},
         ]}
-        trap={<>(b) and (d) leak training overconfidence. (c) leaks HPO overconfidence — the validation set was already used to tune hyperparameters.</>}
-        lens={<>(a) — three-way split with calibration carved out separately. The most common bug is calibrating on the validation set used for HPO.</>}
-        stretch={<>How do you do this with k-fold cross-validation?</>}
+        trap={<>(a)(c)(d) miss the shape + data-volume rule.</>}
+        lens={<>Inspect reliability diagram shape. Sigmoid means Platt; arbitrary monotone with enough data means isotonic.</>}
+        stretch={<>Could you fit both and ensemble?</>}
       />
 
       <VIS.TrapProblem
-        id="iso-p3"
-        difficulty="medium"
-        title="P3 — Reading the calibration curve"
-        scenario={<>You plot a reliability diagram. Predicted probability on x-axis, observed frequency on y-axis. The curve is above the y equals x diagonal across the whole range. Diagnose.</>}
-        options={[
-          {key:"a", text:"The model is systematically OVERCONFIDENT — it predicts higher probabilities than the actual fraud frequency in each bin. Common cause: class-rebalancing intervention (SMOTE, class weights, focal) that amplified the positive signal during training. Fix: post-hoc calibration via Platt or isotonic on a held-out set.", correct:true},
-          {key:"b", text:"The model is under-confident; predictions should be raised."},
-          {key:"c", text:"The model is uncalibrated; we need more training data."},
-          {key:"d", text:"The reliability diagram is wrong; check the binning."},
-        ]}
-        trap={<>(b) reverses the diagnosis. (c) and (d) duck the actual reading.</>}
-        lens={<>(a) — curve above diagonal means predicted too high relative to observed. Pull predictions down via post-hoc calibration.</>}
-        stretch={<>What does a sigmoid-shaped curve below diagonal mean?</>}
-      />
-
-      <VIS.TrapProblem
-        id="iso-p4"
+        id="cal-p3"
         difficulty="hard"
-        title="P4 — Pool-adjacent-violators (PAV)"
-        scenario={<>How does isotonic regression actually fit the step function?</>}
+        title="P3 — Where does the calibration set come from?"
+        scenario={<><em>Discriminating insight: must be DISJOINT from training (the model has not seen these rows) and from final test (don't tune on test). Two patterns: hold out 10-15% of training data as a dedicated calibration set; OR use cross-validated out-of-fold predictions on the training set, fit calibrator on those, then refit the model on all training data.</em><br/><br/>Calibration set discipline.</>}
         options={[
-          {key:"a", text:"PAV (pool-adjacent-violators) algorithm: sort the calibration data by score. Start with each point as its own block (block average equal to observed label). Sweep left to right; whenever two adjacent block averages violate monotonicity (left greater than right), pool them into one block with their weighted-average label. Repeat until monotone. O(N) total work after sorting.", correct:true},
-          {key:"b", text:"Gradient descent on a piecewise-linear loss."},
-          {key:"c", text:"Random search over step locations."},
-          {key:"d", text:"Cubic spline fitting."},
+          {key:"a", text:"Use the training set."},
+          {key:"b", text:"Two valid patterns, both ensuring the calibrator never sees model-confident predictions on training rows. (1) Dedicated holdout: split 70/15/15 train/calibration/test. Train model on train; collect (score, label) on calibration; fit Platt/isotonic; evaluate on test. Simple, costs you 15% training data. (2) Cross-validation: run K-fold CV on training, collect out-of-fold predictions for every training row (each row's score comes from a model that didn't train on it), fit calibrator on these OOF predictions, then refit the final model on ALL training data and apply the calibrator at inference. Recovers the 15% data at the cost of K training runs. NEVER fit the calibrator on the model's training predictions — those scores are over-confident due to train-set fit and the calibrator will learn a wrong remap.", correct:true},
+          {key:"c", text:"Use the test set."},
+          {key:"d", text:"Skip the holdout."},
         ]}
-        trap={<>(b)-(d) are wrong specifics. PAV is the canonical isotonic-fitting algorithm.</>}
-        lens={<>(a) — PAV is linear-time and exactly optimal for isotonic regression with squared loss. Every implementation (sklearn, R isotone, etc.) uses some variant of it.</>}
-        stretch={<>What's the analog of PAV for cross-entropy loss?</>}
+        trap={<>(a) over-confident scores; (c) leaks test; (d) no data at all.</>}
+        lens={<>Calibration set must be disjoint from training. Dedicated holdout OR cross-val OOF.</>}
+        stretch={<>What if you have a time-based test? How does the OOF approach adapt?</>}
       />
 
       <VIS.TrapProblem
-        id="iso-p5"
-        difficulty="medium"
+        id="cal-p4"
+        difficulty="hard"
         multiSelect
-        title="P5 — When Platt outperforms isotonic"
-        scenario={<>Which conditions favor Platt scaling over isotonic regression? Select all that apply.</>}
+        title="P4 — Calibration metrics: select all that measure calibration (3 correct)"
+        scenario={<><em>Discriminating insight: Brier score (MSE of (p_pred - y)) and Expected Calibration Error (ECE; weighted gap between mean predicted vs empirical rate per bin) and log-loss (NLL) all penalize miscalibration. AUC does NOT — it's rank-only and invariant to monotone remap. Accuracy at fixed threshold is also not a calibration metric.</em><br/><br/>Pick the calibration metrics.</>}
         options={[
-          {key:"a", text:"Calibration set is small (under 500 positives) — isotonic overfits, Platt's 2 parameters generalize.", correct:true},
-          {key:"b", text:"Calibration curve is well-approximated by a sigmoid — common for SVM, neural-net logits.", correct:true},
-          {key:"c", text:"You need a smooth, monotone, differentiable mapping for downstream decision rules.", correct:true},
-          {key:"d", text:"You're using GBDT and the curve is step-like.", correct:false},
-          {key:"e", text:"You always want the most flexible model.", correct:false},
+          {key:"a", text:"Brier score (mean squared error between predicted prob and 0/1 label) — penalizes miscalibration and refinement.", correct:true},
+          {key:"b", text:"Expected Calibration Error (ECE) — bucket scores, compute weighted absolute gap between mean predicted prob and empirical rate per bucket.", correct:true},
+          {key:"c", text:"Negative log-likelihood (log-loss) — penalizes confidently-wrong predictions; goes to infinity for p=0 on y=1.", correct:true},
+          {key:"d", text:"AUC — invariant to any monotone remap, so calibration cannot change AUC; not a calibration metric."},
+          {key:"e", text:"Accuracy at threshold 0.5 — depends on threshold, not calibration directly."},
         ]}
-        trap={<>(d) is the case for isotonic, not Platt. (e) is incorrect because flexibility plus low data equals overfit.</>}
-        lens={<>(a)-(c) — small data, sigmoidal curve, smoothness requirement all favor Platt.</>}
-        stretch={<>How do you know in practice whether the curve is sigmoidal?</>}
+        trap={<>(d) is the classic mistake — 'calibration improves AUC' is FALSE because monotone remaps preserve ranking exactly.</>}
+        lens={<>Brier, ECE, log-loss measure calibration. AUC is rank-only.</>}
+        stretch={<>Why is ECE sensitive to bucket count?</>}
       />
 
       <VIS.TrapProblem
-        id="iso-p6"
-        difficulty="hard"
-        title="P6 — Calibration under distribution drift"
-        scenario={<>You fit isotonic last quarter. This quarter, the calibration curve has shifted upward by 5 percentage points across the score range. What do you do?</>}
+        id="cal-p5"
+        difficulty="medium"
+        title="P5 — After Platt calibration, AUC drops by 0.02. Diagnose."
+        scenario={<><em>Discriminating insight: AUC CANNOT drop after a monotone remap — Platt and isotonic are both monotone non-decreasing, so the ranking is preserved exactly. If AUC drops, the calibration is non-monotone (bug) OR the AUC was computed on a different set (data split mistake).</em><br/><br/>Find the bug.</>}
         options={[
-          {key:"a", text:"Re-fit isotonic on a rolling calibration window from this quarter's data. Don't apply last quarter's calibration to this quarter's scores. Set up automated retraining on a fixed cadence (weekly or monthly), monitor calibration curves in production, and alert when the gap to the diagonal exceeds a threshold. Distribution drift is the canonical reason calibration goes stale.", correct:true},
-          {key:"b", text:"Calibration drift is impossible; check the diagnostic."},
-          {key:"c", text:"Apply last quarter's calibration anyway; small drift doesn't matter."},
-          {key:"d", text:"Switch to Platt — it's more robust to drift."},
+          {key:"a", text:"Platt is broken."},
+          {key:"b", text:"AUC must be EXACTLY equal before and after a monotone remap, because AUC depends only on the ranking of scores and any monotone non-decreasing transform preserves ranking. If you observe AUC dropping by 0.02, something is wrong: (1) implementation bug — your 'Platt' fit produced a non-monotone function (e.g., regression coefficient came out negative because labels were flipped); (2) data-split mistake — calibrator fit on one split, AUC computed on a DIFFERENT split with different ranking; (3) numerical precision — calibrated outputs clipped or quantized in a way that re-orders ties (unlikely to give 0.02 drop). Action: re-verify the fitted A coefficient is positive in Platt; print the (s, p_cal) pairs to confirm monotonicity; recompute AUC on the same rows before and after — they MUST match.", correct:true},
+          {key:"c", text:"AUC always drops with calibration."},
+          {key:"d", text:"Use isotonic instead."},
         ]}
-        trap={<>(b) denies a real phenomenon. (c) is operationally lazy. (d) doesn't help; both Platt and isotonic suffer drift.</>}
-        lens={<>(a) — rolling-window re-fit and production monitoring. The drift problem is a feature of the world, not the method.</>}
-        stretch={<>What signal triggers an emergency recalibration?</>}
+        trap={<>(a)(c)(d) miss the monotone-preserves-AUC theorem.</>}
+        lens={<>Monotone remap preserves AUC exactly. Drop = bug, not feature.</>}
+        stretch={<>What's the only way a 'calibration' could change AUC?</>}
       />
 
       <VIS.TrapProblem
-        id="iso-p7"
+        id="cal-p6"
         difficulty="hard"
-        title="P7 — Calibration vs Brier vs ECE"
-        scenario={<>You see three calibration metrics: Brier score, ECE (Expected Calibration Error), log-loss. Which do you optimize?</>}
+        title="P6 — Isotonic regression at 200 calibration positives. Risk?"
+        scenario={<><em>Discriminating insight: isotonic is non-parametric and steps at each observed score. With 200 positives the step function overfits to noise — each step matches one or two positives, generalization to test set is poor. Need at least 1K positives or fall back to Platt.</em><br/><br/>Lower bound on data.</>}
         options={[
-          {key:"a", text:"Brier is a proper scoring rule combining calibration AND refinement (resolution); good for end-to-end evaluation but doesn't isolate calibration. ECE specifically isolates calibration (mean absolute deviation between predicted and observed across bins) — best for measuring whether calibration helped. Log-loss is also a proper scoring rule. Use ECE to diagnose calibration issues; use Brier or log-loss for final model selection.", correct:true},
-          {key:"b", text:"Always optimize log-loss."},
-          {key:"c", text:"All three are equivalent."},
-          {key:"d", text:"Optimize whichever is lowest."},
+          {key:"a", text:"Isotonic always works."},
+          {key:"b", text:"Isotonic over-fits with few positives. The PAV algorithm produces a piecewise-constant function with up to N steps where N is the number of unique score values on the calibration set. With 200 positives among, say, 1000 calibration rows, you get up to ~200 distinct probability levels in the step function — each level fit to one or two empirical positives. Generalization to test is poor: the test set has different positives at different score values, and the step boundaries the calibrator learned don't match. Rule of thumb: need at least 1K positives in the calibration set for isotonic to generalize. With fewer, fall back to Platt (2 parameters, fits with ~100 positives) or beta calibration (3 parameters, intermediate). Diagnostic: compare calibration metrics on calibration vs test — if Brier on calibration set is much better than on test, isotonic over-fit.", correct:true},
+          {key:"c", text:"Isotonic with 200 is fine."},
+          {key:"d", text:"Use random calibration."},
         ]}
-        trap={<>(b)-(d) miss that the metrics measure different things.</>}
-        lens={<>(a) — ECE isolates calibration; Brier and log-loss are proper scoring rules. They complement each other.</>}
-        stretch={<>What's wrong with naive equal-width binning for ECE?</>}
+        trap={<>(a)(c)(d) miss the data-hungry non-parametric trade-off.</>}
+        lens={<>Isotonic needs at least 1K positives. Under that: Platt or beta.</>}
+        stretch={<>What's the relationship between calibration-set size and the number of effective steps in isotonic?</>}
       />
 
       <VIS.TrapProblem
-        id="iso-p8"
+        id="cal-p7"
         difficulty="hard"
-        title="P8 — Calibration on the calibration set vs test"
-        scenario={<>You fit isotonic on a 10k calibration set. ECE on that set is 0.01 (great). ECE on a held-out test set is 0.05 (worse than uncalibrated). Diagnose.</>}
+        title="P7 — Teammate: 'Calibration improves AUC after class weighting'. Diagnose."
+        scenario={<><em>Discriminating insight (concept-specific): Platt and isotonic are MONOTONE — they cannot change AUC. The teammate has either (1) measured AUC on different splits before and after, (2) is conflating Brier improvement with AUC, or (3) used a non-monotone calibrator (bug).</em><br/><br/>Refute.</>}
         options={[
-          {key:"a", text:"Isotonic overfit the calibration set. The 10k examples were enough to drive the in-sample ECE to near zero but not enough to generalize. Calibration error on a TRULY held-out test set is the honest measure. Fix: use a larger calibration set, or cross-validated calibration, or switch to Platt which has fewer parameters and less overfit risk.", correct:true},
-          {key:"b", text:"The test set has a different distribution; calibration is invalid."},
-          {key:"c", text:"ECE is the wrong metric."},
-          {key:"d", text:"This can't happen."},
+          {key:"a", text:"They're right."},
+          {key:"b", text:"Wrong. Platt scaling and isotonic regression are both MONOTONE NON-DECREASING transforms of the score. AUC depends only on the ranking of scores between positives and negatives (it's the probability that a random positive is ranked above a random negative), and ranking is exactly preserved under monotone transforms. Therefore AUC cannot change. If the teammate measured an AUC improvement, possibilities are: (1) they measured on different data splits before and after (test contamination); (2) they're conflating Brier or log-loss improvement (those CAN improve, by a lot, that's the WHOLE POINT of calibration) with AUC; (3) their 'calibrator' is non-monotone — a bug. Demonstrate by computing AUC before and after on the SAME rows: they must be identical. If they aren't, find the bug.", correct:true},
+          {key:"c", text:"AUC always improves with calibration."},
+          {key:"d", text:"Calibration is wrong."},
         ]}
-        trap={<>(b)-(d) duck the diagnosis.</>}
-        lens={<>(a) — isotonic overfit. Always check calibration on a never-seen test set.</>}
-        stretch={<>What's a cross-validated isotonic procedure that mitigates this?</>}
+        trap={<>(a)(c) confuse metrics; (d) too strong.</>}
+        lens={<>Calibration is monotone. AUC is rank-invariant. Calibration cannot move AUC.</>}
+        stretch={<>What CAN you improve with calibration in addition to Brier? Log-loss, ECE, expected $ savings if policy uses probabilities.</>}
       />
 
       <VIS.TrapProblem
-        id="iso-p9"
+        id="cal-p8"
         difficulty="hard"
-        title="P9 — Calibration after focal loss"
-        scenario={<>Your fraud model was trained with focal loss (gamma equal to 2). Focal hurts calibration by design. Can isotonic recover it?</>}
+        title="P8 — Production scores drift. Re-fit calibrator?"
+        scenario={<><em>Discriminating insight: yes. The calibrator is a snapshot of the score-to-probability relationship at training time. As the model is re-trained or input distribution drifts, the score distribution shifts; the calibrator becomes stale. Re-fit at the same cadence as the model, on a current holdout.</em><br/><br/>Re-fit cadence.</>}
         options={[
-          {key:"a", text:"Mostly yes — isotonic is non-parametric and can recover most of the calibration that focal destroyed, since the focal-induced distortion is still monotonic in the model's scores. The recovery is not perfect because focal also reduces score resolution near the decision boundary; some information is gone. In practice, focal training plus isotonic post-hoc gives calibration close to plain BCE while preserving most of focal's AUC gain.", correct:true},
-          {key:"b", text:"No, focal-trained models cannot be calibrated."},
-          {key:"c", text:"Only Platt can recover focal calibration."},
-          {key:"d", text:"Calibration after focal is identical to before."},
+          {key:"a", text:"Never re-fit."},
+          {key:"b", text:"Re-fit the calibrator at the same cadence as the model (weekly / monthly typical). The calibrator is fit to the score-to-probability relationship AS-OF the training data; as the model is retrained or input distribution drifts (fraud rings evolve, payment mix changes), the score distribution shifts and the old calibrator emits stale probabilities. Concretely: when you retrain the model, ALSO retrain the calibrator on a fresh holdout from the new training window. Monitor calibration in production with rolling Brier or ECE on recent labeled data; alert if Brier degrades by more than X% relative to baseline. For environments where labels arrive with delay (chargeback timeline can be 30-90 days), maintain two calibrators: one on confirmed labels (lagged but accurate) and one on heuristic labels (fast but noisy); use both as bracketing diagnostics.", correct:true},
+          {key:"c", text:"Re-fit once a year."},
+          {key:"d", text:"Calibration is stationary."},
         ]}
-        trap={<>(b) overstates harm. (c) is wrong specific. (d) is wrong.</>}
-        lens={<>(a) — isotonic recovers most of focal's calibration damage. The recipe (focal training plus isotonic post-hoc) is common in production.</>}
-        stretch={<>What's the analogous recipe for class-weighted BCE?</>}
+        trap={<>(a)(c)(d) ignore drift in the score-to-probability map.</>}
+        lens={<>Calibrator = snapshot. Re-fit at model cadence; monitor Brier or ECE.</>}
+        stretch={<>How do you handle the chargeback label delay in calibration?</>}
       />
 
       <VIS.TrapProblem
-        id="iso-p10"
-        difficulty="hard"
-        title="P10 — Senior framing of calibration"
-        scenario={<>Frame post-hoc calibration in a senior interview answer.</>}
+        id="cal-p9"
+        difficulty="medium"
+        title="P9 — Platt's original training labels: y_+ = (N_+ + 1) / (N_+ + 2). Why?"
+        scenario={<><em>Discriminating insight: Bayesian smoothing to avoid the calibrator over-fitting the held-out set's exact label distribution. Plain (0, 1) labels would push the sigmoid to saturate; smoothed labels keep gradient on the sigmoid's mid-section.</em><br/><br/>Why smoothed labels.</>}
         options={[
-          {key:"a", text:"Calibration is a decision-level intervention: it doesn't change how the model ranks transactions, only how it maps ranks to probabilities. You need it whenever downstream decisions consume probabilities (loss-weighted thresholding, expected-value cost-sensitive decisions, risk-policy bands). Platt is the small-data sigmoidal default; isotonic is the larger-data non-parametric option for GBDT. Re-fit on a rolling window to handle drift. Monitor ECE in production. Calibration sits ORTHOGONAL to the choice of model and loss — you can swap the trainer without touching calibration logic, and vice versa.", correct:true},
-          {key:"b", text:"Calibration always hurts."},
-          {key:"c", text:"Calibration is only for SVMs."},
-          {key:"d", text:"Calibration replaces good training."},
+          {key:"a", text:"Random."},
+          {key:"b", text:"Bayesian smoothing to avoid the calibrator over-fitting the held-out set. Plain (0, 1) labels in the logistic-regression fit push the sigmoid toward its saturating regions: for confident positives the loss tries to push p to 1 (logit to +infinity), and the held-out set is finite, so this overfits. Platt's smoothing replaces y=1 with (N_+ + 1) / (N_+ + 2) and y=0 with 1 / (N_- + 2). For 100 positives and 9900 negatives in the calibration set, these labels become ~0.99 and ~0.0001 — close to 0/1 but pulled in slightly. The fit stays on the sigmoid's mid-section and generalizes better. Modern Platt implementations often skip this smoothing if regularization is added directly; the original paper used smoothing because L2 regularization on the logistic fit was less standard then.", correct:true},
+          {key:"c", text:"Just to be different from logistic regression."},
+          {key:"d", text:"Required for numerical stability."},
         ]}
-        trap={<>(b)-(d) miss the orthogonality of calibration to model choice.</>}
-        lens={<>(a) — calibration as a decision-level intervention, orthogonal to training, monitored under drift.</>}
-        stretch={<>Design an A/B test that isolates calibration's contribution from model improvement.</>}
+        trap={<>(a)(c) miss the regularization story; (d) is partial (it's about generalization, not just numerics).</>}
+        lens={<>Smoothed labels = Bayesian prior preventing calibrator overfit.</>}
+        stretch={<>Could you replace smoothing with L2 regularization?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p10"
+        difficulty="hard"
+        title="P10 — Reliability diagram shows over-confidence at high scores, under-confidence at low. Which calibrator?"
+        scenario={<><em>Discriminating insight: that's S-shaped miscalibration — the curve crosses the diagonal twice. Platt's single sigmoid can't fit S-shape (sigmoid is monotone but has a fixed inflection). Isotonic fits any monotone shape. Beta calibration's 3-parameter family also fits S-shapes well.</em><br/><br/>Pick the method.</>}
+        options={[
+          {key:"a", text:"Platt."},
+          {key:"b", text:"Isotonic regression OR beta calibration. The reliability diagram shape — over-confident at high scores AND under-confident at low scores — implies the diagonal is crossed twice; this is an S-shaped curve, not a plain sigmoid (which crosses the diagonal at most twice but with a fixed inflection that Platt's 2-parameter fit can't reposition independently). Platt's logistic regression with parameters (A, B) maps to a sigmoid with location-and-scale only — the shape is fixed. Isotonic regression is non-parametric and fits any monotone shape, including S-curves, exactly (given enough data). Beta calibration uses a 3-parameter beta-family curve (a, b, c) which CAN reposition the inflection and asymmetry. Both fit S-curves; isotonic is more flexible but needs more data; beta is a parametric middle ground specifically designed for this shape and common with GBDT outputs.", correct:true},
+          {key:"c", text:"Just use threshold moving."},
+          {key:"d", text:"Don't calibrate."},
+        ]}
+        trap={<>(a) underfits the S-curve; (c) doesn't change probabilities; (d) wrong.</>}
+        lens={<>S-curve: isotonic (non-parametric) or beta (3-param). Platt under-fits.</>}
+        stretch={<>Could you fit Platt on logit(s) instead of s to expand its expressiveness?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p11"
+        difficulty="hard"
+        title="P11 — You ship calibrated probabilities. PM asks why decisions are unchanged. Diagnose."
+        scenario={<><em>Discriminating insight (concept-specific): if your decision rule is 'reject if score greater than T_old', then changing the score-to-probability map does NOT change decisions until you also re-tune T to a probability-based threshold. Calibration changes the VALUE of probabilities; the decision rule must consume those values. If your rule still uses raw scores, calibration is doing nothing for the decision.</em><br/><br/>Plumbing bug.</>}
+        options={[
+          {key:"a", text:"Random."},
+          {key:"b", text:"Calibration changes the score-to-probability MAP; it does not change the score's RANKING, and your decision rule needs to actually consume the calibrated probability for downstream behavior to change. If the production decision is 'reject if score greater than 0.85' and you swap in a calibrator, the model's RAW scores are unchanged, and the rule fires on the same rows as before — calibration buys nothing operationally. To realize the benefit: (1) re-express the decision rule in PROBABILITY terms: 'reject if p_cal greater than threshold' or, better, 'reject if expected_loss = p_cal * loss_amount greater than $threshold'; (2) re-tune the threshold to the new probability scale (the old 0.85 raw-score cutoff and the new equivalent probability cutoff are different numbers). Without these changes, calibration is a no-op for the decisions made.", correct:true},
+          {key:"c", text:"Calibration is broken."},
+          {key:"d", text:"Use isotonic."},
+        ]}
+        trap={<>(a) dismisses; (c) wrong; (d) doesn't address the decision plumbing.</>}
+        lens={<>Calibration only matters if the decision rule consumes the probability. Re-tune the threshold.</>}
+        stretch={<>How to A/B calibrated vs raw probabilities safely?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p12"
+        difficulty="medium"
+        title="P12 — At 1:1M imbalance, isotonic returns p_cal = 0 on most calibration scores. Why?"
+        scenario={<><em>Discriminating insight: at extreme imbalance the calibration set has very few positives. Isotonic's step function gets a step value equal to the empirical rate per pool, and many pools have zero positives, so the step value is exactly 0. p_cal = 0 is technically correct but unusable for downstream policies that take logs.</em><br/><br/>Underflow story.</>}
+        options={[
+          {key:"a", text:"Bug in isotonic."},
+          {key:"b", text:"Mathematically correct, operationally a problem. At 1:1M imbalance with a 10K calibration set, you have ~0.01 positives — typically 0 or 1. Isotonic's PAV pools adjacent scores until the pool's empirical rate is monotone; pools with zero positives get step value 0 exactly. Downstream policies that take log(p) or compute log-odds blow up at log(0). Fixes: (1) add Laplace smoothing to the per-pool empirical rate: p_pool = (N_+ + 1) / (N + 2); (2) clip output to a small epsilon (e.g., 1e-6) before downstream consumption; (3) increase the calibration set or pool fewer bins (sklearn's IsotonicRegression has out_of_bounds and y_min parameters for this); (4) for extreme imbalance, prefer Platt — its sigmoid output is naturally bounded away from 0/1.", correct:true},
+          {key:"c", text:"Isotonic is wrong for fraud."},
+          {key:"d", text:"Always clip to 0.5."},
+        ]}
+        trap={<>(a) misses the math; (c) too strong; (d) destroys the calibration.</>}
+        lens={<>Extreme imbalance plus isotonic = zero-prob pools. Smooth or clip or use Platt.</>}
+        stretch={<>What about the other tail (p_cal = 1)?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p13"
+        difficulty="hard"
+        title="P13 — Inference: model emits score 0.74. Platt says p_cal = 0.32. Why is p less than s?"
+        scenario={<><em>Discriminating insight: when the model is over-confident (typical after focal/class-weighting), the calibrator REDUCES probabilities for high scores. 0.74 score mapped to 0.32 probability means the empirical positive rate at score=0.74 on the held-out set was 0.32. No paradox; just a remap.</em><br/><br/>Direction of remap.</>}
+        options={[
+          {key:"a", text:"Bug — p must equal s."},
+          {key:"b", text:"No paradox. The model's RAW score 0.74 is the model's own (possibly poorly-calibrated) belief about fraud probability; the calibrated p_cal = 0.32 is the EMPIRICAL positive rate among held-out rows that received score 0.74. After class-weighted training, focal loss, or SMOTE, the model is typically over-confident on positives — it pushes scores high. The calibrator pulls them back to match observed reality. Direction: if the model is over-confident at high scores, p_cal less than s for high s; if under-confident at low scores, p_cal greater than s for low s. The remap is what calibration is for. To validate: reliability diagram on held-out should now sit on the diagonal.", correct:true},
+          {key:"c", text:"Calibration is broken."},
+          {key:"d", text:"Use isotonic."},
+        ]}
+        trap={<>(a)(c) misunderstand calibration; (d) doesn't address.</>}
+        lens={<>p_cal is the empirical rate at that score. Less than s when model is over-confident.</>}
+        stretch={<>What if p_cal greater than s at high scores? Model is under-confident — rare but happens.</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p14"
+        difficulty="hard"
+        title="P14 — Calibrator stale and probabilities now over-confident again. Concept-specific diagnostic."
+        scenario={<><em>Discriminating insight (concept-specific): the model's score-to-probability MAP drifted because the score distribution shifted. Run a fresh reliability diagram on recent data. If the curve has drifted away from the diagonal, refit the calibrator on a fresh holdout. The diagnostic is the reliability diagram on RECENT labels.</em><br/><br/>Stale-calibrator diagnostic.</>}
+        options={[
+          {key:"a", text:"Random."},
+          {key:"b", text:"Concept-specific diagnostic: re-plot the reliability diagram on a recent labeled holdout. Bucket calibrated probabilities into 10-20 bins, plot mean predicted prob vs empirical positive rate per bin. If the curve sits on the diagonal, calibration is healthy. If it drifts above (model under-confident overall) or below (over-confident), the score-to-probability map has shifted. Common cause: the model was retrained on new data but the calibrator wasn't refit, so the new score distribution doesn't match the calibrator's reference. Fix: refit the calibrator on a fresh holdout from the new training window. Add an automated check in CI that re-plots the reliability diagram weekly and alerts if ECE crosses a threshold. This is calibration-specific (CTGAN/SimFraud regressions look completely different).", correct:true},
+          {key:"c", text:"Use focal loss."},
+          {key:"d", text:"Retrain the model."},
+        ]}
+        trap={<>(a) dismisses; (c)(d) wrong layer.</>}
+        lens={<>Reliability diagram on recent data is THE calibration-specific diagnostic.</>}
+        stretch={<>What ECE threshold typically warrants refit?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p15"
+        difficulty="medium"
+        title="P15 — Class-weighted training plus Platt: does Platt undo the class weighting?"
+        scenario={<><em>Discriminating insight: no — Platt remaps the SCORES; it doesn't undo the model. Class weighting changes which features the model attends to, which improves ranking; Platt then maps the (improved) ranking to honest probabilities. Both layers operate on different surgical levers.</em><br/><br/>Are they redundant.</>}
+        options={[
+          {key:"a", text:"Yes, redundant."},
+          {key:"b", text:"Not redundant — they operate on different surgical layers. Class weighting (or SMOTE / focal loss) changes the TRAINING objective so the model attends more to minority structure; this improves what the model LEARNS — better feature representations, better decision boundary, better ranking. The trained model emits scores that rank well but are systematically biased in VALUE. Platt then takes the (already-better-trained) scores and post-hoc remaps them to honest probabilities. Platt does not undo the model's improvements — it preserves ranking exactly (monotone) and only changes the score-to-probability map. Net effect of the stack: model that ranks well (from class weighting) plus probabilities that match reality (from Platt) — strictly better than either alone for decisions that consume probabilities.", correct:true},
+          {key:"c", text:"They cancel out."},
+          {key:"d", text:"Class weighting includes calibration."},
+        ]}
+        trap={<>(a)(c)(d) collapse the layers.</>}
+        lens={<>Class weighting = WHAT model learns. Platt = how scores map to probabilities. Different layers, both needed.</>}
+        stretch={<>How would you A/B 'class weights only' vs 'class weights + Platt' in production?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p16"
+        difficulty="hard"
+        title="P16 — Cross-validated isotonic: how to fit?"
+        scenario={<><em>Discriminating insight: K-fold CV on training, collect out-of-fold predictions for every row, fit isotonic on (OOF_score, label). Then refit the final model on all training data and apply the SAME calibrator at inference. The calibrator never sees a model that trained on the row whose score it's calibrating.</em><br/><br/>CV calibrator recipe.</>}
+        options={[
+          {key:"a", text:"Fit isotonic on training predictions directly."},
+          {key:"b", text:"K-fold cross-validated isotonic recipe: (1) split training into K folds. (2) For each fold k, train a model on the other K-1 folds, predict on fold k, save (score, label) pairs. (3) Concatenate all K folds of OOF predictions to get one set of (score, label) pairs that cover every training row, where each row's score comes from a model that never trained on that row. (4) Fit isotonic regression on this OOF set. (5) Refit the FINAL model on ALL training data. (6) At inference: final model emits a raw score; apply the isotonic calibrator from step 4. Why it works: the calibrator was fit on un-biased (OOF) predictions, so it correctly maps the model's score distribution at test time. This recovers the 15% data cost of a dedicated holdout at the cost of K training runs. Standard in sklearn's CalibratedClassifierCV.", correct:true},
+          {key:"c", text:"Train K models and average."},
+          {key:"d", text:"Random folds."},
+        ]}
+        trap={<>(a) over-confident predictions; (c) averaging is different (ensemble, not calibration).</>}
+        lens={<>OOF predictions then fit calibrator. Refit final model on all training data, apply calibrator at inference.</>}
+        stretch={<>What's the gotcha if folds aren't stratified by label?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p17"
+        difficulty="medium"
+        title="P17 — Platt vs temperature scaling: which is which?"
+        scenario={<><em>Discriminating insight: temperature scaling is Platt with B=0 (single scalar T on the logit: p = sigmoid(z / T)). One parameter, simplest possible calibration. Platt has 2 (A, B). Temperature is popular for neural-net classifiers because the logit is naturally available.</em><br/><br/>Map the relationship.</>}
+        options={[
+          {key:"a", text:"Completely unrelated."},
+          {key:"b", text:"Temperature scaling is a 1-parameter restriction of Platt: instead of p = sigmoid(A * z + B), use p = sigmoid(z / T) where T is a single scalar fit by minimizing NLL on a held-out set. Temperature was popularized by Guo et al. 2017 for modern neural networks where the logit z is naturally available and the miscalibration is approximately a uniform scale of the logit (over-confident by the same factor at all scores). Platt's 2-parameter version is strictly more flexible — it can shift (B) as well as scale (A). Both are sigmoid-based and assume sigmoid-shaped miscalibration. For trees / GBDT where logits aren't natural, Platt on the score is more common; for nets, temperature is the standard first try. Both are out-fitted by isotonic on small-data S-shapes.", correct:true},
+          {key:"c", text:"Same thing."},
+          {key:"d", text:"Temperature is a 2-param Platt."},
+        ]}
+        trap={<>(a)(c)(d) misunderstand the parameter count.</>}
+        lens={<>Temperature = 1-param Platt. Both are sigmoid-family. Net default = temperature; tree default = Platt or beta.</>}
+        stretch={<>When is temperature too restrictive?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p18"
+        difficulty="hard"
+        title="P18 — Calibration after SMOTE: are scores naturally calibrated?"
+        scenario={<><em>Discriminating insight: NO. SMOTE changes the training-set class balance, so the model emits scores whose ranking is good but probability VALUES are biased toward the artificial rate. After SMOTE you MUST recalibrate on a held-out set with the ORIGINAL (un-resampled) class balance — otherwise probabilities reflect the SMOTE-inflated minority rate, not reality.</em><br/><br/>Post-SMOTE calibration discipline.</>}
+        options={[
+          {key:"a", text:"SMOTE already calibrates."},
+          {key:"b", text:"Strongly miscalibrated after SMOTE; recalibration is essential. SMOTE alters the training-set class balance — e.g., from 1:1000 to 1:1 — so the model is trained on a distribution where p(y=1) is artificially inflated. Scores reflect this inflated rate: a 0.5 score from the SMOTE-trained model corresponds to roughly 1:1 fraud odds in TRAINING, but real-world odds are still 1:1000. Calibration discipline: (1) hold out a calibration set with the ORIGINAL natural class balance (NOT SMOTE-resampled); (2) collect (score, label) pairs from the SMOTE-trained model on this holdout; (3) fit Platt or isotonic on these pairs. The fitted calibrator now maps SMOTE-distorted scores back to real-world probabilities. Without this step, downstream policies that consume probabilities (expected-loss, pricing) will over-react to inflated probabilities and approve too few transactions.", correct:true},
+          {key:"c", text:"Skip calibration after SMOTE."},
+          {key:"d", text:"Use raw scores."},
+        ]}
+        trap={<>(a)(c)(d) ship inflated probabilities.</>}
+        lens={<>Post-SMOTE: calibrate on a holdout with ORIGINAL class balance. Mandatory.</>}
+        stretch={<>What's the equivalent discipline after focal loss?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p19"
+        difficulty="hard"
+        title="P19 — Calibration helps Brier but not expected $ savings. Diagnose."
+        scenario={<><em>Discriminating insight: expected $ savings depends on (probability * $ value) summed over decisions. If the high-$ cases are at extreme score values (top/bottom of score distribution) where the calibrator has few samples, calibration's improvement is concentrated in the middle of the distribution and may not move $ savings. Inspect calibration quality per score percentile.</em><br/><br/>Brier up, $ flat.</>}
+        options={[
+          {key:"a", text:"Brier is wrong."},
+          {key:"b", text:"Brier improvement may be concentrated in mid-distribution bins where most data lives; expected $ savings is dominated by the FEW high-$ cases at score extremes. Concretely: Brier is averaged over ALL rows, so a calibrator that fixes mid-distribution probabilities well lowers Brier substantially even if the top 1% of scores are not better-calibrated. Expected $ savings is dominated by high-$ cases (a $5K fraud accepted = much worse than a $20 fraud accepted); if those cases sit at the top or bottom of the score distribution where the calibrator had few training samples (because positives at scores greater than 0.99 are rare), calibration in those regions is noisy. Diagnostic: compute per-score-percentile calibration error AND per-score-percentile $ value at risk. Fix: collect more calibration data at score extremes (oversample the tails) OR use a $-weighted calibration loss instead of plain NLL.", correct:true},
+          {key:"c", text:"$ savings is wrong."},
+          {key:"d", text:"Use threshold moving."},
+        ]}
+        trap={<>(a)(c) dismiss valid metrics; (d) different layer.</>}
+        lens={<>Brier averages; $ savings concentrates on extremes. Per-percentile calibration error.</>}
+        stretch={<>Design a $-weighted Platt fit.</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p20"
+        difficulty="medium"
+        title="P20 — When NOT to use Platt or isotonic."
+        scenario={<><em>Discriminating insight (concept-specific): (1) you need finite-sample coverage guarantee (use conformal instead); (2) S-shape miscalibration on a small calibration set (use beta calibration); (3) downstream consumes ranking only (skip); (4) model is already well-calibrated (skip).</em><br/><br/>Skip-isotonic/Platt cases.</>}
+        options={[
+          {key:"a", text:"Always use Platt or isotonic."},
+          {key:"b", text:"Skip Platt and isotonic when: (1) you need a coverage GUARANTEE (Type I error bounded) — use conformal prediction, which gives finite-sample coverage (1 - alpha) under exchangeability; Platt/isotonic only optimize a calibration loss, no guarantee. (2) S-shape miscalibration and the calibration set is too small for isotonic — use beta calibration instead (3 params, designed for boosting outputs). (3) Downstream decision consumes ranking only (top-K review queue) — calibration is operationally a no-op. (4) The model is already well-calibrated out-of-the-box (a logistic regression with no class weighting, an XGBoost with reg:logistic and natural class balance) — fit Platt anyway and check if it does anything; often it doesn't. (5) The miscalibration shape is non-monotone (rare but possible with adversarial data) — no monotone calibrator works; investigate the data.", correct:true},
+          {key:"c", text:"Never use them."},
+          {key:"d", text:"Always use them."},
+        ]}
+        trap={<>(a)(c)(d) absolutist.</>}
+        lens={<>Use Platt or isotonic when miscalibration is monotone and the decision uses probabilities. Otherwise pick a different tool.</>}
+        stretch={<>How to detect non-monotone miscalibration?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p21"
+        difficulty="hard"
+        title="P21 — 'Calibration is a free win — always apply it.' Critique."
+        scenario={<><em>Discriminating insight: not free. Costs: a held-out calibration set you could have trained on; risk of calibrator overfit (especially isotonic on small N); operational complexity (new artifact to retrain and version); risk that downstream policy isn't probability-aware (no benefit captured). Free-win is wrong; cost-benefit is the right framing.</em><br/><br/>Critique the claim.</>}
+        options={[
+          {key:"a", text:"Critique is wrong — it IS free."},
+          {key:"b", text:"Not free. Concrete costs: (1) data cost — a dedicated 10-15% holdout for calibration is data you could have used to train, modestly hurting model quality (mitigable with cross-validated OOF fitting). (2) Overfit risk — isotonic on a too-small calibration set learns step-function noise that generalizes worse than the raw scores; Platt on a non-sigmoid shape under-fits. (3) Operational complexity — a new artifact in the inference path that must be versioned, monitored for drift, retrained on the model's cadence, and rolled back if it regresses. (4) No benefit if downstream consumes ranking only — top-K review queues don't care about probability values, so calibration is a no-op. The right framing: calibration is justified WHEN downstream decisions consume probability values (pricing, expected-loss, regulator reporting) AND you have enough holdout to fit a non-overfitting calibrator AND the miscalibration is large enough to matter.", correct:true},
+          {key:"c", text:"It IS always a free win."},
+          {key:"d", text:"Calibration is harmful."},
+        ]}
+        trap={<>(a)(c) miss costs; (d) too strong.</>}
+        lens={<>Costs: data, overfit risk, ops complexity, possibly no benefit. Free-win framing is wrong.</>}
+        stretch={<>What's the operational shape of a 'calibration regressed in production' incident?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cal-p22"
+        difficulty="hard"
+        title="P22 — In one sentence, what is THE unique mechanism of isotonic + Platt?"
+        scenario={<><em>Discriminating insight: POST-HOC, MONOTONIC remapping of model scores to probabilities, fit on a held-out (score, label) set. Strip "monotonic remapping" and you have conformal (prediction sets, not probabilities) or threshold moving (probabilities untouched).</em><br/><br/>State the anchor.</>}
+        options={[
+          {key:"a", text:"They re-train the model."},
+          {key:"b", text:"POST-HOC, MONOTONIC NON-DECREASING REMAPPING of model scores to probabilities, fit on a held-out (score, label) set the model never trained on. Platt: 2-parameter sigmoid f(s) = sigmoid(A s + B). Isotonic: non-parametric monotone step function f via pool-adjacent-violators. Both preserve ranking exactly (AUC unchanged) and only change the probability VALUE — what pricing, expected-loss policies, and Brier-driven decisions consume. This distinguishes them from beta calibration (a 3-parameter beta family — also monotone remapping but more flexible curve shape than Platt), from conformal prediction (distribution-free prediction sets with finite-sample coverage — a different output type), and from threshold moving (probabilities untouched; decision cutoff moves).", correct:true},
+          {key:"c", text:"They change AUC."},
+          {key:"d", text:"They move the threshold."},
+        ]}
+        trap={<>(a) wrong (post-hoc); (c) wrong (monotone preserves AUC); (d) describes threshold moving.</>}
+        lens={<>The anchor: post-hoc monotonic remapping of scores to probabilities. Ranking preserved.</>}
+        stretch={<>Why is monotonicity the structural constraint that defines this method family?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li>
-          <a href="https://www.cs.cornell.edu/~caruana/niculescu.scldbst.crc.rev4.pdf" target="_blank" rel="noopener">
-            <strong>Niculescu-Mizil and Caruana — Predicting Good Probabilities with Supervised Learning (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2005)</span>
-          <br/>The canonical paper comparing Platt and isotonic across model families. Section 4's calibration curves are the clearest exposition you'll find.
-        </li>
-        <li>
-          <a href="https://scikit-learn.org/stable/modules/calibration.html" target="_blank" rel="noopener">
-            <strong>scikit-learn — Probability calibration (docs)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(library docs)</span>
-          <br/>Practical guide with code. Shows CalibratedClassifierCV, reliability diagrams, and Brier-score evaluation.
-        </li>
-        <li>
-          <a href="https://wttech.blog/blog/2021/a-guide-to-model-calibration/" target="_blank" rel="noopener">
-            <strong>WTTech blog — A guide to model calibration (blog)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(practitioner blog)</span>
-          <br/>End-to-end walkthrough of fitting Platt and isotonic with reliability diagrams. Best practical introduction.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1706.04599" target="_blank" rel="noopener">
-            <strong>Guo et al. — On Calibration of Modern Neural Networks (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2017)</span>
-          <br/>The temperature-scaling paper. Read for the modern-NN context — deep nets are systematically overconfident and temperature scaling is a one-parameter Platt analog that works on logits.
-        </li>
-        <li>
-          <a href="https://www.youtube.com/watch?v=NKpfShzM6Cg" target="_blank" rel="noopener">
-            <strong>StatQuest — Calibration: Predicted vs Observed (video)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(video)</span>
-          <br/>Josh Starmer's whiteboard walkthrough. Best 10 minutes if you want intuition before code.
-        </li>
+        <li><a href="https://www.cs.cornell.edu/~caruana/niculescu.scldbst.crc.rev4.pdf" target="_blank" rel="noopener"><strong>Niculescu-Mizil & Caruana — Predicting Good Probabilities With Supervised Learning</strong></a> <span style={{color:"#64748b", fontSize:14}}>(ICML 2005, paper)</span><br/>The canonical Platt-vs-isotonic empirical study across model families. Sections 3-4 are the load-bearing reads.</li>
+        <li><a href="https://scikit-learn.org/stable/modules/calibration.html" target="_blank" rel="noopener"><strong>scikit-learn — Probability calibration user guide</strong></a> <span style={{color:"#64748b", fontSize:14}}>(library docs)</span><br/>The clearest practitioner walkthrough: CalibratedClassifierCV, reliability diagrams, when to pick Platt vs isotonic. Start here.</li>
+        <li><a href="https://arxiv.org/abs/1706.04599" target="_blank" rel="noopener"><strong>Guo et al. — On Calibration of Modern Neural Networks (ICML 2017)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper)</span><br/>The paper that popularized temperature scaling. Section 4 derives why nets are over-confident and why a single-parameter remap helps.</li>
+        <li><a href="https://machinelearningmastery.com/calibrated-classification-model-in-scikit-learn/" target="_blank" rel="noopener"><strong>Jason Brownlee — How to Calibrate a Classifier (blog)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>A worked example with sklearn on imbalanced data. Walks through the reliability diagram interpretation.</li>
+        <li><a href="https://www.fharrell.com/post/calibration/" target="_blank" rel="noopener"><strong>Frank Harrell — Statistically Efficient Ways to Quantify Added Predictive Value (blog)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>The statistician's perspective on calibration, ECE, and why Brier score is the right metric for probability-consuming decisions.</li>
       </ul>
     </VIS.Section>
   </main>
