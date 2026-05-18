@@ -1414,324 +1414,637 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// CDLF (Concept-Drift Loss Framework) — Fraud SOTA · Continual learning under concept drift
-// Adaptive per-sample loss weighting from a teacher confidence trajectory under label delay.
+// CDLF (Concept-Drift Loss Framework) — IJCAI 2024
+// v2 redo — trap problems span A-F axes; every problem hinges on CDLF's specific
+// mechanism (per-sample loss weight from a teacher confidence trajectory) and
+// threads the noisy-drift-score-under-label-delay counter-evidence.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Continual learning under concept drift"
       title="CDLF — Concept-Drift Loss Framework"
-      subtitle="Per-sample loss weight from a teacher&apos;s confidence trajectory — up-weight samples that look like the newly-drifted distribution."
+      subtitle="Adaptive per-sample loss weight derived from a teacher's confidence trajectory — up-weight samples that resemble the newly-drifted distribution, even without labels."
       byline={[
         {label: "Paper", value: "Concept Drift Aware Loss for Imbalanced Streaming Fraud (IJCAI 2024)"},
         {label: "Year", value: "2024"},
-        {label: "L3", value: "Drift-aware loss"},
+        {label: "Domain", value: "Drift-aware loss reweighting"},
       ]}/>
 
     <VIS.TLDR>
-      Static class weights (e.g.{" "}
-      <VIS.Term def="A loss-reweighting technique where misclassified, hard-to-classify samples get a larger gradient via a (1 - p)^gamma multiplier. Designed for class imbalance.">focal loss</VIS.Term>{" "}
-      or fixed pos_weight) ignore drift DIRECTION. CDLF derives a per-sample{" "}
-      <VIS.Term def="A scalar (per-sample) signal that estimates how much the current sample resembles the recently-drifted distribution versus the older one. CDLF uses the trajectory of a teacher model&apos;s confidence on this sample over recent training rounds.">drift score</VIS.Term>{" "}
-      from a teacher&apos;s confidence trajectory, then up-weights samples that resemble the new regime. Built for streaming pipelines where labels arrive with 30-60-day delay. The trap: drift score is noisy under label delay, and a miscalibrated teacher silently corrupts the weights.
+      Static class weights (<VIS.Term def="A loss-reweighting technique where misclassified, hard-to-classify samples get a larger gradient via a (1-p)^gamma multiplier. Designed for class imbalance, not drift.">focal loss</VIS.Term>, fixed pos_weight) ignore drift DIRECTION — they up-weight rare classes uniformly, not the samples that look new. CDLF derives a per-sample <VIS.Term def="A scalar signal estimating how much a current sample resembles the recently-drifted distribution versus the historical one. CDLF computes it from the TRAJECTORY of a teacher model's confidence on similar samples over recent training rounds.">drift score</VIS.Term> from a <VIS.Term def="A previously-trained model kept around for inference-only purposes — used to score current samples and trace how its confidence on each sample has evolved across training rounds.">teacher model</VIS.Term> and uses it to weight today's samples for training when labels are 30-60 days late. The interview trap: a miscalibrated teacher silently corrupts every weight; the framework's signal-to-noise ratio collapses under label delay. Source: <a href="https://www.ijcai.org/proceedings/2024/0500" target="_blank" rel="noopener">IJCAI 2024 #500</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        CDLF answers a specific operational question: "Labels for today&apos;s transactions arrive in 45 days. How do I train on today&apos;s transactions WITHOUT ground truth?" The recipe:
+        CDLF answers a specific operational question: "Labels for today's transactions arrive in 45 days. How do I train on today's transactions WITHOUT ground truth?" The recipe:
       </p>
       <ol>
-        <li><strong>Teacher confidence trajectory</strong> — keep a teacher model that scored each sample over the last K training rounds; track how its confidence on that sample evolved.</li>
-        <li><strong>Drift score per sample</strong> — d_i is high when teacher confidence has SHIFTED substantially across rounds (the sample now looks like a newly-emerging pattern).</li>
-        <li><strong>Adaptive loss weight</strong> — multiply per-sample loss by a function of d_i: high-drift samples get larger gradient.</li>
+        <li><strong>Teacher confidence trajectory</strong> — keep a teacher model that has scored each sample (or its bucket) over the last K training rounds; track how the teacher's softmax confidence on similar samples evolved over those rounds.</li>
+        <li><strong>Per-sample drift score d_i</strong> — high when teacher confidence on this sample (or its cluster) has shifted substantially across recent rounds; low when stable. d_i ≈ |conf_{`{t}`} - conf_{`{t-K}`}| smoothed.</li>
+        <li><strong>Adaptive loss weight</strong> — L = Σ_i w(d_i) · l(y_i, ŷ_i) where w is a monotone function of d_i (e.g., w = 1 + α·d_i). Samples that look like the new regime get more weight.</li>
       </ol>
-      <VIS.Equation tex={String.raw`\mathcal{L}_{\text{CDLF}} = \sum_i w(d_i) \cdot \mathcal{L}_{\text{CE}}(y_i, \hat{y}_i), \quad w(d_i) = 1 + \alpha \cdot \sigma(d_i)`} display />
       <VIS.Mermaid chart={`
 flowchart TB
-  X["Sample x_i"] --> T["Teacher v_k"]
-  T --> C["Conf trajectory c_i"]
-  C --> D["Drift score d_i"]
-  D --> W["Per-sample weight w_i"]
-  X --> S["Student model"]
-  S --> CE["Cross-entropy"]
-  W --> LOSS["Weighted loss"]
-  CE --> LOSS
-  LOSS --> UPD["Student update"]
-  style T fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  X["Today's sample x_i"]
+  T["Teacher model (frozen)"]
+  T --> H["History: teacher confidence over rounds t, t-1, ..., t-K"]
+  H --> D["Drift score d_i = |conf_t - conf_{t-K}|"]
+  D --> W["Loss weight w_i = 1 + alpha * d_i"]
+  X --> L["Current model loss l(y_i, y_hat_i)"]
+  W --> L
+  L --> G["Weighted gradient update"]
   style D fill:#fef3c7,stroke:#b45309,stroke-width:2px
-  style W fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+  style W fill:#dbeafe,stroke:#2563eb,stroke-width:2px
       `} />
-      <p>Yellow = the drift score; red = the per-sample weight. Everything else is a standard teacher-student loop.</p>
+      <p>Yellow = the drift signal; blue = the weight derived from it. The teacher must be well-calibrated for d_i to be trustworthy.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from static class weighting">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead>
-          <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Static class weight / Focal loss</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>CDLF</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Weight derived from</td>
-            <td style={{padding:"8px 10px"}}>Class label or prediction probability</td>
-            <td style={{padding:"8px 10px"}}>Teacher confidence trajectory</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Direction-aware?</td>
-            <td style={{padding:"8px 10px"}}>No — same weight if class is old or new</td>
-            <td style={{padding:"8px 10px"}}>Yes — up-weights newly-drifted samples</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Label dependency</td>
-            <td style={{padding:"8px 10px"}}>Needs labels for both classes</td>
-            <td style={{padding:"8px 10px"}}>Drift score is label-free</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Failure mode</td>
-            <td style={{padding:"8px 10px"}}>Under-weights drifted samples</td>
-            <td style={{padding:"8px 10px"}}>Bad teacher &rarr; bad weights</td>
-          </tr>
-        </tbody>
-      </table>
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from focal loss, class weights, sample selection">
+      <p>
+        <strong>Static class weights (pos_weight).</strong> All positive (fraud) samples get the same up-weight, regardless of whether they look like the new or the old regime. CDLF weights vary per sample.
+      </p>
+      <p>
+        <strong>Focal loss.</strong> Per-sample weight is (1 - p)^γ — large for hard samples, small for easy ones. This is HARDNESS-based, not drift-based. A sample that's hard because it represents a stable rare class gets the same weight as one hard because it represents a new MO. CDLF distinguishes.
+      </p>
+      <p>
+        <strong>Sample selection (importance sampling).</strong> Pick which samples to train on based on a drift indicator. Binary inclusion vs CDLF's continuous reweighting. Selection loses information that reweighting retains.
+      </p>
+      <p>
+        <strong>Active learning (BALD / BatchBALD).</strong> Pick samples to LABEL based on uncertainty. CDLF assumes you label everything eventually (in 45 days) and asks "how to train TODAY before labels arrive." Different problem.
+      </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Always-on streaming pipelines</strong> with severe label delay (30-60 days for chargebacks).</li>
-        <li><strong>Bursty drift</strong> — new attack regimes that shift the input distribution sharply.</li>
-        <li><strong>Existing teacher available</strong> — you have a well-calibrated incumbent model to read confidence off.</li>
-      </ul>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
+      <p>
+        Pick CDLF when (a) labels arrive 30-60 days late, (b) you HAVE a well-calibrated teacher model to read confidence from, (c) drift is bursty enough that "today's samples deserve more weight than last quarter's" is true, (d) you can train daily/weekly. Don't pick it if your teacher is miscalibrated (you get noise, not signal) or drift is too slow (today's samples look like yesterday's; weights collapse to uniform).
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  D["Label delay > 30 days?"]
+  D -->|No| WAIT["Wait for labels; standard training"]
+  D -->|Yes| Q1{"Have well-calibrated teacher?"}
+  Q1 -->|No| CALIB["Calibrate first; revisit"]
+  Q1 -->|Yes| Q2{"Drift bursty (regime shifts)?"}
+  Q2 -->|No, smooth| SAME["Static class weights suffice"]
+  Q2 -->|Yes| CDLF["CDLF"]
+  style CDLF fill:#dcfce7,stroke:#16a34a
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <VIS.Callout kind="gotcha" title="Teacher calibration is the silent killer">
-        CDLF assumes the teacher&apos;s confidence is meaningful. If the teacher is miscalibrated (e.g. 0.7 score corresponds to 0.5 actual rate), the drift score is noise and you up-weight random samples. ALWAYS run an isotonic/Platt recalibration on the teacher before deploying CDLF.
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Teacher miscalibration corrupts every weight">
+        CDLF's drift score is the difference of teacher confidences across rounds. If the teacher is not isotonic-regressed and its confidence is biased high or low, d_i is systematically off — and every sample's weight is wrong, every gradient is biased, and the model degrades silently. Calibration is not optional.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Drift score noisy under label delay">
-        Without labels you cannot validate that the drift score is tracking real drift versus teacher noise. Sanity-check by computing the drift score on a SYNTHETIC drift you injected (a known label-flipped subset) and verifying it spikes for those samples.
+      <VIS.Callout kind="gotcha" title="Drift score is noisy under label delay">
+        The teacher's confidence is a noisy proxy for true drift when labels are absent. On a 45-day-delayed stream, d_i is dominated by sampling noise for sparse fraud classes — the framework's signal-to-noise ratio is structurally low. Heavy smoothing (cluster-level confidence) is necessary.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Up-weighting accelerates whatever pattern is in the new regime">
-        If the new regime contains a higher fraction of label noise (e.g. recently-onboarded merchants with bad chargeback definitions), CDLF up-weights the noise and degrades the model. Cap the per-sample weight or pair with a confidence filter.
+      <VIS.Callout kind="gotcha" title="Up-weighting today amplifies today's noise">
+        If today's samples are a noisy snapshot (small batch, label noise on the few labels available), CDLF's "more weight on the new regime" amplifies the noise. Without a minimum batch size or noise-aware calibration, today's mistakes propagate faster than they would under uniform weighting.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten traps on adaptive loss weighting, label delay, and teacher calibration.
+        Strip "CDLF" — each correct answer must still hinge on per-sample-weight-from-teacher-confidence-trajectory, not generic "reweighted training."
       </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
       <VIS.TrapProblem
-        id="cdlf-p1"
+        id="cd-a1"
         difficulty="hard"
-        title="P1 — 45-day label delay: how to weight today&apos;s training"
-        scenario={<>You retrain a fraud model daily. Today is day T. Chargeback labels for transactions on day T arrive on day T+45. Your training data is everything from day T-200 to day T-45 (labelled) plus the last 45 days (unlabelled). How do you weight the unlabelled tail in training?</>}
+        title="A1 — CDLF vs focal loss"
+        scenario={<>"Why CDLF over focal loss? Both reweight samples." Pick the discriminator.</>}
         options={[
-          {key:"a", text:"Use a teacher model to score the unlabelled tail, derive a drift weight per sample from the teacher&apos;s confidence trajectory, and weight unlabelled samples accordingly with pseudo-labels from the teacher.", correct:true},
-          {key:"b", text:"Exclude the unlabelled tail; train only on the labelled window."},
-          {key:"c", text:"Hard-label the unlabelled tail with the teacher&apos;s top class (no weighting)."},
-          {key:"d", text:"Use a fixed weight (e.g. 2x) on the tail."},
+          {key:"a", text:"Focal loss weights by HARDNESS (1-p)^γ — a sample is up-weighted because the model's predicted probability for the correct class is low. A stable-rare-class sample with no drift gets the same focal weight as a new-MO sample. CDLF weights by DRIFT (teacher confidence trajectory across rounds) — only samples that the teacher has changed its mind about get up-weighted. Different signals; CDLF requires the teacher and the trajectory; focal does not.", correct:true},
+          {key:"b", text:"CDLF is faster."},
+          {key:"c", text:"They are the same."},
+          {key:"d", text:"Focal loss is for vision; CDLF is for fraud."},
         ]}
-        trap={<>(b) loses the most recent (and most drift-relevant) information. (c) creates confirmation bias. (d) ignores variation across samples.</>}
-        lens={<>(a) is CDLF&apos;s core insight. The teacher gives both pseudo-labels and a drift signal; combine them. Apply confidence filtering: only use teacher pseudo-labels above a threshold, and weight by drift score.</>}
-        stretch={<>What is the bias introduced by using teacher pseudo-labels vs eventual chargebacks?</>}
+        trap={<>(b), (c), (d) miss the hardness-vs-drift distinction.</>}
+        lens={<>The discriminator is the SIGNAL: hardness (focal) vs drift (CDLF). Different signals → different gradients.</>}
+        stretch={<>When does focal beat CDLF? Defend the regime.</>}
       />
 
       <VIS.TrapProblem
-        id="cdlf-p2"
+        id="cd-a2"
         difficulty="medium"
-        title="P2 — Focal loss vs CDLF: pick one"
-        scenario={<>Your fraud rate is 0.5% (severe imbalance) AND you have known drift every few weeks. Pick the loss.</>}
-        options={[
-          {key:"a", text:"Both — combine: focal loss for class imbalance (modulates by prediction probability) and CDLF drift weight (modulates by drift score). They are orthogonal modulators.", correct:true},
-          {key:"b", text:"Focal loss — imbalance is the bigger problem."},
-          {key:"c", text:"CDLF only — drift trumps imbalance."},
-          {key:"d", text:"Neither — use BCE with class weight."},
-        ]}
-        trap={<>(b)(c) treat the choice as either/or. (d) ignores both modulators.</>}
-        lens={<>(a). Focal loss modulates by p (hard examples), CDLF modulates by d (drifted examples). Composing them is well-defined: w_focal * w_drift * CE. Watch combined magnitude — cap at, say, 5x to avoid runaway gradients.</>}
-        stretch={<>How would you tune both gammas (focal and drift) jointly?</>}
-      />
-
-      <VIS.TrapProblem
-        id="cdlf-p3"
-        difficulty="hard"
+        title="A2 — CDLF vs static class weights"
+        scenario={<>What does CDLF give you over fixed pos_weight=20 for the rare fraud class?</>}
         multiSelect
-        title="P3 — Teacher miscalibration: which symptoms cripple CDLF?"
-        scenario={<>You deploy CDLF. After 4 weeks the model is worse than baseline. Which signs point at teacher calibration as the culprit?</>}
         options={[
-          {key:"a", text:"Brier score of the teacher on a recent labelled holdout is poor (much higher than expected for the AUROC).", correct:true},
-          {key:"b", text:"Per-sample weights have a heavy-tailed distribution — a few samples get weight 50x.", correct:true},
-          {key:"c", text:"Confidence histogram of the teacher is bimodal (everything is 0.05 or 0.95).", correct:true},
-          {key:"d", text:"Student model loss is decreasing smoothly during training."},
-          {key:"e", text:"Recalibrating the teacher (isotonic regression on holdout) restores baseline performance.", correct:true},
+          {key:"a", text:"Per-sample resolution: pos_weight=20 applies uniformly; CDLF weights vary by drift score. Two positives that look very different (one is the old MO, one is a new MO) get different weights.", correct:true},
+          {key:"b", text:"Adaptation to changing imbalance: if fraud rate changes from 0.5% to 2%, fixed pos_weight is stale; CDLF's reweighting is sample-by-sample.", correct:true},
+          {key:"c", text:"Information from unlabelled current data: CDLF can use today's drift signal without today's labels.", correct:true},
+          {key:"d", text:"Better convergence speed."},
         ]}
-        trap={<>(d) is the noise — smooth loss curve does not prove anything about test perf.</>}
-        lens={<>(a)(b)(c)(e). A bimodal confidence histogram is the giveaway for overconfident-tree-ensemble teachers (XGBoost without calibration). Brier confirms. Heavy-tailed weights mean you are up-weighting an unreliable signal.</>}
-        stretch={<>Why are tree ensembles particularly prone to overconfidence?</>}
+        trap={<>(d) is not generally true — CDLF can converge slower because weights vary.</>}
+        lens={<>Three real wins: per-sample, drift-adaptive, label-free signal. Speed is not one of them.</>}
+        stretch={<>How would you measure (a)'s effect?</>}
       />
 
       <VIS.TrapProblem
-        id="cdlf-p4"
+        id="cd-a3"
         difficulty="hard"
-        title="P4 — Adversarial drift: attacker injects high-drift-score samples"
-        scenario={<>An attacker realises that CDLF up-weights "drifted" samples. They inject synthetic transactions designed to look maximally different from the model&apos;s known distribution but to actually behave benignly. The drift score for these samples is huge, so they get up-weighted in training as pseudo-labelled benign. What happens?</>}
+        title="A3 — Counterfactual: no drift-aware loss"
+        scenario={<>Without CDLF, what's the strongest alternative for "labels arrive in 45 days, drift is bursty"?</>}
         options={[
-          {key:"a", text:"The student model over-learns the benign pattern on these adversarial samples, lowering the score for any real future fraud that resembles this synthetic distribution — a poisoning attack.", correct:true},
-          {key:"b", text:"Nothing — CDLF is robust to adversarial inputs."},
-          {key:"c", text:"Drift score only fires for real drift, not synthetic."},
-          {key:"d", text:"The teacher will reject these samples."},
+          {key:"a", text:"Active learning with BatchBALD on the unlabelled current stream to acquire labels faster from a small budget (overcome label delay by labeling the most informative samples manually) + static class weights. Cost: human labelers; benefit: real ground truth instead of a teacher-derived weight. CDLF is the no-extra-labelers alternative.", correct:true},
+          {key:"b", text:"Train on yesterday's data only."},
+          {key:"c", text:"Ignore drift."},
+          {key:"d", text:"Use focal loss."},
         ]}
-        trap={<>(b)(c)(d) underestimate adversarial CL.</>}
-        lens={<>(a). CDLF is itself a control surface for an attacker; high-drift up-weighting is exactly the lever. Mitigations: per-sample weight cap, anomaly detection on the high-drift-score samples before training, slow-burn weight schedule.</>}
-        stretch={<>How would you detect this poisoning attempt? Hint: distribution of drift scores.</>}
+        trap={<>(b), (c), (d) are not equivalent solutions.</>}
+        lens={<>The honest fallback is "buy ground truth via active learning." CDLF is the cheaper, weaker alternative that uses the teacher's confidence as a proxy.</>}
+        stretch={<>What's the active-learning cost in your stack?</>}
       />
 
       <VIS.TrapProblem
-        id="cdlf-p5"
-        difficulty="medium"
-        title="P5 — Drift-score formula: alpha and sigma"
-        scenario={<>The weight is w(d) = 1 + alpha * sigma(d). With alpha = 5 and sigma the standard logistic, what is the max effective up-weight a sample can receive?</>}
-        options={[
-          {key:"a", text:"6x — sigmoid saturates at 1, so w &le; 1 + 5 = 6.", correct:true},
-          {key:"b", text:"5x — alpha is the upper bound."},
-          {key:"c", text:"Unbounded — drift score can be arbitrarily high."},
-          {key:"d", text:"Depends on the loss; cannot say."},
-        ]}
-        trap={<>(b) forgets the +1 base. (c) forgets the sigmoid clamps the multiplier. (d) over-thinks.</>}
-        lens={<>(a). The sigmoid clamps the multiplier between 1 (low drift) and 1+alpha (high drift). This is why the formula uses sigmoid not raw d — to bound the weight. If you saw unbounded drift weights in code, that&apos;s a bug.</>}
-        stretch={<>What goes wrong if you use ReLU instead of sigmoid for w(d)?</>}
-      />
-
-      <VIS.TrapProblem
-        id="cdlf-p6"
+        id="cd-a4"
         difficulty="hard"
+        title="A4 — Stack CDLF + focal loss"
+        scenario={<>You combine CDLF and focal loss. What's the right thinking?</>}
         multiSelect
-        title="P6 — Validating CDLF without labels: which tools?"
-        scenario={<>You cannot wait 45 days to know if CDLF is working. Which low-latency proxies can validate the loss function in &lt; 1 week? Select all that apply.</>}
         options={[
-          {key:"a", text:"Inject a known synthetic drift (e.g. flip 5% of training labels in a recent window) and check that the drift score spikes for those samples.", correct:true},
-          {key:"b", text:"Compare student predictions against weak labels (3DS challenge outcomes, manual review queue) for fast-feedback validation.", correct:true},
-          {key:"c", text:"Track distribution of the per-sample weight; should be roughly stable and peaked around 1 in normal times.", correct:true},
-          {key:"d", text:"Wait for chargebacks — there is no substitute."},
-          {key:"e", text:"Run an A/B with the model and a CDLF-disabled control on traffic; compare 3DS challenge rates and manual review queue sizes.", correct:true},
+          {key:"a", text:"Feasible: total weight per sample is w_focal(p_i) · w_drift(d_i). The two signals are orthogonal — hardness and drift can co-occur or independently apply.", correct:true},
+          {key:"b", text:"Risk: if both weights are aggressive, samples that are BOTH hard AND drifted get extreme weights (compounding) — gradient norm blows up, training unstable. Cap the product.", correct:true},
+          {key:"c", text:"Worth it ONLY when hardness and drift signals disagree often (sample is hard but not drifted, or drifted but easy); otherwise focal alone is fine.", correct:true},
+          {key:"d", text:"Cannot be combined."},
         ]}
-        trap={<>(d) gives up too easily.</>}
-        lens={<>(a)(b)(c)(e). Weak labels and synthetic drift injection are how production CL teams close the validation gap. Weight distribution monitoring is the cheap continuous check.</>}
-        stretch={<>What is the bias of using 3DS outcomes as a weak label?</>}
+        trap={<>(d) is too strong.</>}
+        lens={<>Composition is possible but you must cap the product and verify signal disagreement.</>}
+        stretch={<>What's the cap heuristic you'd use?</>}
       />
 
       <VIS.TrapProblem
-        id="cdlf-p7"
+        id="cd-a5"
         difficulty="hard"
-        title="P7 — Drift score on the WRONG model output"
-        scenario={<>A team computes the drift score from the STUDENT model&apos;s own confidence trajectory (not a separate teacher) to save compute. What goes wrong?</>}
+        title="A5 — Where CDLF stops winning"
+        scenario={<>When does CDLF stop beating static class weights?</>}
         options={[
-          {key:"a", text:"Self-referential loop: the student becomes confident on samples it has been training on, drift score collapses to noise, and CDLF effectively becomes uniform weighting — but you only discover this after performance silently flatlines.", correct:true},
-          {key:"b", text:"Performance is the same — teacher vs self is a wash."},
-          {key:"c", text:"Faster convergence — fewer parameters."},
-          {key:"d", text:"Numerical instability."},
+          {key:"a", text:"When drift is SLOW enough that teacher confidence trajectories barely change across rounds. d_i ≈ 0 for all samples → all weights ≈ 1 → CDLF degenerates to uniform training. The framework's added complexity buys nothing in stable regimes.", correct:true},
+          {key:"b", text:"CDLF always wins."},
+          {key:"c", text:"On large batches."},
+          {key:"d", text:"On GPUs."},
         ]}
-        trap={<>(b)(c) ignore the self-reference. (d) is a generic answer.</>}
-        lens={<>(a). The teacher must be DIFFERENT from the student to provide an external view. A frozen previous-epoch student is acceptable; the current student is not. Save compute another way — e.g. teacher only on a sampled fraction of data.</>}
-        stretch={<>Could you use an EMA-of-student as the teacher (Mean Teacher style)?</>}
+        trap={<>(b), (c), (d) miss the regime dependency.</>}
+        lens={<>CDLF's advantage scales with drift speed × burstiness. Slow drift = degenerate to uniform.</>}
+        stretch={<>What's the smallest drift rate at which CDLF helps?</>}
       />
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>B. Application</h3>
+
       <VIS.TrapProblem
-        id="cdlf-p8"
+        id="cd-b1"
         difficulty="medium"
-        title="P8 — When labels finally arrive (day T+45), what changes?"
-        scenario={<>On day T+45, the labels for day T finally arrive. You used CDLF with teacher pseudo-labels. What do you do now?</>}
+        title="B1 — Pick the right tool for THIS scenario"
+        scenario={<>Scenario: card-not-present fraud, chargeback labels confirmed in 45 days, weekly retraining cadence, distribution shifts driven by BIN-attack waves, well-calibrated teacher available, GBDT model. Which loss strategy?</>}
         options={[
-          {key:"a", text:"Run a backfill training pass using the REAL labels for day T (overwriting pseudo-labels) and downweighting CDLF&apos;s adaptive weight on this slice (you now have ground truth).", correct:true},
-          {key:"b", text:"Ignore — model has already learned what it needs."},
-          {key:"c", text:"Roll back to before day T and retrain from scratch."},
-          {key:"d", text:"Use the new labels to update the teacher only, not the student."},
+          {key:"a", text:"CDLF with the calibrated teacher as the confidence source. The 45-day label delay is the canonical CDLF regime; the calibrated teacher gives clean d_i; bursty BIN attacks generate the drift signal CDLF expects. Pair with isotonic recalibration of the teacher monthly.", correct:true},
+          {key:"b", text:"Focal loss alone."},
+          {key:"c", text:"Active learning to acquire labels."},
+          {key:"d", text:"Static pos_weight."},
         ]}
-        trap={<>(b) wastes ground truth. (c) is the sledgehammer. (d) keeps the bias in the student.</>}
-        lens={<>(a). CDLF&apos;s pseudo-label phase is a transient — when ground truth arrives, do a corrective backfill. This bounds the long-term bias of pseudo-labelling.</>}
-        stretch={<>How much weight should the backfill samples get vs current samples?</>}
+        trap={<>(b) misses drift signal. (c) is the alternative; choose it only if you can afford labelers. (d) ignores drift.</>}
+        lens={<>The scenario matches CDLF's design space: delayed labels + bursty drift + calibrated teacher.</>}
+        stretch={<>What's the smoothing window K you would use for confidence trajectory?</>}
       />
 
       <VIS.TrapProblem
-        id="cdlf-p9"
+        id="cd-b2"
         difficulty="hard"
-        title="P9 — CDLF with extreme imbalance"
-        scenario={<>Fraud rate = 0.1%. CDLF is computing drift scores. The BENIGN samples dominate the weight distribution because there are 1000x more of them. The fraud signal is drowned. What change?</>}
+        title="B2 — 'Bigger alpha = stronger drift adaptation'"
+        scenario={<>A teammate sets α=10 in w = 1 + α·d_i for "more aggressive drift handling." What goes wrong?</>}
         options={[
-          {key:"a", text:"Compute the drift score per CLASS — benign drift and fraud drift separately; weight within class. Or: combine CDLF with focal loss so per-sample weight is product of focal (imbalance) and drift modulators.", correct:true},
-          {key:"b", text:"Reduce alpha to make weights closer to 1."},
-          {key:"c", text:"Drop drift score for the benign class."},
-          {key:"d", text:"Sample 1:1 benign:fraud before applying CDLF."},
+          {key:"a", text:"At α=10, samples with high d_i dominate the gradient — the effective training set becomes the small subset of newly-drifted samples. Variance explodes (small effective n); the model overfits today's snapshot; per-MO recall on stable patterns drops because they receive ~1x weight while drifted samples receive ~10x. The framework needs α tuned via cross-validated AUPRC, not by intuition.", correct:true},
+          {key:"b", text:"α=10 is always optimal."},
+          {key:"c", text:"α has no effect."},
+          {key:"d", text:"α=10 breaks gradient flow."},
         ]}
-        trap={<>(b) dampens the signal you want. (c) loses information. (d) loses calibration on benign drift.</>}
-        lens={<>(a). Class-stratified drift score is the cleanest. Or compose with focal loss as discussed in P2. The mistake is letting one class dominate the modulation.</>}
-        stretch={<>Sketch the formula for class-stratified drift.</>}
+        trap={<>(b), (c), (d) miss the variance-amplification.</>}
+        lens={<>α controls how much new-regime samples dominate. Too high = overfit-to-today. Tune via held-out AUPRC on past MOs.</>}
+        stretch={<>What's the diagnostic that says α is too high?</>}
       />
 
       <VIS.TrapProblem
-        id="cdlf-p10"
-        difficulty="medium"
-        title="P10 — CDLF + drift-triggered retrain: friends or foes?"
-        scenario={<>Your stack already has ADWIN-triggered retraining. Adding CDLF on top — useful or redundant?</>}
+        id="cd-b3"
+        difficulty="hard"
+        title="B3 — Pitch CDLF to the fraud-ops team"
+        scenario={<>Your fraud-ops lead asks "Why not just use focal loss?" Pick the pitch that hinges on CDLF's mechanism.</>}
         options={[
-          {key:"a", text:"Useful and orthogonal: ADWIN decides WHEN to retrain (a control on training frequency); CDLF decides HOW to weight samples WITHIN a training run (a control on training content). They compose cleanly.", correct:true},
-          {key:"b", text:"Redundant — ADWIN already handles drift."},
-          {key:"c", text:"Conflicting — CDLF up-weighting will keep ADWIN firing."},
-          {key:"d", text:"Only choose one — both is over-engineering."},
+          {key:"a", text:"Focal loss makes hard samples more important — but a sample is hard for many reasons, including stable rare patterns we already know about. CDLF uses our teacher model's confidence TRAJECTORY across the last K weeks to identify samples the teacher has CHANGED its mind about — those are the new-MO samples specifically, not just any hard sample. We train on today's data with weights derived from how today differs from last month, before chargeback labels confirm the new MO 45 days from now.", correct:true},
+          {key:"b", text:"CDLF is the latest paper."},
+          {key:"c", text:"CDLF reduces parameter count."},
+          {key:"d", text:"It scales."},
         ]}
-        trap={<>(b)(c)(d) miss that these are different levels of the same problem.</>}
-        lens={<>(a). ADWIN = trigger, CDLF = loss. The combined design covers both "we need to retrain" and "given that we are retraining, weight the recent samples appropriately."</>}
-        stretch={<>What metric tells you CDLF is hurting rather than helping in this combined stack?</>}
+        trap={<>(b), (c), (d) miss the trajectory-based-discriminator argument.</>}
+        lens={<>The concept-specific pitch names (i) teacher confidence trajectory, (ii) change-of-mind as the discriminator, (iii) label-delay as the constraint that motivates it.</>}
+        stretch={<>What's the failure mode if the teacher is brittle?</>}
       />
+
+      <VIS.TrapProblem
+        id="cd-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use CDLF"
+        scenario={<>Which scenarios are CDLF anti-patterns?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Teacher model is not calibrated — drift score is noise.", correct:true},
+          {key:"b", text:"Labels arrive in seconds (e.g., spam click-through). No need for the teacher-proxy; train on labels.", correct:true},
+          {key:"c", text:"Drift is smooth (no bursty regime changes). The signal d_i ≈ 0; the framework adds cost without benefit.", correct:true},
+          {key:"d", text:"Bursty drift with 45-day label delay and calibrated teacher."},
+        ]}
+        trap={<>(d) is the regime CDLF was designed for.</>}
+        lens={<>Three anti-patterns: uncalibrated teacher, fast labels, smooth drift. Each suggests a different baseline.</>}
+        stretch={<>What's the calibration threshold (ECE) below which CDLF is safe?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      <VIS.TrapProblem
+        id="cd-c1"
+        difficulty="hard"
+        title="C1 — Why teacher confidence (not student confidence)?"
+        scenario={<>Why does CDLF derive d_i from the TEACHER's confidence trajectory rather than the current student's?</>}
+        options={[
+          {key:"a", text:"The student is being trained on today's data with the same weights we are computing — using its confidence for d_i creates a circular dependency: high w_i biases the student toward d_i-high samples, which biases its future confidence on those samples, which inflates d_i further. The teacher is FROZEN, so its confidence trajectory is an exogenous signal. The teacher provides an independent reference frame.", correct:true},
+          {key:"b", text:"Teacher is bigger."},
+          {key:"c", text:"Student does not have confidence."},
+          {key:"d", text:"Teacher is faster."},
+        ]}
+        trap={<>(b), (c), (d) miss the circular-dependency argument.</>}
+        lens={<>The teacher's freeze breaks the feedback loop. Using a live model's confidence would create a bias amplifier.</>}
+        stretch={<>What's the right teacher refresh cadence?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-c2"
+        difficulty="medium"
+        title="C2 — Window K"
+        scenario={<>K = how many past training rounds we look back at teacher confidence. What does K control?</>}
+        options={[
+          {key:"a", text:"K trades off signal stability against detection latency. Large K → stable d_i but slow to flag new drift. Small K → reactive d_i but noisy on individual samples. Tune K so that K rounds ≈ the burst horizon of MO changes (e.g., 4 weekly rounds for a month-scale burst).", correct:true},
+          {key:"b", text:"K is a fixed constant."},
+          {key:"c", text:"K has no effect."},
+          {key:"d", text:"Larger K is always better."},
+        ]}
+        trap={<>(b), (c), (d) miss the latency-stability tradeoff.</>}
+        lens={<>K is the time scale of drift you want to detect. Match it to the burst horizon.</>}
+        stretch={<>What's the K for your stack?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-c3"
+        difficulty="hard"
+        title="C3 — What CDLF drops"
+        scenario={<>What does CDLF drop relative to static-class-weight training?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Uniform per-class weight — replaced by per-sample weight from drift score.", correct:true},
+          {key:"b", text:"Implicit drift-blindness — the loss now reads drift signal.", correct:true},
+          {key:"c", text:"The need to wait for labels to detect MO changes — the teacher's confidence trajectory is a label-free proxy.", correct:true},
+          {key:"d", text:"The classification loss itself."},
+        ]}
+        trap={<>(d) is retained.</>}
+        lens={<>Three drops: uniform weights, drift blindness, label dependency for drift detection.</>}
+        stretch={<>Which drop is most valuable in your stack?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-c4"
+        difficulty="hard"
+        title="C4 — Which knob, mis-set, breaks CDLF?"
+        scenario={<>Rank: (i) α (weight scale), (ii) K (window), (iii) teacher calibration, (iv) clustering for per-cluster confidence smoothing.</>}
+        options={[
+          {key:"a", text:"(iii) Teacher calibration > (i) α > (ii) K > (iv) clustering. Miscalibrated teacher invalidates every d_i (silent catastrophic failure). α controls weight scale (visible overfit-to-today). K is secondary. Clustering smoothing is fine-tuning.", correct:true},
+          {key:"b", text:"All equally important."},
+          {key:"c", text:"K dominates."},
+          {key:"d", text:"Clustering dominates."},
+        ]}
+        trap={<>(b), (c), (d) miss the calibration sensitivity.</>}
+        lens={<>Teacher calibration is the FOUNDATION; everything else depends on it.</>}
+        stretch={<>What's your teacher-calibration acceptance test?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-c5"
+        difficulty="medium"
+        title="C5 — Data-assumption: teacher coverage"
+        scenario={<>What if a new fraud MO produces samples in a region the teacher has never scored well?</>}
+        options={[
+          {key:"a", text:"The teacher's confidence on these samples is meaningless (extrapolation outside its trained support). d_i derived from a no-coverage region is noise. The framework will up-weight or down-weight these samples essentially at random — the worst possible outcome for the new MO we wanted to learn. Mitigation: out-of-distribution detection on teacher inputs; fall back to uniform weight for OOD samples.", correct:true},
+          {key:"b", text:"Teacher extrapolates correctly."},
+          {key:"c", text:"d_i is high (correctly)."},
+          {key:"d", text:"OOD samples have no effect."},
+        ]}
+        trap={<>(b), (c), (d) miss the OOD-extrapolation pathology.</>}
+        lens={<>The teacher's coverage gates CDLF's validity. OOD samples = no signal.</>}
+        stretch={<>How do you detect teacher OOD at scoring?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      <VIS.TrapProblem
+        id="cd-d1"
+        difficulty="medium"
+        title="D1 — 'Drift score = ground truth for drift'"
+        scenario={<>A junior treats d_i as if it were a calibrated drift probability. What goes wrong?</>}
+        options={[
+          {key:"a", text:"d_i is an UNCALIBRATED score — its scale depends on the teacher's confidence dynamics, which depend on its temperature, calibration method, and training-data composition. Treating it as a probability invites cliff effects (samples just above a threshold are treated very differently from just below). Use d_i as a CONTINUOUS weighting signal, not a binary classifier.", correct:true},
+          {key:"b", text:"d_i is always calibrated."},
+          {key:"c", text:"d_i is a probability by definition."},
+          {key:"d", text:"d_i has no scale."},
+        ]}
+        trap={<>(b), (c), (d) misread d_i.</>}
+        lens={<>d_i is a SIGNAL, not a probability. Use continuously, not as a thresholded gate.</>}
+        stretch={<>What's the calibration of d_i in your stack?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-d1b"
+        difficulty="hard"
+        title="D1b — 'Teacher trajectory is a drift detector'"
+        scenario={<>Junior: "We can use CDLF's d_i as our drift detector." Where does this break?</>}
+        options={[
+          {key:"a", text:"CDLF's d_i is computed per-sample on labelled training data — not on the live unlabelled stream. To use d_i as a drift detector you'd need to compute it on incoming traffic, but the teacher's confidence on a single live sample is a noisy 1-shot — drift detection needs aggregate signal (ADWIN on score distributions, DDM on errors). CDLF and drift detectors are complementary, not interchangeable.", correct:true},
+          {key:"b", text:"CDLF's d_i is a drift detector."},
+          {key:"c", text:"They are equivalent."},
+          {key:"d", text:"Drift detection is part of CDLF."},
+        ]}
+        trap={<>(b), (c), (d) conflate per-sample signal with stream-level detection.</>}
+        lens={<>d_i is per-sample for training; ADWIN/DDM are stream-level for triggering. Different layers.</>}
+        stretch={<>How would you stack CDLF + ADWIN?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: trust an uncalibrated teacher"
+        scenario={<>You skip teacher recalibration ("the AUC is good, calibration doesn't matter"). Trace the cascade.</>}
+        options={[
+          {key:"a", text:"Teacher confidence is systematically biased (high in some regions, low in others) → d_i = difference of biased confidences → bias persists in the difference → wrong samples up-weighted (e.g., the teacher is confidently wrong on a new MO; d_i ≈ 0, the samples are down-weighted) → new MO under-trained → recall drops on the regime CDLF was supposed to help with → team blames 'drift' when the root cause is teacher calibration.", correct:true},
+          {key:"b", text:"AUC is enough; calibration doesn't matter."},
+          {key:"c", text:"Nothing happens."},
+          {key:"d", text:"GPU OOM."},
+        ]}
+        trap={<>(b), (c), (d) deny the calibration dependency.</>}
+        lens={<>AUC is rank, calibration is magnitude. CDLF depends on magnitude (the difference in confidence). AUC is necessary but not sufficient.</>}
+        stretch={<>What ECE threshold gates teacher use in CDLF?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior diagnostic"
+        scenario={<>Junior: "CDLF beats focal by 2 AUPRC on the last 4 weeks." Senior question?</>}
+        options={[
+          {key:"a", text:"'On WHICH weeks specifically? CDLF's gain concentrates on weeks with new MOs; on stable weeks the gain shrinks or flips. Report PER-WEEK delta with regime labels. Also: was the teacher calibrated on the SAME 4 weeks (in-sample tuning) or earlier? And: what's the variance across runs? With per-sample reweighting, CDLF runs are noisier than focal runs.'", correct:true},
+          {key:"b", text:"'Ship it.'"},
+          {key:"c", text:"'Use FP16.'"},
+          {key:"d", text:"'Try larger α.'"},
+        ]}
+        trap={<>(b), (c), (d) skip the protocol.</>}
+        lens={<>The senior probes (i) regime decomposition of the lift, (ii) teacher-tuning leakage, (iii) variance.</>}
+        stretch={<>What's the per-week dashboard you'd build?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: high α 'wins'"
+        scenario={<>You bump α from 1 to 5 and AUPRC on the current week improves by 1 point. Is α=5 better?</>}
+        options={[
+          {key:"a", text:"Maybe — but probably overfitting to the current snapshot. Verify: (i) per-MO recall on past MOs should NOT have dropped; (ii) AUPRC on a held-out future week (not training week) should improve. If past-MO recall dropped while current-week AUPRC rose, α=5 is overfitting today at the cost of old MOs — a textbook short-term gain, long-term loss.", correct:true},
+          {key:"b", text:"Higher α is always better."},
+          {key:"c", text:"AUPRC improvement = ship it."},
+          {key:"d", text:"α has no effect on past-MO recall."},
+        ]}
+        trap={<>(b), (c), (d) ignore the temporal-fairness tradeoff.</>}
+        lens={<>α is a temporal-tradeoff dial. Always verify past-MO recall when increasing.</>}
+        stretch={<>Sketch the per-MO eval grid for α sweeps.</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>E. Operations</h3>
+
+      <VIS.TrapProblem
+        id="cd-e1"
+        difficulty="hard"
+        title="E1 — CDLF-specific gotcha"
+        scenario={<>Pick the gotcha most specific to CDLF (would not bite focal or class weights):</>}
+        options={[
+          {key:"a", text:"Teacher drift: the teacher itself becomes stale over months. Its confidence becomes uncalibrated against the current regime. d_i is computed from stale baseline → wrong samples up-weighted. Mitigation: monthly teacher refresh + isotonic recalibration; freeze the teacher between refreshes for stable trajectories.", correct:true},
+          {key:"b", text:"GPU OOM."},
+          {key:"c", text:"Slow inference."},
+          {key:"d", text:"Cold-start models."},
+        ]}
+        trap={<>(b), (c), (d) are generic.</>}
+        lens={<>Teacher staleness is CDLF's signature failure. Recalibrate periodically; never let it drift unbounded.</>}
+        stretch={<>What's the teacher-refresh policy in your stack?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-e2"
+        difficulty="hard"
+        title="E2 — Friday: per-MO recall drops"
+        scenario={<>Friday: recall on a 3-month-old MO drops from 80% to 50% over 2 weeks. CDLF is in production. Diagnose.</>}
+        options={[
+          {key:"a", text:"CDLF over-weighting current samples (high d_i for new MOs) AT THE COST OF old-MO weight. The old MO's samples have stable teacher confidence (d_i ≈ 0) and small weight; new MO samples dominate the gradient. Mitigation: floor on minimum weight (w_min = 0.5), regularization toward uniform weights, or reduce α.", correct:true},
+          {key:"b", text:"GPU failure."},
+          {key:"c", text:"Random fluctuation."},
+          {key:"d", text:"Backbone drift."},
+        ]}
+        trap={<>(b), (c), (d) miss the CDLF-specific over-weighting cascade.</>}
+        lens={<>CDLF's per-sample weighting CAN starve old-MO samples of gradient. Monitor per-MO recall as the canary.</>}
+        stretch={<>Sketch the per-MO recall dashboard.</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-e3"
+        difficulty="hard"
+        title="E3 — Eval-protocol audit"
+        scenario={<>Which findings invalidate a CDLF-beats-focal benchmark?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Teacher trained on a window that overlaps the evaluation period (leakage).", correct:true},
+          {key:"b", text:"Comparison done only on current-week AUPRC, not on per-MO recall.", correct:true},
+          {key:"c", text:"α tuned on the test stream.", correct:true},
+          {key:"d", text:"GBDT used as the model."},
+        ]}
+        trap={<>(d) is fine.</>}
+        lens={<>Three audit failures: teacher leakage, current-week-only metric, in-sample α tuning. All inflate CDLF's apparent edge.</>}
+        stretch={<>What's the right teacher-training window?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-e4"
+        difficulty="medium"
+        title="E4 — Rollout sequence"
+        scenario={<>Order: (i) full cutover, (ii) shadow CDLF with α=0 sanity check, (iii) traffic ramp with per-MO recall guards, (iv) teacher calibration audit.</>}
+        options={[
+          {key:"a", text:"iv → ii → iii → never i without guards. Calibrate teacher first; shadow with α=0 to verify pipeline; ramp with per-MO recall guards.", correct:true},
+          {key:"b", text:"i first."},
+          {key:"c", text:"iii → i."},
+          {key:"d", text:"Direct cutover."},
+        ]}
+        trap={<>(b), (c), (d) skip calibration or monitoring.</>}
+        lens={<>Calibration is gated by audit; rollout is gated by per-MO recall.</>}
+        stretch={<>What's the per-MO recall alert threshold?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-e5"
+        difficulty="medium"
+        title="E5 — Reproducibility"
+        scenario={<>Which CDLF reproducibility issues bite teams?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Teacher model identity and checkpoint rarely shared.", correct:true},
+          {key:"b", text:"α value not always reported.", correct:true},
+          {key:"c", text:"Whether confidence is per-sample or per-cluster smoothed varies.", correct:true},
+          {key:"d", text:"CDLF cannot run on GPUs."},
+        ]}
+        trap={<>(d) is false.</>}
+        lens={<>Three holes: teacher identity, α, smoothing strategy. All silent.</>}
+        stretch={<>What's your reproducibility checklist?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination"
+        scenario={<>Which contamination paths inflate CDLF claims?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Teacher trained on data overlapping eval window.", correct:true},
+          {key:"b", text:"Tuning α and K on the eval stream.", correct:true},
+          {key:"c", text:"Baseline focal loss with poorly-tuned γ (sandbagged).", correct:true},
+          {key:"d", text:"AUPRC as metric."},
+        ]}
+        trap={<>(d) is fine.</>}
+        lens={<>Three contaminations: teacher leakage, in-sample tuning, sandbagged baseline. Standard senior bar.</>}
+        stretch={<>Hardest to detect in published work?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>F. Failure modes & edge cases</h3>
+
+      <VIS.TrapProblem
+        id="cd-f1"
+        difficulty="hard"
+        title="F1 — Smallest input that breaks CDLF"
+        scenario={<>Construct the smallest scenario where CDLF reduces to uniform-weight training.</>}
+        options={[
+          {key:"a", text:"A stable distribution: the teacher's confidence on every sample is identical across all K past rounds → d_i = 0 for every sample → w_i = 1 for every sample → uniform training. CDLF's machinery has no signal to work with.", correct:true},
+          {key:"b", text:"Empty input."},
+          {key:"c", text:"One sample."},
+          {key:"d", text:"CDLF never reduces."},
+        ]}
+        trap={<>(b), (c), (d) miss the stable-distribution degenerate.</>}
+        lens={<>CDLF requires drift. Stable distribution = no signal.</>}
+        stretch={<>What's the minimum drift rate at which CDLF's signal is informative?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: poison the teacher trajectory"
+        scenario={<>Design an attack on CDLF.</>}
+        options={[
+          {key:"a", text:"Submit many adversarial samples that bend the teacher's confidence trajectory in a region — over multiple training rounds the teacher's confidence on that region shifts (because it was retrained including the adversarial samples). Then submit a small batch of fraud-like adversarial samples whose d_i is now low (teacher's confidence has shifted to match), so the student down-weights them — fraud passes through. Defense: cap d_i tail effect; outlier detection on training inputs; isolate teacher updates.", correct:true},
+          {key:"b", text:"No attack possible."},
+          {key:"c", text:"Feature perturbation."},
+          {key:"d", text:"Increase fraud rate."},
+        ]}
+        trap={<>(b), (c), (d) miss the trajectory-poisoning surface.</>}
+        lens={<>The teacher's training data is the attack surface. Isolate it.</>}
+        stretch={<>How would you isolate teacher updates?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-f4"
+        difficulty="medium"
+        title="F4 — Paper-admitted limitation"
+        scenario={<>Which limitation does the CDLF paper itself acknowledge?</>}
+        options={[
+          {key:"a", text:"Teacher calibration is critical; the paper notes that ECE on the teacher should be below a threshold for the framework to add value, and that recalibration is a precondition.", correct:true},
+          {key:"b", text:"CDLF has no limitations."},
+          {key:"c", text:"CDLF is patented."},
+          {key:"d", text:"CDLF requires GPUs only."},
+        ]}
+        trap={<>(b), (c), (d) are wrong.</>}
+        lens={<>The paper is honest about the calibration precondition. Reading the limitations is the senior tell.</>}
+        stretch={<>What ECE threshold does the paper suggest?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-f5"
+        difficulty="hard"
+        title="F5 — Fair-eval critique"
+        scenario={<>What does fair-eval find about CDLF vs focal loss?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"On bursty-drift weeks, CDLF beats focal by 1-2 AUPRC.", correct:true},
+          {key:"b", text:"On stable weeks, CDLF ties focal — d_i ≈ 0 collapses to uniform.", correct:true},
+          {key:"c", text:"Past-MO recall under CDLF can DROP when α is high; focal preserves past-MO recall better at the cost of new-MO adaptation.", correct:true},
+          {key:"d", text:"CDLF always wins."},
+        ]}
+        trap={<>(d) overstates.</>}
+        lens={<>Regime-dependent. Report by drift regime AND by past-MO recall.</>}
+        stretch={<>What's the per-week reporting template?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cd-f5b"
+        difficulty="hard"
+        title="F5b — The interview gold question"
+        scenario={<>Interviewer: "Walk me through the ablation that proves CDLF's win is from the drift signal, not from teacher capacity."</>}
+        options={[
+          {key:"a", text:"Built four baselines under temporal CV with strict 45-day label-delay simulation: (i) focal loss + same teacher (teacher used only for confidence trajectory, not as a baseline model), (ii) CDLF with α=0 (sanity — should match focal), (iii) CDLF with full α, (iv) ensemble of teacher + student (to test if 'using teacher predictions' alone explains the gain). Reported per-week AUPRC AND per-MO recall on 6 prior MOs. CDLF beat focal by 1.6 AUPRC on bursty weeks, tied on stable weeks, and ensemble (iv) closed half the gap — so the win is partly drift signal, partly teacher information. Honest report attributes both.", correct:true},
+          {key:"b", text:"Compared to plain GBDT and shipped."},
+          {key:"c", text:"CDLF always wins."},
+          {key:"d", text:"Compared at α=10."},
+        ]}
+        trap={<>(b), (c), (d) skip the rigorous ablation.</>}
+        lens={<>The ensemble baseline isolates "teacher capacity" from "drift signal." Without it, attribution is sloppy.</>}
+        stretch={<>If ensemble matched CDLF, would you ship CDLF? Defend.</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://www.ijcai.org/proceedings/2024/0500" target="_blank" rel="noopener">
-            <strong>Concept Drift Aware Loss for Imbalanced Streaming Fraud Detection</strong>
-          </a>{" "}
+          <a href="https://www.ijcai.org/proceedings/2024/0500" target="_blank" rel="noopener"><strong>Concept Drift Aware Loss for Imbalanced Streaming Fraud</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, IJCAI 2024)</span>
-          <br/>The CDLF paper. Sections 3 (loss formulation) and 4.2 (ablations on alpha, teacher choice) are the core.
+          <br/>The original. Section 3 (drift score), Section 4 (loss form), Section 5 (experiments). Limitations include teacher calibration.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/1708.02002" target="_blank" rel="noopener">
-            <strong>Lin et al. — Focal Loss for Dense Object Detection</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/1708.02002" target="_blank" rel="noopener"><strong>Lin et al. — Focal Loss for Dense Object Detection</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, ICCV 2017)</span>
-          <br/>The canonical loss-modulation paper. Read Sec 3.2 — CDLF&apos;s formula is the same family.
+          <br/>The reweighting comparator. Reading focal's derivation makes CDLF's drift-signal distinction click.
         </li>
         <li>
-          <a href="https://huyenchip.com/2022/02/07/data-distribution-shifts-and-monitoring.html" target="_blank" rel="noopener">
-            <strong>Chip Huyen — Data Distribution Shifts and Monitoring</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Practitioner overview of label delay, weak labels, and drift monitoring. CDLF sits at the intersection of all three.
+          <a href="https://arxiv.org/abs/1706.04599" target="_blank" rel="noopener"><strong>Guo et al. — On Calibration of Modern Neural Networks</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2017)</span>
+          <br/>Why your teacher needs temperature scaling before CDLF. ECE as the metric.
         </li>
         <li>
-          <a href="https://scikit-learn.org/stable/modules/calibration.html" target="_blank" rel="noopener">
-            <strong>scikit-learn — Probability Calibration</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(docs)</span>
-          <br/>Sec on Platt vs isotonic. ALWAYS calibrate the CDLF teacher before deploy.
+          <a href="https://arxiv.org/abs/1010.4784" target="_blank" rel="noopener"><strong>Gama et al. — Concept Drift Adaptation Survey</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(survey, 2014)</span>
+          <br/>Drift taxonomy. Helps locate CDLF as "passive reweighting under drift" vs "active drift detection + retrain."
         </li>
         <li>
-          <a href="https://eng.lyft.com/handling-data-drift-with-streaming-machine-learning-2dcdf0c34c89" target="_blank" rel="noopener">
-            <strong>Lyft Engineering — Handling Data Drift with Streaming ML</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Production write-up of weak-label pipelines under chargeback delay. Pairs cleanly with CDLF&apos;s setting.
+          <a href="https://arxiv.org/abs/1906.01529" target="_blank" rel="noopener"><strong>Ktena et al. — Addressing Label Sparsity for Fraud Detection</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, 2019)</span>
+          <br/>Label-delay landscape. Useful context for why a teacher-derived signal is industrially relevant.
         </li>
       </ul>
     </VIS.Section>
   </main>
 );
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
 
 </script>
   <script>

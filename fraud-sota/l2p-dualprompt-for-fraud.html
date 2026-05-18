@@ -1414,328 +1414,639 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// L2P / DualPrompt for fraud — Fraud SOTA · Continual learning under concept drift
-// Frozen backbone + learnable prompt pool — replay-free continual learning under GDPR.
+// L2P / DualPrompt for fraud — Wang et al. CVPR 2022 + tabular adaptation 2025
+// v2 redo — trap problems span A-F axes; every problem hinges on the SPECIFIC
+// L2P mechanism (frozen backbone + query-key-indexed prompt pool, replay-free
+// continual learning) and threads the "backbone-freeze limits feature update"
+// counter-evidence.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Continual learning under concept drift"
       title="L2P / DualPrompt for fraud"
-      subtitle="Frozen backbone + a small learnable prompt pool indexed by task identity. No replay buffer, no stored fraud examples."
+      subtitle="Frozen pretrained backbone + a small pool of learnable prompts, selected per input via a key-query match. No replay buffer — past fraud examples never need to be stored."
       byline={[
-        {label: "Paper", value: "Wang et al. L2P (CVPR 2022); tabular adaptation arXiv 2025"},
+        {label: "Paper", value: "Wang et al. L2P (CVPR 2022) + DualPrompt (ECCV 2022); tabular adaptation arXiv 2025"},
         {label: "Year", value: "2025"},
-        {label: "L3", value: "Prompt-based continual learning"},
+        {label: "Domain", value: "Privacy-constrained continual fraud"},
       ]}/>
 
     <VIS.TLDR>
-      Classical{" "}
-      <VIS.Term def="A technique for continual learning where you store a small buffer of past examples and mix them into the current training batch to prevent forgetting older tasks.">replay-based CL</VIS.Term>{" "}
-      stores past fraud cases — which is a GDPR/PII landmine. L2P keeps a frozen feature extractor and learns a tiny pool of{" "}
-      <VIS.Term def="Small learnable embedding vectors prepended to a model&apos;s input or hidden states. Originally from prompt-tuning of LLMs; here used to encode task-specific knowledge without storing raw examples.">prompts</VIS.Term>{" "}
-      indexed by a query-key match on the input. Each new fraud regime trains a new prompt; old prompts are never overwritten. The trap: backbone is frozen, so you cannot fix systematic feature failures.
+      Classical <VIS.Term def="A continual-learning technique that stores a small set of past examples and mixes them into the current training batch to prevent forgetting prior tasks. Examples: Experience Replay, ER-ACE, DER++.">replay-based CL</VIS.Term> stores raw past fraud cases — a GDPR / right-to-be-forgotten landmine. L2P freezes a pretrained backbone and learns a pool of small <VIS.Term def="Learnable embedding vectors prepended to a model's input or hidden state. Originally from prompt-tuning of LLMs (Lester et al. 2021); here used to encode task-specific knowledge without retaining raw data.">prompts</VIS.Term> indexed by a <VIS.Term def="Each prompt has a learnable KEY; at inference the input is projected to a query vector and the top-k matching prompts are selected. Forces task-specific behaviour without explicit task IDs at test time.">query-key match</VIS.Term> on the input. Each new fraud regime trains a new prompt; old prompts are never overwritten — so no forgetting, no PII storage. The interview trap: the backbone is frozen, so systematic feature failures cannot be corrected without breaking the no-forgetting guarantee. Source: <a href="https://arxiv.org/abs/2112.08654" target="_blank" rel="noopener">arXiv:2112.08654</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        Continual learning under GDPR or "right to be forgotten" has a brutal constraint: you cannot keep raw fraud examples around for replay. L2P (Learning to Prompt) and its sibling DualPrompt sidestep this by NEVER storing examples — instead they store small learnable vectors (prompts) that encode what was learned without retaining the data itself.
+        L2P has three components:
       </p>
       <ol>
-        <li><strong>Frozen backbone</strong> — a pretrained encoder (transformer, MLP) is locked. No gradients flow through it.</li>
-        <li><strong>Prompt pool</strong> — N learnable prompt vectors stored alongside N learnable keys. Each new task adds 1-2 new (key, prompt) pairs.</li>
-        <li><strong>Query-key match</strong> — at inference, the input is encoded by the frozen backbone to a query; nearest keys retrieve their prompts; those prompts are prepended/inserted before the classifier head.</li>
+        <li><strong>Frozen backbone f_θ</strong> — a pretrained encoder (transformer for FATA-Trans or TabBERT in tabular fraud). Gradients DO NOT flow through it. θ never changes after pretraining.</li>
+        <li><strong>Prompt pool {`{(k_i, p_i)}`}</strong> — N (key, prompt) pairs. k_i is a learnable retrieval key; p_i is a learnable prompt vector. Both update via gradients.</li>
+        <li><strong>Query-key matching</strong> — at inference, the input x is projected to q(x); top-K prompts are selected by cosine(q(x), k_i); their p_i values are prepended to the backbone's input/hidden state.</li>
       </ol>
       <VIS.Mermaid chart={`
 flowchart TB
-  X["Input txn"] --> ENC["Frozen encoder"]
-  ENC --> Q["Query vector q"]
-  POOL["Prompt pool (K_i, P_i)"] --> MATCH["Top-k key match"]
-  Q --> MATCH
-  MATCH --> P["Selected prompts"]
-  ENC --> H["Hidden state"]
-  P --> COMBINE["Prepend / inject"]
-  H --> COMBINE
-  COMBINE --> HEAD["Classifier head"]
-  HEAD --> Y["Fraud score"]
-  style ENC fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style POOL fill:#fef3c7,stroke:#b45309,stroke-width:2px
+  X["Transaction x"]
+  X --> Q["Project to query q(x)"]
+  Q --> M["Cosine match to N keys"]
+  M --> S["Top-K prompts selected"]
+  S --> P["Prompts prepended to backbone input"]
+  X --> P
+  P --> F["FROZEN backbone f_theta"]
+  F --> H["Head -> fraud score"]
+  style F fill:#e2e8f0,stroke:#475569,stroke-width:2px
+  style S fill:#dcfce7,stroke:#16a34a,stroke-width:2px
       `} />
-      <p>Blue = frozen, yellow = the only thing that learns. Per-task gradient updates touch the prompt pool and the head only.</p>
+      <p>Grey = frozen (cannot change). Green = learnable per task (new fraud regime adds a new prompt, never overwrites old ones).</p>
+      <p>DualPrompt is a variant: TWO pools — G-prompt (task-agnostic, shared) + E-prompts (task-specific, expert). The query selects an E-prompt; G-prompt is always applied.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from replay-based CL">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead>
-          <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Replay buffer (ER, GEM, A-GEM)</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>L2P / DualPrompt</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Stores</td>
-            <td style={{padding:"8px 10px"}}>Raw past examples (PII risk)</td>
-            <td style={{padding:"8px 10px"}}>Learned prompt vectors only</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Catastrophic forgetting</td>
-            <td style={{padding:"8px 10px"}}>Mitigated by mixing replay</td>
-            <td style={{padding:"8px 10px"}}>Prevented — old prompts untouched</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Storage cost</td>
-            <td style={{padding:"8px 10px"}}>O(buffer size) data</td>
-            <td style={{padding:"8px 10px"}}>O(N tasks) small vectors</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Backbone update</td>
-            <td style={{padding:"8px 10px"}}>Free to fine-tune</td>
-            <td style={{padding:"8px 10px"}}>Frozen — limits representation drift</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>GDPR delete</td>
-            <td style={{padding:"8px 10px"}}>Hard (buffer + retrain)</td>
-            <td style={{padding:"8px 10px"}}>Drop the relevant prompt</td>
-          </tr>
-        </tbody>
-      </table>
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from Replay / EWC / ConFL">
+      <p>
+        <strong>Experience Replay.</strong> Stores raw past examples in a buffer; replays them in current training. Effective but breaks GDPR right-to-be-forgotten and stores PII forever. L2P stores PROMPTS (small abstract vectors), not examples.
+      </p>
+      <p>
+        <strong>EWC (Elastic Weight Consolidation).</strong> Regularizes weight changes via Fisher information from past tasks. No raw data stored, but the backbone STILL CHANGES — and accumulates regularization terms that eventually conflict. L2P freezes the backbone entirely; old prompts are bit-stable.
+      </p>
+      <p>
+        <strong>ConFL.</strong> Combines replay + EWC + FedAvg — strong on cross-bank drift but stores raw fraud examples. L2P is the privacy-strict alternative when even buffer storage is forbidden.
+      </p>
+      <p>
+        <strong>Full fine-tuning each round.</strong> Catastrophic forgetting baseline. L2P beats it precisely because the backbone never updates.
+      </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Privacy-regulated settings</strong> — EU/UK GDPR, CCPA — where storing raw fraud examples is a compliance risk.</li>
-        <li><strong>Task-boundary visible</strong> — new BIN-attack waves, new geo onboards, where you can label "this is task k+1".</li>
-        <li><strong>Backbone is good enough</strong> — pretrained on broad transaction data; you do not need representations to fundamentally shift per task.</li>
-      </ul>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
+      <p>
+        Pick L2P when (a) privacy regime forbids storing raw fraud examples (GDPR, right-to-be-forgotten, cross-jurisdiction PII), (b) you have a strong pretrained backbone already (FATA-Trans, TabBERT, FraudFM), (c) drift takes the form of new MO regimes you can label as tasks (BIN attack of October, mule ring of November), (d) you accept that backbone-level feature failures cannot be corrected.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  P["Privacy constraint?"]
+  P -->|Can store raw examples| REPLAY["Replay / ConFL"]
+  P -->|Cannot store raw| Q1{"Have pretrained backbone?"}
+  Q1 -->|No| TRAIN["Train backbone first; revisit"]
+  Q1 -->|Yes| Q2{"Drift forms identifiable tasks?"}
+  Q2 -->|No, continuous drift| EWC2["EWC + DP-SGD"]
+  Q2 -->|Yes, regime tasks| L2P["L2P / DualPrompt"]
+  style L2P fill:#dcfce7,stroke:#16a34a
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <VIS.Callout kind="gotcha" title="Frozen backbone is a ceiling, not a floor">
-        L2P only works when the frozen encoder captures the features needed for all future tasks. If a new fraud regime requires NEW features (e.g. crypto-on-chain signals on a backbone trained on card txns), prompts cannot fix this. You will need either a backbone refresh (which forgets) or a hybrid (backbone + adapter).
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Frozen backbone = systematic feature failures cannot be fixed">
+        If the pretrained backbone has a systematic blind spot (e.g., poor encoding of merchant-category-code mismatches), no amount of new prompts can patch it — prompts modulate, not replace, the backbone's features. L2P pushes the burden upstream: backbone quality is now a hard constraint.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Prompt drift over many tasks">
-        After 50+ tasks, key-query matching becomes ambiguous (many keys cluster). Performance on early tasks degrades silently. Mitigations: hierarchical prompt pools (DualPrompt&apos;s general + expert prompts), or prompt consolidation (merge similar keys).
+      <VIS.Callout kind="gotcha" title="Prompt pool grows monotonically — eventually saturates">
+        Each new fraud regime adds a prompt. After 50+ tasks, the prompt-key space gets crowded: queries no longer cleanly map to one prompt, and the top-K retrieval pulls semi-relevant prompts that interfere. The paper's experiments stop at ~10 tasks; production fraud sees more.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Task identity at inference is implicit">
-        L2P does not need explicit task labels at inference — the key-query match does that. But if the query is ambiguous (an input that looks like both old fraud and new fraud), the prompts you retrieve may be wrong. Run with a confidence threshold on the match score.
+      <VIS.Callout kind="gotcha" title="Key-query collapse: all keys converge">
+        Without a key-diversity regularizer (cosine-orthogonality penalty), gradient updates push keys toward the centroid of frequent query queries. The pool stops discriminating; every input retrieves the same prompts. Symptom: forgetting returns despite the architectural promise.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten traps on prompt-based CL vs replay, GDPR right-to-be-forgotten, and the frozen-backbone ceiling.
+        Strip "L2P" / "DualPrompt" — each correct answer must still hinge on frozen-backbone + query-key-indexed-prompt-pool, not generic "continual learning."
       </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
       <VIS.TrapProblem
-        id="l2p-p1"
+        id="lp-a1"
         difficulty="hard"
-        title="P1 — Replay vs prompt under GDPR right-to-be-forgotten"
-        scenario={<>An EU customer files a GDPR Article 17 request: delete all personal data. Your fraud model was trained with a 50k-example replay buffer that included this user&apos;s past transactions. Compare against an L2P stack with a frozen backbone and 30 task-specific prompts. Which is GDPR-compliant out of the box?</>}
+        title="A1 — L2P vs Experience Replay under GDPR"
+        scenario={<>Your privacy officer says "we cannot store raw fraud examples past 30 days." Pick the discriminator that explains L2P's advantage.</>}
         options={[
-          {key:"a", text:"Replay-based — the buffer is well-defined, you can delete the user&apos;s rows and retrain."},
-          {key:"b", text:"L2P — the prompt pool does not contain raw examples; you cannot identify the user&apos;s contribution to any specific prompt at inference time. But the relevant prompt may still encode the user&apos;s pattern, so you may still need to retrain it. L2P is closer to compliant by design.", correct:true},
-          {key:"c", text:"Both equivalently compliant — both store derived representations."},
-          {key:"d", text:"Neither — any model trained on the user&apos;s data violates GDPR."},
+          {key:"a", text:"Experience Replay stores raw past examples in a buffer to prevent forgetting; that buffer IS PII storage and falls under GDPR retention limits, right-to-be-forgotten, and breach reporting. L2P stores learnable PROMPT VECTORS (abstract embeddings learned over the task) plus learnable KEYS — neither is a record of any individual, neither identifies a customer, neither must be deleted on a right-to-be-forgotten request. Prompts are model parameters; raw examples are data.", correct:true},
+          {key:"b", text:"L2P is faster than Replay."},
+          {key:"c", text:"L2P uses less memory."},
+          {key:"d", text:"Both have the same privacy properties."},
         ]}
-        trap={<>(a) ignores that "delete and retrain" is exactly what GDPR demands and replay makes this expensive. (c) glosses over the storage distinction. (d) misreads GDPR — derived models are usually fine.</>}
-        lens={<>(b). L2P stores no raw examples and the prompts are an indirect representation. Compliance-wise this is much cleaner. But honest answer: a prompt trained on a user&apos;s data may still encode their pattern, so for true Article 17 compliance you retrain the affected prompt(s). Total cost: smaller than full retrain.</>}
-        stretch={<>What is "machine unlearning" and how does it relate?</>}
+        trap={<>(b), (c) are side benefits, not the discriminator. (d) is false.</>}
+        lens={<>The legal distinction is data-vs-parameters. Prompts are derived parameters; raw examples are personal data. The architecture maps onto the regulation.</>}
+        stretch={<>Could a prompt vector still leak PII via membership inference? Defend.</>}
       />
 
       <VIS.TrapProblem
-        id="l2p-p2"
+        id="lp-a2"
         difficulty="medium"
-        title="P2 — Prompt pool size: 10 or 100?"
-        scenario={<>Your fraud regime changes every 2-3 weeks. Over a year you accumulate ~20 distinct task regimes. The L2P paper uses pool size 10 for vision benchmarks (split-CIFAR100). What pool size should you start with?</>}
-        options={[
-          {key:"a", text:"~30-40 — slightly larger than the expected number of regimes, leaving headroom for sub-tasks and key collisions.", correct:true},
-          {key:"b", text:"Exactly 20 — one per regime."},
-          {key:"c", text:"10 — copy the paper&apos;s setting."},
-          {key:"d", text:"500 — more is always better."},
-        ]}
-        trap={<>(b) is the textbook trap — 1:1 mapping ignores that key collisions and sub-task variation need slack. (c) copies a setting tuned for a different domain. (d) makes the key-query match slow and ambiguous.</>}
-        lens={<>(a). Pool size should be 1.5-2x the expected number of distinct tasks. With 20 regimes, start at 30-40 with top-k=2 retrieval, then prune unused prompts after stabilisation. Monitor the key utilisation histogram for collisions.</>}
-        stretch={<>What metric on the prompt pool tells you it&apos;s too small vs too large?</>}
-      />
-
-      <VIS.TrapProblem
-        id="l2p-p3"
-        difficulty="hard"
+        title="A2 — L2P vs DualPrompt"
+        scenario={<>What's the real difference between L2P and DualPrompt?</>}
         multiSelect
-        title="P3 — Frozen backbone fails: which symptoms indicate it?"
-        scenario={<>You deploy L2P on a card-fraud problem. After 8 months of task additions, performance on the latest task plateaus 4 points below what a fresh model can achieve. Which symptoms point to backbone-not-prompt as the bottleneck? Select all that apply.</>}
         options={[
-          {key:"a", text:"New task involves a feature distribution not seen at backbone pretraining (e.g. new BNPL flow features).", correct:true},
-          {key:"b", text:"Even with task labels known at inference, prompt-based prediction underperforms head-only fine-tuning of the same prompts.", correct:true},
-          {key:"c", text:"Performance on old tasks is also degrading."},
-          {key:"d", text:"Prompt pool key entropy is high (good utilisation across keys).", correct:true},
-          {key:"e", text:"Increasing pool size from 30 to 60 does not help.", correct:true},
+          {key:"a", text:"L2P has a single prompt pool; DualPrompt splits into a G-prompt (task-agnostic, always applied) and an E-prompt pool (task-specific, retrieved).", correct:true},
+          {key:"b", text:"The G-prompt encodes domain-general fraud knowledge (e.g., temporal patterns are suspicious); E-prompts encode regime-specific patterns (BIN-attack signature, mule-ring topology).", correct:true},
+          {key:"c", text:"DualPrompt empirically reduces interference when many tasks share underlying structure — common in fraud (most MOs share temporal-burst features).", correct:true},
+          {key:"d", text:"DualPrompt requires labeling tasks at inference; L2P does not."},
         ]}
-        trap={<>(c) points to forgetting, which is a different problem.</>}
-        lens={<>(a)(b)(d)(e) all indicate the backbone is the ceiling. New feature regimes the backbone never saw cannot be rescued by prompts alone. Fix: hybrid with a small adapter layer (LoRA-style) that gets trained per task alongside the prompt.</>}
-        stretch={<>Would you re-pretrain the backbone or hybridise with adapters?</>}
+        trap={<>(d) is backwards — neither requires explicit task ID at inference, both use query-key matching.</>}
+        lens={<>DualPrompt's G/E split is the real innovation: it forces a shared representation for the common substrate while keeping task-specific overrides.</>}
+        stretch={<>When does DualPrompt beat L2P? Defend the regime.</>}
       />
 
       <VIS.TrapProblem
-        id="l2p-p4"
+        id="lp-a3"
         difficulty="hard"
-        title="P4 — Key-query match gives the wrong prompt"
-        scenario={<>An incoming transaction triggers prompt retrieval. Top-1 key match is prompt-7 (old phishing regime), but the input is actually a new BIN-attack pattern (would be best handled by prompt-23, top-2 match). The model misclassifies. What systemic fix?</>}
+        title="A3 — Counterfactual: no L2P / DualPrompt"
+        scenario={<>Without prompt-based CL, what's the strongest privacy-strict fallback for continual fraud?</>}
         options={[
-          {key:"a", text:"Increase top-k from 1 to 3 and average / concatenate retrieved prompts; rely on the classifier head to compose information from multiple regimes.", correct:true},
-          {key:"b", text:"Hard-code task labels at inference; never use key-query matching."},
-          {key:"c", text:"Delete prompt-7 — it must be wrong."},
-          {key:"d", text:"Retrain the backbone."},
+          {key:"a", text:"EWC with DP-SGD: each round trains with Fisher-information regularization (no replay) and the differential-privacy-noised gradients (compositional privacy). Forgetting is partial, privacy is provable, but accumulating regularization terms eventually conflict across many tasks. L2P sidesteps this by FREEZING the backbone, eliminating the conflict.", correct:true},
+          {key:"b", text:"Train from scratch every round."},
+          {key:"c", text:"Replay anyway and hope no one checks."},
+          {key:"d", text:"Stop fraud detection entirely."},
         ]}
-        trap={<>(b) requires task labels you do not have at inference. (c) deletes useful information. (d) is the sledgehammer.</>}
-        lens={<>(a). The L2P paper uses top-N (typically 4-5) prompts with summation. When the top-1 is ambiguous, mixing the top-k forces the head to learn cross-prompt composition. Pair with a confidence-on-match score: when the match is low-confidence, fall back to a default prompt or a rules path.</>}
-        stretch={<>What replaces the key-query match in DualPrompt and why?</>}
+        trap={<>(b) catastrophically forgets. (c) is illegal. (d) is not an alternative.</>}
+        lens={<>EWC + DP-SGD is the honest fallback. L2P's advantage over it is the architectural elimination of regularization conflict.</>}
+        stretch={<>Quantify the privacy budget burned by EWC + DP-SGD over 12 rounds.</>}
       />
 
       <VIS.TrapProblem
-        id="l2p-p5"
-        difficulty="medium"
+        id="lp-a4"
+        difficulty="hard"
+        title="A4 — Stack L2P + replay buffer"
+        scenario={<>You stack L2P with a small replay buffer "for safety." What's the right thinking?</>}
         multiSelect
-        title="P5 — DualPrompt vs L2P: what does the second prompt buy?"
-        scenario={<>DualPrompt extends L2P with two prompt types: G-prompt (general, task-shared) and E-prompt (expert, task-specific). Why?</>}
         options={[
-          {key:"a", text:"G-prompts capture task-invariant features so individual E-prompts can be smaller and more specialised.", correct:true},
-          {key:"b", text:"DualPrompt does not need a key-query match — G-prompt is always used and E-prompt selected by task id.", correct:true},
-          {key:"c", text:"Reduces forgetting on shared features across tasks.", correct:true},
-          {key:"d", text:"Eliminates the need for a backbone."},
-          {key:"e", text:"DualPrompt only works on vision, not tabular data."},
+          {key:"a", text:"You re-introduce the privacy violation that motivated L2P in the first place. If you can replay, you don't need prompts.", correct:true},
+          {key:"b", text:"The two mechanisms are largely redundant: replay protects past tasks via raw data; prompts protect past tasks via frozen-architecture. Stacking adds storage and complexity without architectural gain.", correct:true},
+          {key:"c", text:"Engineering pragmatism: a 30-day rolling replay (within GDPR retention) plus permanent prompts gives both fast recovery from recent drift AND long-term task memory. Hybrid is legit but only with careful retention controls.", correct:true},
+          {key:"d", text:"You cannot combine them."},
         ]}
-        trap={<>(d) misreads the architecture. (e) is false; tabular adaptations exist.</>}
-        lens={<>(a)(b)(c). The G/E split is just the realisation that some learning IS task-shared and some isn&apos;t. By giving each a separate prompt, you stop fighting the trade-off. The cost is more hyperparameters.</>}
-        stretch={<>How do you initialise G-prompt — random or from L2P&apos;s top-k average?</>}
+        trap={<>(d) is too strong — pragmatic hybrids exist.</>}
+        lens={<>The combination only makes sense if you split timescales (short-term replay + long-term prompts). Otherwise it's complexity for nothing.</>}
+        stretch={<>Sketch the retention policy for the hybrid.</>}
       />
 
       <VIS.TrapProblem
-        id="l2p-p6"
+        id="lp-a5"
         difficulty="hard"
-        title="P6 — Replay buffer with synthetic data instead of real"
-        scenario={<>An alternative to L2P: keep replay-based CL but use synthetic / generated fraud examples instead of real ones, satisfying GDPR. Compare to L2P for a card-fraud detector.</>}
+        title="A5 — Where L2P stops winning"
+        scenario={<>At what task count does L2P's advantage over EWC vanish?</>}
         options={[
-          {key:"a", text:"Synthetic replay only works if the generator captures the true fraud distribution; in adversarial fraud the distribution evolves and the generator lags. L2P&apos;s frozen-backbone-plus-prompt is more robust because it learns directly from real new tasks without needing to model the data distribution.", correct:true},
-          {key:"b", text:"Synthetic replay is strictly better — no privacy risk."},
-          {key:"c", text:"Both equivalent — synthetic data is real for training purposes."},
-          {key:"d", text:"Synthetic replay is the only GDPR-compliant solution."},
+          {key:"a", text:"Beyond ~30-50 tasks the prompt pool gets crowded enough that query-key matching no longer cleanly retrieves the right prompts; interference returns. EWC's degradation is smoother — it has its own conflict accumulation but no pool-saturation cliff. The crossover regime depends on key dimensionality, regularizer strength, and task similarity.", correct:true},
+          {key:"b", text:"L2P always wins."},
+          {key:"c", text:"L2P wins only at 1 task."},
+          {key:"d", text:"At exactly 100 tasks."},
         ]}
-        trap={<>(b)(d) treat synthetic data as a privacy panacea. (c) ignores distribution-gap issues.</>}
-        lens={<>(a). Synthetic data has its place but the generator is itself a model that must be kept current — meta-problem. L2P avoids the generator entirely.</>}
-        stretch={<>When would you use synthetic data alongside L2P?</>}
+        trap={<>(b), (c), (d) miss the saturation argument.</>}
+        lens={<>L2P's win has a finite horizon set by prompt-pool capacity. After saturation, you either prune (forget) or grow (cost).</>}
+        stretch={<>What's your pool-pruning policy?</>}
       />
 
-      <VIS.TrapProblem
-        id="l2p-p7"
-        difficulty="hard"
-        title="P7 — Task identity not given: how do you split into tasks?"
-        scenario={<>The L2P paper assumes a stream of clearly-bounded tasks. In production fraud, drifts are continuous — there is no obvious "task k boundary". How do you bootstrap L2P?</>}
-        options={[
-          {key:"a", text:"Use an unsupervised drift detector (ADWIN on feature embeddings) to declare a new task each time it fires; create a new prompt at that moment.", correct:true},
-          {key:"b", text:"Calendar-based: declare a new task every 2 weeks."},
-          {key:"c", text:"L2P cannot work without explicit task labels — switch to a different approach."},
-          {key:"d", text:"Use the LLM to label tasks based on incident descriptions."},
-        ]}
-        trap={<>(b) is the brittle textbook fallback. (c) gives up too early. (d) is over-engineered and depends on incident descriptions you may not have.</>}
-        lens={<>(a). Pair a drift detector with L2P&apos;s prompt creation. When ADWIN/DDM fires, you have your task boundary; create a new prompt. This is exactly the composability L2P enables — and ties back to the DDM/ADWIN visual.</>}
-        stretch={<>What if drift detector and prompt creation get out of sync?</>}
-      />
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="l2p-p8"
+        id="lp-b1"
         difficulty="medium"
-        title="P8 — Prompt size: how many vectors per prompt?"
-        scenario={<>Each "prompt" is a sequence of small learnable vectors (e.g. 5-20 vectors of dimension 768). What governs the choice of length per prompt?</>}
+        title="B1 — Pick the right tool for THIS scenario"
+        scenario={<>Scenario: EU-only card-fraud model, GDPR right-to-be-forgotten enforced (raw transactions auto-purged after 30 days), 12 distinct MO regimes labeled per year by fraud-ops, pretrained FATA-Trans backbone available. What architecture do you pick?</>}
         options={[
-          {key:"a", text:"Longer prompts have more capacity but train slower and risk overfitting on small per-task data; choose by data-budget per task and validate on holdout.", correct:true},
-          {key:"b", text:"Always 5 — the original paper&apos;s setting."},
-          {key:"c", text:"Length should equal the backbone&apos;s sequence length."},
-          {key:"d", text:"One vector per class."},
+          {key:"a", text:"DualPrompt with FATA-Trans as the frozen backbone. The pretrained backbone gives the substrate; the G-prompt encodes shared fraud-temporal structure; per-MO E-prompts let each regime be learned without storing examples past 30 days. The 12-regimes-per-year horizon stays well below pool saturation.", correct:true},
+          {key:"b", text:"ConFL with full replay."},
+          {key:"c", text:"DLRM trained from scratch each month."},
+          {key:"d", text:"Pure EWC with no backbone freeze."},
         ]}
-        trap={<>(b) is copy-paste from the paper without re-tuning. (c) confuses prompt length with input length. (d) misreads how prompts work.</>}
-        lens={<>(a). Prompt length is a capacity knob. For small per-task fraud data (a few thousand examples) 5-10 vectors per prompt is typical. Tune as you would any hyperparameter — wider with more data, narrower with less.</>}
-        stretch={<>What is "prefix tuning" and how does it differ from prompt tuning?</>}
+        trap={<>(b) violates GDPR. (c) catastrophically forgets. (d) accumulates regularization conflicts.</>}
+        lens={<>Scenario forces DualPrompt: privacy constraint, pretrained backbone, identifiable tasks, manageable count.</>}
+        stretch={<>What if regimes were 100/year? Defend revised choice.</>}
       />
 
       <VIS.TrapProblem
-        id="l2p-p9"
+        id="lp-b2"
         difficulty="hard"
-        title="P9 — Combined L2P + rules engine for cold start"
-        scenario={<>You have an L2P fraud detector with 12 prompts learned over 6 months. A new geography onboards. Day-1 you have no labels, no prompt. Architecture?</>}
+        title="B2 — 'Sounds reasonable' — bigger prompt pool"
+        scenario={<>A teammate says "we have 20 tasks, let's set pool size N=200 for headroom." Why is this specifically wrong?</>}
         options={[
-          {key:"a", text:"Inference on the new geo falls back to a rules engine; in parallel, label a small bootstrap set from rules-engine outputs and train a new prompt; switch over once the new prompt validates on a holdout.", correct:true},
-          {key:"b", text:"Use the closest existing prompt by key match."},
-          {key:"c", text:"Train a backbone refresh; L2P is unsuitable for cold start."},
-          {key:"d", text:"Average all existing prompts."},
+          {key:"a", text:"With N=200 keys and only 20 tasks, the top-K matching becomes noisier — many key-prompt pairs are barely-used, gradient updates on their keys are sparse and high-variance, and the queries start matching ill-fitted prompts. Empirically L2P performance degrades when N >> tasks. The right rule of thumb is N ≈ 1.5x to 3x expected task count.", correct:true},
+          {key:"b", text:"Bigger pool always helps."},
+          {key:"c", text:"N has no effect."},
+          {key:"d", text:"N=200 breaks gradient flow."},
         ]}
-        trap={<>(b) is a reasonable interim but unsafe at scale — the closest prompt may be totally inappropriate. (c) is over-correction. (d) blurs all knowledge into one prompt.</>}
-        lens={<>(a). Production CL stacks always have a rules-engine fallback for cold start. L2P&apos;s prompt training is fast and data-efficient, so you can stand up a new prompt within days.</>}
-        stretch={<>How would you know when to switch from rules to the new prompt?</>}
+        trap={<>(b), (c), (d) miss the under-utilized-prompts pathology.</>}
+        lens={<>Pool size is a goldilocks knob — too small under-fits new tasks, too large dilutes retrieval. Tune to task count, not to "headroom."</>}
+        stretch={<>What's your pool-grow policy when a new task arrives?</>}
       />
 
       <VIS.TrapProblem
-        id="l2p-p10"
-        difficulty="medium"
-        title="P10 — Forgetting check: how do you verify?"
-        scenario={<>You claim L2P avoids catastrophic forgetting. To prove it, you need to measure performance on OLD tasks after training new ones. But you cannot store the old examples (the whole point of L2P). What do you do?</>}
+        id="lp-b3"
+        difficulty="hard"
+        title="B3 — Pitch L2P to the legal team"
+        scenario={<>Your CPO asks "Why prompt-based CL over EWC?" Pick the pitch that requires understanding L2P's specific mechanism.</>}
         options={[
-          {key:"a", text:"Keep a small private evaluation set per task (NOT used for training) that is approved for retention under your compliance framework; measure on it after each new task.", correct:true},
-          {key:"b", text:"You cannot — that&apos;s the trade-off."},
-          {key:"c", text:"Use synthetic data to evaluate."},
-          {key:"d", text:"Compare to a held-out fresh distribution."},
+          {key:"a", text:"Our right-to-be-forgotten obligation requires that customer data be deleted within 30 days of request. EWC requires retaining the FISHER INFORMATION matrix derived from past data — auditable as derived data and potentially subject to deletion. L2P trains a small pool of PROMPT VECTORS keyed by learned QUERIES; neither references nor encodes any individual customer; deleting a customer's record affects no prompt. The architecture is the legal answer to a data-architecture problem.", correct:true},
+          {key:"b", text:"L2P is faster."},
+          {key:"c", text:"Transformers are state of the art."},
+          {key:"d", text:"It's the latest paper."},
         ]}
-        trap={<>(b) gives up too easily. (c) puts the generator quality on the critical path. (d) measures different distribution, not old-task perf.</>}
-        lens={<>(a). Evaluation sets under retention agreement are standard in regulated ML. They are smaller and segregated from training; lawful basis is "evaluation of automated decision-making" under GDPR Recital 71.</>}
-        stretch={<>How big does the per-task eval set need to be to give a confidence interval of ±1 F1 point?</>}
+        trap={<>(b), (c), (d) miss the legal-architecture argument.</>}
+        lens={<>The concept-specific pitch names the data-vs-parameters distinction and how L2P's pool structure maps cleanly onto deletion guarantees.</>}
+        stretch={<>What's the audit story when a customer requests deletion?</>}
       />
+
+      <VIS.TrapProblem
+        id="lp-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use L2P"
+        scenario={<>Which scenarios are L2P anti-patterns?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Backbone is poor — pretrained on a domain that doesn't transfer (e.g., text BERT applied to high-cardinality tabular fraud features without fine-tuning).", correct:true},
+          {key:"b", text:"Drift is continuous and unsegmentable — no clear 'tasks' to learn distinct prompts for.", correct:true},
+          {key:"c", text:"Privacy is not constrained — replay-based CL is simpler and stronger.", correct:true},
+          {key:"d", text:"GDPR-restricted EU model with monthly MO regimes and a strong pretrained backbone."},
+        ]}
+        trap={<>(d) is the regime L2P was built for.</>}
+        lens={<>Three anti-patterns: poor backbone, no task boundaries, no privacy constraint. Each suggests a different baseline (fine-tune backbone first; EWC-only; replay).</>}
+        stretch={<>How do you decide if your drift is taskable?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      <VIS.TrapProblem
+        id="lp-c1"
+        difficulty="hard"
+        title="C1 — Why frozen backbone?"
+        scenario={<>Why does L2P freeze the backbone instead of fine-tuning with regularization?</>}
+        options={[
+          {key:"a", text:"Freezing is the PRIVACY guarantee: a frozen backbone is bit-stable across rounds, so the model parameters at time T+1 are derivable from time T's parameters plus the new prompt — there is no path by which past data can influence backbone weights after their pretraining. A regularized backbone STILL receives gradients from current data, so any privacy claim must depend on regularization strength (probabilistic), not architecture (deterministic).", correct:true},
+          {key:"b", text:"Freezing is faster."},
+          {key:"c", text:"Freezing uses less memory."},
+          {key:"d", text:"Freezing is a side effect."},
+        ]}
+        trap={<>(b), (c) are side benefits. (d) misses the design intent.</>}
+        lens={<>The freeze is the legal guarantee. Soft-regularization-based privacy is harder to defend in an audit.</>}
+        stretch={<>What audit artifact proves the freeze is honored?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-c2"
+        difficulty="medium"
+        title="C2 — Key-query loss design"
+        scenario={<>L2P's training loss has a pull-keys-toward-queries term. What does it specifically achieve?</>}
+        options={[
+          {key:"a", text:"It encourages each selected key to ALIGN with the input queries that match it during training, making the retrieval more confident over time. Without it, keys would only update through the downstream classification loss (slow and indirect) and the retrieval would never reliably pick the right prompt.", correct:true},
+          {key:"b", text:"It replaces the classification loss."},
+          {key:"c", text:"It only reduces parameter count."},
+          {key:"d", text:"It is unused in practice."},
+        ]}
+        trap={<>(b), (c), (d) miss the role.</>}
+        lens={<>The key-query pull is the RETRIEVAL signal — without it, the prompt pool would never learn which prompt belongs where.</>}
+        stretch={<>What happens when the pull weight is too high?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-c3"
+        difficulty="hard"
+        title="C3 — What L2P drops vs full fine-tuning"
+        scenario={<>What does L2P drop relative to full fine-tuning?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Backbone parameter updates — frozen.", correct:true},
+          {key:"b", text:"Per-task fine-tune cycles — replaced by per-task prompt updates only.", correct:true},
+          {key:"c", text:"Replay buffer — replaced by prompt pool.", correct:true},
+          {key:"d", text:"The classification head."},
+        ]}
+        trap={<>(d) is retained (and may also stay frozen or be small per-task).</>}
+        lens={<>Three drops: backbone updates, full fine-tunes, replay buffer. The architecture replaces all three with a prompt pool.</>}
+        stretch={<>Which drop most reduces forgetting?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-c4"
+        difficulty="hard"
+        title="C4 — Which knob, mis-set, breaks L2P?"
+        scenario={<>Rank by operational sensitivity: (i) pool size N, (ii) top-K retrieval, (iii) prompt length, (iv) key dimensionality.</>}
+        options={[
+          {key:"a", text:"(i) Pool size N > (ii) top-K > (iv) key dim > (iii) prompt length. Pool size sets the saturation horizon; top-K controls interference (too high = mixed prompts retrieved); key dim controls retrieval cleanness; prompt length is secondary.", correct:true},
+          {key:"b", text:"Prompt length dominates."},
+          {key:"c", text:"All equally important."},
+          {key:"d", text:"Top-K is irrelevant."},
+        ]}
+        trap={<>(b), (c), (d) miss the operational sensitivity.</>}
+        lens={<>For L2P, the retrieval-control knobs (N and K) matter more than the prompt-internal ones.</>}
+        stretch={<>How do you tune N and K jointly?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-c5"
+        difficulty="medium"
+        title="C5 — Data-assumption: tasks are identifiable"
+        scenario={<>L2P assumes inputs naturally cluster into tasks the query-key system can separate. What if fraud MOs blend smoothly into each other (no clear regime boundary)?</>}
+        options={[
+          {key:"a", text:"Without identifiable clusters, query vectors form a continuum, top-K retrieval pulls a mixture of vaguely-related prompts each step, and per-prompt learning signal degrades. Performance approaches naive fine-tuning. The fix is either explicit task labels at training time (relaxes L2P's task-agnostic-inference claim) or a clustering preprocessor that creates discrete regimes.", correct:true},
+          {key:"b", text:"L2P degrades gracefully with no fix needed."},
+          {key:"c", text:"L2P refuses to train on continuous drift."},
+          {key:"d", text:"Continuous drift has no effect on L2P."},
+        ]}
+        trap={<>(b), (c), (d) miss the continuum failure mode.</>}
+        lens={<>L2P needs separable tasks. Continuous drift breaks the retrieval design. Fix: cluster first, or use EWC.</>}
+        stretch={<>What's the smallest task count at which L2P is justified over EWC?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      <VIS.TrapProblem
+        id="lp-d1"
+        difficulty="medium"
+        title="D1 — 'Frozen = no learning'"
+        scenario={<>A junior says "if the backbone is frozen, the model can't actually learn new patterns." Where does this break?</>}
+        options={[
+          {key:"a", text:"Learning happens entirely in the prompt pool and the head. A prompt vector — though small — gets prepended to backbone inputs / hidden states, modulating the attention and MLP computations along the way. Empirically a 5-token prompt can change downstream behavior substantially. The backbone is a powerful FROZEN SUBSTRATE; the prompts choreograph it.", correct:true},
+          {key:"b", text:"Frozen means no learning is possible."},
+          {key:"c", text:"Prompts cannot change behavior."},
+          {key:"d", text:"L2P uses no gradients."},
+        ]}
+        trap={<>(b), (c), (d) all misunderstand prompt-tuning.</>}
+        lens={<>Prompts are NOT decorative — they steer the frozen backbone through its existing capability space. Learning lives in the modulators, not the substrate.</>}
+        stretch={<>What's the smallest prompt size that still works?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-d1b"
+        difficulty="hard"
+        title="D1b — 'Prompts are private — no PII risk'"
+        scenario={<>Junior: "Prompts are just learned vectors; they cannot leak PII." Where can this break?</>}
+        options={[
+          {key:"a", text:"Membership inference: an attacker who can query the model can test whether specific past examples were in the task that trained a given prompt. If the prompt sharply distinguishes 'in-distribution' vs 'out' for one MO regime, the attacker can infer that a borderline transaction belonged to that training task — and by extension, that the corresponding customer was in the dataset. Prompts ARE parameters, but they CAN leak via membership inference. DP-noise on prompt gradients is the standard mitigation.", correct:true},
+          {key:"b", text:"Prompts have no PII risk."},
+          {key:"c", text:"Prompts are encrypted."},
+          {key:"d", text:"Only raw data leaks."},
+        ]}
+        trap={<>(b), (c), (d) miss the membership-inference channel.</>}
+        lens={<>Privacy-by-architecture is necessary, not sufficient. DP-noise on prompt training is the second layer.</>}
+        stretch={<>Sketch the DP-SGD budget for prompt training.</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: ignore backbone quality"
+        scenario={<>You assume "any backbone will do — prompts compensate." Trace the production cascade.</>}
+        options={[
+          {key:"a", text:"Weak backbone → backbone features fail to discriminate the relevant fraud signal (e.g., merchant-category embedding lacks the resolution needed) → prompts try but cannot synthesize features the backbone never represents → per-task AUPRC stays low across all tasks → team adds more prompts → no improvement → root cause is the backbone, not the prompt design. Fix is upstream: fine-tune backbone on a wide-fraud corpus, THEN freeze.", correct:true},
+          {key:"b", text:"Any backbone is fine."},
+          {key:"c", text:"More prompts always fix it."},
+          {key:"d", text:"L2P does not need a backbone."},
+        ]}
+        trap={<>(b), (c), (d) deny the backbone dependency.</>}
+        lens={<>Backbone quality is the upper bound on L2P performance. Prompts modulate; they cannot synthesize missing features.</>}
+        stretch={<>What's your backbone-quality acceptance test before freezing?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior diagnostic"
+        scenario={<>Junior: "L2P beats EWC by 3 AUPRC on our continual benchmark." Senior question?</>}
+        options={[
+          {key:"a", text:"'Did the EWC baseline use the SAME frozen backbone as L2P? Most published L2P comparisons use a smaller backbone for EWC because EWC fine-tunes everything and a giant backbone is impractical to fine-tune fairly. Equalize the backbone, then compare. Also: what's per-task AUPRC over the last K tasks? L2P's wins often come from task 1 and task 2; later tasks degrade as the pool saturates.'", correct:true},
+          {key:"b", text:"'Ship it.'"},
+          {key:"c", text:"'Try more heads.'"},
+          {key:"d", text:"'Use FP16.'"},
+        ]}
+        trap={<>(b), (c), (d) skip the protocol.</>}
+        lens={<>The senior probes (i) backbone parity in the EWC baseline and (ii) per-task degradation, not just aggregate.</>}
+        stretch={<>What ablation isolates pool size from key-query learning?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: prompt collapse"
+        scenario={<>L2P's per-task AUPRC declines after task 15 although no MO repeats. Causes: (i) data quality drift, (ii) key-query collapse, (iii) pool saturation, (iv) backbone degradation. Most likely?</>}
+        options={[
+          {key:"a", text:"(ii) Key-query collapse OR (iii) pool saturation. Without a key-orthogonality regularizer, the keys drift toward the query centroid; retrieval picks similar prompts regardless of task. Diagnose by measuring pairwise cosine of learned keys — if it has risen toward 1, you have collapse. Fix: cosine-orthogonality penalty in the loss.", correct:true},
+          {key:"b", text:"(i) Data quality."},
+          {key:"c", text:"(iv) Backbone degradation."},
+          {key:"d", text:"Random fluctuation."},
+        ]}
+        trap={<>(b), (c), (d) miss the L2P-specific failure.</>}
+        lens={<>Key collapse is a SILENT failure mode — performance drops without any error sign. Monitor pairwise key cosines as a diagnostic.</>}
+        stretch={<>Design the key-orthogonality regularizer term.</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>E. Operations</h3>
+
+      <VIS.TrapProblem
+        id="lp-e1"
+        difficulty="hard"
+        title="E1 — L2P-specific gotcha"
+        scenario={<>Pick the gotcha most specific to L2P (would not bite EWC or Replay):</>}
+        options={[
+          {key:"a", text:"Key-collapse: keys drift toward the centroid of frequent queries, the retrieval stops discriminating, and forgetting returns despite the frozen backbone. Monitor pairwise key cosine; add cosine-orthogonality regularizer; reset collapsed keys.", correct:true},
+          {key:"b", text:"GPU memory."},
+          {key:"c", text:"Cold-start models."},
+          {key:"d", text:"Slow inference."},
+        ]}
+        trap={<>(b), (c), (d) are generic.</>}
+        lens={<>Key collapse is L2P's signature failure — and it's silent until performance drops. Diagnose with pairwise cosines.</>}
+        stretch={<>What's the early-warning threshold on key cosine?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-e2"
+        difficulty="hard"
+        title="E2 — Friday: task-15 AUPRC drops"
+        scenario={<>Friday: task-15 (just trained) AUPRC = 0.62; task-1 (trained 14 months ago) AUPRC also = 0.62. What's going on?</>}
+        options={[
+          {key:"a", text:"Pool has saturated AND/OR keys have collapsed. Diagnose: (i) measure pairwise key cosine — should be near 0 with orthogonality; if rising toward 1, collapse. (ii) Visualize top-K retrieval for current vs past inputs — if both retrieve the same prompts, retrieval is broken. Fix: add orthogonality regularizer, prune dead prompts, optionally reset the most-collapsed key/prompt pair.", correct:true},
+          {key:"b", text:"Random fluctuation."},
+          {key:"c", text:"Backbone drift."},
+          {key:"d", text:"GPU failure."},
+        ]}
+        trap={<>(b), (c), (d) miss the L2P diagnostic.</>}
+        lens={<>Key-cosine and retrieval-overlap are L2P's vital signs. Monitor both.</>}
+        stretch={<>What's the dashboard you would build for these signals?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-e3"
+        difficulty="hard"
+        title="E3 — Eval-protocol audit"
+        scenario={<>Which findings invalidate an L2P-beats-Replay benchmark?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Replay baseline used a tiny buffer (10 examples per task) when GDPR allows 30-day retention (much larger buffer).", correct:true},
+          {key:"b", text:"Pool size was tuned on test tasks.", correct:true},
+          {key:"c", text:"Backbone was pretrained on the eval distribution, leaking signal.", correct:true},
+          {key:"d", text:"AUPRC was the metric."},
+        ]}
+        trap={<>(d) is fine.</>}
+        lens={<>Three audits: sandbagged replay, in-sample tuning, leaky backbone. All common in privacy-CL papers.</>}
+        stretch={<>What's the right replay-buffer size for parity?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-e4"
+        difficulty="medium"
+        title="E4 — Rollout sequence"
+        scenario={<>Order: (i) full cutover, (ii) shadow vs Replay (parity backbone), (iii) traffic ramp with key-collapse monitoring, (iv) backbone-quality acceptance.</>}
+        options={[
+          {key:"a", text:"iv → ii → iii → i. Backbone quality first (everything else depends on it); shadow parity to verify wins; ramp with key-monitoring guards. Cutover only after months.", correct:true},
+          {key:"b", text:"i first."},
+          {key:"c", text:"iii → i."},
+          {key:"d", text:"ii → i."},
+        ]}
+        trap={<>(b), (c), (d) skip backbone gating or monitoring.</>}
+        lens={<>Backbone is the critical input. Rollout sequence respects the dependency.</>}
+        stretch={<>What's the backbone-acceptance test in your stack?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-e5"
+        difficulty="medium"
+        title="E5 — Reproducibility"
+        scenario={<>Which L2P / DualPrompt reproducibility issues bite teams?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Exact backbone checkpoint is rarely shared in industry adaptations.", correct:true},
+          {key:"b", text:"Key-pulling loss weight (lambda for the cosine-pull term) is not always reported.", correct:true},
+          {key:"c", text:"Whether prompts are prepended at input or hidden state varies across implementations.", correct:true},
+          {key:"d", text:"L2P does not run on GPUs."},
+        ]}
+        trap={<>(d) is false.</>}
+        lens={<>Three reproducibility holes: backbone provenance, loss weights, prompt insertion point. All silently affect results.</>}
+        stretch={<>What's your minimum-viable reproducibility checklist?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination"
+        scenario={<>Which contamination paths affect L2P claims?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Backbone pretraining set overlapped the continual-eval task distribution (leakage).", correct:true},
+          {key:"b", text:"Task ordering chosen to favor L2P (similar tasks grouped; the easy regime).", correct:true},
+          {key:"c", text:"Replay baseline given a sandbagged buffer size.", correct:true},
+          {key:"d", text:"L2P is too new to evaluate."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three contamination paths: backbone leakage, task-ordering bias, sandbagged replay. The first is hardest to detect.</>}
+        stretch={<>How would you audit backbone provenance?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>F. Failure modes & edge cases</h3>
+
+      <VIS.TrapProblem
+        id="lp-f1"
+        difficulty="hard"
+        title="F1 — Smallest input that breaks L2P"
+        scenario={<>Construct the smallest scenario where L2P provably under-performs naive fine-tuning.</>}
+        options={[
+          {key:"a", text:"A single task (no continual constraint). With one task, the frozen-backbone restriction has no upside (no forgetting to prevent) and only the downside (cannot fix backbone limitations). Naive fine-tuning wins on parameter efficiency and final accuracy. L2P's value vanishes at T=1.", correct:true},
+          {key:"b", text:"A 100-event stream."},
+          {key:"c", text:"A graph with one node."},
+          {key:"d", text:"L2P always wins."},
+        ]}
+        trap={<>(b), (c), (d) miss the T=1 degenerate.</>}
+        lens={<>L2P's value scales with task count. At T=1, the architecture imposes overhead without benefit.</>}
+        stretch={<>What's the minimum task count to justify L2P?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: pollute the prompt pool"
+        scenario={<>Design an attack on L2P.</>}
+        options={[
+          {key:"a", text:"Inject adversarial 'fraud examples' whose embeddings cluster near multiple existing keys, then submit a 'new task' that bundles those examples. The prompt pool either (i) misclassifies them as belonging to existing prompts (forgetting attack — adversary's pattern bleeds into old prompts) or (ii) trains a new prompt that overlaps multiple existing ones (key-collapse acceleration). Defense: outlier-detection on incoming queries; cosine-orthogonality regularizer; reject task batches with high-overlap query distributions.", correct:true},
+          {key:"b", text:"Feature perturbation only."},
+          {key:"c", text:"No attack possible."},
+          {key:"d", text:"Increase fraud volume."},
+        ]}
+        trap={<>(b), (c), (d) miss the pool-injection surface.</>}
+        lens={<>The pool is the attack surface — an adversary who controls task submission can shape retrieval.</>}
+        stretch={<>How would you gate task admission to the pool?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-f4"
+        difficulty="medium"
+        title="F4 — Paper-admitted limitation"
+        scenario={<>Which limitation does the L2P paper itself acknowledge?</>}
+        options={[
+          {key:"a", text:"The pool's retrieval depends on the backbone's representation quality — a poor backbone makes the query embedding uninformative, degrading retrieval. The paper notes that L2P assumes a strong pretrained backbone (ViT-B/16 in vision); the assumption is doing more work than the abstract suggests.", correct:true},
+          {key:"b", text:"L2P works for all backbones equally."},
+          {key:"c", text:"L2P has no limitations."},
+          {key:"d", text:"L2P requires CPU only."},
+        ]}
+        trap={<>(b), (c), (d) miss the paper's honest caveat.</>}
+        lens={<>L2P inherits backbone dependence. Knowing this signals careful reading.</>}
+        stretch={<>What's the backbone-quality threshold below which L2P is wrong?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-f5"
+        difficulty="hard"
+        title="F5 — Fair-eval critique"
+        scenario={<>What does fair-eval find about L2P vs simpler privacy-CL baselines?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"On few (~5) tasks with a strong backbone, L2P matches EWC + DP-SGD; the architectural advantage is small.", correct:true},
+          {key:"b", text:"On many (20+) tasks, L2P's advantage grows because EWC's regularization terms conflict, but only until pool saturation kicks in.", correct:true},
+          {key:"c", text:"The 'L2P beats Replay' claim depends critically on the Replay buffer size used; with a 30-day-retention buffer (allowable under GDPR), Replay closes much of the gap.", correct:true},
+          {key:"d", text:"L2P always wins."},
+        ]}
+        trap={<>(d) overstates.</>}
+        lens={<>Regime-dependent: few tasks ≈ EWC; many tasks (pre-saturation) L2P; allowable-Replay closes gaps. Honest reporting includes the regime.</>}
+        stretch={<>What's the task-count crossover with EWC?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lp-f5b"
+        difficulty="hard"
+        title="F5b — The interview gold question"
+        scenario={<>Interviewer: "You championed DualPrompt for our GDPR fraud model. Walk me through the ablation that proves the win is from the architecture, not from the backbone."</>}
+        options={[
+          {key:"a", text:"Built four baselines under temporal continual eval with leave-one-task-out cross-validation: (i) naive fine-tune (catastrophic forgetting baseline), (ii) EWC with same frozen backbone (FATA-Trans), (iii) Replay with GDPR-allowable 30-day buffer + same backbone, (iv) DualPrompt with same backbone. Also varied backbone (FATA-Trans vs raw transformer) to isolate backbone contribution. Reported per-task AUPRC AND key-cosine trajectory to detect pool saturation. DualPrompt beat EWC by 1.4 and Replay by 0.6 — small wins that justify ONLY because of the legal architecture, not raw accuracy.", correct:true},
+          {key:"b", text:"Compared DualPrompt to naive fine-tune (which forgets) and won by 8 points; shipped."},
+          {key:"c", text:"Transformers always win."},
+          {key:"d", text:"Compared with a basic backbone."},
+        ]}
+        trap={<>(b), (c), (d) skip rigorous ablation.</>}
+        lens={<>The right ablation isolates backbone contribution from architecture contribution, with backbone-matched baselines.</>}
+        stretch={<>If EWC matched DualPrompt at par AUPRC, would you ship DualPrompt? Defend.</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/2112.08654" target="_blank" rel="noopener">
-            <strong>Wang et al. — Learning to Prompt for Continual Learning (L2P)</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2112.08654" target="_blank" rel="noopener"><strong>Wang et al. — Learning to Prompt for Continual Learning (L2P)</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, CVPR 2022)</span>
-          <br/>The original L2P paper. Read sections 3 (method) and 4.3 (ablations on pool size, top-k, prompt length).
+          <br/>The original. Section 3 (algorithm), Section 4 (query-key match), Section 5 (experiments). The "Discussion" section is honest about backbone dependence.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2204.04799" target="_blank" rel="noopener">
-            <strong>Wang et al. — DualPrompt</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2204.04799" target="_blank" rel="noopener"><strong>Wang et al. — DualPrompt</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, ECCV 2022)</span>
-          <br/>The G-prompt / E-prompt split. Pair with L2P to see the design evolution.
+          <br/>G-prompt + E-prompts. The G/E split is what makes DualPrompt beat L2P on tasks that share substrate.
         </li>
         <li>
-          <a href="https://lilianweng.github.io/posts/2022-02-20-active-learning/" target="_blank" rel="noopener">
-            <strong>Lilian Weng — Active Learning &amp; Continual Learning</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Surveys the full CL landscape — replay, regularisation, parameter-isolation, prompt-based. Best single read to place L2P in context.
+          <a href="https://arxiv.org/abs/2107.13586" target="_blank" rel="noopener"><strong>Liu et al. — Pre-train, Prompt, Predict</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(survey, 2021)</span>
+          <br/>The broader prompt-learning landscape. Helps situate L2P in the NLP→CL transfer.
         </li>
         <li>
-          <a href="https://github.com/G-U-N/PyCIL" target="_blank" rel="noopener">
-            <strong>PyCIL — Python Class-Incremental Learning toolbox</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(library)</span>
-          <br/>Reference implementations of L2P, DualPrompt, iCaRL, GEM, A-GEM under a common API. Run the head-to-heads before committing to one approach.
+          <a href="https://arxiv.org/abs/2306.07664" target="_blank" rel="noopener"><strong>Smith et al. — Continual Learning of Diffusion Models with Generative Distillation</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, 2023)</span>
+          <br/>Useful counter-evidence: when generative replay beats prompt-based CL on tasks with rich shared structure.
         </li>
         <li>
-          <a href="https://gdpr-info.eu/art-17-gdpr/" target="_blank" rel="noopener">
-            <strong>GDPR Article 17 — Right to be forgotten (official text)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(reference)</span>
-          <br/>Read this once before designing the CL architecture. Recital 71 is the relevant note on automated decision-making.
+          <a href="https://www.continualai.org/" target="_blank" rel="noopener"><strong>ContinualAI Wiki</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(community resource)</span>
+          <br/>The clearest taxonomy of CL methods (replay, regularization, parameter-isolation) — L2P lives in parameter-isolation, with prompt-pool as the isolation unit.
         </li>
       </ul>
     </VIS.Section>
   </main>
 );
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
 
 </script>
   <script>
