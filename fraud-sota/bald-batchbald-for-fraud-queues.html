@@ -1656,17 +1656,17 @@ flowchart TB
       <VIS.TrapProblem
         id="bald-p7"
         difficulty="hard"
-        title="P7 — AUC 0.78 → 0.91 across 6 BALD rounds. Real or contamination?"
-        scenario={<><em>Discriminating insight: AL-acquired cases are systematically harder; merging them into eval upward-shifts the eval distribution's difficulty in a way real-population AUC won't reproduce.</em><br/><br/>BatchBALD for 6 cycles. Held-out AUC went 0.78 → 0.91. Held-out set was a random 20% pre-AL, but the team has been adding BatchBALD-labeled cases to BOTH train and eval over the rounds. Diagnose.</>}
+        title="P7 — BatchBALD propensity reweighting: why marginal-MI propensities blow up at large batch K."
+        scenario={<><em>Discriminating insight: BatchBALD's acquisition propensity for case i in batch B is governed by joint MI, not marginal BALD(x_i); using marginal-MI propensities to inverse-weight gives an importance-weight variance that explodes when batch size K grows relative to pool size N (joint-MI selects diverse batches, so marginals undercount the chance the case appears in any batch).</em><br/><br/>You want Horvitz-Thompson reweighting to fix train-set bias from BatchBALD. Engineer A: use marginal BALD(x_i) as the propensity. Engineer B: use the joint-MI inclusion probability of x_i in batch B. K=512, pool N=200k. Pick the BatchBALD-specific concern.</>}
         options={[
-          {key:"a", text:"AUC=0.91 is realistic; ship."},
-          {key:"b", text:"The held-out set is fine; AL only adds to train, not eval."},
-          {key:"c", text:"Eval was contaminated by AL labels. BatchBALD selects cases with high model uncertainty (systematically harder than random); merging them into eval shifts the eval distribution to harder-than-population, AND introduces train/eval correlation. AUC is unreliable both ways.", correct:true},
-          {key:"d", text:"AUC sample size is too small to be reliable at 20% holdout."},
+          {key:"a", text:"Either propensity is fine — they're proportional."},
+          {key:"b", text:"BatchBALD's diversity penalty makes the joint-MI inclusion probability for x_i in batch B DIFFER from marginal BALD(x_i) by a redundancy-correction term. As K/N grows, the marginal-vs-joint gap grows; using marginal-MI propensities in IPW gives importance weights with unbounded variance (some cases have near-zero marginal MI but appear in batches due to diversity; their IPW weight diverges). Must use joint inclusion probabilities, or a clipped marginal approximation with explicit batch-budget bound.", correct:true},
+          {key:"c", text:"Use uniform propensity — BatchBALD doesn't change them."},
+          {key:"d", text:"Joint-MI inclusion is uncomputable; only marginal works."},
         ]}
-        trap={<>(a) and (b) miss the contamination. (d) is a different (smaller) concern.</>}
-        lens={<>The eval set must be frozen, OR sourced from a stratified random reserve labeled in parallel that AL never touches. The companion visual covers the reserve protocol.</>}
-        stretch={<>If you've already contaminated, how would you BOUND the eval bias without re-labeling?</>}
+        trap={<>(a) ignores the diversity-correction gap. (c) treats BatchBALD as random sampling. (d) is false — joint inclusion is estimable via the same MC samples used in acquisition.</>}
+        lens={<>This is a BatchBALD-unique correction: the joint-MI batch construction means propensity for IPW is NOT marginal BALD. The gap is biggest at large K, small N.</>}
+        stretch={<>At what K/N ratio does the marginal approximation's IPW variance exceed the joint estimator's by 10x?</>}
       />
 
       {/* axis: E3 — cold-start operational gotcha */}
@@ -1792,17 +1792,17 @@ flowchart TB
       <VIS.TrapProblem
         id="bald-p15"
         difficulty="hard"
-        title="P15 — Compose BatchBALD with a stratified random reserve. Where does the reserve sit?"
-        scenario={<><em>Discriminating insight: the reserve must be DISJOINT from the AL pool — otherwise BatchBALD's acquisition can include reserve cases and contaminate both.</em><br/><br/>You're shipping BatchBALD (95% of labels) + a stratified random reserve (5% for unbiased eval). Pick the protocol.</>}
+        title="P15 — BatchBALD MC-estimator with M samples meets stratified pool sampling. Variance composition?"
+        scenario={<><em>Discriminating insight: BatchBALD's joint-MI is approximated by a Monte Carlo estimator with M parameter samples; when the candidate pool is also stratified (e.g., by score band), the per-stratum joint-MI estimate inherits BOTH MC variance and stratum-size variance, and they COMPOUND — the effective standard error is sqrt(sigma_MC&sup2;/M + sigma_strat&sup2;/n_s), not max of the two. Naive M tuning ignores n_s.</em><br/><br/>You scale BatchBALD to a 50M pool by first stratifying the pool by predicted-score decile (sample n_s = 5k per stratum), then running BatchBALD on the union. You tune M = 100 MC samples by checking variance on the full pool. Why does the rare-stratum batch ranking still look noisy?</>}
         options={[
-          {key:"a", text:"Reserve and AL pool overlap is fine — reserve labels are gold-standard either way."},
-          {key:"b", text:"Reserve is sampled from the AL-acquired labels, post hoc."},
-          {key:"c", text:"Reserve is a DISJOINT random stratified sample from the unlabeled pool, removed BEFORE BatchBALD acquisition. BatchBALD never sees it. Reserve labels enter EVAL only; AL labels enter TRAIN only.", correct:true},
-          {key:"d", text:"Reserve is sampled from the cases BatchBALD did NOT select — that's the natural complement."},
+          {key:"a", text:"Increase M to 1000 — that fixes it."},
+          {key:"b", text:"Switch to greedy top-K BALD instead of BatchBALD."},
+          {key:"c", text:"Per-stratum joint-MI variance has TWO compounding sources: the MC estimator's sigma_MC&sup2;/M AND the stratum-subsampling sigma_strat&sup2;/n_s. Tuning M on the full pool sets sigma_MC&sup2;/M small relative to marginal sigma_strat&sup2; across strata, but inside the rare stratum n_s is small so its sigma_strat&sup2;/n_s dominates and MC noise is the wrong knob. Fix: per-stratum n_s budget proportional to sigma_strat, OR couple MC samples across candidates in the same stratum (common-random-numbers) to cancel sigma_MC contribution to rankings.", correct:true},
+          {key:"d", text:"MC variance and stratum variance don't compound — the larger one dominates."},
         ]}
-        trap={<>(a) lets BatchBALD's acquisition bias correlate with the reserve. (b) is contamination by construction. (d) samples from the EASY half of the pool — biased toward low-uncertainty cases, defeats the unbiased-prevalence point.</>}
-        lens={<>The reserve and AL pool MUST be disjoint and independent. Reserve sampling is uniform-stratified over the full pool, done first; AL operates on what remains.</>}
-        stretch={<>How small can the reserve be before its AUC CI is wider than the AL improvement signal?</>}
+        trap={<>(a) increases M but ignores n_s. (b) abandons batch diversity. (d) is the classical 'max-of-two' misread; for variance of a difference they actually ADD.</>}
+        lens={<>BatchBALD's MC joint-MI estimator interacts non-trivially with stratified pool sampling. Both variance sources contribute to the rank-ordering noise; common-random-numbers across candidates is the cheap fix.</>}
+        stretch={<>Derive the M-vs-n_s tradeoff curve for fixed compute budget M*n_s.</>}
       />
 
       {/* axis: F2 — adversarial */}
