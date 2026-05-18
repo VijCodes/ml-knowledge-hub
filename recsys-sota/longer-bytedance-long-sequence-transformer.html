@@ -1414,243 +1414,723 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// LONGER — ByteDance Long-Sequence Transformer (RecSys 2025)
+// v2 redo — ~38 trap problems spanning A-F taxonomy axes.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Lifelong sequence models"
-      title="LONGER (ByteDance long-sequence transformer)"
-      subtitle="Global-token + token-merge + InnerTransformer hybrid attention with KV-cache serving for 5k–50k user histories on GPU rankers."
+      pill="RecSys SOTA · Lifelong sequence (hybrid attention)"
+      title="LONGER — ByteDance Long-Sequence Transformer"
+      subtitle="Global-token + token-merge + InnerTransformer hybrid attention that scales industrial recommender transformers from L=500 to L=50k without quadratic cost."
       byline={[
-        {label: "Paper", value: "Sun et al., RecSys 2025 (arXiv 2505.04421)"},
-        {label: "Domain", value: "industrial ranker, Douyin Ads"},
+        {label: "Paper", value: "Sun et al., RecSys 2025"},
+        {label: "Year", value: "2025"},
+        {label: "Domain", value: "Industrial CVR/CTR ranker"},
       ]}/>
 
     <VIS.TLDR>
-      Vanilla full attention over a 50k user-history sequence is quadratic and unservable. LONGER compresses the long tail via a learned <VIS.Term def="A single learnable vector that attends to (and aggregates from) the entire user history, then is broadcast back to every position. Cheaper than all-to-all attention but riskier than alternating local/global stacks because everything funnels through one vector.">global token</VIS.Term> bottleneck plus <VIS.Term def="A learned merge operation that collapses adjacent (or similar) tokens into one — like average-pooling, but the merge weights are trained.">token-merging</VIS.Term>, while an InnerTransformer block keeps fine-grained interactions on the kept tokens. It ships with KV-cache serving and unified sparse+dense GPU parameter sync so the training/serving stack actually scales.
+      Vanilla long-seq transformers die on industrial sequences at O(L²). LONGER hybridizes <strong>one learned global token</strong> (sequence summary bottleneck), <strong>learned token-merge</strong> (adjacent similar tokens fuse mid-network), and an <strong>InnerTransformer</strong> over the shrunken sequence — plus a <strong>unified GPU sync</strong> that fuses sparse+dense gradients into one all-reduce. Deployed in 10+ ByteDance scenarios (Douyin Ads, etc.). Source: <a href="https://arxiv.org/abs/2505.04421" target="_blank" rel="noopener">arXiv:2505.04421</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        LONGER is ByteDance's production recipe for putting a <VIS.Term def="A neural network that uses self-attention to mix information across all positions of a sequence at once. Quadratic in sequence length, which is why long histories are hard.">transformer</VIS.Term> over very long user behavior histories inside an online ranker. The three pieces work together:
+        LONGER is a <VIS.Term def="A model that predicts CTR or CVR by scoring (user, candidate item) pairs — discriminative output, not generative.">discriminative ranker</VIS.Term> built on a transformer that natively handles user histories of 5k-50k events. The win is three architectural pieces composed inside a single forward pass.
       </p>
       <VIS.Mermaid chart={`
 flowchart TB
-  H["User history 5k-50k items"]
-  H --> G["Global token reads all"]
-  H --> M["Token-merge keeps top-K"]
-  G --> IT["InnerTransformer block"]
-  M --> IT
-  IT --> R["Ranker logits"]
+  H["Raw user-action sequence (5k to 50k tokens)"]
+  H --> E["Token + position embedding + prepend global token"]
+  E --> A1["Block 1: full attention (global token absorbs summary)"]
+  A1 --> M1["Token-merge layer (cosine-similar adjacent tokens fuse)"]
+  M1 --> A2["InnerTransformer block (attention over merged tokens)"]
+  A2 --> O["Pointwise CTR or CVR head"]
+  style E fill:#dbeafe,stroke:#1e40af
+  style M1 fill:#fef3c7,stroke:#d97706
       `} />
-      <ul>
-        <li><strong>Global token</strong> — one learned vector reads the whole sequence and is broadcast back, giving every position a cheap summary of "what else happened."</li>
-        <li><strong>Token-merge</strong> — adjacent/redundant behaviors are merged so the InnerTransformer only does dense attention on a small kept set.</li>
-        <li><strong>InnerTransformer</strong> — the surviving tokens get standard multi-head attention, recovering the fine-grained interactions a pure pooler would lose.</li>
-        <li><VIS.Term def="A serving trick where the keys and values computed for previously-seen tokens are stored, so adding a new token only requires computing one new K/V row instead of re-running the whole transformer. Critical for ranker throughput.">KV-cache</VIS.Term> serving + unified sparse/dense GPU parameter sync make the system production-shaped, not just paper-shaped.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
       <p>
-        Baseline "scale the transformer" approaches either truncate the sequence (lose tail signal), do alternating local/global attention (still expensive at 50k), or hash-bucket the history (lose semantic structure). LONGER's bet is that <strong>one</strong> learned global token, paired with merging the bulk and only doing dense attention on what's left, is the right operating point for industrial CVR/CTR.
+        The output head is <strong>pointwise sigmoid</strong> (not generative). LONGER replaces SIM-style retrieval-then-attention pipelines and absorbs the whole history into one transformer pass.
       </p>
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Approach</th><th style={{textAlign:"left",padding:8}}>Long-tail signal</th><th style={{textAlign:"left",padding:8}}>Online cost</th></tr></thead>
-        <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Truncate to last N</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Lost</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Cheap</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Alternating local/global</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>OK</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Still O(L·log L)+</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>SIM-style hash retrieval</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Partial</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Cheap, but lossy</td></tr>
-          <tr style={{background:"#ecfdf5"}}><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}><strong>LONGER (global+merge)</strong></td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Preserved via global</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Linear in kept tokens</td></tr>
-        </tbody>
-      </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>GPU-served ranker on mixed-precision hardware where you already do dense matmuls (so adding attention is incremental cost).</li>
-        <li>User histories in the 5k–50k range — long enough that truncation is leaving signal on the floor, short enough that the global-token bottleneck doesn't collapse semantics.</li>
-        <li>Engagement-driven domains (short-video, ads) where the next action depends on subtle long-range patterns (e.g., "user binged cooking last Tuesday").</li>
-        <li>Teams that can pay the infra cost of unified sparse/dense parameter sync (most embedding tables are sparse, transformer weights are dense — keeping them in step on the same GPU step is non-trivial).</li>
-      </ul>
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from siblings">
+      <p>
+        <strong>vs vanilla transformer:</strong> O(L²) attention dies at L=10k. LONGER replaces the full L×L matrix with O(L) global-token writes + O(L_merged²) inner attention, where L_merged is much smaller than L.
+      </p>
+      <p>
+        <strong>vs SIM / ETA / TWIN:</strong> Those use <VIS.Term def="A pipeline that first retrieves a small candidate-relevant subset of the user's history (via hashing or clustering), then attends only to the retrieved subset.">retrieval-then-attention</VIS.Term> — hash or cluster history offline, fetch top-K online, attend to K. LONGER attends to the WHOLE sequence but compresses via global-token + merge. No external retrieval index.
+      </p>
+      <p>
+        <strong>vs alternating local-global (Longformer/BigBird):</strong> Longformer uses a fixed sparse local + sparse global pattern. LONGER uses ONE learned global token (instead of a sparse pattern) and merges tokens (instead of dropping/sparsifying). Author claim: one global token + merge outperforms alternating patterns on industrial CVR.
+      </p>
+      <p>
+        <strong>vs HSTU:</strong> HSTU is a generative transducer with next-action CE; LONGER is a pointwise CTR/CVR ranker. Different output, different loss, different deployment.
+      </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations & gotchas">
-      <ul>
-        <li><strong>Global-token bottleneck</strong> — one vector cannot encode genuinely diverse multi-interest histories. Users with 3+ orthogonal taste clusters will see compression artifacts.</li>
-        <li><strong>Merge is lossy by construction</strong> — if your domain has critical rare events (one purchase among 10k impressions), the merge can erase them. Need a "keep" rule for high-value tokens.</li>
-        <li><strong>KV-cache invalidation</strong> — every new user behavior changes the cache state; if you don't keep cache logic correct under feature updates, you silently serve stale embeddings.</li>
-        <li><strong>Sparse/dense sync</strong> is a known scaling pain point; if your embedding-table updates lag the dense transformer updates, you train on inconsistent state.</li>
-      </ul>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
+      <p>
+        Pick LONGER when: industrial CVR/CTR ranker, user histories 5k-50k events, GPU-served (KV-cache friendly), score against a delivered candidate set (not generate). Don't pick when histories are short (under 200), CPU-only serving, or SIM-style pipelines are already calibrated.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  D["Surface assessment"]
+  D --> Q1{"Median history > 1000?"}
+  Q1 -->|No| SASRec["SASRec / BSARec is fine"]
+  Q1 -->|Yes| Q2{"Retrieval-then-attention sufficient?"}
+  Q2 -->|Yes, SIM works| SIM["SIM / TWIN V2"]
+  Q2 -->|No, need full-seq context| LONGER["LONGER"]
+  style LONGER fill:#dcfce7,stroke:#16a34a
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Each problem hides the signal in plausible noise. Pick, then reveal.</p>
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <p>
+        The <strong>global-token bottleneck</strong> can collapse on diverse-interest users — a single vector cannot summarize wildly heterogeneous histories without information loss. The <strong>token-merge</strong> is greedy and embedding-space-dependent: change item embeddings and the merge decisions shift downstream. <strong>KV-cache</strong> staleness is the dominant production failure mode.
+      </p>
+      <VIS.Callout kind="gotcha" title="The merge-cache invalidation trap">
+        When an item-embedding refresh changes a token's vector, the *merge decisions* downstream of that token may change too. Invalidating only the touched token's K,V is not enough; you must invalidate everything that merged with it. Most teams discover this only when offline NDCG and online CVR diverge.
+      </VIS.Callout>
+    </VIS.Section>
 
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
+      <p style={{color:"#475569", marginBottom: 16}}>
+        ~38 problems spanning A-F. Each passes the redaction litmus: replace "LONGER" with "Model X" → can a generic-ML candidate still answer? If yes, drop.
+      </p>
+
+      {/* ============== A. Identity & comparison ============== */}
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity &amp; comparison</h3>
+
+      {/* axis: A1 (distinguish from sibling) */}
       <VIS.TrapProblem
-        id="lg-p1" difficulty="hard"
-        title="P1 — Why does LONGER's single global token beat alternating local-global on industrial CVR?"
-        scenario={<>You compare two long-seq transformers on a 30k-item user history for CVR prediction. Architecture A: 6 layers, alternating local-window (w=128) and global attention. Architecture B (LONGER-style): 6 layers, each with one learned global token + token-merge + InnerTransformer on the kept 256 tokens. Same FLOP budget. A has slightly higher offline NDCG; B wins online CVR by 1.4%. What is the most plausible reason?</>}
+        id="longer-a1"
+        difficulty="hard"
+        title="A1 — LONGER vs SIM: same problem, opposite philosophy"
+        scenario={<>Your VP says "SIM and LONGER both handle 50k-event histories — pick one." You need to name the actual discriminator, not the family resemblance.</>}
         options={[
-          {key:"a", text:"A overfits during offline eval because it has more effective attention pathways; B is regularized by the bottleneck.", correct:true},
-          {key:"b", text:"A's local windows leak future-action info; B is causally cleaner."},
-          {key:"c", text:"B's InnerTransformer is deeper, so it captures higher-order interactions."},
-          {key:"d", text:"Online traffic has different distribution than offline; both should perform equally on industrial CVR."},
+          {key:"a", text:"SIM does retrieval-then-attention (hash history, fetch a candidate-relevant subset, attend to it); LONGER attends to the entire sequence via global-token + token-merge compression — no external retrieval index.", correct:true},
+          {key:"b", text:"SIM is for retrieval; LONGER is for ranking."},
+          {key:"c", text:"SIM uses transformers; LONGER does not."},
+          {key:"d", text:"LONGER works for short histories; SIM only for long."},
         ]}
-        trap={<>(b) sounds plausible but local windows are causal-safe by construction. (c) misreads the spec — both are 6 layers. (d) is a generic excuse that ignores the specific 1.4% delta.</>}
-        lens={<>The global-token bottleneck acts as a strong regularizer: the model is forced to summarize long history through one vector, which prevents the kind of position-specific overfitting that hurts online generalization. A's expressive alternating attention wins offline NDCG but transfers worse — a classic capacity-vs-generalization tradeoff on industrial-scale logs.</>}
-        stretch={<>What ablation would isolate "global-token regularization" from "token-merge denoising" as the actual win source?</>}
+        trap={<>(b) confuses the role — both are ranking-stage user encoders. (c) is false; LONGER is a transformer. (d) inverts the truth.</>}
+        lens={<>The architectural philosophy splits at the retrieval question. SIM/TWIN/ETA *drop* most of the sequence and attend to a candidate-relevant subset. LONGER *keeps* the whole sequence and compresses it via global-token + merge inside the forward pass. Different infra implications: SIM needs an offline retrieval index; LONGER does not.</>}
+        stretch={<>Could you stack them — SIM-retrieve then LONGER-attend to the retrieved subset?</>}
       />
 
+      {/* axis: A2 (definitional trap) */}
       <VIS.TrapProblem
-        id="lg-p2" difficulty="medium" multiSelect
-        title="P2 — Which user populations are MOST at risk from the global-token bottleneck?"
-        scenario={<>You deploy LONGER as your main ranker. Holdout slice analysis shows uneven CVR lift across user cohorts. Which cohorts would you expect to be HURT by the global-token compression? Select all that apply.</>}
+        id="longer-a2"
+        difficulty="medium"
+        title="A2 — 'LONGER's global token = Longformer's [CLS]'"
+        scenario={<>A reviewer says "the global token is just a [CLS] token." What's actually different?</>}
+        multiSelect
         options={[
-          {key:"a", text:"Users with 3+ distinct interest clusters (e.g., gaming + parenting + cooking).", correct:true},
-          {key:"b", text:"New users with <50 history items."},
-          {key:"c", text:"Power users with very long but topically narrow histories."},
-          {key:"d", text:"Users whose recent intent has shifted dramatically (e.g., job change → new hobby).", correct:true},
-          {key:"e", text:"Users with mostly impression history but few clicks."},
+          {key:"a", text:"LONGER uses ONE learned global token, not a fixed sparse pattern of global+local blocks; Longformer/BigBird alternate dense-local with sparse-global.", correct:true},
+          {key:"b", text:"LONGER's global token is paired with a token-merge layer that shrinks the sequence mid-network; Longformer has no merge step.", correct:true},
+          {key:"c", text:"LONGER's global token is bidirectionally written and read across all positions; Longformer's global tokens are write-only."},
+          {key:"d", text:"Longformer is a discriminative ranker; LONGER is generative."},
         ]}
-        trap={<>(b) is the obvious "cold-start" instinct but new users have so little history the bottleneck isn't even active. (c) is wrong direction — narrow histories compress cleanly into one vector. (e) is unrelated to the compression mechanism.</>}
-        lens={<>The bottleneck hurts when one vector must encode genuinely DIVERSE intent. (a) multi-interest users get their tail interests blurred; (d) sudden interest shifts get smoothed against historical preferences. Mitigation: per-interest global tokens, or fall back to multi-head attention for high-diversity histories.</>}
-        stretch={<>How would you detect "this user's history needs 2 global tokens not 1" online?</>}
+        trap={<>(c) is technically incorrect — Longformer's global attention is also bidirectional within the pattern; the discriminator is the *pattern*, not the directionality. (d) inverts it.</>}
+        lens={<>The structural fix in LONGER is the COMBINATION: bottleneck (global token) + adaptive shrinking (merge) + inner attention. Each piece alone exists in prior art; their integration is the contribution.</>}
+        stretch={<>Why does the paper claim ONE global token beats K&gt;1 on industrial CVR?</>}
       />
 
+      {/* axis: A3 (counterfactual) */}
       <VIS.TrapProblem
-        id="lg-p3" difficulty="hard"
-        title="P3 — KV-cache shows stale predictions after feature deploy"
-        scenario={<>You deploy a new item-side feature (creator-popularity). The ranker is LONGER with KV-cache serving. For 48 hours post-deploy, your dashboards show CVR predictions that look fine but a long-tail of users whose recommended slate hasn't changed at all despite their having taken new actions. What is the single most likely root cause?</>}
+        id="longer-a3"
+        difficulty="hard"
+        title="A3 — Counterfactual: what if LONGER didn't exist?"
+        scenario={<>Without LONGER, your fallback for 20k-event histories at 30ms p99 is which combination, and what concrete cost do you pay?</>}
         options={[
-          {key:"a", text:"Cache invalidation key didn't include the new feature; cached K/V vectors are stale even though raw inputs changed.", correct:true},
-          {key:"b", text:"Mixed-precision overflow in the new feature's embedding."},
-          {key:"c", text:"Sparse parameter sync drift between training and serving."},
-          {key:"d", text:"Token-merge dropped the new feature because it looks redundant."},
+          {key:"a", text:"SIM with hash-bucketed retrieval (cheap online, but loses semantic structure → 2-4% CTR vs LONGER) + a much larger offline retrieval ETL pipeline.", correct:true},
+          {key:"b", text:"Plain transformer at L=20k (latency budget blown, p99 at 200ms+)."},
+          {key:"c", text:"DLRM with crosses (no sequence model, loses the engagement-loop signal entirely)."},
+          {key:"d", text:"All three are valid fallbacks depending on infra; LONGER's contribution is the merge layer specifically."},
         ]}
-        trap={<>(b)(c)(d) are all plausible failure modes for LONGER, but the symptom — "predictions don't update despite new actions" — points specifically to a cache that isn't being invalidated.</>}
-        lens={<>KV-caches must be keyed by everything that influences K/V. Adding a feature without bumping the cache version (or invalidating affected users) gives you correct math on stale state. The fix is a cache-key schema that includes feature-version, plus a kill-switch to flush after deploys.</>}
-        stretch={<>How would you size a partial-flush rollout to bound user-visible regression while invalidating cleanly?</>}
+        trap={<>(b) and (c) are valid but each has a clear-cut showstopper. (d) overgeneralizes; the question asks for the dominant fallback at the given constraint.</>}
+        lens={<>The pragmatic alternative is SIM. LONGER's value is keeping the full sequence's semantic structure that hashing destroys, at the cost of slightly higher dense-transformer compute (offset by KV-cache).</>}
+        stretch={<>If SIM is "good enough" at +2% CTR cost, when do you justify the LONGER migration?</>}
       />
 
+      {/* axis: A4 (composition) */}
       <VIS.TrapProblem
-        id="lg-p4" difficulty="hard" mode="ordered"
-        title="P4 — Order your wins when porting from a 1k-history ranker to LONGER at 30k"
-        scenario={<>You currently serve a SASRec-style ranker on the last 1k actions. You're moving to LONGER on 30k. List the validation/ship steps in priority order. Wrong moves should not be ranked.</>}
+        id="longer-a4"
+        difficulty="hard"
+        title="A4 — Composing LONGER with TIGER (Semantic IDs)"
+        scenario={<>You want generative retrieval + LONGER ranking. Where does Semantic-ID quantization slot in?</>}
         options={[
-          {key:"a", text:"Validate that KV-cache hit-rate on prod traffic stays above 80% before ramp.", order:3},
-          {key:"b", text:"Run offline backfill on 30k histories and check that long-tail CVR slice improves vs 1k baseline.", order:1},
-          {key:"c", text:"Increase global-token dim to match the longer sequence."},
-          {key:"d", text:"A/B test 10% traffic with shadow logging of cache stale-rate.", order:2},
-          {key:"e", text:"Drop SIM-style hash retrieval since LONGER replaces it."},
+          {key:"a", text:"TIGER decodes Semantic IDs of candidate items upstream; LONGER takes those candidates' Semantic-ID embeddings as the item-side input and ranks them — token-merge operates over the (user-history, Semantic-ID) joint embedding space.", correct:true},
+          {key:"b", text:"Replace user-side embeddings with Semantic IDs to shrink the global token."},
+          {key:"c", text:"Run TIGER on the user history sequence itself."},
+          {key:"d", text:"They cannot compose."},
         ]}
-        trap={<>(c) is a knob without evidence. (e) is destructive — keep SIM as a fallback during ramp.</>}
-        lens={<>Validate signal first (offline backfill), then cost (shadow with cache stats), then ramp gated on cache health.</>}
-        stretch={<>What rollback signal would trip a 1% → 0% kill?</>}
+        trap={<>(b) confuses what gets Semantic-IDed (items, not users). (c) misuses TIGER. (d) is wrong; the composition is published industrial practice.</>}
+        lens={<>The clean separation: TIGER replaces the ANN retrieval index (generates candidate Semantic IDs autoregressively); LONGER ranks the candidates against the user history. Composition gives strong cold-start (from TIGER's content-derived IDs) AND long-sequence ranking (from LONGER).</>}
+        stretch={<>Does token-merge change its behavior when the item embeddings are quantized Semantic IDs vs continuous learned embeddings?</>}
       />
 
+      {/* axis: A5 (boundary) */}
       <VIS.TrapProblem
-        id="lg-p5" difficulty="medium"
-        title="P5 — Sparse + dense parameter sync"
-        scenario={<>Embedding tables (sparse) update on async parameter-server steps; the transformer dense weights update on synchronous all-reduce. Why does LONGER care unusually much about keeping these in step?</>}
+        id="longer-a5"
+        difficulty="medium"
+        title="A5 — Where does LONGER stop beating SIM?"
+        scenario={<>At what user-history length does LONGER stop being meaningfully better than SIM, and why?</>}
         options={[
-          {key:"a", text:"Because the global token's representation depends on aggregating embeddings — a mismatch makes the bottleneck encode pre-update state while dense weights expect post-update.", correct:true},
-          {key:"b", text:"Because sparse embeddings are fp16 and dense is fp32."},
-          {key:"c", text:"Because the transformer has no normalization layer."},
-          {key:"d", text:"Because the merge operation is non-differentiable."},
+          {key:"a", text:"Under ~500 events: token-merge has too little to merge (the merge layer reduces to mean-pool over a short sequence), and the global-token bottleneck doesn't carry distinguishing signal — SIM with hash retrieval is competitive.", correct:true},
+          {key:"b", text:"There is no length threshold; LONGER always wins."},
+          {key:"c", text:"Above 100k events; below that, SIM is always better."},
+          {key:"d", text:"Length is irrelevant; only catalog size matters."},
         ]}
-        trap={<>(b)(c)(d) are confidently-stated falsehoods that distract from the actual coupling.</>}
-        lens={<>Global pooling makes the dense path read from the sparse path's outputs every step. If sparse lags by even one step, dense weights are being trained against a stale view of user history — accumulating bias the model can't recover from.</>}
-        stretch={<>What's the simplest "are we in sync?" instrumentation to add?</>}
+        trap={<>(b) is the marketing answer; (c) and (d) are wrong by construction.</>}
+        lens={<>LONGER's value scales with how much sequence there is to merge AND with how much the candidate-irrelevant context still carries useful signal. Short sequences fail both criteria. Empirically the ByteDance paper reports gains concentrate above L~2k.</>}
+        stretch={<>Is there a "minimum effective history length" below which LONGER's overhead is pure waste?</>}
       />
 
+      {/* ============== B. Application ============== */}
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>B. Application</h3>
+
+      {/* axis: B1 (when to use over alternatives) */}
       <VIS.TrapProblem
-        id="lg-p6" difficulty="hard" multiSelect
-        title="P6 — Token-merge ablation hurts more than expected"
-        scenario={<>You ablate the token-merge step (keep global + InnerTransformer, drop merge). FLOPs grow 8x but offline AUC drops by 0.4 points. Which explanations are plausible? Select all.</>}
+        id="longer-b1"
+        difficulty="hard"
+        title="B1 — 30ms p99 latency, 20k-event histories, GPU fleet"
+        scenario={<>You have 30ms p99 budget, median user history 20k events, a GPU-served ranker fleet, and an existing well-tuned SIM pipeline doing 18ms p99. Pick: (a) stay on SIM, (b) migrate to LONGER, (c) plain transformer at L=20k, (d) DLRM + last-100-only sequence feature.</>}
         options={[
-          {key:"a", text:"Token-merge denoises by collapsing near-duplicate impressions; without it, repetitive history dilutes signal.", correct:true},
-          {key:"b", text:"InnerTransformer was trained to operate on merged tokens; raw tokens are out-of-distribution.", correct:true},
-          {key:"c", text:"The global token can't read 30k positions cleanly; merge provided implicit summarization.", correct:true},
-          {key:"d", text:"Removing merge breaks the autoregressive mask."},
-          {key:"e", text:"More tokens always means better attention; the drop must be a training bug."},
+          {key:"a", text:"(b) — LONGER. SIM's hash-retrieval is destroying semantic structure of the tail; LONGER's KV-cache makes 20k feasible in budget. Expect 2-3% CTR lift and the migration cost is justified by the existing GPU fleet.", correct:true},
+          {key:"b", text:"(a) — stay on SIM; if it's at 18ms it's fine."},
+          {key:"c", text:"(c) — plain transformer; FlashAttention2 can handle 20k."},
+          {key:"d", text:"(d) — sequence is overrated; DLRM is robust."},
         ]}
-        trap={<>(d) confuses architecture pieces. (e) is the "more is better" fallacy LONGER's whole design argues against.</>}
-        lens={<>Three mechanisms compound: denoising (a), distribution shift in InnerTransformer (b), and the global token's effective summarization capacity (c). The merge is doing real work beyond cost reduction.</>}
-        stretch={<>How would you decouple (b) from (a)?</>}
+        trap={<>(c) is wrong because plain attention at L=20k blows the 30ms p99 budget even with FA2 at production batch sizes. (a) is the no-action default that the brief is asking you to challenge. (d) ignores the long-tail signal.</>}
+        lens={<>The scenario is exactly LONGER's sweet spot: long histories + GPU infra + a competitor (SIM) that loses tail signal. The discriminator is the brief's "20k-event" detail — at L=2k, SIM would be the right call.</>}
+        stretch={<>What's the rollout sequence — what's the first thing you'd ship in shadow?</>}
       />
 
+      {/* axis: B2 (sounds reasonable, isn't) */}
       <VIS.TrapProblem
-        id="lg-p7" difficulty="medium"
-        title="P7 — Where does LONGER NOT fit?"
-        scenario={<>Which production setting is the WORST fit for LONGER as published?</>}
+        id="longer-b2"
+        difficulty="hard"
+        title="B2 — 'Just widen the global token to fix bottleneck collapse'"
+        scenario={<>An engineer proposes: "global-token collapse on diverse-interest users → widen the global token (e.g., 256 to 2048 dim) to give it more capacity." Why is this the wrong fix?</>}
         options={[
-          {key:"a", text:"CPU-only ranker with strict 20ms p99.", correct:true},
-          {key:"b", text:"GPU-served ranker on 10k history with 80ms p99."},
-          {key:"c", text:"GPU-served two-tower retrieval on 50k user history."},
-          {key:"d", text:"GPU ranker with mixed-precision and existing KV-cache infra."},
+          {key:"a", text:"Widening doesn't fix the underlying issue: the bottleneck is collapsing because a SINGLE vector cannot summarize multi-modal interest distributions, regardless of dimension. The right fix is MULTIPLE global tokens (K&gt;1) each capturing one interest mode.", correct:true},
+          {key:"b", text:"Wider global tokens break the token-merge similarity computation."},
+          {key:"c", text:"Wider global tokens are slower."},
+          {key:"d", text:"Widening is correct; it's the standard fix."},
         ]}
-        trap={<>(c) sounds wrong because LONGER is published as a ranker, but the architecture would technically work in a retrieval tower — just isn't where it's been validated. (a) is the true mismatch: no GPU, no KV-cache substrate, latency too tight.</>}
-        lens={<>LONGER assumes you have GPU dense matmul throughput and a KV-cache infrastructure. CPU at 20ms p99 violates both. Use a SIM-style retrieval ranker instead.</>}
-        stretch={<>What would have to be true about the CPU server for LONGER to fit?</>}
+        trap={<>(b) is false — merge similarity uses item tokens, not the global token. (c) is a side concern, not the reason it doesn't work. (d) is the naive default.</>}
+        lens={<>Bottleneck collapse is about CARDINALITY of summary slots, not their width. One 2048-dim vector still has to average over heterogeneous interests; K 256-dim vectors can specialize. The paper's choice of K=1 is intentional simplification; community follow-ups propose K&gt;1.</>}
+        stretch={<>Detect collapse before it kicks in — what diagnostic do you log?</>}
       />
 
+      {/* axis: B3 (business framing) */}
       <VIS.TrapProblem
-        id="lg-p8" difficulty="hard"
-        title="P8 — Online CVR up 1.4%, dwell-time flat. What does it mean?"
-        scenario={<>You ship LONGER. CVR moves +1.4% (p&lt;0.01). Average dwell-time per session is flat. Time-to-first-conversion drops 12%. How do you interpret?</>}
+        id="longer-b3"
+        difficulty="medium"
+        title="B3 — Pitch LONGER to your PM"
+        scenario={<>Your PM asks for the one-sentence reason LONGER is worth a 4-month migration. Pick the sentence that captures the business case (not the architecture).</>}
         options={[
-          {key:"a", text:"Model is surfacing the same items but earlier in the session — long-range history helps it identify intent faster.", correct:true},
-          {key:"b", text:"Model is overfitting to easy wins; ship cautiously."},
-          {key:"c", text:"Dwell-time being flat is a red flag — likely a regression in content quality."},
-          {key:"d", text:"CVR lift is spurious because dwell didn't move."},
+          {key:"a", text:"It absorbs the user's entire history into ranking — surfacing tail-interest items that hash-based retrieval drops, lifting engagement on the users whose tastes don't fit the dominant patterns.", correct:true},
+          {key:"b", text:"It uses learned token merging instead of static sparse attention."},
+          {key:"c", text:"It improves O(L²) to O(L log L)."},
+          {key:"d", text:"It's 5x faster than FlashAttention2."},
         ]}
-        trap={<>(b)(c)(d) all retreat from a clean positive signal. (c) confuses "flat" with "down."</>}
-        lens={<>Long-range history lets the model recognize intent earlier — first impressions are more relevant, so conversions happen sooner without users needing to dwell longer. This is the expected signature of "we now use the full history."</>}
-        stretch={<>How would you confirm vs. ad-load-side novelty effects?</>}
+        trap={<>(b), (c), (d) are architecture; they don't translate to a PM's vocabulary.</>}
+        lens={<>Business case = "what cohort gets better, in what metric, why does that matter to the company." LONGER's distinguishing audience win is on diverse-interest users whose tail history carries signal SIM destroys.</>}
+        stretch={<>What's the secondary business case — operational simplicity?</>}
       />
 
+      {/* axis: B4 (when NOT to use) */}
       <VIS.TrapProblem
-        id="lg-p9" difficulty="medium"
-        title="P9 — Cost regression: serving cost up 35%, lift only 1.4%"
-        scenario={<>Post-launch, GPU cost per QPS is up 35%. CVR lift = 1.4%. CFO asks if this pencils. What's your move?</>}
+        id="longer-b4"
+        difficulty="medium"
+        title="B4 — Surface where LONGER is the wrong choice"
+        scenario={<>Your team handles luxury-goods recommendations (mean session 4 events, sparse repeat-purchase, content-rich item descriptions). Should you migrate to LONGER?</>}
         options={[
-          {key:"a", text:"Tune token-merge aggressiveness — shrink kept set from 256 to 128, re-validate.", correct:true},
-          {key:"b", text:"Increase KV-cache size to amortize the cost."},
-          {key:"c", text:"Roll back to SASRec — 1.4% doesn't justify 35%."},
-          {key:"d", text:"Switch to fp8 — cuts cost 50% with no quality risk."},
+          {key:"a", text:"No — short sessions kill token-merge (nothing to merge), the global-token bottleneck has no diverse history to compress, and the catalog is content-rich (HLLM or TIGER would dominate). LONGER would be wasted compute.", correct:true},
+          {key:"b", text:"Yes — LONGER always wins on long-term user value modeling."},
+          {key:"c", text:"Yes — luxury users have lifelong cross-session histories LONGER can absorb."},
+          {key:"d", text:"Maybe — depends on GPU budget."},
         ]}
-        trap={<>(b) confuses cache size with throughput. (c) ignores that you can tune the cost knob. (d) is overconfident about fp8 — quality risk is real.</>}
-        lens={<>Merge aggressiveness IS the dominant cost knob — fewer kept tokens = quadratic savings in InnerTransformer. Re-run offline at 128 to see if you preserve most lift at half the cost.</>}
-        stretch={<>What's the breakeven CVR delta at which 35% cost is justified?</>}
+        trap={<>(c) misreads "session" vs "lifelong" — luxury repeat purchase is rare (sometimes a single high-value purchase per year), so lifelong sequence is sparse, not dense. (b) ignores the scenario.</>}
+        lens={<>The two assumptions LONGER depends on (long, dense sequences AND signal in the tail) fail for luxury. Content-rich items favor HLLM (content embeddings) or TIGER (Semantic IDs).</>}
+        stretch={<>If the catalog is luxury but each user shops daily on the platform, does the calculus change?</>}
       />
 
+      {/* ============== C. Mechanism ============== */}
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      {/* axis: C1 (architectural choice) */}
       <VIS.TrapProblem
-        id="lg-p10" difficulty="hard"
-        title="P10 — Debugging: training loss converges, online CVR drops 2%"
-        scenario={<>Loss curves look perfect — train and val both converge cleanly. But A/B shows CVR DOWN 2% on a 10% holdout. What's the most likely root cause among these?</>}
+        id="longer-c1"
+        difficulty="hard"
+        title="C1 — Why ONE global token, not K&gt;1?"
+        scenario={<>The paper uses ONE learned global token. Why not K=8 or K=16 (one per likely interest mode)?</>}
         options={[
-          {key:"a", text:"Train-serve skew in KV-cache assembly: training sees full sequence; serving accumulates incrementally and a bug drops the global token recompute.", correct:true},
-          {key:"b", text:"Optimizer state mismatch on resume."},
-          {key:"c", text:"Holdout traffic has different demographics."},
-          {key:"d", text:"Validation set is too small to detect the regression."},
+          {key:"a", text:"K=1 is a deliberate simplification — fewer params, simpler attention pattern, easier to debug. The paper acknowledges multi-token variants but claims one-token is sufficient at the scales tested. Follow-up work explores K&gt;1 for diverse-interest users.", correct:true},
+          {key:"b", text:"K>1 is mathematically impossible with the merge layer."},
+          {key:"c", text:"K>1 breaks the unified GPU sync."},
+          {key:"d", text:"K=1 is empirically optimal at every scale."},
         ]}
-        trap={<>(c)(d) explain WHY you might see different numbers but not WHY serving systematically underperforms. (b) is unrelated to deployment.</>}
-        lens={<>Classic train-serve skew on cached architectures: training computes K/V fresh for every batch; serving reuses cache, and if a corner case skips recomputing the global token, online sees a frozen summary. Diagnose by replaying training batches through the serving path and diffing logits.</>}
-        stretch={<>What unit test would have caught this pre-launch?</>}
+        trap={<>(b), (c) are false. (d) is the marketing read; the paper itself flags the limitation on diverse users.</>}
+        lens={<>One-vs-many global tokens is a quality/complexity trade. ByteDance picked simplicity; the cost is bottleneck collapse on heterogeneous users. Multi-token follow-ups exist but add complexity to the attention pattern.</>}
+        stretch={<>If you were redesigning, what's the rule for choosing K?</>}
       />
+
+      {/* axis: C2 (loss / objective) */}
+      <VIS.TrapProblem
+        id="longer-c2"
+        difficulty="hard"
+        title="C2 — Loss-shape consequences"
+        scenario={<>LONGER outputs a pointwise sigmoid for CTR/CVR. HSTU outputs a generative softmax over an action vocabulary. What downstream calibration difference matters in production?</>}
+        options={[
+          {key:"a", text:"LONGER's pointwise sigmoid Platt-scales cleanly (existing nightly calibrators transfer); HSTU's generative softmax requires a new calibration head fit on the action-distribution shape — a known migration pain point.", correct:true},
+          {key:"b", text:"LONGER has no calibration; HSTU does."},
+          {key:"c", text:"LONGER's sigmoid is harder to calibrate."},
+          {key:"d", text:"Calibration is identical for both."},
+        ]}
+        trap={<>(b) is wrong (LONGER inherits pointwise calibration practice). (c) inverts. (d) is the lazy answer.</>}
+        lens={<>LONGER's pragmatic appeal vs HSTU is precisely calibration continuity — you can swap LONGER in without rebuilding the Platt scaler. The cost is forfeiting HSTU's scaling-law evidence.</>}
+        stretch={<>If your team values calibration continuity above all, which sequence model do you pick?</>}
+      />
+
+      {/* axis: C3 (what's dropped vs baseline) */}
+      <VIS.TrapProblem
+        id="longer-c3"
+        difficulty="hard"
+        title="C3 — Token-merge throws away which signal?"
+        scenario={<>The token-merge layer fuses adjacent similar tokens into one. What does this *systematically lose* relative to keeping all tokens?</>}
+        options={[
+          {key:"a", text:"Fine-grained ordering/repetition within a merged region — e.g., '5 clicks in a row on the same item' becomes one merged token; the *frequency* of repetition is captured (via the weighting) but the temporal microstructure within the burst is lost.", correct:true},
+          {key:"b", text:"All temporal information."},
+          {key:"c", text:"Cross-item attention."},
+          {key:"d", text:"The global token."},
+        ]}
+        trap={<>(b) is too strong — temporal structure between bursts survives. (c) is wrong — inner attention still operates over the merged tokens. (d) is unrelated.</>}
+        lens={<>Merge is a lossy compression with a specific bias: it preserves coarse temporal structure (which bursts happened in which order) and sacrifices fine within-burst structure. If your domain depends on within-burst dynamics (e.g., rapid back-and-forth comparison of items), this is the wrong compression.</>}
+        stretch={<>A diagnostic to detect whether you're losing within-burst signal that matters?</>}
+      />
+
+      {/* axis: C4 (hyperparameter sensitivity) */}
+      <VIS.TrapProblem
+        id="longer-c4"
+        difficulty="hard"
+        title="C4 — Which knob, if mis-set, catastrophically breaks LONGER?"
+        scenario={<>Rank these by "production breakage if mis-set": (a) merge similarity threshold, (b) global-token dimension, (c) inner-transformer layer count, (d) KV-cache TTL.</>}
+        options={[
+          {key:"a", text:"merge threshold > KV-cache TTL > inner layers > global-token dim. The merge threshold controls how aggressively the sequence shrinks; too high and the inner attention gets ~1 merged token (no signal); too low and you lose the speedup. KV-cache TTL controls staleness; too long and embedding refreshes silently rot the cache. Layer count and dim are tuning, not catastrophic.", correct:true},
+          {key:"b", text:"All equally critical."},
+          {key:"c", text:"global-token dim is the most critical knob."},
+          {key:"d", text:"inner-transformer layers; everything else is robust."},
+        ]}
+        trap={<>(c) is the seductive answer (the bottleneck "feels" central); but the global-token dim is a tuning param with a wide acceptable range. (d) underweights the cache/staleness risk.</>}
+        lens={<>Production breakage is about *silent* failure modes. Merge threshold and KV-cache TTL both fail silently. Layer count and dim fail loudly (training instability).</>}
+        stretch={<>What monitor would catch merge-threshold mis-tuning before it ships?</>}
+      />
+
+      {/* axis: C5 (data assumption violation) */}
+      <VIS.TrapProblem
+        id="longer-c5"
+        difficulty="medium"
+        title="C5 — Pure ID catalog (no content embeddings)"
+        scenario={<>Your catalog has no content (just opaque SKUs). What breaks in LONGER specifically?</>}
+        options={[
+          {key:"a", text:"Token-merge similarity is computed over item embeddings; without content, embeddings are random-init learned-IDs → similarity is noise → merge collapses (or fuses semantically-unrelated items). The compression becomes adversarial; performance drops below SASRec.", correct:true},
+          {key:"b", text:"The global token cannot be learned without content."},
+          {key:"c", text:"Inner-transformer fails."},
+          {key:"d", text:"Nothing breaks; LONGER is content-agnostic."},
+        ]}
+        trap={<>(d) is the marketing read; in practice the merge layer's quality scales with embedding quality.</>}
+        lens={<>LONGER inherits an implicit content-quality assumption from the merge layer. Pure-ID catalogs need either (a) a strong CF-derived embedding before merging (b) a switch to a non-merge variant (SASRec/BSARec).</>}
+        stretch={<>Can you bootstrap content-free embeddings to make merge sensible?</>}
+      />
+
+      {/* axis: C1 — InnerTransformer */}
+      <VIS.TrapProblem
+        id="longer-c1b"
+        difficulty="medium"
+        title="C1b — Why an InnerTransformer block after merge?"
+        scenario={<>Why does LONGER use a standard transformer block AFTER merging, instead of just outputting the global token?</>}
+        options={[
+          {key:"a", text:"Post-merge, the shortened sequence still carries useful local structure (intra-burst patterns, ordering of merged regions) that the global token alone cannot represent — inner attention captures cross-merged-token interactions cheaply (since the merged sequence is small).", correct:true},
+          {key:"b", text:"Inner-transformer is for backwards compatibility."},
+          {key:"c", text:"The global token alone is enough; inner is a redundant ablation."},
+          {key:"d", text:"Inner-transformer adds the position embedding."},
+        ]}
+        trap={<>(c) is the strong-bottleneck-hypothesis answer; the paper's ablation shows it underperforms.</>}
+        lens={<>Two-stage compression: global token = absolute summary; inner attention = relative interactions among merged regions. Each captures a different aspect.</>}
+        stretch={<>Could you replace inner attention with a simple MLP-mixer over the merged tokens?</>}
+      />
+
+      {/* ============== D. Intuition traps ============== */}
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      {/* axis: D1 (intuitive but wrong) */}
+      <VIS.TrapProblem
+        id="longer-d1"
+        difficulty="hard"
+        title="D1 — 'Alternating local+global is the standard, must be best'"
+        scenario={<>Standard long-context transformers (Longformer, BigBird) alternate sparse local + sparse global attention. Why does LONGER's single-global-token + merge claim to outperform them on industrial CVR?</>}
+        options={[
+          {key:"a", text:"Industrial behavior is bursty (long stretches of similar actions punctuated by shifts). Alternating patterns waste FLOPs uniformly; LONGER's adaptive merge collapses the dense regions and lets attention focus on transitions — better-aligned to the data distribution.", correct:true},
+          {key:"b", text:"Longformer doesn't work on sequences over 4k tokens."},
+          {key:"c", text:"LONGER doesn't really beat them — it's marketing."},
+          {key:"d", text:"Alternating patterns are quadratic."},
+        ]}
+        trap={<>(b), (d) are false. (c) is dismissive without the architectural argument.</>}
+        lens={<>The win comes from data-adaptive compression (merge) over static patterns (alternating). When data is uniform, both perform similarly; when data has burst structure (which industrial behavior does), adaptive wins.</>}
+        stretch={<>If your domain's behavior were *not* bursty (smooth, stationary), would alternating-pattern transformers be competitive?</>}
+      />
+
+      {/* axis: D1 — merge=meanpool */}
+      <VIS.TrapProblem
+        id="longer-d1b"
+        difficulty="hard"
+        title="D1b — 'Token-merge is just mean-pooling'"
+        scenario={<>A skeptic claims "token-merge is just adaptive mean-pooling — strip it out, mean-pool every 4 tokens, you'll get the same result." Show why this is wrong.</>}
+        options={[
+          {key:"a", text:"Token-merge is LEARNED and SELECTIVE — it only fuses adjacent tokens whose cosine similarity exceeds a learned threshold. Fixed-window mean-pool fuses unconditionally, destroying transition information (the exact signal LONGER preserves). Empirical regression: ~3-5% CVR.", correct:true},
+          {key:"b", text:"Mean-pool is mathematically the same as token-merge."},
+          {key:"c", text:"Mean-pool is faster, so it would be better."},
+          {key:"d", text:"Token-merge requires backprop through the merge decisions."},
+        ]}
+        trap={<>(d) is true (it's straight-through estimated) but doesn't explain WHY mean-pool fails.</>}
+        lens={<>Selectivity matters. The boundaries between merged regions are themselves signal (a "transition" between bursts). Fixed-window pooling can't see these.</>}
+        stretch={<>What's the cheapest learned-selective alternative to merge?</>}
+      />
+
+      {/* axis: D2 (wrong-assumption cascade) */}
+      <VIS.TrapProblem
+        id="longer-d2"
+        difficulty="hard"
+        title="D2 — 'Drop LONGER in, keep the rest of the pipeline'"
+        scenario={<>You decide to swap your SIM ranker for LONGER. You keep: (i) the existing item-embedding pipeline, (ii) the existing KV-cache infra, (iii) the existing calibration head. Which assumptions cascade into bugs?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Item embeddings: LONGER's global token co-trains with embeddings; if you freeze them at SIM-era values, the global token cannot reach a useful summary.", correct:true},
+          {key:"b", text:"KV-cache: LONGER's cache stores POST-merge states; refreshing only the touched token's K,V leaves stale merged downstream states.", correct:true},
+          {key:"c", text:"Calibration: LONGER's pointwise sigmoid Platt-scales cleanly; the existing calibration head transfers (this assumption is OK)."},
+          {key:"d", text:"Token-merge similarity is computed on embeddings; quantized/pruned embeddings change merge decisions silently.", correct:true},
+        ]}
+        trap={<>(c) is the correct exception — calibration is the ONE thing that does transfer between SIM and LONGER (both pointwise sigmoid).</>}
+        lens={<>Cascade: embeddings then merge decisions then KV-cache states — all coupled. Calibration is the lone independent component.</>}
+        stretch={<>What's the rollout order that respects this dependency graph?</>}
+      />
+
+      {/* axis: D3 (senior-vs-junior) */}
+      <VIS.TrapProblem
+        id="longer-d3"
+        difficulty="medium"
+        title="D3 — Junior says shard; senior says merge"
+        scenario={<>Sequence length is 50k. A junior says "must shard the sequence across 4 GPUs (sequence parallelism)." What does a senior do first?</>}
+        options={[
+          {key:"a", text:"Use token-merge to shrink the effective sequence INSIDE a single forward pass — usually 50k goes to ~2-4k post-merge, fitting one GPU. Sequence-parallel sharding is rarely needed below 100k.", correct:true},
+          {key:"b", text:"Agree with junior; sequence parallelism is the standard fix."},
+          {key:"c", text:"Run on CPU."},
+          {key:"d", text:"Reduce batch size."},
+        ]}
+        trap={<>(b) is the textbook long-context-LLM answer; it ignores LONGER's specific compression.</>}
+        lens={<>Senior recognizes that LONGER's design already addresses long sequences via in-pass compression. Sharding is a hammer for problems LONGER's design has already softened.</>}
+        stretch={<>At what L does sharding actually become necessary even with merge?</>}
+      />
+
+      {/* axis: D4 (plausible misattribution) */}
+      <VIS.TrapProblem
+        id="longer-d4"
+        difficulty="hard"
+        title="D4 — 'Online CVR dropped 0.5% — widen the global token!'"
+        scenario={<>Post-launch, online CVR dropped 0.5% (offline was strong). A teammate proposes widening the global token. What's the most likely real cause?</>}
+        options={[
+          {key:"a", text:"KV-cache staleness from a recent embedding-table refresh — the cache holds POST-merge states whose merge decisions were made on the OLD embeddings. Widening the global token does nothing here.", correct:true},
+          {key:"b", text:"Bottleneck collapse — widen the global token."},
+          {key:"c", text:"Catastrophic forgetting in fine-tune."},
+          {key:"d", text:"Random eval noise; ignore."},
+        ]}
+        trap={<>(b) is the seductive misattribution — the offline-vs-online gap matches the bottleneck-collapse symptom. (c), (d) are dismissive.</>}
+        lens={<>Diagnose by comparing fresh-cache p99 to stale-cache p99. If the gap is cache age, no architectural change fixes it; you need a cache-invalidation strategy that respects merge dependencies.</>}
+        stretch={<>What's the cheapest cache-aware diagnostic to add?</>}
+      />
+
+      {/* axis: D1 — global token reads */}
+      <VIS.TrapProblem
+        id="longer-d1c"
+        difficulty="medium"
+        title="D1c — 'Global token is write-once'"
+        scenario={<>True or false: "The global token is written once at layer 0, then ignored by downstream blocks." Pick the right characterization.</>}
+        options={[
+          {key:"a", text:"False — the global token is bidirectionally re-read by every position in every block; it's a persistent summary slot that downstream attention consults. Otherwise the bottleneck would be useless for distant-token information transfer.", correct:true},
+          {key:"b", text:"True; that's the definition of a bottleneck."},
+          {key:"c", text:"True; sequence tokens read only from each other."},
+          {key:"d", text:"False — but the global token is read-only after layer 0."},
+        ]}
+        trap={<>(b), (c), (d) are common misreads — they all underestimate how persistently the global token serves as the "long-range channel."</>}
+        lens={<>The global token's value is precisely its persistence — it's the only channel by which token at position 1 communicates with token at position 49999 within budget.</>}
+        stretch={<>If the global token is written-then-frozen, what does the design degrade to?</>}
+      />
+
+      {/* ============== E. Operations ============== */}
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>E. Operations</h3>
+
+      {/* axis: E1 (production gotcha) */}
+      <VIS.TrapProblem
+        id="longer-e1"
+        difficulty="hard"
+        title="E1 — Merge-aware cache invalidation"
+        scenario={<>You refresh the item embedding for SKU X (rare popularity-correction update). What cache entries must be invalidated?</>}
+        options={[
+          {key:"a", text:"Every user-history KV-cache entry where SKU X appears AND every entry where a token MERGED WITH SKU X under the old embeddings — because the merge similarity changes, the merged-token's K,V is no longer valid.", correct:true},
+          {key:"b", text:"Only entries containing SKU X."},
+          {key:"c", text:"All caches must be invalidated globally."},
+          {key:"d", text:"None — the cache stores pre-embedding raw IDs."},
+        ]}
+        trap={<>(b) misses the merge dependency. (c) is overkill. (d) is wrong (cache stores POST-merge states, per the architecture).</>}
+        lens={<>LONGER's cache invalidation is structurally harder than vanilla transformer cache invalidation. Either (i) maintain a merge-graph alongside cache for surgical invalidation, or (ii) accept some stale-cache cost and shorten TTL.</>}
+        stretch={<>Cost of approach (i) vs (ii) at 100M users?</>}
+      />
+
+      {/* axis: E2 (failure-on-Friday — LONGER-specific) */}
+      <VIS.TrapProblem
+        id="longer-e2"
+        difficulty="hard"
+        title="E2 — Friday 3am: fresh creatives under-served"
+        scenario={<>LONGER ships Thursday on Douyin Ads. Friday 3am page: ad CVR is steady but advertisers report <strong>fresh creatives (under 24h old) have CVR -7%</strong>. Latency, util, NDCG fine. Why specifically LONGER, not any model?</>}
+        options={[
+          {key:"a", text:"Token-merge greedily collapses tokens whose embeddings haven't yet diverged from older creatives' embeddings — fresh creatives, whose embeddings are still close to their nearest-neighbor older creatives, get merged-out before their attention can fire. The fix is a freshness-gate that forbids merging tokens with creative-age below a threshold.", correct:true},
+          {key:"b", text:"Calibration drift on fresh creatives."},
+          {key:"c", text:"Cold-start — fresh creatives have no history."},
+          {key:"d", text:"Bottleneck collapse on fresh content."},
+        ]}
+        trap={<>(b) would shift CTR predictions broadly, not specifically fresh-creative CVR. (c) is the generic cold-start answer and doesn't anchor in LONGER's merge mechanism. (d) is unrelated to creative age.</>}
+        lens={<>The failure traces specifically to the merge layer's similarity metric on under-trained fresh embeddings. It's the exact failure mode passing the redaction test — replace "LONGER" with "Model X" and you'd need to know there's a merge layer to even consider this hypothesis.</>}
+        stretch={<>Could you "warm-start" fresh embeddings to avoid this?</>}
+      />
+
+      {/* axis: E3 (implementation specifics) */}
+      <VIS.TrapProblem
+        id="longer-e3"
+        difficulty="medium"
+        title="E3 — Default config that silently halves throughput"
+        scenario={<>You deploy LONGER via the open-source HuggingFace launcher. Throughput is half of what the paper reports. What's the silent default to check?</>}
+        options={[
+          {key:"a", text:"Unified GPU sync requires NCCL above a specific version AND identical sparse+dense layout across ranks; the default launcher silently falls back to 2-phase sync (sparse-then-dense), halving step time without raising an error.", correct:true},
+          {key:"b", text:"Mixed precision not enabled by default."},
+          {key:"c", text:"Gradient checkpointing on by default."},
+          {key:"d", text:"Sequence parallelism off."},
+        ]}
+        trap={<>(b), (c), (d) are plausible perf defaults to check but are not the LONGER-specific contribution. The unified GPU sync IS the optimization that breaks silently.</>}
+        lens={<>The paper's claim depends on the unified-sync optimization; reproducibility hinges on it. If your launcher silently degrades, your perf claim is false.</>}
+        stretch={<>How would you validate that unified sync is active in production?</>}
+      />
+
+      {/* axis: E4 (rollout) */}
+      <VIS.TrapProblem
+        id="longer-e4"
+        difficulty="hard"
+        title="E4 — Migration order with cache TTL"
+        scenario={<>Order: (i) shadow-only, (ii) mirror with logged comparisons, (iii) 1% ramp KV-cache OFF, (iv) KV-cache ON short TTL, (v) full ramp. Is this the right order?</>}
+        options={[
+          {key:"a", text:"Yes — verify model first, then verify perf without cache, THEN turn on cache with short TTL (so any merge-invalidation bug surfaces fast), then ramp. Putting cache-on before perf-without-cache makes cache bugs look like model bugs.", correct:true},
+          {key:"b", text:"No — cache on from step 1; cache misses skew the comparison."},
+          {key:"c", text:"No — skip shadow; mirror is enough."},
+          {key:"d", text:"No — full ramp first."},
+        ]}
+        trap={<>(b) is the latency-optimization-first answer; it makes cache bugs invisible by entangling them with model bugs. (c), (d) ignore standard rollout discipline.</>}
+        lens={<>KV-cache is LONGER's most fragile dependency. Verify model without it, then enable with short TTL (which mitigates any invalidation bug by limiting blast radius), then lengthen.</>}
+        stretch={<>What metric decides "TTL is safe to lengthen"?</>}
+      />
+
+      {/* axis: E5 (reproducibility) */}
+      <VIS.TrapProblem
+        id="longer-e5"
+        difficulty="hard"
+        title="E5 — The hidden experimental detail behind 5x"
+        scenario={<>The paper reports LONGER is 5x faster than baseline transformer at L=8k. Which detail must you match to reproduce?</>}
+        options={[
+          {key:"a", text:"The baseline does NOT use FlashAttention2 — comparing LONGER against a vanilla attention baseline. Reproducing the gap against an FA2 baseline cuts the speedup to ~2x (which is still meaningful but not 5x).", correct:true},
+          {key:"b", text:"Match the GPU model exactly."},
+          {key:"c", text:"Use the exact same dataset."},
+          {key:"d", text:"Match the seed."},
+        ]}
+        trap={<>(b), (c), (d) are reproducibility hygiene but don't explain the gap.</>}
+        lens={<>"X is N-times faster than baseline" claims must always specify the baseline. The 5x is real for vanilla attention; against a FA2-tuned baseline, the gap shrinks substantially. Honest comparison.</>}
+        stretch={<>Does the merge layer benefit from FA2 internally?</>}
+      />
+
+      {/* axis: E6 (eval contamination) */}
+      <VIS.TrapProblem
+        id="longer-e6"
+        difficulty="hard"
+        title="E6 — Why a random 1% eval slice misses LONGER's wins"
+        scenario={<>Offline benchmark on a random 1% slice shows LONGER ~flat vs SIM. But online A/B shows +1.5% CVR. Why does offline miss the win?</>}
+        options={[
+          {key:"a", text:"LONGER's gains concentrate on diverse-interest long-tail users (~5-10% of traffic). A random 1% slice underrepresents this cohort; their gain is washed out by the dominant cohort's flat performance.", correct:true},
+          {key:"b", text:"Offline never matches online; ignore offline."},
+          {key:"c", text:"The 1% is too small a sample for any signal."},
+          {key:"d", text:"Offline data leaks into training."},
+        ]}
+        trap={<>(b) abdicates the diagnosis. (c) is plausible but doesn't anchor in LONGER's actual gain pattern.</>}
+        lens={<>Offline eval must be cohort-stratified for LONGER — the long-tail cohort is where the win lives. Random slicing is a silent under-measurement.</>}
+        stretch={<>What's the right eval stratification — by history length, history diversity, or interest entropy?</>}
+      />
+
+      {/* ============== F. Failure modes ============== */}
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>F. Failure modes</h3>
+
+      {/* axis: F1 (edge case) */}
+      <VIS.TrapProblem
+        id="longer-f1"
+        difficulty="medium"
+        title="F1 — Edge case: user with under 100 events"
+        scenario={<>Construct the shortest user-history length that makes LONGER regress below SASRec on offline metrics. Name the architectural reason.</>}
+        options={[
+          {key:"a", text:"Under ~100 events: token-merge has nothing to merge, the global-token bottleneck degenerates to 'average of 100 tokens' which is no better than mean-pool, and the inner-transformer sees a sequence indistinguishable from SASRec's input but with extra parameters that overfit. Threshold around L=100.", correct:true},
+          {key:"b", text:"Under 10 events."},
+          {key:"c", text:"Under 5000 events."},
+          {key:"d", text:"Never regresses."},
+        ]}
+        trap={<>(d) is the marketing read; (b) understates; (c) overstates the threshold.</>}
+        lens={<>LONGER's value scales with sequence length. Below the threshold, you're paying overhead for no compression benefit. The paper acknowledges this; ByteDance routes short-history users to a separate small-history ranker.</>}
+        stretch={<>How would you detect a short-history user at inference time and route them away?</>}
+      />
+
+      {/* axis: F2 (adversarial test) */}
+      <VIS.TrapProblem
+        id="longer-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: a maximally-degrading sequence"
+        scenario={<>Design a user history that maximally degrades LONGER while leaving SASRec unaffected.</>}
+        options={[
+          {key:"a", text:"A user whose entire history is one repeated action ([click_X] x 10000). Token-merge collapses them all into ONE merged token; the global token becomes a copy of that action; inner attention sees effectively 1 distinct token. SASRec attends over the raw 10k tokens (slow but informative). The attack is a single-mode interest profile, exploited by the merge layer.", correct:true},
+          {key:"b", text:"Random sequence of unrelated items."},
+          {key:"c", text:"Sequence with the rarest items only."},
+          {key:"d", text:"Empty sequence."},
+        ]}
+        trap={<>(b) is the opposite — random sequences merge little (low similarity), so LONGER fully utilizes them. (c) and (d) miss the merge-collapse mechanism.</>}
+        lens={<>The attack exposes LONGER's assumption that merged tokens carry useful "summary" signal. When the sequence is single-mode, there's nothing to summarize and merge becomes deletion.</>}
+        stretch={<>How would you defend against this in production?</>}
+      />
+
+      {/* axis: F3 (reverse engineering) */}
+      <VIS.TrapProblem
+        id="longer-f3"
+        difficulty="hard"
+        title="F3 — Symptom: global-token norm grows, attention weights flatten"
+        scenario={<>During scaling experiments, the global-token's representation norm grows unbounded across training, while downstream attention weights to it flatten. Which LONGER-specific cause explains this?</>}
+        options={[
+          {key:"a", text:"Bottleneck saturation — every sequence's information is getting squeezed into the SAME direction in global-token space; as similarity-across-users grows, downstream attention loses ability to discriminate. Diagnostic: cosine similarity of global tokens across diverse users — if above 0.95, the bottleneck has collapsed.", correct:true},
+          {key:"b", text:"Standard transformer training instability."},
+          {key:"c", text:"Layer-norm misconfiguration."},
+          {key:"d", text:"Gradient explosion."},
+        ]}
+        trap={<>(b), (c), (d) would also cause symptoms but wouldn't selectively show in the global-token direction.</>}
+        lens={<>The symptom is specific to having a single summary slot that all sequences pass through. Multi-token (K&gt;1) variants spread the load across slots and avoid this collapse mode.</>}
+        stretch={<>Detect this BEFORE NDCG drops — what's the early warning?</>}
+      />
+
+      {/* axis: F4 (paper-named) */}
+      <VIS.TrapProblem
+        id="longer-f4"
+        difficulty="medium"
+        title="F4 — Regimes the paper itself flags"
+        scenario={<>Which regimes does the LONGER paper explicitly note as degradation territory?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Ultra-cold-start cohorts where the user has no prior history at all (the global token has nothing to summarize).", correct:true},
+          {key:"b", text:"Surfaces where the candidate set distribution differs sharply from train (no candidate-aware loss term).", correct:true},
+          {key:"c", text:"GPU-poor environments."},
+          {key:"d", text:"Multi-modal item content (text+image)."},
+        ]}
+        trap={<>(c) is a deployment concern, not a paper-named degradation. (d) is unrelated.</>}
+        lens={<>Paper-named regimes are the most honest weaknesses — they're not adversarial. Cold-start and candidate-set-shift are real LONGER limitations from the source.</>}
+        stretch={<>How would you mitigate the candidate-set-shift problem in production?</>}
+      />
+
+      {/* axis: F5 (community-found) */}
+      <VIS.TrapProblem
+        id="longer-f5"
+        difficulty="hard"
+        title="F5 — Multi-token follow-ups expose LONGER's choice"
+        scenario={<>A follow-up paper proposes K=8 global tokens (multi-bottleneck). It shows LONGER's single-token underperforms on a specific user cohort. Without looking up the paper, predict the cohort.</>}
+        options={[
+          {key:"a", text:"Diverse-interest users (the user shops across 5+ unrelated categories). One global-token cannot summarize K independent interest modes; multi-token specializes one slot per mode. These users are exactly where LONGER's bottleneck collapses.", correct:true},
+          {key:"b", text:"Short-history users."},
+          {key:"c", text:"Users with high catalog churn."},
+          {key:"d", text:"Cold-start users."},
+        ]}
+        trap={<>(b), (c), (d) are LONGER weaknesses but unrelated to the single-token bottleneck specifically.</>}
+        lens={<>Multi-token follow-ups attack the EXACT architectural choice (K=1) and target the EXACT cohort where that choice hurts. The argument is mechanistic, not empirical.</>}
+        stretch={<>If you adopt K=8, what new failure mode appears?</>}
+      />
+
+      {/* axis: F1 — high-noise data */}
+      <VIS.TrapProblem
+        id="longer-f1b"
+        difficulty="hard"
+        title="F1b — Adversarial: many thin clusters (latency attack)"
+        scenario={<>Inject behaviors that span many micro-clusters thinly (e.g., 1 click each on 10000 different items, each from a different category). What happens?</>}
+        options={[
+          {key:"a", text:"Token-merge similarity is uniformly low (no adjacent similar pairs); merge layer barely fires, sequence stays near-full L; inner-transformer cost spikes; KV-cache bloats. Latency-attack surface even without bad model output.", correct:true},
+          {key:"b", text:"Merge layer fires aggressively."},
+          {key:"c", text:"Global token saturates."},
+          {key:"d", text:"No effect."},
+        ]}
+        trap={<>(b) reverses the merge logic. (c), (d) miss the latency dimension.</>}
+        lens={<>LONGER's worst-case compute is unmerged O(L²); for diverse sequences, the compression doesn't engage. A malicious actor can construct such histories to spike serving cost — defend by capping post-merge sequence length and falling back to retrieval-then-attention above threshold.</>}
+        stretch={<>What's the right cap, and what fallback do you use above it?</>}
+      />
+
+      {/* axis: F3 — second variant */}
+      <VIS.TrapProblem
+        id="longer-f3b"
+        difficulty="hard"
+        title="F3b — Loss looks fine, online metric flat"
+        scenario={<>Training loss decreases normally, offline NDCG improves with scale, but online CVR is flat. Diagnose the most LONGER-specific cause.</>}
+        options={[
+          {key:"a", text:"The merge layer is overfitting to in-distribution sequences during training but produces inconsistent merge decisions at serving time on out-of-distribution histories — silent train/serve skew localized at the merge layer. Diagnostic: log the count and identity of merged-token-groups; compare offline-train to online-serving distributions.", correct:true},
+          {key:"b", text:"Standard offline-online gap; ignore."},
+          {key:"c", text:"Calibration drift."},
+          {key:"d", text:"GPU thermal throttling."},
+        ]}
+        trap={<>(b) abdicates diagnosis. (c) would shift predictions broadly, not specifically the offline-online gap. (d) is irrelevant.</>}
+        lens={<>Merge is a learned operator that can train/serve skew. Monitor merge stats as a first-class production metric, not just downstream NDCG.</>}
+        stretch={<>What's the merge-stats dashboard a senior would build?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://arxiv.org/abs/2505.04421" target="_blank" rel="noopener">Sun et al. — <em>LONGER: Scaling Up Long Sequence Modeling in Industrial Recommenders</em> (RecSys 2025, paper)</a> — primary source with ablations.</li>
-        <li><a href="https://arxiv.org/abs/2006.05525" target="_blank" rel="noopener">Tay et al. — <em>Efficient Transformers: A Survey</em> (paper)</a> — taxonomy for global/local/merge attention variants; situates LONGER among Reformer, Performer, Longformer.</li>
-        <li><a href="https://lilianweng.github.io/posts/2023-01-27-the-transformer-family-v2/" target="_blank" rel="noopener">Lilian Weng — <em>The Transformer Family v2.0</em> (blog)</a> — clean walkthrough of bottleneck and sparsity tricks LONGER builds on.</li>
-        <li><a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">Jay Alammar — <em>The Illustrated Transformer</em> (blog)</a> — foundation for understanding why KV-cache is non-trivial.</li>
-        <li><a href="https://arxiv.org/abs/2205.09588" target="_blank" rel="noopener">Pi et al. — <em>SIM: Search-based User Interest Modeling</em> (paper)</a> — the hash-retrieval baseline LONGER's global-token approach competes with.</li>
+        <li>
+          <a href="https://arxiv.org/abs/2505.04421" target="_blank" rel="noopener"><strong>Sun et al. — LONGER: Scaling Up Long Sequence Modeling in Industrial Recommenders</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, RecSys 2025)</span>
+          <br/>The LONGER paper. Read §3 (architecture: global token + merge + InnerTransformer), §4 (unified GPU sync), §5 (industrial deployment).
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2210.09461" target="_blank" rel="noopener"><strong>Bolya et al. — Token Merging (ToMe)</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2023)</span>
+          <br/>The ViT-side ancestor of LONGER's token-merge layer. Useful for understanding the merge primitive divorced from the recsys context.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noopener"><strong>Beltagy et al. — Longformer</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, 2020)</span>
+          <br/>The alternating local+global attention pattern LONGER claims to beat on industrial CVR. Reading both back-to-back makes the architectural choice concrete.
+        </li>
+        <li>
+          <a href="https://eugeneyan.com/writing/recsys2024/" target="_blank" rel="noopener"><strong>Eugene Yan — RecSys 2024 / 2025 notes</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
+          <br/>Practitioner perspective on where LONGER, HSTU, TWIN V2 fit in the industrial-recsys landscape.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2407.16357" target="_blank" rel="noopener"><strong>Si et al. — TWIN V2</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, CIKM 2024)</span>
+          <br/>The retrieval-then-attention sibling. Compare against LONGER for the two opposite design philosophies on long sequences.
+        </li>
       </ul>
     </VIS.Section>
   </main>
 );
+
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
