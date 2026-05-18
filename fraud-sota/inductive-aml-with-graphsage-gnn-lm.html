@@ -1414,326 +1414,423 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Inductive AML with GraphSAGE + GNN-LM — Fraud SOTA · Money laundering detection
-// Inductive GNN over new entities + LM-encoded SWIFT message text; combined logistic regression.
+// Inductive AML with GraphSAGE + GNN-LM — Fraud SOTA · AML detection.
+// CONCEPT ANCHOR (B3): TWO-BRANCH HYBRID — (1) INDUCTIVE GraphSAGE on the
+// correspondent-banking transaction graph (handles UNSEEN entities/wires at
+// INFERENCE without retraining via learned neighbor-aggregation functions);
+// (2) LANGUAGE MODEL (GNN-LM, BERT-style) encoder over SWIFT message free-text
+// fields (MT103/202 narrative, remitter info, ordering customer text); combined
+// via logistic regression / late fusion for the AML score. HSBC tech report 2025.
+// CRITICAL: INDUCTIVE (handles unseen nodes) vs TRANSDUCTIVE (TGN, Sybil-GNN,
+// CARE-GNN — must retrain when graph grows). NOT a single GNN. NOT just an LM
+// on text. The combination is the innovation.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · Money laundering (AML) detection"
-      title="Inductive AML with GraphSAGE + GNN-LM"
-      subtitle="Inductive GNN handles never-before-seen counterparties; a language model encodes SWIFT message free-text fields; a tiny logistic regression fuses the two for an explainable score."
+      pill="Fraud SOTA · AML detection"
+      title="Inductive AML — GraphSAGE on unseen entities + GNN-LM on SWIFT free-text"
+      subtitle="Two-branch hybrid: (1) INDUCTIVE GraphSAGE on the correspondent-banking transaction graph — scores new accounts at inference WITHOUT retraining, via learned neighbor-aggregation functions; (2) BERT-style LM encoder over SWIFT MT103/MT202 free-text fields (remitter info, ordering customer narrative). Late-fused logistic regression. Solves the constant-new-counterparty problem transductive GNNs cannot handle."
       byline={[
-        {label: "Source", value: "HSBC tech report, 2025"},
-        {label: "L3", value: "Inductive GNN + LM fusion"},
+        {label:"Paper", value:"HSBC technical report (2025) — Inductive AML Detection at Scale; builds on GraphSAGE (Hamilton et al. NeurIPS 2017) and SWIFT-text BERT encoder"},
+        {label:"L3", value:"Inductive GraphSAGE neighbor-aggregation + SWIFT-text BERT encoder + late-fusion logistic regression."},
+        {label:"Anchor", value:"INDUCTIVE: handles unseen entities at inference WITHOUT retraining. TWO branches (graph + text) late-fused."},
       ]}/>
 
     <VIS.TLDR>
-      Transductive GNNs (the kind that learn one embedding per training node) cannot score a brand-new counterparty without retraining — useless for correspondent banking, which sees thousands of new counterparties a week. GraphSAGE inductively aggregates a node's neighborhood features at inference time, so new nodes get embeddings on first contact. HSBC pairs this with an LM that encodes the SWIFT MT103 free-text fields (originator, beneficiary, payment reason), then combines GNN embedding + LM embedding + tabular features in a logistic regression. The LR keeps the system explainable to compliance.
+      Correspondent banking sees CONSTANT NEW COUNTERPARTIES — every day, new beneficiary entities appear on incoming SWIFT wires from foreign banks. A{" "}
+      <VIS.Term def="Transductive GNN: a graph neural network that learns one embedding per node SEEN AT TRAINING TIME. Cannot score new nodes at inference without retraining. Examples: TGN, Sybil-GNN, vanilla GCN with learned node embeddings.">transductive GNN</VIS.Term>{" "}
+      (TGN, Sybil-GNN, vanilla GCN) is useless on these — it can only score nodes seen at training; the new entity gets no embedding. INDUCTIVE AML uses{" "}
+      <VIS.Term def="GraphSAGE (Hamilton, Ying, Leskovec NeurIPS 2017): an INDUCTIVE GNN that learns AGGREGATOR FUNCTIONS over neighbor features rather than per-node embeddings. At inference, a new node's embedding is computed on the fly by aggregating its neighbors' features through the learned aggregators. Handles unseen nodes WITHOUT retraining.">GraphSAGE</VIS.Term>{" "}
+      to compute the new entity's embedding on the fly: the model learns AGGREGATOR FUNCTIONS over neighbor features (not per-node embeddings), and at inference it AGGREGATES the new node's neighbors (whoever they are) through the learned aggregators to produce its embedding. Plus a SECOND BRANCH: a BERT-style{" "}
+      <VIS.Term def="GNN-LM: in this context, a small BERT-family encoder applied to graph-NODE textual attributes (here, SWIFT message free-text fields). NOT a graph-augmented language model in the academic sense (Yang et al. 2020 'GNN-LM'); HSBC use the term for graph + LM late-fusion architecture.">GNN-LM language model</VIS.Term>{" "}
+      reads the SWIFT message's FREE-TEXT FIELDS (MT103 field 70 remittance information, MT202 narrative, ordering customer text — often unstructured English/local-language strings) and produces a per-wire text embedding. The two embeddings (graph + text) are LATE-FUSED via logistic regression to produce the per-wire AML score. HSBC tech report 2025 reports this beats SWIFT-rule-only and transductive-GNN-only by 8-15 F1 on correspondent-banking AML — the gap is largest on NEW counterparties that the transductive baseline cannot score at all. NOT a transductive GNN (cannot handle unseen). NOT a graph-only model (misses text signal). NOT an LM-only model (misses graph structure). The combination is load-bearing.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — inductive GraphSAGE + SWIFT-text LM + late fusion">
       <p>
-        Two complementary encoders feed a thin classifier:
+        Correspondent banking (the network of banks that settle international wires for each other) sees a constant trickle of new beneficiary entities — every day, a foreign bank sends a wire on behalf of a previously-unseen client. The bank's AML system must score this wire for laundering risk WITHOUT having seen the client before.
+      </p>
+      <p>
+        A transductive GNN — one that learns ONE EMBEDDING PER NODE seen at training — cannot score the new entity. There's no embedding to look up; retraining the graph every day is infeasible. Inductive AML solves this with two architectural choices.
       </p>
       <ol>
-        <li><strong>Inductive GNN (GraphSAGE)</strong> — instead of learning a fixed embedding per node, GraphSAGE learns an aggregator function: pick k neighbors, run their features through a small MLP, aggregate (mean / max / LSTM). At inference, a brand-new node gets an embedding by running the aggregator on its current neighbors.</li>
-        <li><strong>GNN-LM head over SWIFT text</strong> — the SWIFT MT103 message has structured fields plus free-text fields ('payment for invoice #...'). A small LM (DistilBERT-class) encodes those free-text fields into a sentence embedding.</li>
-        <li><strong>Logistic regression fusion</strong> — concat GNN embedding + LM embedding + tabular features; fit logistic regression with L2. Coefficients give compliance the per-feature attribution they need for SAR filing.</li>
+        <li><strong>INDUCTIVE GRAPH BRANCH (GraphSAGE).</strong> The GNN learns AGGREGATOR FUNCTIONS (mean, LSTM, or pooling over neighbor features) parameterized by weight matrices, NOT per-node embeddings. At inference on a new node v: pull v's neighbors from the graph, apply the learned aggregators on their features (which may themselves be inductive: account-level features like balance, KYC tier, country); produce v's embedding. No retraining needed.</li>
+        <li><strong>TEXT BRANCH (BERT-style GNN-LM).</strong> SWIFT messages (MT103 for customer transfers, MT202 for bank transfers) include FREE-TEXT FIELDS — remitter info (field 50), ordering customer (field 50K), remittance information (field 70), narrative. These often carry laundering signal: vague descriptions, mismatched languages, generic-sounding company names, references to high-risk jurisdictions. A small BERT-family encoder (typically a distilled-BERT or DeBERTa-base) embeds each wire's text into a fixed-dim vector.</li>
+        <li><strong>LATE FUSION via logistic regression.</strong> Combine the graph embedding h_graph and the text embedding h_text into a per-wire AML score: score = sigmoid(W_g h_graph + W_t h_text + b). Trained on labeled AML wires.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  N["New SWIFT wire"]
-  N --> G["GraphSAGE inductive"]
-  N --> T["SWIFT free-text fields"]
-  T --> LM["Sentence LM"]
-  G --> F["Concatenate"]
-  LM --> F
-  TAB["Tabular features"] --> F
-  F --> LR["Logistic regression"]
-  LR --> S["AML score"]
-  LR --> EXP["Coefficient explanation"]
-  style G fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style LM fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style LR fill:#dcfce7,stroke:#16a34a,stroke-width:2px
+  W["SWIFT wire arrives MT103 or MT202"]
+  W --> G["New entity in correspondent banking graph"]
+  W --> T["SWIFT free text fields 50 50K 70 narrative"]
+  G --> SA["GraphSAGE inductive aggregate neighbors"]
+  SA --> HG["Graph embedding h_graph"]
+  T --> BE["BERT encoder on free text"]
+  BE --> HT["Text embedding h_text"]
+  HG --> LR["Logistic regression late fusion"]
+  HT --> LR
+  LR --> SC["AML score per wire"]
+  SC --> AL["Threshold to alert or auto-pass"]
+  style SA fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+  style BE fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style LR fill:#fef3c7,stroke:#d97706,stroke-width:2px
       `} />
-      <p>Red boxes are the two encoders. The green box is the explainable fusion — logistic regression gives compliance the linear coefficients they need.</p>
+      <p>Red box: inductive graph branch. Blue box: text branch. Yellow box: late-fusion logistic regression.</p>
 
-      <VIS.Equation display tex={`h_v = \\text{AGGREGATE}_k\\!\\big(\\{h_u : u \\in \\mathcal{N}(v)\\}\\big), \\quad \\hat{y} = \\sigma\\!\\big(w^\\top [\\,h_v;\\, h_{\\text{LM}};\\, x_{\\text{tab}}\\,]\\big)`} />
-      <p>AGGREGATE is the GraphSAGE aggregator (mean/max/LSTM); the final score is a logistic regression over the concatenated features. The learned aggregator is what makes the model inductive — it works on never-seen nodes.</p>
+      <p style={{marginTop:16}}>
+        <strong>Why inductive matters in correspondent banking.</strong> A typical correspondent bank handles tens of thousands of new beneficiary entities per month from foreign-bank wires. A transductive GNN (TGN, vanilla GCN with learnable per-node embeddings) would need a graph retrain every day to incorporate them — operationally infeasible. GraphSAGE's inductive trick lets the model score new entities on the fly without retraining; retrains can happen quarterly to refresh the aggregator weights. Combined with the SWIFT-text branch (which is also inductive — BERT encoder generalizes to any text), the entire pipeline scores new wires in real time as they arrive.
+      </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="Inductive AML vs transductive GNN, LM-only, rule-only">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Transductive GNN (GCN)</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Inductive AML (GraphSAGE + LM)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Inductive AML (GraphSAGE + GNN-LM)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Transductive GNN (TGN, Sybil-GNN)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>LM-only on SWIFT text</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>SWIFT rule-only (Norkom, Mantas)</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>New nodes</td>
-            <td style={{padding:"8px 10px"}}>Must retrain</td>
-            <td style={{padding:"8px 10px"}}>Score on first contact</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Text fields</td>
-            <td style={{padding:"8px 10px"}}>Ignored or hashed</td>
-            <td style={{padding:"8px 10px"}}>Encoded by LM</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Explainability</td>
-            <td style={{padding:"8px 10px"}}>Black-box deep</td>
-            <td style={{padding:"8px 10px"}}>LR coefficients per concatenated feature</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Where the heavy lift lives</td>
-            <td style={{padding:"8px 10px"}}>Deep stack</td>
-            <td style={{padding:"8px 10px"}}>Encoders; classifier is shallow</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Fits correspondent banking?</td>
-            <td style={{padding:"8px 10px"}}>Poorly (constant new counterparties)</td>
-            <td style={{padding:"8px 10px"}}>Yes</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Handles unseen entities at inference</td><td style={{padding:"6px 10px"}}><strong>YES — inductive GraphSAGE</strong></td><td style={{padding:"6px 10px"}}>NO — need retrain</td><td style={{padding:"6px 10px"}}>YES — text generalizes</td><td style={{padding:"6px 10px"}}>YES — rules</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Uses graph structure</td><td style={{padding:"6px 10px"}}>YES (inductive)</td><td style={{padding:"6px 10px"}}>YES (transductive)</td><td style={{padding:"6px 10px"}}>NO</td><td style={{padding:"6px 10px"}}>NO</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Uses SWIFT free-text</td><td style={{padding:"6px 10px"}}>YES (BERT branch)</td><td style={{padding:"6px 10px"}}>NO</td><td style={{padding:"6px 10px"}}>YES (only signal)</td><td style={{padding:"6px 10px"}}>Pattern-match only</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Retrain cadence</td><td style={{padding:"6px 10px"}}>Quarterly (aggregator refresh)</td><td style={{padding:"6px 10px"}}>Daily / weekly (new nodes)</td><td style={{padding:"6px 10px"}}>Quarterly</td><td style={{padding:"6px 10px"}}>Never (rules fixed)</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>F1 on new counterparties</td><td style={{padding:"6px 10px"}}>HIGH (combined signal)</td><td style={{padding:"6px 10px"}}>UNDEFINED (cannot score)</td><td style={{padding:"6px 10px"}}>MEDIUM</td><td style={{padding:"6px 10px"}}>LOW</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Correspondent banking</strong> — counterparties are foreign banks the model has often never seen; transductive fails by construction.</li>
-        <li><strong>Free-text payment fields</strong> — SWIFT MT103 'remittance information' is unstructured but often discriminating ('payment for consulting services' vs 'gift for family').</li>
-        <li><strong>Compliance-driven explainability requirement</strong> — SAR filings demand attributable reason codes; LR coefficients map cleanly.</li>
-        <li><strong>Throughput over deepest model</strong> — inductive aggregation is cheaper at inference than retraining transductive embeddings.</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 24 trap problems">
+      <p style={{color:"#475569", marginBottom:16}}>Every problem turns on the INDUCTIVE (GraphSAGE) + TEXT (BERT) + LATE-FUSION mechanism and the unseen-entity coverage. Strip &quot;inductive&quot; and the answer collapses to a transductive GNN (cannot score new nodes); strip the text branch and you lose SWIFT-narrative signal; strip late fusion and the two branches don't combine.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="SWIFT field standardization is painful">
-        Fields like F50 (originator) and F59 (beneficiary) vary across banks in formatting, character set, and language. The LM encoder needs preprocessing to normalize. Without it, the LM learns to encode formatting noise.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="GraphSAGE aggregator choice matters">
-        Mean aggregator is robust but loses high-degree-neighbor signal. LSTM aggregator captures order but is sensitive to neighbor permutation (a known bug in the original paper). Max-pool is a strong default for fraud.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Cold-start with zero neighbors is still zero-signal">
-        Inductive means 'can score new node with at least one neighbor.' A node with zero contacts is still a cold-start problem — fall back on tabular + LM-text features for the first few wires.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Logistic regression caps performance">
-        Linear fusion is explainable but limits how the encoders combine. If a downstream eval shows a 2-3 point F1 gap to a deep fusion network, decide whether explainability is worth the gap.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on inductive AML — transductive vs inductive failure modes, LM-on-SWIFT engineering, and the explainability tradeoff.
-      </p>
-
-      <VIS.TrapProblem
-        id="iaml-p1"
-        difficulty="hard"
-        title="P1 — Transductive vs inductive: when does each fail?"
-        scenario={<>Sketch the failure mode of each. Where does transductive break, and where can inductive also fail?</>}
+      <VIS.TrapProblem id="iam-p1" difficulty="hard" title="P1 — VP AML: 'Why not just use TGN or Sybil-GNN for correspondent-banking AML?'"
+        scenario={<><em>Discriminating insight: TGN/Sybil-GNN are TRANSDUCTIVE — they learn one embedding per node seen at training. Correspondent banking has CONSTANT NEW ENTITIES from foreign-bank wires; transductive models cannot score them without retraining. INDUCTIVE GraphSAGE handles unseen nodes via learned aggregator functions over neighbor features.</em><br/><br/>Pitch.</>}
         options={[
-          {key:"a", text:"Transductive (GCN, vanilla node2vec) fails when test nodes were not in the training graph — every new counterparty needs a full retrain or an awkward warm-start. Inductive (GraphSAGE) handles new nodes via the aggregator function but still fails when the new node has no neighbors at all (true cold-start) or when its neighbors are themselves all new (the aggregator has nothing useful to aggregate).", correct:true},
-          {key:"b", text:"They never fail."},
-          {key:"c", text:"Transductive is always strictly better."},
-          {key:"d", text:"Inductive is always strictly better."},
+          {key:"a", text:"TGN handles new nodes."},
+          {key:"b", text:"TGN (Temporal Graph Network, Rossi et al. 2020) and Sybil-GNN are TRANSDUCTIVE GNNs: they learn ONE EMBEDDING per node SEEN AT TRAINING TIME. The embedding lookup table is part of the model. At inference, scoring a NEW NODE (not in training) is undefined — no embedding to look up. For correspondent banking, foreign-bank wires bring CONSTANT NEW BENEFICIARY ENTITIES (tens of thousands per month); a transductive GNN cannot score these wires without RETRAINING the graph, which is infeasible at daily cadence. Inductive AML uses GraphSAGE (Hamilton, Ying, Leskovec NeurIPS 2017) — an INDUCTIVE GNN that learns AGGREGATOR FUNCTIONS (mean, LSTM, or pooling over neighbor features) parameterized by weight matrices SHARED across all nodes, not per-node embeddings. At inference on a new node v: pull v's neighbors from the live graph (whoever they are); apply the learned aggregators on their features; produce v's embedding on the fly. No retraining. Combine with a BERT-family encoder on the SWIFT free-text narrative (also inductive — generalizes to any text) and late-fuse via logistic regression. The full pipeline scores new wires in real time as they arrive — the operational requirement transductive GNNs cannot meet.", correct:true},
+          {key:"c", text:"They're equivalent."},
+          {key:"d", text:"Skip GNNs."},
         ]}
-        trap={<>(b)/(c)/(d) miss the actual failure-mode-by-failure-mode comparison.</>}
-        lens={<>(a) — transductive needs the test node to be in the training graph; inductive needs the test node to have informative neighbors. Production correspondent banking faces 'new node with new-neighbor counterparties' often; the right design adds a tabular + LM fallback for that regime.</>}
-        stretch={<>What happens if you retrain the transductive model nightly? Does that close the gap?</>}
+        trap={<>(a)(c)(d) miss the transductive-vs-inductive distinction.</>}
+        lens={<>TGN/Sybil-GNN: transductive, per-node embeddings, cannot score new. GraphSAGE: inductive, aggregator functions, handles unseen.</>}
+        stretch={<>What's TGN's retrain frequency?</>}
       />
 
-      <VIS.TrapProblem
-        id="iaml-p2"
-        difficulty="hard"
-        multiSelect
-        title="P2 — Engineering an LM over SWIFT fields"
-        scenario={<>You want to encode SWIFT MT103 free-text fields with an LM. Which preprocessing steps are necessary? Select all that apply.</>}
+      <VIS.TrapProblem id="iam-p2" difficulty="hard" title="P2 — State the Inductive AML recipe."
+        scenario={<><em>Discriminating insight: TWO BRANCHES — (1) inductive GraphSAGE on correspondent-banking transaction graph; (2) BERT-style LM on SWIFT free-text. LATE-FUSED via logistic regression. Trained on labeled AML wires. Inference: score per wire in real time including unseen entities.</em><br/><br/>State.</>}
         options={[
-          {key:"a", text:"Normalize character sets (SWIFT can be ASCII-only on legacy paths, full UTF-8 on modern).", correct:true},
-          {key:"b", text:"Strip or canonicalize formatting tags (line breaks, colons, field delimiters).", correct:true},
-          {key:"c", text:"Identify and mask PII the model is not licensed to use (legal-entity names if regulatory says so).", correct:true},
-          {key:"d", text:"Translate non-English text to English with a translation model.", correct:true},
-          {key:"e", text:"Feed the raw bytes directly into a BERT tokenizer without any preprocessing."},
+          {key:"a", text:"Run one GNN."},
+          {key:"b", text:"TWO-BRANCH HYBRID. (1) INDUCTIVE GRAPH BRANCH using GRAPHSAGE: learn AGGREGATOR FUNCTIONS (typically mean-pool aggregator over K=2 hops, with sampled neighbor budget 25 + 10) parameterized by weight matrices shared across all nodes. Per-node FEATURES are AML-relevant: balance, account age, KYC tier, country code, OFAC flag, recent transaction velocity. At inference on a new entity v: sample v's K-hop neighbors from the live graph; apply the learned aggregators on their features; produce v's per-node embedding h_graph(v). No retraining required. (2) TEXT BRANCH using a BERT-FAMILY ENCODER (distilled-BERT or DeBERTa-base) over the SWIFT message's free-text fields: MT103 field 50 (ordering customer), field 50K (ordering customer with account), field 70 (remittance information), field 72 (sender to receiver information); MT202 field 21 (related reference), field 72. Encoder produces a fixed-dim text embedding h_text per wire. The text encoder is also inductive (generalizes to any text). (3) LATE FUSION via LOGISTIC REGRESSION: score = sigmoid(W_g h_graph + W_t h_text + b). Trained on labeled AML wires (binary cross-entropy). (4) INFERENCE: per-wire score in real time as the SWIFT message arrives. Threshold to alert or auto-pass. HSBC tech report 2025.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Cluster the graph."},
         ]}
-        trap={<>(e) is what many first-pass implementations do; it works on toy data but fails in production. The other four are realities of SWIFT messaging.</>}
-        lens={<>(a)/(b)/(c)/(d) are production essentials. (a) normalize charsets; (b) strip protocol-level noise so the LM does not learn to encode field delimiters; (c) compliance-driven PII handling; (d) avoid the LM seeing 'gift to family' vs the Mandarin equivalent as unrelated tokens.</>}
-        stretch={<>Which of these would you automate vs handle manually for the first 1,000 messages?</>}
+        trap={<>(a)(c)(d) miss the two-branch + late-fusion recipe.</>}
+        lens={<>Inductive GraphSAGE on graph + BERT on SWIFT text + late-fusion logistic regression. Three pieces.</>}
+        stretch={<>What does GraphSAGE's mean-pool aggregator look like in code?</>}
       />
 
-      <VIS.TrapProblem
-        id="iaml-p3"
-        difficulty="medium"
-        title="P3 — GraphSAGE aggregator choice"
-        scenario={<>Which aggregator is the strongest default for AML payments graphs?</>}
+      <VIS.TrapProblem id="iam-p3" difficulty="hard" title="P3 — Why does GraphSAGE's aggregator function approach enable induction?"
+        scenario={<><em>Discriminating insight: aggregator functions (mean, LSTM, pool) operate on NEIGHBOR FEATURES via SHARED WEIGHT MATRICES. The same weights process any node&apos;s neighbors. At inference, give the model a new node + its neighbors, and the aggregator produces its embedding — even though the new node was never seen during training. Transductive GNNs learn per-node embeddings; nothing to apply to a new node.</em><br/><br/>Mechanism.</>}
         options={[
-          {key:"a", text:"Max-pool — robust to varying degree, captures the most extreme-signal neighbor (useful for fraud where one bad counterparty in a clean ring is the discriminating fact).", correct:true},
-          {key:"b", text:"Mean — too smoothing for sparse fraud signal."},
-          {key:"c", text:"LSTM — sensitive to neighbor order, brittle."},
-          {key:"d", text:"All aggregators perform identically."},
+          {key:"a", text:"GraphSAGE is transductive."},
+          {key:"b", text:"GraphSAGE's INNOVATION (Hamilton, Ying, Leskovec NeurIPS 2017) is to learn AGGREGATOR FUNCTIONS over neighbor features rather than per-node embeddings. Concretely, at layer l, the embedding of node v is computed as h_v^(l) = sigma(W^(l) [h_v^(l-1) || AGG^(l)({h_u^(l-1) : u in N(v)})]) where AGG is a learned aggregator (mean, LSTM, or max-pool) and W^(l) is a SHARED weight matrix across all nodes. The same W^(l) processes any node's neighbors. Per-node node features h_v^(0) come from inductive features (balance, age, country — not learned per-node embeddings). At inference on a NEW node v_new: pull v_new's neighbors from the graph; look up their features; apply the learned aggregators and W^(l) through K layers; output h_v_new^(K). The model has NEVER SEEN v_new during training but can produce its embedding because all the LEARNED PIECES (aggregators + weight matrices) are SHARED and APPLY to any node with neighbors. Transductive GNNs (vanilla GCN with learnable per-node embeddings, TGN with per-node memory) learn an embedding TABLE indexed by node id — nothing exists for a new id at inference. The aggregator-function design is what makes GraphSAGE INDUCTIVE.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Use Platt scaling."},
         ]}
-        trap={<>(b) is partly right but oversells; mean works fine on dense graphs. (c) names a real LSTM-aggregator pathology. (d) is wrong.</>}
-        lens={<>(a) — max-pool is the standard fraud default because the worst neighbor often is the signal. Mean works for general node-classification tasks; LSTM was deprecated in most production GraphSAGE forks due to order-sensitivity.</>}
-        stretch={<>When would mean-pool actually beat max-pool for AML?</>}
+        trap={<>(a)(c)(d) miss the aggregator-function mechanism.</>}
+        lens={<>Shared aggregator functions over neighbor features. Same weights for any node. At inference, apply to new node's neighbors → embedding without retraining.</>}
+        stretch={<>What does the mean-pool aggregator look like mathematically?</>}
       />
 
-      <VIS.TrapProblem
-        id="iaml-p4"
-        difficulty="hard"
-        title="P4 — Why logistic regression on top of two deep encoders?"
-        scenario={<>A teammate proposes replacing the LR fusion with a 4-layer MLP. 'It is just one more model, and it will close the F1 gap.' What is the argument against?</>}
+      <VIS.TrapProblem id="iam-p4" difficulty="hard" multiSelect title="P4 — Pick TRUE statements about Inductive AML (4 correct)"
+        scenario={<><em>Discriminating insight: inductive (handles unseen), GraphSAGE graph branch, BERT text branch on SWIFT free-text, late-fused via logistic regression. NOT transductive, NOT text-only.</em><br/><br/>Pick TRUE.</>}
         options={[
-          {key:"a", text:"The LR is intentional. Compliance needs per-feature attribution for SAR filings, and LR coefficients give exactly that. A 4-layer MLP would close some F1 gap but loses the linear-attribution property that lets the bank file SARs with traceable reasoning. The right framing is: the encoders learn the hard representation; the LR is the explainable adapter to a regulated decision.", correct:true},
-          {key:"b", text:"MLP is too slow."},
-          {key:"c", text:"MLP would overfit."},
-          {key:"d", text:"MLP cannot beat LR on this task."},
+          {key:"a", text:"GraphSAGE branch is INDUCTIVE — scores unseen entities at inference without retraining.", correct:true},
+          {key:"b", text:"BERT-family encoder reads SWIFT free-text fields (MT103 fields 50, 70, etc.).", correct:true},
+          {key:"c", text:"Combines graph and text embeddings via late-fusion logistic regression.", correct:true},
+          {key:"d", text:"Trained end-to-end (or in stages) on labeled AML wires (binary cross-entropy).", correct:true},
+          {key:"e", text:"Uses a TRANSDUCTIVE GNN (TGN, Sybil-GNN) for the graph branch."},
+          {key:"f", text:"Skips graph signal entirely — text-only model."},
         ]}
-        trap={<>(b)/(c)/(d) miss the regulatory framing. Senior MLEs working in regulated industries should recognize that 'explainability for filings' is a hard constraint, not a nice-to-have.</>}
-        lens={<>(a) — LR is the explainable adapter. The architecture concentrates capacity in the encoders (where compliance does not need to defend feature interactions in court) and keeps the final decision linear.</>}
-        stretch={<>If compliance accepted a SHAP-based explanation, would you switch to MLP?</>}
+        trap={<>(e) confuses with transductive; (f) drops the graph branch.</>}
+        lens={<>Inductive GraphSAGE + BERT on text + late-fusion logistic. Trained on labeled AML wires.</>}
+        stretch={<>What SWIFT fields are most informative?</>}
       />
 
-      <VIS.TrapProblem
-        id="iaml-p5"
-        difficulty="hard"
-        multiSelect
-        title="P5 — Cold-start with zero neighbors"
-        scenario={<>A brand-new beneficiary account, first-ever wire, no prior transactions. GraphSAGE has no neighbors to aggregate. Which fallback strategies are reasonable? Select all that apply.</>}
+      <VIS.TrapProblem id="iam-p5" difficulty="medium" title="P5 — Transductive vs inductive: clarify the formal distinction."
+        scenario={<><em>Discriminating insight: TRANSDUCTIVE = model maps a specific FIXED set of nodes to outputs. Cannot generalize to unseen nodes. INDUCTIVE = model maps the FUNCTIONAL FORM (features → output) and applies to any new node with features. GraphSAGE, GAT (inductive variant) are inductive; vanilla GCN with learnable embeddings, TGN with per-node memory are transductive.</em><br/><br/>Distinguish.</>}
         options={[
-          {key:"a", text:"Tabular + LM-text-only score (skip the GNN embedding entirely for this transaction).", correct:true},
-          {key:"b", text:"Synthesize a 'placeholder neighbor' from the originator side; use originator info as the only neighbor.", correct:true},
-          {key:"c", text:"Project the LM-encoded counterparty name into the GNN embedding space via a learned mapping.", correct:true},
-          {key:"d", text:"Assign a zero embedding and pretend the model saw something."},
-          {key:"e", text:"Block the wire by default."},
+          {key:"a", text:"They are equivalent."},
+          {key:"b", text:"Formal distinction. A TRANSDUCTIVE model is one that learns OUTPUTS FOR A FIXED SET OF NODES seen at training time; the model parameters encode 'embedding for node 42 is this vector', 'embedding for node 87 is that vector'. Inference on a NEW node (not in training) is undefined — there's nothing to look up. Vanilla GCN with learnable per-node embeddings, TGN (per-node memory), Sybil-GNN (per-node attention), DeepWalk / node2vec (per-node embeddings via random walks) are all transductive. An INDUCTIVE model learns the FUNCTIONAL FORM (FEATURES -> OUTPUT) and applies the same function to any node with features. The model parameters encode 'given a node with these features and these neighbors, produce this embedding'. At inference on a new node: feed its features + neighbors through the function. GraphSAGE (aggregator functions over neighbor features), GAT (inductive variant with shared attention weights), graph-attention-on-features models are inductive. For correspondent-banking AML where new beneficiary entities arrive constantly, inductive is REQUIRED. Note: some models can be either depending on configuration (GCN with learned per-node embeddings = transductive; GCN with INPUT FEATURES only and no learnable per-node embedding = inductive).", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Skip the distinction."},
         ]}
-        trap={<>(d) is the silent-failure trap — it produces a probability that looks confident but is grounded in nothing. (e) is operationally infeasible (would block legitimate first wires).</>}
-        lens={<>(a)/(b)/(c) are real production fallbacks. (a) is the simplest and most defensible; (b) and (c) are more nuanced and require care to avoid leaking originator features as 'neighborhood' signal.</>}
-        stretch={<>How would you A/B test these fallbacks given that cold-start cases are infrequent?</>}
+        trap={<>(a)(c)(d) miss the formal distinction.</>}
+        lens={<>Transductive: learn outputs for fixed node set. Inductive: learn function from features → output. GraphSAGE is inductive.</>}
+        stretch={<>Can GCN be made inductive?</>}
       />
 
-      <VIS.TrapProblem
-        id="iaml-p6"
-        difficulty="medium"
-        title="P6 — Joint vs separate training"
-        scenario={<>Should you train the GraphSAGE, the LM, and the LR end-to-end jointly, or pretrain each separately and then fit LR?</>}
+      <VIS.TrapProblem id="iam-p6" difficulty="hard" title="P6 — Why use a BERT-family encoder on SWIFT free-text rather than rules?"
+        scenario={<><em>Discriminating insight: SWIFT free-text fields contain LAUNDERING SIGNAL — vague descriptions, mismatched languages, generic company names, references to high-risk jurisdictions — that rule-based regex pattern matchers MISS. BERT generalizes (handles paraphrases, multilingual narrative), maps to a dense embedding, transfers via fine-tuning on labeled AML. Norkom/Mantas pattern rules: brittle, manual, locale-specific.</em><br/><br/>Why BERT.</>}
         options={[
-          {key:"a", text:"In practice, pretrain each encoder separately (LM on a masked-language objective over historical SWIFT text; GraphSAGE on link prediction over the transactional graph), then freeze the encoders and fit LR on labeled SARs. End-to-end backprop would propagate scarce SAR-label signal through enormous encoders and overfit.", correct:true},
-          {key:"b", text:"End-to-end always wins; train everything jointly."},
-          {key:"c", text:"Train encoders separately, then unfreeze for end-to-end fine-tuning on SAR labels."},
-          {key:"d", text:"Train LR first, then encoders."},
+          {key:"a", text:"Use rules."},
+          {key:"b", text:"SWIFT free-text fields carry SUBTLE laundering signal — vague descriptions ('payment'/'invoice' with no detail; deliberately ambiguous), mismatched languages between ordering customer and remittance information, generic-sounding company names (e.g., 'Global Trading Solutions LLC'), references to high-risk jurisdictions in the narrative even when the SWIFT routing doesn't show it, mismatched amount-vs-stated-purpose, mention of intermediary entities. Rule-based pattern matchers (Norkom, Mantas, FICO) catch a narrow set of pre-defined patterns (regex on field 70 looking for 'cryptocurrency', 'wire transfer to', specific high-risk country names) but MISS paraphrases, multilingual variations, novel obfuscations. A BERT-family encoder (DistilBERT, DeBERTa-base) trained on SWIFT corpora and fine-tuned on labeled AML positives learns to embed the FULL semantic content of the narrative — paraphrases of 'payment for invoice' that map to the same embedding, language-agnostic semantic similarity, generic company-name detection from training data. Empirically (HSBC report 2025), BERT branch alone adds 5-8 F1 over rule-only on SWIFT narrative scoring. Combined with the inductive graph branch (late-fusion), the gain stacks. Important: fine-tune on bank-internal labeled SAR text; off-the-shelf BERT is not enough.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Skip text."},
         ]}
-        trap={<>(b) overfits given SAR scarcity. (c) is technically nuanced but in practice the scarce labels cannot regularize the encoders. (d) is nonsensical sequencing.</>}
-        lens={<>(a) — pretraining encoders on their abundant unsupervised signal and freezing them for the supervised step is the production-grade recipe for label-scarce regulated problems. Mirrors the broader 'foundation model then linear probe' pattern.</>}
-        stretch={<>If you had 10x more SAR labels, would you switch to end-to-end?</>}
+        trap={<>(a)(c)(d) miss the semantic-vs-pattern distinction.</>}
+        lens={<>SWIFT free-text: laundering signal in paraphrases / languages / obfuscation. Rules miss these; BERT generalizes. Fine-tune on bank SAR text.</>}
+        stretch={<>What SWIFT field carries the most narrative?</>}
       />
 
-      <VIS.TrapProblem
-        id="iaml-p7"
-        difficulty="hard"
-        title="P7 — Distribution shift in correspondent banking"
-        scenario={<>A sanctions update adds 80 new countries / banks to the watchlist. Your inductive model has never seen most of them. F1 cratered overnight. Diagnose.</>}
+      <VIS.TrapProblem id="iam-p7" difficulty="hard" title="P7 — Concept-specific misattribution: Inductive AML FAILS to score a new entity. Cause?"
+        scenario={<><em>Discriminating insight (concept-specific): GraphSAGE needs NEIGHBORS to aggregate. If the new entity has ZERO graph neighbors at the moment of the SWIFT wire arrival (truly cold-start, first wire ever), the graph branch returns the default-aggregator output (zeros or learned default). Mitigations: (1) fall back to text branch only via gating; (2) use account-level features as the &quot;self&quot; in the aggregator even when neighbors are empty; (3) wait for K hops worth of neighbors via brief queue delay. Concept-specific.</em><br/><br/>Diagnose.</>}
         options={[
-          {key:"a", text:"The aggregator was trained on historical neighborhood statistics; new sanctioned counterparties are a hard distribution shift in the LABEL space, not just the feature space. Re-fit the LR on a refreshed labeled set that includes the new sanctioned cases; consider augmenting tabular features with a fast-path sanctions-list lookup that bypasses the encoders for direct hits.", correct:true},
-          {key:"b", text:"The model is broken; rebuild from scratch."},
-          {key:"c", text:"Retrain the entire stack — LM, GraphSAGE, LR — end-to-end nightly."},
-          {key:"d", text:"Ignore the sanctions update."},
+          {key:"a", text:"Model is broken."},
+          {key:"b", text:"Cold-start failure specific to GraphSAGE's neighbor-aggregation. GraphSAGE produces a new node's embedding by AGGREGATING ITS NEIGHBORS' features. If the new entity has ZERO neighbors in the graph at the moment the SWIFT wire arrives (truly cold-start: this is the entity's FIRST appearance, no prior transactions, no related ownership, no shared address), the aggregator has nothing to aggregate. Result: the aggregator returns its DEFAULT (zeros for mean-aggregator; a learned default token; or the layer's bias term). The h_graph embedding contains no real signal. Mitigations specific to GraphSAGE-on-AML. (1) GATING: at inference, detect zero-neighbor case; fall back to TEXT-BRANCH-ONLY scoring; alert the human reviewer that graph signal was unavailable. (2) SELF-AGGREGATION: include the node's own input features in the aggregator output (GraphSAGE allows this); even with zero neighbors, the self-features (entity country, KYC tier, SWIFT-listed risk) carry signal. (3) BRIEF QUEUE DELAY: if the new wire is part of a multi-wire transaction sequence, briefly queue (10-60 sec) to let the graph build up neighbors from concurrent wires. (4) ENTITY-RESOLUTION BACKFILL: link the new entity to existing entities via name match, address match, OFAC ID match; if any link is found, use those neighbors. Production: bank pipelines typically combine 2 + 3 + 4.", correct:true},
+          {key:"c", text:"Use Platt scaling."},
+          {key:"d", text:"Random."},
         ]}
-        trap={<>(b)/(c) are over-reactions. (d) is non-compliant.</>}
-        lens={<>(a) — the right fix is to add a sanctions-list bypass at the tabular layer and refit the LR on a labeled set that includes the new cases. End-to-end retraining is rarely the cheapest path under label drift.</>}
-        stretch={<>How would you decide between 'bypass via tabular' and 'add to the graph as new edges'?</>}
+        trap={<>(a)(c)(d) miss the cold-start mechanism.</>}
+        lens={<>Zero-neighbor new entity → GraphSAGE default → no graph signal. Mitigations: gating to text-only / self-aggregation / queue delay / entity-resolution backfill.</>}
+        stretch={<>What does the self-aggregation option look like in GraphSAGE?</>}
       />
 
-      <VIS.TrapProblem
-        id="iaml-p8"
-        difficulty="medium"
-        title="P8 — Neighborhood sampling"
-        scenario={<>GraphSAGE samples k neighbors per node. A correspondent bank node can have 10,000 neighbors. Pick a sampling strategy.</>}
+      <VIS.TrapProblem id="iam-p8" difficulty="hard" title="P8 — Why LATE FUSION (logistic regression) and not joint end-to-end training?"
+        scenario={<><em>Discriminating insight: late fusion = train graph + text branches SEPARATELY, then logistic on the concatenated outputs. Advantages: (a) train branches on DIFFERENT data scales (graph branch on full bank-graph data; text branch on a smaller text-labeled subset); (b) update branches asynchronously (text branch retrains weekly with new BERT data; graph branch quarterly); (c) interpretable fusion weights. Joint training is harder to debug and harder to update incrementally.</em><br/><br/>Late fusion.</>}
         options={[
-          {key:"a", text:"Importance-sample neighbors by recency and value flow: more weight on high-value recent edges. Cap at k around 25-50 per layer. Avoid uniform sampling that buries the discriminating neighbors in noise.", correct:true},
-          {key:"b", text:"Sample uniformly at random; the law of large numbers will handle it."},
-          {key:"c", text:"Use all neighbors."},
-          {key:"d", text:"Pick the lowest-degree neighbors."},
+          {key:"a", text:"Joint is always better."},
+          {key:"b", text:"Late fusion has operational and model-quality advantages over joint end-to-end training. (1) DIFFERENT TRAINING DATA SCALES: the graph branch trains on the full bank correspondent-banking graph (100M+ entities, 1B+ wires); the text branch trains on a smaller subset (only wires with non-trivial free-text). Joint training would force both to share the same training set, wasting data. Late fusion lets each branch use its best data. (2) ASYNCHRONOUS UPDATES: in production, the text branch can be retrained WEEKLY (new SWIFT corpora, new labeled SAR text) while the graph branch retrains QUARTERLY (graph snapshot rebuild). Joint end-to-end requires retraining everything together. (3) INTERPRETABLE FUSION WEIGHTS: the logistic regression coefficients W_g, W_t tell investigators 'this alert is 70% graph-driven, 30% text-driven' — direct attribution. With joint training, attribution requires post-hoc explainers. (4) DEBUGGING: when the model performs poorly, late fusion lets you ablate per branch (graph-only AUC vs text-only AUC vs combined); joint models are harder to debug. (5) TRANSFER LEARNING: each branch can be pretrained separately (text branch can use off-the-shelf BERT then fine-tune); joint training requires from-scratch coordination. Trade-off: late fusion may lose a few F1 points vs perfectly-tuned joint training, but the operational wins dominate at bank-scale AML.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"They are identical."},
         ]}
-        trap={<>(b) wastes samples on irrelevant neighbors. (c) is intractable. (d) inverts the relevance signal.</>}
-        lens={<>(a) — importance sampling by recency and value is the production default. The original GraphSAGE paper used uniform sampling on small academic graphs; real fraud graphs are too skewed for that.</>}
-        stretch={<>How does importance sampling interact with calibration?</>}
+        trap={<>(a)(c)(d) miss the operational advantages.</>}
+        lens={<>Late fusion: different data scales, async updates, interpretable, debuggable, transferable. Joint may win F1 but loses operability.</>}
+        stretch={<>What's a hybrid (partial joint + partial late) fusion approach?</>}
       />
 
-      <VIS.TrapProblem
-        id="iaml-p9"
-        difficulty="hard"
-        title="P9 — A/B test design"
-        scenario={<>You want to A/B test inductive (new) vs transductive (current) AML model. Compliance says you cannot randomize alerts: every wire must be scored with the production model. How do you measure?</>}
+      <VIS.TrapProblem id="iam-p9" difficulty="hard" title="P9 — Compare Inductive AML to Multi-GNN-AML (IBM)."
+        scenario={<><em>Discriminating insight: Multi-GNN-AML = heterogeneous-GNN with per-relation towers + cross-tower attention (focus on multi-relation structure). Inductive AML = inductive GraphSAGE + BERT-text + late fusion (focus on unseen-entity handling + free-text signal). Different focus. Multi-GNN typically transductive per tower; Inductive AML is single-relation but inductive. Combine: per-relation INDUCTIVE towers + text branch (hybrid).</em><br/><br/>Compare.</>}
         options={[
-          {key:"a", text:"Shadow-mode: run the inductive model in parallel on every wire, never acting on its scores, log both predictions for offline analysis. After a labeled window arrives, compare precision, recall, and recall-on-novel-counterparties between the two models on identical traffic. Decide based on shadow-mode evidence.", correct:true},
-          {key:"b", text:"Random A/B on 50 percent of wires — accept the compliance pushback."},
-          {key:"c", text:"Switch over fully and see what happens."},
-          {key:"d", text:"Skip evaluation; ship inductive."},
+          {key:"a", text:"They are the same."},
+          {key:"b", text:"DIFFERENT focus, COMPLEMENTARY. Multi-GNN-AML (IBM NeurIPS 2024) focuses on HETEROGENEOUS GRAPH structure: per-relation GNN towers + cross-tower attention; captures cross-relation laundering paths (transactions + ownership + residence). Default per-tower architecture in IBM benchmark is GraphSAGE-like (potentially inductive); but the FOCUS is multi-relation. Inductive AML (HSBC tech report 2025) focuses on UNSEEN-ENTITY HANDLING and SWIFT free-text: inductive GraphSAGE (single relation typically — correspondent-banking wires) + BERT on free-text + late fusion. The focus is operational ability to score new beneficiary entities at inference WITHOUT retraining. They can COMBINE: build per-relation INDUCTIVE GraphSAGE towers (Multi-GNN-AML's per-relation decomposition + Inductive AML's inductive aggregators), add the BERT-text branch as another late-fusion input. This hybrid handles cross-relation AML + unseen entities + text signal. HSBC and IBM benchmarks suggest the hybrid is the SOTA on correspondent-banking AML circa 2025. Pick Inductive AML when: constant new entities is the dominant challenge, SWIFT text data is rich. Pick Multi-GNN-AML when: rich heterogeneous graph + entities mostly seen at training. Pick hybrid when: both.", correct:true},
+          {key:"c", text:"Multi-GNN is always better."},
+          {key:"d", text:"Random."},
         ]}
-        trap={<>(b) violates the compliance constraint. (c) is reckless. (d) skips evaluation.</>}
-        lens={<>(a) — shadow-mode is the standard regulated-AML evaluation pattern. You eval offline against the labeled SAR ground truth once labels arrive (typically 4-6 weeks lag).</>}
-        stretch={<>How would you handle the case where shadow-mode and production disagree on a specific wire?</>}
+        trap={<>(a)(c)(d) collapse the two.</>}
+        lens={<>Multi-GNN-AML: heterogeneous graph + per-relation towers. Inductive AML: unseen entities + text branch. Combine for SOTA.</>}
+        stretch={<>What does the hybrid architecture look like?</>}
       />
 
-      <VIS.TrapProblem
-        id="iaml-p10"
-        difficulty="hard"
-        title="P10 — LR fusion saturating?"
-        scenario={<>You scaled GraphSAGE width from 64 to 256 and LM from DistilBERT to a larger sentence model. The LR fusion score barely moved. What is going on?</>}
+      <VIS.TrapProblem id="iam-p10" difficulty="hard" title="P10 — GraphSAGE neighbor sampling: what does it do?"
+        scenario={<><em>Discriminating insight: at inference (and during training), GraphSAGE SAMPLES a fixed-size subset of neighbors per hop rather than using ALL neighbors. Typical budget: 25 first-hop, 10 second-hop. Bounds memory/latency per inference. Necessary for nodes with very high degree (institutional accounts with thousands of counterparties); without sampling, aggregating all neighbors is intractable.</em><br/><br/>Sampling.</>}
         options={[
-          {key:"a", text:"LR's linear capacity is the bottleneck; doubling encoder width doesn't help when fusion is linear. Either accept the bottleneck (it is the price of explainability) or move to a constrained-MLP fusion (e.g., monotonic GBM, or a 2-layer MLP with strong regularization) that preserves enough interpretability for SAR filing.", correct:true},
-          {key:"b", text:"The encoders are broken."},
-          {key:"c", text:"Train longer."},
-          {key:"d", text:"Reduce encoder width."},
+          {key:"a", text:"Use all neighbors."},
+          {key:"b", text:"GraphSAGE NEIGHBOR SAMPLING: at each hop k, sample a fixed-size subset of K_k neighbors per node (typical: K_1 = 25 first hop, K_2 = 10 second hop), rather than using ALL neighbors. Why critical for correspondent-banking AML: high-degree nodes (institutional accounts, large correspondent banks) have THOUSANDS of counterparties; aggregating all neighbors at every hop is intractable both in MEMORY (activations explode) and LATENCY (sub-second SLA per wire scoring impossible). Sampling bounds the per-inference cost to a fixed budget K_1 * K_2 * d (neighbor count times embedding dim). At training time, sampling also acts as REGULARIZATION (dropout-like). Sampling strategy: UNIFORM (each neighbor equal probability) by default; can be WEIGHTED by edge attributes (recent transactions sampled more often than old ones — captures temporal recency). For inference on a new entity at a wire arrival: pull K_1 = 25 first-hop neighbors (counterparties on related wires), for each pull K_2 = 10 second-hop; aggregate; produce embedding. Latency: ~10-50 ms for K = 2 hops with 25 + 10 sampling, on commodity infrastructure. Without sampling, latency would be unbounded.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Skip sampling."},
         ]}
-        trap={<>(b)/(c)/(d) miss the linear-capacity diagnosis.</>}
-        lens={<>(a) — when an LR is the fusion, encoder capacity scaling laws stop applying. The right move is either to acknowledge the linear ceiling or to upgrade to a constrained nonlinear fusion with explainability guarantees (e.g., EBM, monotonic constraints, SHAP-stable).</>}
-        stretch={<>Would using a calibrated GBM as the fusion preserve enough explainability? What argument would you make to compliance?</>}
+        trap={<>(a)(c)(d) miss the sampling necessity.</>}
+        lens={<>Neighbor sampling: K_1 = 25, K_2 = 10. Bounds memory + latency. Regularization side effect. Without it, high-degree nodes intractable.</>}
+        stretch={<>What's the temporal-weighted sampling strategy?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p11" difficulty="medium" title="P11 — Production: correspondent banking at 10M wires per day — feasibility?"
+        scenario={<><em>Discriminating insight: feasible with neighbor sampling + BERT batching. Per-wire latency: graph branch ~10-50 ms (K=2 sampling); text branch ~5-20 ms (DistilBERT on small text); late-fusion logistic ~&lt;1 ms; total ~20-100 ms per wire. 10M wires / day = ~115 wires / sec — well within capacity on a small GPU cluster. Real-time scoring as wires arrive.</em><br/><br/>Feasibility.</>}
+        options={[
+          {key:"a", text:"Infeasible."},
+          {key:"b", text:"FEASIBLE for real-time scoring as wires arrive. Per-wire latency budget. (1) GRAPH BRANCH (inductive GraphSAGE): neighbor sampling (K_1 = 25, K_2 = 10) + aggregator-function forward pass through K = 2 layers on the sampled neighborhood. Latency: 10-50 ms on commodity GPU/CPU. (2) TEXT BRANCH (DistilBERT or DeBERTa-base): tokenize the SWIFT free-text (avg 30-100 tokens per wire); single forward pass; latency 5-20 ms on GPU, 20-50 ms on CPU. (3) LATE-FUSION LOGISTIC: matrix-vector product on concatenated h_graph and h_text; latency <1 ms. TOTAL: 20-100 ms per wire end-to-end. THROUGHPUT: 10M wires / day = ~115 wires / sec = ~10 wires / 100 ms peak. With one 8-GPU node serving the BERT batches + a small graph DB cluster (TigerGraph or DGL distributed), this fits comfortably with headroom for peak loads. Real-time scoring as each wire arrives at the bank's correspondent-banking processor. RETRAIN CADENCE: graph aggregator weights refreshed quarterly (low cadence — aggregators generalize across nodes); text encoder fine-tuned weekly on new labeled SAR text; logistic regression coefficients re-tuned monthly. Graph DB snapshot refreshed nightly (new entities added). Audit: every alert documents model versions per branch.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Always infeasible."},
+        ]}
+        trap={<>(a)(c)(d) miss the per-wire feasibility analysis.</>}
+        lens={<>20-100 ms per wire; 115 wires / sec average; fits on 8-GPU node. Real-time scoring feasible. Retrain cadence per branch.</>}
+        stretch={<>What's the SLA at peak hour for correspondent banking?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p12" difficulty="hard" title="P12 — Concept-specific misattribution: Inductive AML LOSES F1 vs rule-only on cold-start wires."
+        scenario={<><em>Discriminating insight (concept-specific): cold-start wires have ZERO graph neighbors (covered in P7) — graph branch returns near-zero embedding; if logistic-regression weights favor graph branch, the model goes silent on cold-start. Fix: weight late-fusion to text-only when graph signal is absent; or use neighbor-count gating. NOT a model-architecture failure — a fusion-weighting failure.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Model is broken."},
+          {key:"b", text:"Cold-start failure exacerbated by fusion weighting. On a cold-start wire (new entity with zero graph neighbors), the graph branch returns its DEFAULT aggregator output (near-zero embedding). If the late-fusion logistic regression is trained on a dataset where most wires HAVE graph neighbors (the dominant case), the model's W_g (graph branch weight) is calibrated assuming meaningful h_graph; on cold-start, h_graph is near-zero and W_g * h_graph is near-zero, so the score relies entirely on the text branch — but the SINGLE COEFFICIENT W_t may be too small to make a positive prediction alone. Result: cold-start wires are systematically UNDERSCORED, possibly worse than a rule-only baseline that has direct cold-start rules. Fix specific to this architecture. (1) NEIGHBOR-COUNT GATING: at inference, detect zero-neighbor case; switch to a text-only model branch (separately trained on cold-start positives). (2) RE-CALIBRATE FUSION on a cold-start-balanced training set: oversample cold-start wires in the logistic regression training data so W_t learns to make confident predictions alone. (3) ADD COLD-START RULES alongside the model — a simple rule layer (e.g., 'OFAC-listed beneficiary' or 'high-risk-jurisdiction-not-in-prior-history') catches what the model misses; route to model only for non-cold-start. Production: bank pipelines layer all three.", correct:true},
+          {key:"c", text:"Use Platt scaling."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(a)(c)(d) miss the fusion-weighting cause.</>}
+        lens={<>Cold-start: h_graph near zero; W_g * h_graph near zero; W_t alone too small. Fix: gating / oversampling / cold-start rule layer.</>}
+        stretch={<>How do you oversample cold-start positives in training?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p13" difficulty="medium" multiSelect title="P13 — Decoys: which are NOT Inductive AML? (4 correct)"
+        scenario={<><em>Discriminating insight: TGN, Sybil-GNN, GCN with learned per-node embeddings (transductive), DeepWalk (random-walk embedding) are NOT inductive. GraphSAGE + BERT + late fusion IS.</em><br/><br/>Pick NOT-inductive-AML.</>}
+        options={[
+          {key:"a", text:"TGN (Temporal Graph Network) with per-node memory.", correct:true},
+          {key:"b", text:"Sybil-GNN with learned per-node attention weights.", correct:true},
+          {key:"c", text:"GCN with learnable per-node embedding table.", correct:true},
+          {key:"d", text:"DeepWalk random-walk embeddings (per-node vectors).", correct:true},
+          {key:"e", text:"GraphSAGE aggregator functions + BERT on SWIFT text + logistic fusion."},
+        ]}
+        trap={<>(a)(b)(c)(d) all transductive or per-node-table; (e) is the inductive recipe.</>}
+        lens={<>Inductive AML = GraphSAGE aggregator + BERT text + late-fusion logistic. Drop induction or text and it's something else.</>}
+        stretch={<>Why is DeepWalk transductive?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p14" difficulty="hard" title="P14 — Concept-specific misattribution: Inductive AML CONFIDENTLY MISCLASSIFIES a novel-MO laundering wire."
+        scenario={<><em>Discriminating insight (concept-specific): novel MO means the laundering PATTERN is new — both the graph structure (new kind of neighbor configuration) AND the text (new obfuscation in narrative). Inductive GraphSAGE is OOD on the graph; BERT is OOD on the text. Both branches give in-distribution embeddings. Mitigations: (1) deep ensemble of GraphSAGE + BERT for uncertainty; (2) DSVDD on top of fused embedding for OOD detection; (3) periodic catalog updates with new MOs from investigators. Concept-specific.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Bug in late fusion."},
+          {key:"b", text:"Novel-MO is OOD for BOTH branches. The laundering pattern is new in (a) graph structure (a configuration of neighbors / ownership / transaction velocities not seen at training) and (b) text (new obfuscation phrasing in narrative). GraphSAGE's INDUCTIVE generalization works for FEATURE-similar new nodes but breaks when the new node's graph context is structurally novel — the aggregator was trained on different patterns; out-of-distribution input gets a confidently-looking embedding that's not actually informative. BERT similarly: trained on existing SAR narratives, OOD on new obfuscation phrasing; produces a high-confidence-looking embedding without real signal. Late-fusion logistic on two OOD embeddings = confident-wrong prediction. Concept-specific mitigations. (1) UNCERTAINTY ESTIMATION: small deep ensemble of GraphSAGE + BERT (M = 3) to estimate disagreement; route high-disagreement wires to human review. (2) OOD DETECTOR on the FUSED EMBEDDING: train a DSVDD or one-class SVM on labeled in-distribution wires; new wires far from the training cluster flagged as OOD even if both branches confidently say 'benign'. (3) PERIODIC MO CATALOG UPDATES: when investigators detect a new MO, add labeled examples to the next retrain cycle; rapid iteration. (4) LAYER MOTIF MINING on top — its catalog catches typology-aligned patterns even if novel; the combination catches more.", correct:true},
+          {key:"c", text:"Lower learning rate."},
+          {key:"d", text:"Use Platt scaling."},
+        ]}
+        trap={<>(a)(c)(d) miss the dual-OOD nature.</>}
+        lens={<>Novel MO: OOD for both graph (structure) and text (phrasing). Both branches confident-wrong. Mitigate: ensemble disagreement / DSVDD on fused / catalog updates / motif mining layer.</>}
+        stretch={<>How does DSVDD give OOD signal on the fused embedding?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p15" difficulty="hard" title="P15 — Why is the term 'GNN-LM' used here vs the academic graph-augmented LM?"
+        scenario={<><em>Discriminating insight: academic GNN-LM (Yang et al. 2020) augments a language model with k-NN retrieval over graph nodes during generation/inference. HSBC&apos;s &quot;GNN-LM&quot; in this context refers to the GRAPH-BRANCH + LM-BRANCH ARCHITECTURE (late fusion), NOT the academic technique. Industry vs academic terminology overlap. Important to clarify when discussing.</em><br/><br/>Terminology.</>}
+        options={[
+          {key:"a", text:"They are the same thing."},
+          {key:"b", text:"DIFFERENT TECHNIQUES, OVERLAPPING NAME. The academic 'GNN-LM' (Yang et al. 2020, 'Improving Language Models by Retrieving from Trillions of Tokens' / Yu et al. 'GNN-LM: Language Modeling with k-NN GNN' 2022) refers to a GRAPH-AUGMENTED LANGUAGE MODEL: during inference, the LM retrieves the top-k nearest neighbors of the current context from a large GRAPH of token-context nodes, builds a GNN over them, and uses the GNN output to BIAS the LM's next-token prediction. The GNN is INSIDE the LM's prediction loop. In contrast, HSBC's 2025 Inductive AML report uses 'GNN-LM' loosely to refer to the TWO-BRANCH ARCHITECTURE: a GNN branch (GraphSAGE) and an LM branch (BERT), late-fused via logistic regression. The two branches are SEPARATE; there's no retrieval inside the LM. This is an INDUSTRY TERMINOLOGY OVERLOAD that can confuse interviewers familiar with the academic technique. In an interview, clarify which is meant: 'in the HSBC context, GNN-LM means the GNN + LM late-fusion architecture, not the Yang et al. 2020 retrieval-augmented LM'. When asked specifically about graph-augmented LMs as a technique, point to the academic version (Yang/Yu papers). Both are valid in their context; conflating them invites confusion.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Skip terminology."},
+        ]}
+        trap={<>(a)(c)(d) collapse the terminology distinction.</>}
+        lens={<>Academic GNN-LM: graph-augmented LM with retrieval. HSBC GNN-LM (this concept): GNN-branch + LM-branch late-fusion. Different techniques; same name.</>}
+        stretch={<>What does the academic GNN-LM gain vs vanilla LM?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p16" difficulty="medium" title="P16 — Junior: 'Inductive AML is just GraphSAGE'. Refute."
+        scenario={<><em>Discriminating insight: half right — uses GraphSAGE for the graph branch. Misses the SWIFT TEXT BRANCH (BERT-family encoder) and the LATE-FUSION combination. Strip the text branch and you lose SWIFT-narrative signal. Strip late fusion and you don&apos;t combine the two.</em><br/><br/>Refute.</>}
+        options={[
+          {key:"a", text:"Junior is right."},
+          {key:"b", text:"Half right, missing the text branch. YES — the graph branch is GraphSAGE, an inductive GNN that handles unseen entities. That alone is one of three components. The full Inductive AML pipeline adds: (1) BERT-FAMILY TEXT BRANCH on SWIFT free-text fields (MT103 50, 70; MT202 narrative). Trained on bank SAR-labeled text; produces a per-wire text embedding. SWIFT narrative carries laundering signal — vague descriptions, paraphrases of high-risk activity, mismatched languages — that GraphSAGE alone (operating on transaction graph) cannot see. Strip this branch and you LOSE the text signal; report literature (HSBC 2025) says this is worth 5-8 F1 on cold-start wires. (2) LATE-FUSION LOGISTIC REGRESSION combining graph and text embeddings into the final AML score. The fusion weights are trained on labeled AML wires; interpretable (W_g = 0.7, W_t = 0.3 tells investigators graph contributed more on average). Strip late fusion and the two embeddings don't combine. Calling Inductive AML 'just GraphSAGE' loses the text-signal branch and the fusion mechanism — both load-bearing for the cold-start and the SWIFT-narrative signal cases.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"They are identical."},
+        ]}
+        trap={<>(a)(c)(d) miss the text + fusion components.</>}
+        lens={<>Inductive AML = GraphSAGE (graph) + BERT (text) + logistic fusion. Drop text or fusion and capability is lost.</>}
+        stretch={<>What's the F1 lift from adding the text branch?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p17" difficulty="hard" title="P17 — Skeptic: 'Just retrain TGN nightly — same effect as inductive'. Refute."
+        scenario={<><em>Discriminating insight: nightly retrain has TWO problems — (a) operational cost (full TGN retrain on the bank graph is hours-to-days, not nightly-affordable at large banks); (b) does not handle wires arriving BETWEEN retrains (today&apos;s new entity gets no embedding until tomorrow). Inductive GraphSAGE scores in real time. Hybrid: nightly TGN retrain + real-time inductive GraphSAGE fallback for between-retrain new entities.</em><br/><br/>Refute.</>}
+        options={[
+          {key:"a", text:"Skeptic is right."},
+          {key:"b", text:"Nightly retrain has two operational problems Inductive AML solves. (1) OPERATIONAL COST: full TGN (Temporal Graph Network) retrain on a 100M-entity correspondent-banking graph takes MANY HOURS — typically 4-12 hours on an 8-GPU node, including data prep, training, and evaluation. 'Nightly' is the absolute minimum cadence; at large banks this is constrained by data freshness, compute availability, and model-validation gate (independent SOX-required validation). Quarterly retrains are the realistic SOX-validated cadence; nightly is not. (2) BETWEEN-RETRAIN GAP: even if nightly retrain were affordable, NEW ENTITIES arriving BETWEEN retrains (a wire at 09:00 from an entity first seen at 08:00) cannot be scored by the previously-retrained TGN — they're not in the trained node table. They'd have to wait for tonight's retrain. Inductive GraphSAGE scores them in real time as they arrive, using the learned aggregator functions on whatever neighbors they have. Score-now vs score-tomorrow: critical operational difference. HYBRID PATTERN: many production banks run TGN on the seen-entity subgraph (precise per-node embedding, retrained quarterly) AND inductive GraphSAGE on the full graph (handles new entities, retrained quarterly with same aggregators); combine via gating ('use TGN embedding if entity in TGN table, else GraphSAGE'). Best of both, with the operational benefits of induction.", correct:true},
+          {key:"c", text:"TGN is the only choice."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(a)(c)(d) miss the cost + between-retrain gap.</>}
+        lens={<>TGN nightly retrain: hours to days; between-retrain gap. Inductive GraphSAGE: real-time on new entities. Hybrid: TGN where available + GraphSAGE elsewhere.</>}
+        stretch={<>What's the SOX requirement on model retrain validation?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p18" difficulty="hard" title="P18 — Entity resolution: how does Inductive AML benefit?"
+        scenario={<><em>Discriminating insight: entity resolution (linking SWIFT-name strings to canonical entities) increases NEIGHBORHOOD CONNECTIVITY of new entities. A new entity that resolves to an existing master entity inherits that entity&apos;s neighbors → GraphSAGE has more to aggregate → richer h_graph. Without entity resolution, every new SWIFT name is treated as a brand-new entity (cold start). Entity resolution upstream of GraphSAGE is critical for production AML.</em><br/><br/>ER.</>}
+        options={[
+          {key:"a", text:"Entity resolution is unrelated."},
+          {key:"b", text:"Entity resolution is the UPSTREAM step that linkifies SWIFT-name strings to canonical entities; it dramatically improves Inductive AML's signal on cold-start wires. The problem: SWIFT messages identify counterparties by FREE-TEXT NAME STRINGS (MT103 field 50: 'JOHN DOE LIMITED HONG KONG'), which are noisy — same entity appears as 'JOHN DOE LTD HK', 'J DOE LIMITED', 'JOHN DOE LIMITED HONG KONG OFFICE' across different wires. Without entity resolution, each name is treated as a NEW entity in the graph; the entity has zero neighbors; GraphSAGE cold-start kicks in (P7); h_graph is uninformative. With ENTITY RESOLUTION (probabilistic record linkage, embedding-based matching, OFAC ID matching, address matching, beneficial-ownership disclosure matching), the new SWIFT name is resolved to an EXISTING CANONICAL ENTITY in the graph; the canonical entity has prior transaction neighbors, prior ownership relations, prior residence; GraphSAGE aggregates these; h_graph carries rich signal. Production banks run entity resolution as a PIPELINE STAGE before the AML scorer: SWIFT message → entity resolver → graph node lookup → Inductive AML. The lift from entity resolution on cold-start cases is large — often 10-20 F1 points. Tools: Senzing, Tamr, custom embedding-based ER on internal CRM + global entity lists.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Skip ER."},
+        ]}
+        trap={<>(a)(c)(d) miss the ER role.</>}
+        lens={<>Entity resolution: SWIFT name → canonical entity; new entity inherits neighbors; cold-start largely eliminated. Pipeline upstream of GraphSAGE.</>}
+        stretch={<>What probabilistic ER methods work for SWIFT?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p19" difficulty="medium" title="P19 — Which SWIFT fields are most informative for the BERT branch?"
+        scenario={<><em>Discriminating insight: MT103 field 70 (remittance info, free-text), field 50K (ordering customer name + address), field 72 (sender-to-receiver narrative), field 71A (charges narrative). MT202 field 21 (related reference), field 72. Fields 32A (amount + value date), 50, 59 are structured — feed to graph branch as features, not text branch.</em><br/><br/>Fields.</>}
+        options={[
+          {key:"a", text:"Use only field 32A."},
+          {key:"b", text:"Most informative SWIFT free-text fields. MT103 (Customer Credit Transfer). Field 70 'REMITTANCE INFORMATION' — narrative description of the purpose of payment, 4 lines of 35 chars; the highest-signal field for AML (vague 'payment', 'invoice', or specific descriptions like 'consulting fee' or 'real estate purchase'). Field 50K 'ORDERING CUSTOMER WITH ACCOUNT' — name + address of the originator; mismatched-language or generic-sounding names = signal. Field 72 'SENDER TO RECEIVER INFORMATION' — additional narrative; less commonly populated but high-signal when present. Field 71A 'DETAILS OF CHARGES' — sometimes carries indirect signal in narrative. MT202 (General Financial Institution Transfer): Field 21 'RELATED REFERENCE' — short reference often carrying narrative; Field 72 'SENDER TO RECEIVER INFO' — narrative on the bank-to-bank context. Concatenate these fields per wire; tokenize with a SWIFT-aware tokenizer (preserves field markers); feed to BERT encoder. STRUCTURED FIELDS (Field 32A 'value date / currency / amount', Field 33B 'currency / instructed amount', Field 50 if ordering customer is a structured BIC code, Field 59 'beneficiary') are NUMERIC or CODED — feed these to the GRAPH BRANCH as node/edge features, NOT to the BERT branch. Fine-tune BERT on bank's SAR-labeled subset for domain transfer.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Skip fields."},
+        ]}
+        trap={<>(a)(c)(d) miss the field-by-field breakdown.</>}
+        lens={<>Free-text fields: MT103 70, 50K, 72, 71A; MT202 21, 72. Concatenate, fine-tune BERT. Structured fields go to graph branch.</>}
+        stretch={<>What does field 70 narrative look like?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p20" difficulty="hard" title="P20 — Concept-specific misattribution: BERT branch dominates the late fusion; graph branch ignored."
+        scenario={<><em>Discriminating insight (concept-specific): (1) text branch has higher-variance signal (free-text is rich); fusion weights learn to over-rely on it; (2) graph branch under-trained (aggregator weights not yet converged); (3) graph features under-specified (missing key node attributes); (4) labeled training data over-represents text-flag-positives (selection bias). Specific to this two-branch architecture.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Model is broken."},
+          {key:"b", text:"Inductive-AML-specific causes for BERT dominance. (1) TEXT BRANCH HIGHER SIGNAL VARIANCE: SWIFT free-text is dense (paraphrases, narrative, locale) and the BERT embedding occupies a high-dimensional informative subspace; the logistic regression's L2-regularized fit naturally weights it heavily. The graph branch may carry signal but the embedding is more compressed. Mitigation: scale the graph branch's embedding to match text's variance before fusion (per-branch layer norm); or use a non-linear fusion head (small MLP) to capture interactions. (2) GRAPH BRANCH UNDER-TRAINED: GraphSAGE aggregator weights need many gradient updates to converge; if the graph branch was trained for fewer steps than BERT (e.g., text branch initialized from pretrained, graph branch from scratch), graph branch is uncalibrated. Fix: train each branch separately to convergence before fusion training. (3) GRAPH FEATURES UNDER-SPECIFIED: if node features in the graph branch are minimal (just country and KYC tier), the GraphSAGE output has low information content; enrich with balance, age, transaction velocity, sanctions flags. (4) TRAINING-DATA SELECTION BIAS: if labeled AML positives in the training set were originally surfaced by NARRATIVE rules (Norkom-style narrative regex), the text branch has the easy job ('paraphrase the rule') and dominates. Mitigation: balance the training set with positives from graph-only signals (TGN historical flags) so both branches learn to contribute. Diagnose via per-branch ablation: train graph-only vs text-only vs fused; compare AUC.", correct:true},
+          {key:"c", text:"Use Platt scaling."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(a)(c)(d) miss the fusion-dynamics causes.</>}
+        lens={<>Text high variance / graph under-trained / graph features sparse / label selection bias. Per-branch ablation diagnoses.</>}
+        stretch={<>What does per-branch ablation look like?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p21" difficulty="hard" title="P21 — In one sentence, THE unique mechanism of Inductive AML."
+        scenario={<><em>Discriminating insight: TWO-BRANCH HYBRID — (1) inductive GraphSAGE on the correspondent-banking graph (handles UNSEEN entities at inference via learned aggregator functions over neighbor features, NO retraining); (2) BERT-family encoder on SWIFT free-text fields; combined via LATE-FUSION LOGISTIC REGRESSION. HSBC tech report 2025. NOT transductive (TGN, Sybil-GNN). NOT graph-only. NOT text-only.</em><br/><br/>State the anchor.</>}
+        options={[
+          {key:"a", text:"It is a transductive GNN."},
+          {key:"b", text:"TWO-BRANCH HYBRID ARCHITECTURE for correspondent-banking AML. (1) INDUCTIVE GRAPH BRANCH: GraphSAGE (Hamilton, Ying, Leskovec NeurIPS 2017) — learn AGGREGATOR FUNCTIONS (mean, LSTM, or max-pool) over neighbor features with SHARED weight matrices across all nodes; at inference on a NEW ENTITY (never seen at training), pull its neighbors from the live graph, apply the learned aggregators, produce its embedding h_graph — NO RETRAINING needed. Neighbor sampling (K_1 = 25 first-hop, K_2 = 10 second-hop) bounds latency. (2) TEXT BRANCH: BERT-family encoder (DistilBERT or DeBERTa-base) over SWIFT free-text fields (MT103 70, 50K, 72; MT202 21, 72) — produces a per-wire text embedding h_text. Fine-tuned on bank SAR-labeled narratives. (3) LATE-FUSION LOGISTIC REGRESSION: score = sigmoid(W_g h_graph + W_t h_text + b); trained on labeled AML wires; W_g and W_t interpret per-branch contribution. INFERENCE: real-time per wire (~20-100 ms); handles unseen beneficiary entities (the constant-new-counterparty problem of correspondent banking). HSBC tech report 2025. NOT transductive (TGN, Sybil-GNN — cannot score new). NOT graph-only (misses SWIFT-narrative signal). NOT text-only (misses graph structure).", correct:true},
+          {key:"c", text:"It is just BERT."},
+          {key:"d", text:"It is motif mining."},
+        ]}
+        trap={<>(a)(c)(d) miss the two-branch hybrid + induction.</>}
+        lens={<>Inductive GraphSAGE (handles unseen) + BERT on SWIFT text + late-fusion logistic. Two branches; real-time scoring.</>}
+        stretch={<>What does HSBC's report emphasize?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p22" difficulty="medium" title="P22 — When NOT to use Inductive AML."
+        scenario={<><em>Discriminating insight (concept-specific): (1) no SWIFT free-text (text branch useless — domestic rails like ACH have no narrative field); (2) entity universe stable (transductive GNN sufficient); (3) graph signal absent (e.g., one-shot scoring with no relations); (4) labels too sparse for two-branch training; (5) regulator demands typology-code interpretability (motif mining better). Concept-specific.</em><br/><br/>Skip.</>}
+        options={[
+          {key:"a", text:"Always use Inductive AML."},
+          {key:"b", text:"Skip Inductive AML when: (1) NO SWIFT FREE-TEXT — domestic payment rails (ACH, Fedwire low-value, RTP) have minimal or no narrative field; the BERT branch has nothing to encode; reduce to graph-only inductive GraphSAGE. For pure ACH AML, no text branch needed. (2) ENTITY UNIVERSE STABLE — if your bank's AML scope is limited to existing customers (retail banking) with rare new entities, the inductive benefit is small; transductive GNN may suffice and produces tighter per-node embeddings. (3) NO GRAPH SIGNAL — for one-shot scoring without relations (KYC document review at onboarding), the graph branch returns trivial output; reduce to text-only BERT. (4) LABELS TOO SPARSE — two-branch training requires enough labeled AML positives to fit both branches (graph + text + fusion); with very few positives (under 1000), single-branch models may generalize better. (5) REGULATOR DEMANDS STRICT TYPOLOGY MAPPING — Inductive AML's interpretability is fusion-weight ('graph contributed 70%, text 30%') and SHAP feature importance; not as direct as motif mining's typology-code mapping. For FinCEN SAR alerts requiring typology codes, prefer motif mining (or hybrid: motif features as graph-branch input). (6) SUB-MS LATENCY required — per-wire latency is 20-100 ms; for sub-ms, use rule pre-filter + on-demand Inductive AML on flagged candidates.", correct:true},
+          {key:"c", text:"Never use Inductive AML."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(a)(c)(d) absolutist.</>}
+        lens={<>Skip when no SWIFT text / stable entity universe / no graph signal / sparse labels / regulator typology codes / sub-ms latency.</>}
+        stretch={<>What does the ACH-only version look like?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p23" difficulty="hard" title="P23 — Production: end-to-end pipeline for correspondent-banking AML?"
+        scenario={<><em>Discriminating insight: incoming SWIFT wire → ENTITY RESOLUTION (resolves names to canonical entities) → GRAPH BRANCH (inductive GraphSAGE with neighbor sampling) + TEXT BRANCH (BERT on free-text) → LATE-FUSION LOGISTIC → score → alert queue with branch-contribution attribution → investigator → SAR or pass. Real-time. Retrain cadences: text weekly; graph quarterly; logistic monthly.</em><br/><br/>Pipeline.</>}
+        options={[
+          {key:"a", text:"Just run the model."},
+          {key:"b", text:"End-to-end real-time pipeline. (1) INCOMING SWIFT WIRE: arrives at correspondent-banking processor; parsed into structured + free-text fields. (2) ENTITY RESOLUTION: SWIFT name strings (field 50, 50K, 59) resolved against the canonical entity table via probabilistic record linkage + OFAC ID lookup + address match. New entities created if no match. (3) GRAPH SNAPSHOT LOOKUP: pull K_1 = 25 first-hop neighbors, K_2 = 10 second-hop from the live graph DB (TigerGraph or DGL distributed) for the resolved entity. (4) GRAPH BRANCH: inductive GraphSAGE forward pass on the sampled neighborhood; aggregator functions trained quarterly; produces h_graph. (5) TEXT BRANCH: tokenize SWIFT free-text (concatenate fields 70, 50K, 72, 21); single BERT-family forward pass; produces h_text. Encoder fine-tuned weekly. (6) LATE-FUSION LOGISTIC: score = sigmoid(W_g * h_graph + W_t * h_text + b). Coefficients re-fit monthly on labeled positives. (7) THRESHOLD: high score → alert queue; medium → secondary review; low → auto-pass. (8) ALERT PACKAGE: per-branch contribution (W_g * h_graph and W_t * h_text), top contributing SWIFT-text tokens (BERT attention), top contributing graph neighbors (GraphSAGE attention). (9) INVESTIGATOR REVIEW: SAR decision; confirmed SARs become next month's labeled training data. (10) MONITORING: per-branch AUC; entity-resolution match rate; per-day new-entity volume; alert volume. (11) AUDIT: model versions per branch, ER version, alert package archival for regulator reproducibility.", correct:true},
+          {key:"c", text:"Random."},
+          {key:"d", text:"Use Platt scaling."},
+        ]}
+        trap={<>(a)(c)(d) miss the end-to-end pipeline.</>}
+        lens={<>SWIFT wire → ER → graph + text branches → logistic fusion → score → alert with attribution → SAR → feedback → monitoring → audit.</>}
+        stretch={<>What does the alert package look like for an investigator?</>}
+      />
+
+      <VIS.TrapProblem id="iam-p24" difficulty="hard" title="P24 — Compare to FATE (foundation model for AML)."
+        scenario={<><em>Discriminating insight: FATE = pretrained FOUNDATION MODEL on AML data (graph + text + transactions); fine-tuned per bank task. Inductive AML = TWO-BRANCH ARCHITECTURE assembled from off-the-shelf GraphSAGE + BERT; trained on bank-specific labeled data. FATE benefits from cross-bank pretraining if available; Inductive AML benefits from operational simplicity and per-bank tuning. Different architectural strategies.</em><br/><br/>Compare.</>}
+        options={[
+          {key:"a", text:"They are identical."},
+          {key:"b", text:"DIFFERENT architectural strategies. FATE (Foundation model for AML; e.g., the FATE paper) is a PRETRAINED FOUNDATION MODEL on a large cross-bank or industry-scale AML corpus (graph + text + transactions). Trained via self-supervised objectives (masked language modeling on SWIFT text, graph contrastive learning); produces a UNIVERSAL embedding per entity/wire. Fine-tuned PER BANK TASK with labeled AML positives. Benefits: cross-bank pretraining leverages industry-wide patterns; transfer learning to data-poor banks. Challenges: data sharing across banks is regulatorily and legally constrained; available pretraining data is limited; fine-tuning still needed per bank. Inductive AML (HSBC 2025) is a TWO-BRANCH ARCHITECTURE assembled FROM OFF-THE-SHELF components (GraphSAGE + BERT) with bank-specific training data only; no cross-bank pretraining; tightly scoped to the bank's data and labels. Benefits: operationally simpler (no cross-bank coordination), interpretable per branch, can ship without inter-bank data agreements. Challenges: needs sufficient bank-internal labeled data; cannot leverage industry-wide patterns. Use FATE when cross-bank data sharing is available (rare); use Inductive AML when single-bank deployment is the path. Hybrid: use FATE pretrained as the base ENCODER for the BERT branch in Inductive AML — get the cross-bank pretraining benefit + the operational simplicity of the two-branch architecture.", correct:true},
+          {key:"c", text:"FATE is always better."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(a)(c)(d) collapse the architectures.</>}
+        lens={<>FATE: pretrained foundation model on cross-bank corpora. Inductive AML: assembled-from-off-the-shelf two-branch. Hybrid: FATE encoder inside Inductive AML's BERT branch.</>}
+        stretch={<>What cross-bank pretraining corpora are realistic?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li>
-          <a href="https://arxiv.org/abs/1706.02216" target="_blank" rel="noopener">
-            <strong>Hamilton, Ying, Leskovec — Inductive Representation Learning on Large Graphs (GraphSAGE)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2017)</span>
-          <br/>The GraphSAGE paper. Read sections 3 (aggregator architecture) and 4 (inductive eval) for the inductive-vs-transductive intuition.
-        </li>
-        <li>
-          <a href="https://www.hsbc.com/our-approach/ai-research" target="_blank" rel="noopener">
-            <strong>HSBC — AI Research (Inductive AML technical write-ups)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(corporate engineering page)</span>
-          <br/>HSBC's public-facing summary of their inductive AML stack and how they pair GraphSAGE with LM-encoded SWIFT text.
-        </li>
-        <li>
-          <a href="https://www.swift.com/standards/data-standards/mt-message-standards" target="_blank" rel="noopener">
-            <strong>SWIFT — MT Message Standards reference</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(industry standard)</span>
-          <br/>The MT103 field-by-field spec. Skim before doing any LM-on-SWIFT engineering — knowing the field semantics is half the data work.
-        </li>
-        <li>
-          <a href="https://snap.stanford.edu/graphsage/" target="_blank" rel="noopener">
-            <strong>SNAP Stanford — GraphSAGE project page</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(reference site)</span>
-          <br/>Project home with code links, blog posts, and slide decks from Jure Leskovec's group. Best non-paper read for building intuition.
-        </li>
-        <li>
-          <a href="https://www.fincen.gov/sites/default/files/shared/FinCEN_SAR_NarrativeGuidance_FINAL_11.5.21.pdf" target="_blank" rel="noopener">
-            <strong>FinCEN — Guidance on Writing SAR Narratives</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(regulator guidance)</span>
-          <br/>Required reading for understanding what 'explainable to compliance' actually means in this domain. Your LR coefficients ARE the SAR narrative inputs.
-        </li>
+        <li><a href="https://www.hsbc.com/our-approach/ai-research" target="_blank" rel="noopener"><strong>HSBC AI Research — Inductive AML Detection at Scale (2025)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(tech report)</span><br/>The reference for this architecture. Walks through the GraphSAGE + BERT + late-fusion design, operational considerations (entity resolution, retrain cadences), and benchmark results on correspondent-banking AML.</li>
+        <li><a href="https://arxiv.org/abs/1706.02216" target="_blank" rel="noopener"><strong>Hamilton, Ying, Leskovec — Inductive Representation Learning on Large Graphs (GraphSAGE)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(NeurIPS 2017, paper)</span><br/>The foundational paper for inductive GNNs. Sections 3-4 motivate the aggregator-function design; Section 5 ablates aggregator types (mean, LSTM, pool); critical reading for understanding why GraphSAGE works for unseen entities.</li>
+        <li><a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener"><strong>Devlin, Chang, Lee, Toutanova — BERT (NAACL 2019)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper)</span><br/>The text-branch backbone. For SWIFT-specific encoders, distilled-BERT or DeBERTa-base are typical production choices.</li>
+        <li><a href="https://www.swift.com/standards/message-types" target="_blank" rel="noopener"><strong>SWIFT — MT103 and MT202 message standards</strong></a> <span style={{color:"#64748b", fontSize:14}}>(reference)</span><br/>Official SWIFT message field definitions. Understand field 70 (remittance info), 50K (ordering customer), 72 (sender-to-receiver) before encoding for BERT.</li>
+        <li><a href="https://www.fincen.gov/sites/default/files/shared/sar_tti.pdf" target="_blank" rel="noopener"><strong>FinCEN — SAR Typology Reports</strong></a> <span style={{color:"#64748b", fontSize:14}}>(regulator reference)</span><br/>The regulator-published typology catalog Inductive AML alerts must map to in production. Use as a checklist for what the model must catch and how to package alerts for investigator review.</li>
       </ul>
     </VIS.Section>
   </main>
