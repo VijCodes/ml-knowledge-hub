@@ -1414,261 +1414,438 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// K-RagRec — Knowledge Graph RAG for LLM-based Recommendation.
-// "Knowledge Graph Retrieval-Augmented Generation for LLM-based Recommendation" 2025.
+// REDO v2 — RecSys-SOTA batch 16
+// K-RagRec — Knowledge Graph RAG for LLM-based Recommendation (2025)
+// Unique mechanism: a knowledge graph (movies, products, etc.) is INDEXED at
+// the SUBGRAPH level via a GNN that produces subgraph embeddings. For each
+// user query the retriever pulls the most relevant MULTI-HOP SUBGRAPH; the
+// retrieved subgraph (entities + relations) is INJECTED INTO THE PROMPT as
+// structured paths, and the LLM reads it as language alongside user history.
+// LLM-rec pair caution (this batch):
+//   - P5             = ONE LLM, FIVE tasks, prompt-TEMPLATE per task
+//   - Time-aware Prompting = ONE LLM, ONE task, inject TIME context
+//   - K-RagRec       = ONE LLM, ONE task, inject KG ENTITIES + RELATIONS  [THIS]
+// Cross-batch / sibling caution: NOT "vanilla LLM rec" (no KG) and NOT
+// "text-RAG" (retrieves unstructured docs). K-RagRec retrieves STRUCTURED
+// MULTI-HOP SUBGRAPHS via GNN indexing.
+// Anchor that survives §2a redaction: "retrieve a relevant MULTI-HOP SUBGRAPH
+// from a domain KG via GNN-indexed embeddings; inject the subgraph's
+// entities and relations into the LLM prompt as structured language."
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Knowledge-graph recommendation"
-      title="K-RagRec — KG-RAG for LLM Rec"
-      subtitle="Index multi-hop subgraphs with a GNN; retrieve the most relevant subgraph; inject it into the LLM prompt as structured paths."
+      pill="RecSys SOTA · Knowledge-graph RAG for LLM rec"
+      title="K-RagRec — KG-RAG for LLM-based recommendation"
+      subtitle="Index multi-hop subgraphs of a domain knowledge graph via a GNN. For each user, retrieve the most relevant subgraph and inject its entities and relations into the LLM&apos;s prompt as structured language. The LLM reads the KG fragment alongside user history, then generates the recommendation."
       byline={[
-        {label: "Paper", value: "ResearchGate 2025"},
-        {label: "Domain", value: "LLM-based rec with KG"},
-        {label: "Core idea", value: "Subgraph-RAG for recs"},
+        {label: "Paper", value: "'Knowledge Graph Retrieval-Augmented Generation for LLM-based Recommendation' (2025)"},
+        {label: "Surface", value: "LLM-based recommender on a domain with a curated KG — movies, products, music — where explicit relations carry signal"},
+        {label: "Anchor that survives redaction", value: "Retrieve a MULTI-HOP SUBGRAPH via GNN-indexed embeddings; inject its entities + relations as structured language into the LLM prompt"},
       ]}/>
 
     <VIS.TLDR>
-      Vanilla LLM-based recommenders see items as text; they ignore the explicit relational structure that <VIS.Term def="A graph database of entities (movies, actors, genres, products) and the relations between them (acted-in, directed-by, sequel-of). MovieLens-KG and Amazon product graphs are common examples.">knowledge graphs</VIS.Term> already encode. K-RagRec indexes multi-hop <VIS.Term def="A small connected piece of the larger knowledge graph centered on the entities involved in a query — typically the item, its related entities, and the user's history-item neighborhood.">subgraphs</VIS.Term> via a GNN, retrieves the most relevant one for a query, and injects it into the LLM prompt as explicit relational paths. Source: <a href="https://www.researchgate.net/publication/394273018" target="_blank" rel="noopener">ResearchGate paper</a>.
+      A vanilla LLM recommender consumes user history as text and generates the next item from its parametric memory — explicit relations (director, genre, &ldquo;sequel of&rdquo;, &ldquo;same studio as&rdquo;) are invisible unless the model happens to have memorised them at pretraining. K-RagRec attaches a domain knowledge graph: a GNN pre-indexes multi-hop subgraphs into embeddings; at inference, the user&apos;s history retrieves the most relevant subgraph; the subgraph&apos;s entities and relations are inserted into the prompt as structured paths (&ldquo;Movie A → directed_by → X → also_directed → Movie B&rdquo;). Senior trap: this is NOT &ldquo;fine-tune the LLM on KG triples&rdquo; (which writes facts into weights and stales fast), NOT &ldquo;text-RAG over Wikipedia&rdquo; (which retrieves unstructured prose), and NOT &ldquo;use a GNN as the recommender&rdquo; (the GNN is an indexer, not the model). It is a retrieval discipline targeting STRUCTURED subgraphs.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        K-RagRec is a retrieval-augmented generation pattern specialized for recsys. Step 1: build a knowledge graph over items, entities, and relations (movie → directed-by → director → also-directed → other-movies). Step 2: train a GNN over the KG so each subgraph has a learned embedding. Step 3: at query time, retrieve the top-K subgraphs most relevant to the user's history and candidate items. Step 4: serialize the retrieved subgraphs as structured natural-language paths and inject them into the LLM's prompt. Step 5: the LLM generates the recommendation conditioned on both the user history AND the structured KG context.
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  U["User history"]
-  C["Candidate items"]
-  KG["Knowledge graph over entities"]
-  KG --> GNN["GNN subgraph encoder"]
-  U --> Q["Query embedding"]
-  C --> Q
-  Q --> R["Retrieve top-K subgraphs"]
-  GNN --> R
-  R --> S["Serialize as relational paths"]
-  S --> L["LLM prompt with KG context"]
-  L --> O["Recommendation"]
-  style L fill:#dbeafe,stroke:#1e40af,stroke-width:2px
-      `} />
-      <p>
-        The pattern is structurally identical to text-RAG but with a graph retriever instead of a dense vector retriever. The "documents" are subgraphs; the "embedding" is a GNN-learned subgraph representation.
-      </p>
+    <VIS.Section id="sec-what" title="What it is — GNN-indexed subgraph retrieval, prompt-injected">
+      <VIS.Mermaid chart={`flowchart TB
+  KG["Domain knowledge graph (entities + relations)"]
+  GNN["GNN subgraph encoder (offline)"]
+  IDX["Subgraph embedding index (ANN)"]
+  Q["User history + query"]
+  RET["Retrieve top-k subgraphs"]
+  PROMPT["Prompt with KG paths inserted"]
+  LLM["LLM recommender"]
+  REC["Generated recommendation"]
+  KG --> GNN
+  GNN --> IDX
+  Q --> RET
+  IDX --> RET
+  RET --> PROMPT
+  Q --> PROMPT
+  PROMPT --> LLM
+  LLM --> REC`} />
+      <ul>
+        <li><strong>Offline subgraph indexing.</strong> A GNN traverses the KG and produces embeddings for multi-hop subgraphs (e.g., 2-3 hop neighbourhoods around each entity). Embeddings live in an ANN index.</li>
+        <li><strong>Retrieval at query time.</strong> The user&apos;s recent history is embedded; the ANN returns the top-k most relevant subgraphs.</li>
+        <li><strong>Prompt injection.</strong> The retrieved subgraphs&apos; entities and relations are formatted as structured language paths and inserted into the LLM&apos;s prompt alongside user history.</li>
+        <li><strong>Generative recommendation.</strong> The LLM consumes the augmented prompt and generates the next item.</li>
+      </ul>
+      <p>The KG facts are surfaced through retrieval, not memorised. Updating the KG updates the index, not the LLM weights.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <p>
-        <strong>Vanilla LLM rec (the baseline).</strong> User history and candidate items are presented to the LLM as text. The LLM is responsible for inferring relations between items from whatever world knowledge it acquired during pretraining, plus whatever fine-tuning has been done on the recsys task. Explicit relations (this movie's director also directed X, this product's brand also makes Y) are present in the LLM's weights but not retrievable on demand.
-      </p>
-      <p>
-        <strong>K-RagRec (the delta).</strong> Explicit relations are surfaced via subgraph retrieval and injected into the prompt as text. The LLM sees "movie A → directed-by → director D → also-directed → movie B" as an explicit path; this is much more reliable than hoping the LLM has memorized the relation.
-      </p>
-      <p>
-        <strong>Why this beats fine-tuning on KG triples.</strong> Fine-tuning bakes the KG into the model weights but doesn't allow the KG to be updated without retraining. K-RagRec keeps the KG external; updates to the KG propagate to predictions immediately via the retriever. This is the same argument that motivates RAG over fine-tuning for general LLM applications: freshness and updatability.
-      </p>
+    <VIS.Section id="sec-diff" title="How K-RagRec differs from neighbours">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>How the KG is used</th>
+          <th style={{textAlign:"left", padding:8}}>What enters the prompt</th>
+          <th style={{textAlign:"left", padding:8}}>KG update path</th>
+        </tr></thead>
+        <tbody>
+          <tr><td style={{padding:8}}>Vanilla LLM rec</td><td style={{padding:8}}>Not used</td><td style={{padding:8}}>User history only</td><td style={{padding:8}}>N/A</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Fine-tune LLM on KG triples</td><td style={{padding:8}}>Baked into weights</td><td style={{padding:8}}>User history only</td><td style={{padding:8}}>Retrain</td></tr>
+          <tr><td style={{padding:8}}>Text-RAG over Wikipedia</td><td style={{padding:8}}>Unstructured docs retrieved</td><td style={{padding:8}}>Free-text passages</td><td style={{padding:8}}>Re-embed docs</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>GNN-as-recommender (KGAT)</td><td style={{padding:8}}>GNN IS the recommender</td><td style={{padding:8}}>N/A</td><td style={{padding:8}}>Retrain GNN</td></tr>
+          <tr><td style={{padding:8}}><strong>K-RagRec</strong></td><td style={{padding:8}}><strong>GNN-indexed subgraph retrieval</strong></td><td style={{padding:8}}><strong>Structured KG paths as language</strong></td><td style={{padding:8}}><strong>Re-embed subgraphs</strong></td></tr>
+        </tbody>
+      </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick it / where it wins">
-      <p>
-        K-RagRec wins in three settings. (1) Domains with rich curated KGs — movies (IMDb), products (Amazon catalog graph), academic papers (citation networks), professional networks (LinkedIn-style). (2) Cold-start where new items have few interactions but rich relational metadata (a new movie has director, actors, genre on day one). (3) Explainable recs where the KG path itself is the explanation ("recommended because you watched another movie by this director").
-      </p>
-      <p>
-        Avoid K-RagRec when your KG is sparse or noisy, when latency budgets cannot absorb the subgraph-retrieval overhead, or when the LLM's pretrained world knowledge already covers your domain well (general-purpose recsys with no specialized KG).
-      </p>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 22 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the axis. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-gotchas" title="Limitations & gotchas">
-      <p>
-        Five failure modes. <strong>Prompt-length explosion</strong> — multi-hop subgraphs serialize into many tokens; aggressive truncation is required and changes which paths survive. <strong>KG retrieval latency</strong> — GNN inference + top-K subgraph search adds 50-200ms per query. <strong>KG quality matters</strong> — noisy or biased KGs propagate noise directly into recommendations; the LLM amplifies whatever signal it's given. <strong>Subgraph relevance scoring</strong> — different scoring objectives (cosine on GNN embeddings, learned re-ranker, rule-based) give different downstream metrics. <strong>Hallucination through false confidence</strong> — when the LLM sees an explicit KG path, it tends to trust it more than its own world knowledge; if the KG path is wrong, the recommendation is wrong with high confidence.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
-      <p style={{color:"#475569", marginBottom: 16}}>
-        Ten trap problems on K-RagRec: when KG-RAG beats fine-tuning, the production gotchas of subgraph retrieval, and the failure modes that distinguish a working deployment from prompt-stuffing theater.
-      </p>
-
-      <VIS.TrapProblem
-        id="krr-p1"
-        difficulty="hard"
-        title="P1 — Why KG-RAG beats fine-tuning on KG triples"
-        scenario={<>A peer suggests "Just fine-tune the LLM on KG triples; that's simpler than building a retrieval pipeline." When does K-RagRec win over fine-tuning?</>}
+      <VIS.TrapProblem id="kr-p1" difficulty="hard"
+        title="P1 — K-RagRec vs fine-tuning an LLM on KG triples: load-bearing difference?"
+        scenario={<><em>Discriminating insight: fine-tuning bakes KG facts into model weights — facts become stale when the KG updates, and adding/removing entities requires retraining. K-RagRec keeps facts in a retrieval index; KG updates re-embed subgraphs without touching the LLM. The model never owns the facts; it reads them per query.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Fine-tuning always wins; it bakes knowledge into the model."},
-          {key:"b", text:"K-RagRec wins when the KG updates frequently — daily catalog adds, new actor-movie links — and you can't retrain the LLM on every KG change.", correct:true},
-          {key:"c", text:"K-RagRec wins because it's slower."},
-          {key:"d", text:"They're equivalent."},
+          {key:"a", text:"Fine-tuning bakes KG facts into LLM weights — updates require retraining and stale facts persist. K-RagRec keeps facts in a retrieval index; KG updates re-embed subgraphs without touching the LLM. Facts are read per query, not memorised.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"Fine-tuning is strictly better."},
+          {key:"d", text:"K-RagRec also requires LLM retraining."},
         ]}
-        trap={<>(a) underweights the freshness argument. (c) misreads "wins." (d) is dismissive. The senior recognizes that the RAG-vs-fine-tune choice is a freshness-vs-baked-in tradeoff.</>}
-        lens={<>The RAG-vs-fine-tune choice has a generic answer in LLM applications: RAG wins on freshness and updatability; fine-tuning wins on latency and on signals that don't change. KGs in recsys update constantly (new items, new relations), so RAG is the natural pattern. Fine-tuning would mean retraining the LLM weekly or daily — operationally infeasible.</>}
-        stretch={<>If the KG were frozen and you had unlimited fine-tuning budget, would you still pick K-RagRec?</>}
+        trap={<>(b)(c)(d) collapse the fact-location distinction.</>}
+        lens={<>Facts in weights vs facts in retrieval index — different update paths.</>}
+        stretch={<>What is the KG update lag for each approach?</>}
       />
 
-      <VIS.TrapProblem
-        id="krr-p2"
-        difficulty="hard"
-        multiSelect
-        title="P2 — Prompt-length explosion"
-        scenario={<>You implement K-RagRec for a movie recommender. The retrieved 3-hop subgraphs serialize into ~800 tokens of relational paths per query. Your LLM has a 2k context budget. You also need 400 tokens for user history and 200 for the candidate items. Which mitigations are valid? Select all that apply.</>}
+      <VIS.TrapProblem id="kr-p2" difficulty="hard"
+        title="P2 — K-RagRec vs text-RAG over Wikipedia: definitional boundary"
+        scenario={<><em>Discriminating insight: text-RAG retrieves UNSTRUCTURED prose passages; the LLM parses entities and relations on the fly. K-RagRec retrieves STRUCTURED multi-hop subgraphs with explicit entity-relation-entity paths; the LLM consumes pre-parsed structure. The two differ in what the retriever returns, not in the LLM&apos;s role.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Restrict to 1-hop or 2-hop subgraphs to cut serialization length.", correct:true},
-          {key:"b", text:"Re-rank the retrieved paths and keep only the top-K most relevant.", correct:true},
-          {key:"c", text:"Compress the path representation: use special tokens for relations instead of natural language.", correct:true},
-          {key:"d", text:"Move to a larger-context LLM if the win justifies it.", correct:true},
-          {key:"e", text:"Drop user history; KG paths are more important."},
-          {key:"f", text:"Ignore the budget; modern LLMs handle 2k+ contexts fine."},
+          {key:"a", text:"Text-RAG retrieves unstructured prose; the LLM must re-extract entities and relations at inference. K-RagRec retrieves structured multi-hop subgraphs (entity-relation-entity paths); the LLM consumes pre-parsed structure. Both inject context but the structure level differs.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"K-RagRec is a special case of text-RAG."},
+          {key:"d", text:"Text-RAG retrieves entity-relation paths."},
         ]}
-        trap={<>(e) is wrong — user history is the primary signal; KG is augmentation. (f) ignores the constraint. The senior must navigate the actual context-budget tradeoffs.</>}
-        lens={<>Four valid mitigations. Restrict hop depth (a). Re-rank and truncate paths (b). Compress representation (c). Upgrade context length (d). The wrong move is to drop user history (e) — KG context is augmentation, not replacement. This is a generic RAG production pattern adapted to subgraphs.</>}
-        stretch={<>If you had to pick ONE mitigation, which gives the most benefit per implementation effort?</>}
+        trap={<>(b)(c)(d) collapse the structure distinction.</>}
+        lens={<>Unstructured prose vs structured subgraphs — what the retriever returns.</>}
+        stretch={<>Why does the LLM benefit from pre-parsed structure?</>}
       />
 
-      <VIS.TrapProblem
-        id="krr-p3"
-        difficulty="hard"
-        title="P3 — Hallucination through false confidence"
-        scenario={<>Your K-RagRec deployment recommends Movie B "because Director D directed Movie A which you watched." Audit shows Director D did NOT actually direct Movie A — the KG had a bad triple. The LLM stated the relation as fact in its explanation. The user complained. Why is this failure mode SPECIFIC to K-RagRec rather than vanilla LLM rec?</>}
+      <VIS.TrapProblem id="kr-p3" difficulty="medium"
+        title="P3 — Without K-RagRec, what is the realistic fallback?"
+        scenario={<><em>Discriminating insight: fallbacks include vanilla LLM rec (no KG signal — weak on relations), fine-tuning the LLM on KG triples (stale facts, expensive update path), text-RAG over a Wikipedia mirror (unstructured retrieval), or GNN-as-recommender (no language interface).</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Vanilla LLM rec would have made the same mistake."},
-          {key:"b", text:"When the LLM is given an explicit KG path, it tends to repeat the path as fact; vanilla LLM rec might have hedged or admitted uncertainty without the path.", correct:true},
-          {key:"c", text:"K-RagRec has a bug in its prompt template."},
-          {key:"d", text:"Hallucination is unrelated to KG-RAG."},
+          {key:"a", text:"Vanilla LLM rec (no explicit KG — weak on relations), fine-tuning the LLM on KG triples (stale facts on update), text-RAG over Wikipedia (unstructured retrieval, weaker on relations), or GNN-as-recommender (no language interface). K-RagRec occupies the structured-retrieval-plus-language corner.", correct:true},
+          {key:"b", text:"Random recommendations at parity."},
+          {key:"c", text:"Skip recommendation entirely."},
+          {key:"d", text:"Use a static collaborative filter."},
         ]}
-        trap={<>(a) misses the asymmetry. (c) blames implementation. (d) is dismissive. The senior recognizes that explicit context in the prompt makes the LLM MORE confident, which is a feature when the context is right and a bug when the context is wrong.</>}
-        lens={<>Explicit context in a prompt boosts LLM confidence in whatever the context says. This is desirable when the context is accurate; it amplifies errors when the context is wrong. K-RagRec inherits KG quality directly; bad KG triples become high-confidence hallucinations. The fix is upstream KG quality control (validation, provenance, freshness) — not LLM-side patches.</>}
-        stretch={<>What single signal in the LLM's output could detect a likely false-KG-context hallucination?</>}
+        trap={<>(b)(c) absurd. (d) abandons LLM-based generation.</>}
+        lens={<>K-RagRec is structured retrieval + language consumption.</>}
+        stretch={<>When does GNN-as-recommender beat K-RagRec?</>}
       />
 
-      <VIS.TrapProblem
-        id="krr-p4"
-        difficulty="medium"
-        title="P4 — KG retrieval latency budget"
-        scenario={<>Your serving p99 budget is 100ms. GNN-based subgraph retrieval is measured at 80ms per query. Adding K-RagRec leaves only 20ms for the LLM. The eng lead asks for the path to feasibility. What's the cleanest fix?</>}
+      <VIS.TrapProblem id="kr-p4" difficulty="hard"
+        title="P4 — Compose K-RagRec with time-aware prompting"
+        scenario={<><em>Discriminating insight: time-aware prompting injects TIME context into the prompt; K-RagRec injects KG ENTITIES into the prompt. They occupy the same layer (prompt construction) but different fields (time fields vs KG paths). They stack additively under prompt-budget constraints.</em><br/>What does the stack achieve?</>}
         options={[
-          {key:"a", text:"Drop K-RagRec; the budget is infeasible."},
-          {key:"b", text:"Precompute and cache subgraph embeddings; cache user-history → subgraph results; run GNN inference asynchronously where possible.", correct:true},
-          {key:"c", text:"Replace the GNN with a one-hop heuristic."},
-          {key:"d", text:"Increase the budget to 500ms."},
+          {key:"a", text:"Both inject information into the prompt — time-aware prompting adds time fields (now, lapsed, dow) and K-RagRec adds KG paths (entity-relation-entity). They stack additively but compete for prompt budget; field selection and rounding matter more under composition.", correct:true},
+          {key:"b", text:"They cannot coexist."},
+          {key:"c", text:"They are mathematically identical."},
+          {key:"d", text:"Composition forces an LLM retrain."},
         ]}
-        trap={<>(a) gives up. (c) loses the multi-hop signal. (d) ignores the constraint. The senior recognizes that caching and async are standard production-RAG patterns.</>}
-        lens={<>GNN inference is expensive but cacheable. User-history-driven retrieval can be cached on user updates rather than per request. Subgraph embeddings can be precomputed offline. These three patterns (cache embeddings, cache user-history retrieval, async GNN) take K-RagRec from infeasible to typical-RAG latency.</>}
-        stretch={<>What changes in the workload would make this caching strategy break down?</>}
+        trap={<>(b)(c)(d) misread the composition.</>}
+        lens={<>Both are prompt-injection techniques; they share the prompt budget.</>}
+        stretch={<>How to allocate prompt budget between time and KG fields?</>}
       />
 
-      <VIS.TrapProblem
-        id="krr-p5"
-        difficulty="hard"
-        multiSelect
-        title="P5 — Where K-RagRec wins, where it doesn't"
-        scenario={<>Four product surfaces. (i) Movie recommender with rich IMDb KG. (ii) News recommender with no curated KG. (iii) E-commerce with strong product-graph (brand, category, complementary items). (iv) Music streaming with rich artist-genre KG and severe cold-start. Which surfaces are good K-RagRec fits? Select all that apply.</>}
+      <VIS.TrapProblem id="kr-p5" difficulty="medium"
+        title="P5 — When does K-RagRec stop helping?"
+        scenario={<><em>Discriminating insight: K-RagRec needs (i) a curated KG with reliable entities and relations, (ii) recommendation tasks where explicit relations carry signal (director, genre, sequel-of). On domains without a curated KG (UGC platforms, ephemeral content) or where relations do not predict next-item, K-RagRec adds prompt-budget cost without lift.</em><br/>Where is the boundary?</>}
         options={[
-          {key:"a", text:"(i) — rich KG, explainability matters, movies have multi-hop relations.", correct:true},
-          {key:"b", text:"(ii) — no KG, K-RagRec has nothing to retrieve."},
-          {key:"c", text:"(iii) — product-graph + complementary-item signal is exactly what KG-RAG was built for.", correct:true},
-          {key:"d", text:"(iv) — cold-start + rich KG is the K-RagRec sweet spot; new items inherit useful behavior via their KG neighbors.", correct:true},
-          {key:"e", text:"K-RagRec wins on every surface."},
+          {key:"a", text:"Domains without a curated KG (UGC platforms, ephemeral content) have no retrieval source; domains where relations do not predict next-item (e.g., trending news where recency dominates) gain nothing from KG injection. Either boundary collapses the value.", correct:true},
+          {key:"b", text:"K-RagRec always wins."},
+          {key:"c", text:"K-RagRec only works on movies."},
+          {key:"d", text:"KG quality is irrelevant."},
         ]}
-        trap={<>(b) is correctly NOT a good fit and the question asks for GOOD fits. (e) is the maximalist trap. The senior recognizes K-RagRec wins are conditional on KG availability.</>}
-        lens={<>Three clear wins: movies (i) with rich KG and explainability needs, e-commerce (iii) with structured product graph, music (iv) with cold-start. The non-fit is news (ii) without a curated KG. The pattern: K-RagRec wins when (a) the KG exists and is high-quality, AND (b) the relations encode genuine recommendation signal.</>}
-        stretch={<>What single property of the KG predicts whether K-RagRec will help?</>}
+        trap={<>(b)(c)(d) miss the KG + relation-predictive contracts.</>}
+        lens={<>Curated KG + predictive relations is the premise.</>}
+        stretch={<>How to test &lsquo;relations predict next-item&rsquo; offline?</>}
       />
 
-      <VIS.TrapProblem
-        id="krr-p6"
-        difficulty="hard"
-        title="P6 — Subgraph relevance scoring"
-        scenario={<>Your top-K subgraph retrieval ranks subgraphs by cosine similarity of GNN embeddings to the query embedding. Offline NDCG is up but the retrieved subgraphs feel "off topic." Inspection shows the retriever returns subgraphs that share genre but ignore plot or thematic similarity. What's the fix?</>}
+      <VIS.TrapProblem id="kr-p6" difficulty="hard"
+        title="P6 — Pick the recsys architecture for a movie LLM recommender with a rich KG"
+        scenario={<><em>Discriminating insight: a movie LLM recommender on a domain with a curated KG (IMDB-style: director, genre, sequel-of, same-studio-as). K-RagRec fits — explicit relations predict next-item strongly, the KG is reliable, and prompt injection keeps the LLM unchanged. Fine-tuning would stale; text-RAG misses the relations; GNN-only loses generation.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Train a learned re-ranker on subgraph-relevance labels (clicks, dwell time) that captures more than cosine similarity.", correct:true},
-          {key:"b", text:"Drop the retriever; use random subgraphs."},
-          {key:"c", text:"Increase the embedding dimension."},
-          {key:"d", text:"Cosine similarity is always the right answer."},
+          {key:"a", text:"K-RagRec — explicit relations (director, genre, sequel-of) predict next-item strongly; the KG is curated and reliable; prompt injection keeps the LLM unchanged so KG updates do not require retraining. Fine-tuning would stale; text-RAG over plot summaries misses structured relations.", correct:true},
+          {key:"b", text:"Vanilla LLM rec — leaves relation signal on the table."},
+          {key:"c", text:"Fine-tune the LLM on KG triples — stale on KG update."},
+          {key:"d", text:"BM25 — no LLM, no relations."},
         ]}
-        trap={<>(b) is absurd. (c) might marginally help but doesn't address the scoring objective. (d) ignores the problem. The senior recognizes that retrieval-as-cosine is a baseline; production RAG always layers a re-ranker.</>}
-        lens={<>Cosine similarity over learned embeddings is a baseline retrieval signal. Production RAG stacks layer a learned re-ranker (cross-encoder, lightweight transformer) on top, trained on labeled relevance data. K-RagRec is no different; the GNN gives a candidate set, the re-ranker picks the actually-relevant subset.</>}
-        stretch={<>What labels would you collect to train a re-ranker for K-RagRec?</>}
+        trap={<>(b)(c)(d) miss the curated-KG + LLM-rec fit.</>}
+        lens={<>Curated KG + LLM rec + relation-predictive → K-RagRec.</>}
+        stretch={<>Recall lift K-RagRec gives over vanilla LLM rec on this surface?</>}
       />
 
-      <VIS.TrapProblem
-        id="krr-p7"
-        difficulty="hard"
-        title="P7 — Multi-hop depth choice"
-        scenario={<>You're picking subgraph hop-depth: 1-hop, 2-hop, or 3-hop. 1-hop misses transitive relations (movie → actor → other-movie). 3-hop blows up serialization length and adds noise. What's the principled choice?</>}
+      <VIS.TrapProblem id="kr-p7" difficulty="hard"
+        title="P7 — Sounds reasonable: &ldquo;just embed the KG triples and retrieve top-k triples&rdquo;"
+        scenario={<><em>Discriminating insight: triple-level retrieval (single &lsquo;A directed_by X&rsquo; per result) misses multi-hop structure that drives recommendation (&lsquo;A directed_by X, X also_directed B, B is sequel of C&rsquo;). K-RagRec indexes SUBGRAPHS — multi-hop neighbourhoods — so the retrieved context carries chains of relations the LLM can reason over.</em><br/>Why is the shortcut wrong?</>}
         options={[
-          {key:"a", text:"Always 3-hop — more context is always better."},
-          {key:"b", text:"Always 1-hop — simplest."},
-          {key:"c", text:"2-hop is the typical sweet spot: captures transitive relations like movie→actor→other-movie or product→brand→other-product without exploding serialization.", correct:true},
-          {key:"d", text:"Hop depth doesn't matter."},
+          {key:"a", text:"Triple-level retrieval returns isolated facts; multi-hop reasoning (&lsquo;A → director → X → also_directed → B → sequel_of → C&rsquo;) needs subgraph structure. K-RagRec indexes multi-hop subgraphs so the retrieved context carries chains of relations, not isolated facts.", correct:true},
+          {key:"b", text:"Triple-level retrieval is strictly better."},
+          {key:"c", text:"Multi-hop subgraphs and triples are equivalent."},
+          {key:"d", text:"Single triples support multi-hop reasoning natively."},
         ]}
-        trap={<>(a) and (b) are extreme positions. (d) is dismissive. The senior recognizes that hop depth is a real tradeoff and 2 is the typical default.</>}
-        lens={<>Hop depth trades signal coverage against serialization cost and noise. 2-hop captures the transitive relations that distinguish KG-RAG from item-only retrieval (movie → actor → another-movie, product → brand → another-product). 1-hop is item-level only; 3-hop bleeds noise. The typical landing point is 2-hop with re-ranking.</>}
-        stretch={<>For an academic-paper recommender with citation networks, would the hop-depth choice change?</>}
+        trap={<>(b)(c)(d) miss the multi-hop structure argument.</>}
+        lens={<>Subgraphs carry chains; triples do not.</>}
+        stretch={<>What hop depth is the practical sweet spot?</>}
       />
 
-      <VIS.TrapProblem
-        id="krr-p8"
-        difficulty="hard"
-        title="P8 — Explanation generation as a feature"
-        scenario={<>Your CEO wants "Netflix-style 'because you watched X' explanations" on every recommendation. K-RagRec retrieves the relational path that connects user history to recommendation. How does this differ from a separate explanation generator?</>}
+      <VIS.TrapProblem id="kr-p8" difficulty="hard"
+        title="P8 — K-RagRec&apos;s anchor (GNN-indexed subgraph retrieval, prompt-injected): pitch it"
+        scenario={<><em>Discriminating insight: the anchor is &ldquo;a GNN pre-indexes multi-hop subgraphs of the domain KG; retrieval pulls the top-k subgraphs for each query; the subgraphs are inserted into the LLM prompt as structured language.&rdquo; The pitch should name all three pieces.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"No difference; both produce text."},
-          {key:"b", text:"K-RagRec's retrieved path IS the explanation — it's grounded in actual KG relations rather than post-hoc text generation; the path is verifiable.", correct:true},
-          {key:"c", text:"K-RagRec doesn't explain; you still need a separate explainer."},
-          {key:"d", text:"Explanations are a different task entirely."},
+          {key:"a", text:"A GNN encodes multi-hop subgraphs of the domain KG offline into an ANN index; at inference, the user&apos;s history retrieves the top-k subgraphs; their entities and relations are inserted into the LLM prompt as structured paths. The LLM reads the KG fragment alongside history and generates the next item.", correct:true},
+          {key:"b", text:"K-RagRec fine-tunes the LLM on KG triples."},
+          {key:"c", text:"K-RagRec uses a GNN as the recommender."},
+          {key:"d", text:"K-RagRec is text-RAG over Wikipedia."},
         ]}
-        trap={<>(a) misses the grounding. (c) underclaims. (d) overclaims. The senior should recognize that the retrieved path is structurally an explanation.</>}
-        lens={<>K-RagRec's retrieved subgraph path is structurally an explanation: "recommended Movie B because of path (Movie A → director D → Movie B)." This is grounded in actual KG relations and is verifiable. Post-hoc text-generated explanations are not grounded and can hallucinate. K-RagRec absorbs explanation generation almost for free if the KG quality is good.</>}
-        stretch={<>How would you measure explanation quality for K-RagRec automatically?</>}
+        trap={<>(b) wrong update path. (c) wrong model role. (d) wrong retrieval target.</>}
+        lens={<>GNN-indexed subgraphs, retrieved per query, prompt-injected as language.</>}
+        stretch={<>Which of the three pieces is hardest to engineer well?</>}
       />
 
-      <VIS.TrapProblem
-        id="krr-p9"
-        difficulty="hard"
-        multiSelect
-        title="P9 — KG quality propagation"
-        scenario={<>Your KG has known issues: some triples are stale, a few are wrong, and biases exist (some genres over-represented). You ship K-RagRec without fixing these. Which downstream issues should you expect? Select all that apply.</>}
+      <VIS.TrapProblem id="kr-p9" difficulty="hard" multiSelect
+        title="P9 — When NOT to use K-RagRec. Select all that apply."
+        scenario={<><em>Discriminating insight: K-RagRec needs (i) a curated KG, (ii) relations that predict next-item, (iii) prompt-budget for KG paths, (iv) LLM-based generative recommender. It is wrong for UGC platforms (no curated KG), recency-dominated surfaces (relations matter less), tight prompt-budget retrieval surfaces, and DLRM/two-tower pipelines.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Stale triples produce recommendations of items that no longer exist or are no longer relevant.", correct:true},
-          {key:"b", text:"Wrong triples produce confident-but-incorrect explanations (the hallucination-through-false-confidence failure).", correct:true},
-          {key:"c", text:"Bias in the KG amplifies through the LLM into biased recommendations.", correct:true},
-          {key:"d", text:"The LLM corrects KG errors using its pretrained world knowledge."},
-          {key:"e", text:"K-RagRec is robust to KG quality issues by design."},
+          {key:"a", text:"UGC platform with no curated KG (everything is user-generated text).", correct:true},
+          {key:"b", text:"Trending-news surface where recency dominates and relations are weak predictors.", correct:true},
+          {key:"c", text:"DLRM or two-tower retrieval pipeline with no LLM in the path.", correct:true},
+          {key:"d", text:"Movie LLM recommender with a curated IMDB-style KG and reliable canonical entities."},
+          {key:"e", text:"Product LLM recommender on an e-commerce catalog with a clean taxonomy KG (brand, category, complement-of) and headroom in the prompt budget."},
         ]}
-        trap={<>(d) and (e) are wishful. The LLM does NOT correct injected context; it amplifies it. The senior must recognize that K-RagRec inherits KG quality issues directly.</>}
-        lens={<>Three real downstream issues. K-RagRec inherits KG freshness (a), accuracy (b), and bias (c) directly. The LLM does not silently correct injected context. KG quality is a hard upstream requirement; you can't paper over it at the LLM. This is one of the strongest "upstream data quality matters" arguments in modern recsys.</>}
-        stretch={<>What single KG-quality metric would you monitor as a leading indicator of K-RagRec quality?</>}
+        trap={<>(d)(e) are canonical fits — curated KG plus LLM rec plus predictive relations.</>}
+        lens={<>Curated KG + predictive relations + LLM + prompt budget.</>}
+        stretch={<>How to decide per-surface whether the KG is &lsquo;curated enough&rsquo;?</>}
       />
 
-      <VIS.TrapProblem
-        id="krr-p10"
-        difficulty="hard"
-        title="P10 — Senior reading of K-RagRec"
-        scenario={<>A junior reads K-RagRec and concludes "every LLM recsys should have a KG-RAG layer." What's the senior framing?</>}
+      <VIS.TrapProblem id="kr-p10" difficulty="hard"
+        title="P10 — Why does the GNN encode SUBGRAPHS instead of entities or triples?"
+        scenario={<><em>Discriminating insight: entity-level embeddings ignore the relational neighbourhood; triple-level embeddings ignore multi-hop chains. Subgraph embeddings capture multi-hop relational context that drives recommendation. The GNN&apos;s message passing aggregates this context naturally over 2-3 hops.</em><br/>Why subgraphs?</>}
         options={[
-          {key:"a", text:"Junior is right; KG-RAG always helps."},
-          {key:"b", text:"KG-RAG helps when (a) a high-quality KG exists, (b) the relations encode real recommendation signal, and (c) freshness/explainability matters; on surfaces without a KG, it has nothing to retrieve and adds latency for no benefit.", correct:true},
-          {key:"c", text:"Junior is wrong; KG-RAG never helps."},
-          {key:"d", text:"It depends on model size."},
+          {key:"a", text:"Entity embeddings ignore relational neighbourhood; triple embeddings ignore multi-hop chains. Subgraph embeddings capture multi-hop relational context that drives next-item recommendation. The GNN&apos;s 2-3 hop message passing is the right tool for this aggregation.", correct:true},
+          {key:"b", text:"Subgraphs are cheaper than entities."},
+          {key:"c", text:"Subgraphs and triples are equivalent."},
+          {key:"d", text:"Entity embeddings already aggregate hops."},
         ]}
-        trap={<>(a) and (c) are dogmatic. (d) is a vague evasion. The senior recognizes the three structural prerequisites for K-RagRec to pay off.</>}
-        lens={<>K-RagRec is not free. It requires a high-quality KG (data engineering cost), it adds retrieval latency (production cost), and it amplifies KG errors (failure-mode cost). When all three prerequisites are met — rich KG, real signal, freshness/explainability matters — it's a strong win. On general LLM rec without a curated KG, the right pattern is text-RAG or just fine-tuning. The architecture follows the data structure, not the most recent paper.</>}
-        stretch={<>What is the cheapest test to validate whether KG-RAG will pay off on a new domain before investing in the pipeline?</>}
+        trap={<>(b)(c)(d) miss the message-passing argument.</>}
+        lens={<>Multi-hop relational context lives at the subgraph level.</>}
+        stretch={<>Optimal hop depth — when does deeper hurt?</>}
       />
+
+      <VIS.TrapProblem id="kr-p11" difficulty="hard"
+        title="P11 — Prompt construction with KG paths"
+        scenario={<><em>Discriminating insight: KG paths must be written in a form the LLM can parse. Triples-as-prose (&lsquo;Movie A was directed by X; X also directed Movie B&rsquo;) often outperforms terse triple syntax (&lsquo;(A, directed_by, X) (X, also_directed, B)&rsquo;) because the LLM&apos;s language priors activate on prose. The path format is per-surface tunable.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Format the KG paths as prose (&lsquo;Movie A was directed by X; X also directed Movie B&rsquo;) so the LLM&apos;s language priors activate. Terse triple syntax tokenises as opaque punctuation and underperforms. The exact prose form is per-surface tunable.", correct:true},
+          {key:"b", text:"Triple syntax with parentheses always wins."},
+          {key:"c", text:"JSON-serialised triples always win."},
+          {key:"d", text:"Path format does not matter."},
+        ]}
+        trap={<>(b)(c)(d) miss the prior-activation argument.</>}
+        lens={<>Prose format activates LLM priors; triple syntax bypasses them.</>}
+        stretch={<>How to benchmark prose vs triple-syntax per surface?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p12" difficulty="hard"
+        title="P12 — What does K-RagRec deliberately drop vs fine-tuning the LLM on KG?"
+        scenario={<><em>Discriminating insight: fine-tuning compresses KG facts into LLM weights, so inference does not pay retrieval latency. K-RagRec pays a retrieval round-trip per query but trades that for KG-update freshness and no retraining. The tradeoff is &lsquo;serving latency&rsquo; vs &lsquo;fact freshness and update agility&rsquo;.</em><br/>What does K-RagRec forfeit?</>}
+        options={[
+          {key:"a", text:"Serving latency. Fine-tuning bakes facts into weights so inference is one LLM forward pass. K-RagRec adds a retrieval round-trip per query. The gain is fact freshness on KG update with no retraining; the loss is per-query latency.", correct:true},
+          {key:"b", text:"K-RagRec forfeits the use of the LLM."},
+          {key:"c", text:"K-RagRec forfeits the use of the KG."},
+          {key:"d", text:"K-RagRec forfeits the recommendation task."},
+        ]}
+        trap={<>(b)(c)(d) misread the trade.</>}
+        lens={<>Retrieval latency is the deliberate sacrifice for freshness.</>}
+        stretch={<>What retrieval latency budget keeps K-RagRec competitive?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p13" difficulty="hard"
+        title="P13 — Most fragile knob"
+        scenario={<><em>Discriminating insight: number of hops in the subgraph indexing dominates fragility. Too few hops misses multi-hop chains; too many hops bloats the index and the prompt budget. Top-k retrieval count is secondary; embedding dimensionality is robust.</em><br/>Rank fragility.</>}
+        options={[
+          {key:"a", text:"Number of GNN hops is most fragile — too few loses multi-hop chains, too many bloats the index and the prompt. Top-k retrieval count is next. Embedding dimensionality is robust within typical ranges.", correct:true},
+          {key:"b", text:"Embedding dimensionality is most fragile."},
+          {key:"c", text:"Optimizer choice is most fragile."},
+          {key:"d", text:"Batch size is most fragile."},
+        ]}
+        trap={<>(b)(c)(d) miss the hop-depth mechanism.</>}
+        lens={<>Hop depth gates multi-hop reasoning and prompt budget.</>}
+        stretch={<>How to detect &lsquo;too few hops&rsquo; from retrieval metrics?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p14" difficulty="medium"
+        title="P14 — Data assumption violations"
+        scenario={<><em>Discriminating insight: K-RagRec assumes KG entities are CANONICAL — each real-world entity has exactly one node. KG entity duplication (e.g., two nodes for the same actor due to name variants) splits the subgraph and breaks multi-hop chains. Retrieval returns half-graphs; the LLM sees broken paths.</em><br/>Which violation is most direct?</>}
+        options={[
+          {key:"a", text:"KG entity duplication — two nodes for the same real-world entity (name variants, alias misses). Multi-hop chains split across the duplicates; retrieval returns half-graphs and the LLM sees broken paths. Entity canonicalisation must precede subgraph indexing.", correct:true},
+          {key:"b", text:"Off-by-one on item-id indexing."},
+          {key:"c", text:"Different tokenizer at inference."},
+          {key:"d", text:"Mismatched batch sizes."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Entity canonicalisation is the K-RagRec-specific data contract.</>}
+        stretch={<>How to detect entity duplication impact on retrieval?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p15" difficulty="hard"
+        title="P15 — Intuitive but wrong: &ldquo;just give the LLM the entire KG and let it figure things out&rdquo;"
+        scenario={<><em>Discriminating insight: the entire KG is far larger than any prompt budget; even small movie KGs have millions of triples. The retrieval step is not optional — it is what makes the technique tractable. Dumping the KG is impossible; dumping a sampled chunk is worse than retrieving relevant subgraphs.</em><br/>Why is the naive view wrong?</>}
+        options={[
+          {key:"a", text:"Even small domain KGs have millions of triples — far beyond any prompt budget. The GNN-indexed retrieval is the load-bearing step that picks the relevant fragment per query. Dumping a random sample is worse than retrieving relevant subgraphs.", correct:true},
+          {key:"b", text:"The entire KG fits in a typical prompt."},
+          {key:"c", text:"Retrieval is optional."},
+          {key:"d", text:"Random samples match retrieved subgraphs."},
+        ]}
+        trap={<>(b)(c)(d) miss the budget + relevance arguments.</>}
+        lens={<>Retrieval is not optional; relevance and budget gate utility.</>}
+        stretch={<>Prompt-budget budget allocation for KG paths vs history?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p16" difficulty="hard"
+        title="P16 — Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: assuming &ldquo;K-RagRec is just RAG with a KG instead of docs&rdquo; cascades into (i) skipping GNN-based subgraph indexing (loses multi-hop chains), (ii) ignoring entity canonicalisation (broken paths), (iii) treating prompt budget as unlimited (KG paths crowd out history).</em><br/>What breaks?</>}
+        options={[
+          {key:"a", text:"All three: GNN-based subgraph indexing, entity canonicalisation, and prompt-budget discipline. Each is load-bearing; remove any one and K-RagRec regresses to (at best) a worse-than-text-RAG baseline.", correct:true},
+          {key:"b", text:"Only the GNN."},
+          {key:"c", text:"Only the canonicalisation."},
+          {key:"d", text:"Nothing — it is just RAG with a KG."},
+        ]}
+        trap={<>(d) the seductive misread.</>}
+        lens={<>Subgraph indexing + canonical entities + prompt budget.</>}
+        stretch={<>Which piece does the paper most underspecify?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p17" difficulty="medium"
+        title="P17 — Senior vs junior framing"
+        scenario={<><em>Discriminating insight: a junior responds to weak K-RagRec lift by increasing top-k. A senior first inspects whether the RETRIEVED subgraphs actually contain relations that predict the held-out next item — if the relations are wrong (retrieval failed) or irrelevant (relations do not predict), top-k will not help. Retrieval audit is the K-RagRec-specific diagnostic.</em><br/>Which lever first?</>}
+        options={[
+          {key:"a", text:"Audit retrieved subgraphs: do they contain relations that connect user history to the held-out next item? If retrieval misses (subgraphs are off-topic) or relations are weak (no predictive signal), top-k tuning won&apos;t fix it. Audit retrieval quality first; then tune top-k.", correct:true},
+          {key:"b", text:"Increase top-k immediately."},
+          {key:"c", text:"Increase the LLM size."},
+          {key:"d", text:"Switch to text-RAG."},
+        ]}
+        trap={<>(b)(c) generic. (d) abandons the structure.</>}
+        lens={<>Retrieval quality audit is the K-RagRec-specific diagnostic.</>}
+        stretch={<>Dashboard panel for retrieval-vs-relevance gap?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p18" difficulty="hard"
+        title="P18 — Plausible-misattribution: recall fell after a KG vendor schema migration"
+        scenario={<><em>Discriminating insight: the KG vendor renamed &lsquo;directed_by&rsquo; to &lsquo;director&rsquo; in a schema migration. The GNN indexer was rebuilt on the new schema; the LLM had been seeing prompts with &lsquo;directed_by&rsquo; phrasing during fine-tune/eval. Now the prompt says &lsquo;director&rsquo;; the LLM&apos;s priors over the old phrasing miss-fire. Engineers blame &lsquo;index staleness&rsquo;. The actual fix is to either keep the prompt phrasing constant via a relation-name alias map, or re-evaluate with the new phrasing.</em><br/>Recall fell after a KG schema migration. Most likely cause?</>}
+        options={[
+          {key:"a", text:"Index staleness — re-embed subgraphs.", correct:false},
+          {key:"b", text:"The schema migration renamed relation predicates (&lsquo;directed_by&rsquo; → &lsquo;director&rsquo;); the GNN re-indexed correctly but the prompt text now uses the new name, bypassing the LLM&apos;s priors learned around the old phrasing. Fix: alias relation names back to the original phrasing in the prompt template, or re-evaluate with the new phrasing.", correct:true},
+          {key:"c", text:"Cache TTL changed.", correct:false},
+          {key:"d", text:"GPU thermal throttling.", correct:false},
+        ]}
+        trap={<>(a) seductive — staleness is the default RAG suspect, but the index is fresh here. (c)(d) generic infra decoys.</>}
+        lens={<>Relation-name changes bypass LLM priors learned on the old phrasing.</>}
+        stretch={<>CI test for relation-name stability in the prompt builder?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p19" difficulty="hard"
+        title="P19 — Production gotcha: subgraph index vs LLM prompt-format skew"
+        scenario={<><em>Discriminating insight: subgraph embeddings encode the KG&apos;s relation set; the prompt template formats relation names as prose. If the embedding model and the prompt template diverge on relation-name set (one knows &lsquo;sequel_of&rsquo; and the other does not), retrieval returns subgraphs the prompt cannot format. Version-pin the relation vocabulary across embedder and prompt builder.</em><br/>What is the discipline?</>}
+        options={[
+          {key:"a", text:"Version-pin the relation vocabulary across the GNN embedder, the subgraph index, and the prompt builder. CI-check that the prompt template can format every relation in the index, and vice versa. Drift between them silently breaks retrieval-to-prompt translation.", correct:true},
+          {key:"b", text:"Relation vocabulary skew is harmless."},
+          {key:"c", text:"Skip versioning."},
+          {key:"d", text:"Embedder and prompt builder need not agree."},
+        ]}
+        trap={<>(b)(c)(d) miss the vocabulary contract.</>}
+        lens={<>Relation vocabulary is the contract across embedder and prompt builder.</>}
+        stretch={<>CI test that catches relation-vocab drift?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p20" difficulty="hard"
+        title="P20 — Failure on Friday: prompt-length p99 spiked and recall cratered"
+        scenario={<><em>Discriminating insight: a team increased top-k from 3 to 5 subgraphs to &lsquo;improve recall&rsquo;. Prompt-length p99 spiked past the LLM&apos;s context limit; tokens past the limit are silently dropped (or the call errors). Recall craters because user-history tokens at the end of the prompt are the ones being truncated. The fix is to either lower top-k or compress KG-path formatting.</em><br/>3am page: recall down 18% after a top-k bump. Diagnosis?</>}
+        options={[
+          {key:"a", text:"Top-k bump pushed prompt length past the LLM&apos;s context limit. Tokens past the limit are dropped (often the user-history tail, depending on prompt structure); the model loses recency signal and recall craters. Lower top-k, compress KG-path prose, or move history before KG paths so it never gets truncated.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"Cache TTL changed."},
+          {key:"d", text:"Index disk full."},
+        ]}
+        trap={<>(b)(c)(d) miss the context-limit truncation mechanism.</>}
+        lens={<>Context limits truncate silently; budget is finite.</>}
+        stretch={<>Runbook entry for top-k bumps in K-RagRec?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p21" difficulty="medium"
+        title="P21 — Library default that bites: GNN default hop depth"
+        scenario={<><em>Discriminating insight: PyTorch Geometric and DGL default GNN hops are often 2; K-RagRec frequently needs 2-3 hops to capture chains like &lsquo;A → director → X → also_directed → B&rsquo;. Sticking with the default silently underutilises the KG. Tune hop depth on a held-out next-item prediction task.</em><br/>Where does the default break K-RagRec?</>}
+        options={[
+          {key:"a", text:"Default 2-hop GNNs may miss the 3-hop chains that drive recommendation (e.g., director-mediated similarities). Tune hop depth on a held-out next-item prediction task; the right depth is per-KG.", correct:true},
+          {key:"b", text:"Default LR is wrong."},
+          {key:"c", text:"Default batch size is wrong."},
+          {key:"d", text:"Default optimizer is wrong."},
+        ]}
+        trap={<>(b)(c)(d) generic knobs.</>}
+        lens={<>Hop depth must match the chain length that predicts the target.</>}
+        stretch={<>How to find the right hop depth empirically?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p22" difficulty="hard" ordered
+        title="P22 — Order the K-RagRec rollout"
+        scenario={<><em>Discriminating insight: rollout is (1) canonicalise KG entities, (2) train and freeze the GNN subgraph encoder, (3) build the ANN index over subgraph embeddings, (4) write the prompt template with KG-path slots, (5) per-surface offline eval vs vanilla LLM rec, (6) shadow A/B. Skipping canonicalisation breaks every subsequent step.</em><br/>Order.</>}
+        options={[
+          {key:"a", text:"Canonicalise KG entities → train GNN subgraph encoder → build ANN index over subgraph embeddings → write prompt template with KG-path slots → per-surface offline eval vs vanilla LLM rec → shadow A/B", correct:true},
+          {key:"b", text:"Skip canonicalisation."},
+          {key:"c", text:"Build the index before training the GNN."},
+          {key:"d", text:"Ship to production before offline eval."},
+        ]}
+        trap={<>(b)(c)(d) lose stage diagnostics.</>}
+        lens={<>Canonicalise → train GNN → index → prompt → eval → ramp.</>}
+        stretch={<>Why canonicalise first?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p23" difficulty="hard"
+        title="P23 — Smallest input that breaks K-RagRec&apos;s claimed advantage"
+        scenario={<><em>Discriminating insight: a domain where the KG&apos;s relations do not predict next-item (e.g., a news surface where recency dominates and &lsquo;same-author&rsquo; or &lsquo;same-topic&rsquo; relations are weak predictors compared to publication time) collapses K-RagRec&apos;s lift. The retrieval is correct but the relations carry no signal.</em><br/>Construct the edge case.</>}
+        options={[
+          {key:"a", text:"A recency-dominated surface (e.g., trending news) where KG relations like &lsquo;same-author&rsquo; or &lsquo;same-topic&rsquo; are weak predictors compared to publication time. Retrieval is correct but the retrieved relations carry no predictive signal; K-RagRec&apos;s premise is violated.", correct:true},
+          {key:"b", text:"Movie LLM rec with a curated IMDB-style KG (canonical fit)."},
+          {key:"c", text:"100M users."},
+          {key:"d", text:"Catalog of 50M items."},
+        ]}
+        trap={<>(b) canonical fit. (c)(d) scale red herrings.</>}
+        lens={<>Predictive relations are the premise; recency-only domains violate it.</>}
+        stretch={<>How to detect &lsquo;relations not predictive&rsquo; from logged data?</>}
+      />
+
+      <VIS.TrapProblem id="kr-p24" difficulty="hard"
+        title="P24 — Paper-named failure: prompt-length explosion"
+        scenario={<><em>Discriminating insight: the K-RagRec paper explicitly flags prompt-length explosion under recursive subgraph retrieval as the dominant failure mode. Larger subgraphs and higher top-k both inflate the prompt past the LLM&apos;s context limit. The fix is path compression (round numbers, drop low-importance hops) and strict top-k bounds — not architecture.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Prompt-length explosion under multi-hop subgraph retrieval. Larger subgraphs and higher top-k inflate the prompt past the LLM&apos;s context limit; truncation silently drops user history at the tail. The fix is path compression (drop low-importance hops, shorten predicate phrasing) and strict top-k bounds.", correct:true},
+          {key:"b", text:"GPU thermal throttling is the dominant failure."},
+          {key:"c", text:"Embedding dimensionality is the dominant failure."},
+          {key:"d", text:"There are no failures."},
+        ]}
+        trap={<>(b)(c)(d) misread the named failure.</>}
+        lens={<>Prompt-length explosion is the named failure; compress paths and bound k.</>}
+        stretch={<>Heuristic for &lsquo;low-importance hop&rsquo; dropping?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://www.researchgate.net/publication/394273018" target="_blank" rel="noopener"><strong>K-RagRec — Knowledge Graph Retrieval-Augmented Generation for LLM-based Recommendation</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper, 2025)</span><br/>The source paper. Read the retrieval-vs-fine-tune ablation and the prompt-template section.</li>
-        <li><a href="https://eugeneyan.com/writing/llm-patterns/" target="_blank" rel="noopener"><strong>Eugene Yan — Patterns for Building LLM-based Systems</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Best practitioner survey of RAG patterns including KG-RAG. Read the "retrieve, then augment" section.</li>
-        <li><a href="https://arxiv.org/abs/2005.11401" target="_blank" rel="noopener"><strong>Lewis et al. — Retrieval-Augmented Generation</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2020)</span><br/>The original RAG paper. K-RagRec is the recsys-specific adaptation; read this for the underlying retrieval-augmentation framework.</li>
-        <li><a href="https://eugeneyan.com/writing/recsys-llm/" target="_blank" rel="noopener"><strong>Eugene Yan — LLMs for recommender systems</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Where K-RagRec fits among the broader LLM-based recsys landscape; useful for picking between K-RagRec, TIGER, and HSTU.</li>
-        <li><a href="https://arxiv.org/abs/1902.07243" target="_blank" rel="noopener"><strong>KGAT — Knowledge Graph Attention Network</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper, KDD 2019)</span><br/>The pre-LLM KG-recommender that K-RagRec inherits its GNN-over-KG idea from. Useful for grounding in the GNN-on-KG literature.</li>
+        <li><a href="https://www.researchgate.net/publication/394273018" target="_blank" rel="noopener">Anon., <em>Knowledge Graph Retrieval-Augmented Generation for LLM-based Recommendation (K-RagRec)</em> (2025)</a> — the canonical paper. Sections on GNN subgraph indexing and prompt injection are the must-read.</li>
+        <li><a href="https://arxiv.org/abs/2005.11401" target="_blank" rel="noopener">Lewis et al., <em>Retrieval-Augmented Generation for Knowledge-Intensive NLP</em> (NeurIPS 2020)</a> — the foundational RAG paper. K-RagRec is RAG with subgraph retrieval instead of doc retrieval.</li>
+        <li><a href="https://distill.pub/2021/gnn-intro/" target="_blank" rel="noopener">Sanchez-Lengeling et al. — <em>A Gentle Introduction to Graph Neural Networks</em> (Distill, 2021)</a> — best practitioner intro to GNNs; covers the message-passing math K-RagRec relies on for subgraph encoding.</li>
+        <li><a href="https://arxiv.org/abs/1905.07953" target="_blank" rel="noopener">Wang et al., <em>KGAT: Knowledge Graph Attention Network for Recommendation</em> (KDD 2019)</a> — the GNN-as-recommender neighbour; useful to see what K-RagRec deliberately avoids.</li>
+        <li><a href="https://eugeneyan.com/writing/llm-patterns/" target="_blank" rel="noopener">Eugene Yan — <em>Patterns for Building LLM-based Systems and Products</em> (blog)</a> — practitioner framing of RAG pipelines, prompt budget, and retrieval-vs-finetune tradeoffs.</li>
       </ul>
     </VIS.Section>
   </main>
 );
-
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>

@@ -1414,265 +1414,436 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// P5 — Pretrain, Personalized Prompt & Predict.
-// Geng et al. RecSys 2022; still the canonical "recsys-as-language" baseline 2024-2025.
+// REDO v2 — RecSys-SOTA batch 16
+// P5 (Pretrain, Personalized Prompt & Predict) — Geng et al., RecSys 2022; baseline 2024-25
+// Unique mechanism: ONE encoder-decoder LLM (T5-style) handles FIVE recsys tasks
+// (rating prediction, sequential rec, explanation generation, review summary,
+// direct rec) via TASK-SPECIFIC PROMPT TEMPLATES that splice in user-id and
+// item-id text. Multi-task amortization at the LLM level, not at the
+// retrieval/ranking layer.
+// LLM-rec pair caution (cross-visual in this batch):
+//   - P5             = ONE LLM, FIVE tasks, prompt-TEMPLATE per task    [THIS visual]
+//   - Time-aware Prompting = ONE LLM, ONE task, inject TIME context into prompt
+//   - K-RagRec       = ONE LLM, ONE task, inject KG ENTITIES into prompt
+// Cross-batch caution: NOT LLM-CDR (batch 10 — cross-DOMAIN transfer) and
+// NOT RecBase (batch 15 — pretraining a recsys foundation model on rec-task
+// signals). P5 is fine-tuning a pretrained T5 to do 5 different recsys tasks
+// from one model via prompt-format unification.
+// Anchor that survives §2a redaction: "one pretrained LLM, five recsys tasks,
+// task is selected by the prompt template — NOT a retrieval/ranker swap."
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Foundation models for recs"
+      pill="RecSys SOTA · Foundation models for rec"
       title="P5 — Pretrain, Personalized Prompt & Predict"
-      subtitle="Unify rating prediction, sequential rec, explanation, and review tasks into one text-to-text transformer with task-conditioning prompts."
+      subtitle="A single text-to-text LLM handles five recsys tasks (rating, sequential, explanation, review, direct rec) by switching the PROMPT TEMPLATE. The model is task-agnostic; the prompt is task-specific. Production rarely deploys raw P5 because raw LLM inference cannot meet retrieval latency."
       byline={[
-        {label: "Paper", value: "Geng et al., RecSys 2022"},
-        {label: "Status 2025", value: "Cited baseline, rarely deployed"},
-        {label: "Domain", value: "Generative / multi-task rec"},
+        {label: "Paper", value: "Geng et al., 'Recommendation as Language Processing' (P5), RecSys 2022; cited as foundational baseline 2024-2025"},
+        {label: "Surface", value: "Research/prototyping LLM-based unified recsys; rarely deployed raw at production latency"},
+        {label: "Anchor that survives redaction", value: "ONE pretrained T5-family LLM does FIVE recsys tasks by prompt template — task selection lives in the prompt, not the model"},
       ]}/>
 
     <VIS.TLDR>
-      P5 reframes every recsys task as <VIS.Term def="A learning setup where both inputs and outputs are natural-language strings. A single model handles many tasks by varying the input prompt template.">text-to-text</VIS.Term>: "Predict rating for user_23 on item_47" → "4". One T5-style transformer, many <VIS.Term def="A task-conditioning input string template. Filling slots like {user_id} and {item_id} into a sentence lets the same model behave differently per task.">personalized prompts</VIS.Term>. Great research demo; production rarely deploys raw P5 because dedicated DLRMs win on ranking metrics at the same compute. Source: <a href="https://arxiv.org/abs/2203.13366" target="_blank" rel="noopener">arXiv:2203.13366</a>.
+      Per-task recsys stacks duplicate engineering — one model for rating prediction, another for sequential rec, another for explanation, another for review summarisation, another for direct top-K. P5 collapses all five into ONE encoder-decoder LLM by writing each task as a text-to-text prompt with user-id and item-id tokens spliced in. The senior trap: this is NOT &ldquo;use an LLM for rec&rdquo; (vague) and NOT &ldquo;multi-task learning&rdquo; (which still typically uses task heads). P5&apos;s load-bearing claim is that the PROMPT TEMPLATE selects the task, the model is unchanged, and adding a new task is writing a new template — no head, no new architecture.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        P5 takes a pretrained <VIS.Term def="An encoder-decoder transformer (Raffel et al. 2020) pretrained on a massive text corpus with a text-to-text objective. Used as the backbone for many later generative recsys.">T5 backbone</VIS.Term> and fine-tunes it on a multi-task mixture where every recsys task is verbalized as natural language. Five task families share one set of weights: rating prediction, sequential recommendation, explanation generation, review summarization, and direct recommendation. The user and item IDs are inserted into the prompt as numeric tokens.
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  R["Rating prompt: rate item_47 for user_23"]
-  S["Sequential prompt: next item after history"]
-  E["Explanation prompt: why like item_47"]
-  X["Review prompt: summarize review"]
-  D["Direct rec prompt: pick top-k for user_23"]
-  R --> T["Shared T5 encoder-decoder"]
-  S --> T
-  E --> T
-  X --> T
-  D --> T
-  T --> O["Text output: rating / item id / sentence"]
-  style T fill:#dbeafe,stroke:#1e40af,stroke-width:2px
-      `} />
-      <p>
-        Inference is autoregressive decoding. To recommend an item, P5 generates the item ID token-by-token (constrained or unconstrained, depending on the variant).
-      </p>
+    <VIS.Section id="sec-what" title="What it is — one LLM, five tasks, prompt template selects the task">
+      <VIS.Mermaid chart={`flowchart TB
+  T1["Prompt template 1 (rating)"]
+  T2["Prompt template 2 (sequential rec)"]
+  T3["Prompt template 3 (explanation)"]
+  T4["Prompt template 4 (review summary)"]
+  T5["Prompt template 5 (direct rec)"]
+  LLM["P5 encoder-decoder LLM (T5-family, shared weights)"]
+  OUT["Text output decoded into task-specific format"]
+  T1 --> LLM
+  T2 --> LLM
+  T3 --> LLM
+  T4 --> LLM
+  T5 --> LLM
+  LLM --> OUT`} />
+      <ul>
+        <li><strong>One model, no task heads.</strong> All five tasks share the same encoder, decoder, and weights. The model never knows the task name explicitly — it sees a prompt.</li>
+        <li><strong>Prompt templates carry the task.</strong> A rating prompt looks like &ldquo;What rating would user_123 give item_456?&rdquo;; a direct-rec prompt looks like &ldquo;Recommend an item for user_123 from list [item_456, item_789, ...].&rdquo;</li>
+        <li><strong>User and item IDs are TOKENS.</strong> P5 introduces special-token ids (or vocab-embedded numeric ids) so the model can reason about them as language.</li>
+        <li><strong>Pretrain + multi-task fine-tune.</strong> Initialise from T5; multi-task fine-tune on the five tasks jointly with their prompt templates.</li>
+      </ul>
+      <p>Adding a sixth task at inference time means writing a sixth prompt template — no new training in principle, though in practice you fine-tune for it.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <p>
-        <strong>Per-task models (the baseline).</strong> A typical production stack has a dedicated CTR model (DLRM-style), a dedicated rating predictor (matrix factorization or factorization machines), a dedicated next-item model (SASRec/BERT4Rec), and a dedicated explanation generator. Each has its own training pipeline, feature store, and serving budget.
-      </p>
-      <p>
-        <strong>P5 (the delta).</strong> One shared model amortizes representation learning across tasks. The prompt template determines which task. The hope is positive transfer — explanation data helps rating prediction, review data helps sequential prediction — and operational simplicity (one model, one deploy).
-      </p>
-      <p>
-        <strong>Where it breaks down in practice.</strong> The unifying assumption (every task is text) is also the bottleneck: text decoding is slow versus a single dot-product, item IDs encoded as digit tokens carry zero semantic structure, and the multi-task mixture rarely beats a well-tuned single-task DLRM on raw ranking metrics. P5 is a research vehicle; production has largely moved to <VIS.Term def="Generative recommenders that keep the text-to-text framing but replace digit-token item IDs with content-derived discrete codes — see TIGER and HSTU-family models.">Semantic ID generative recs</VIS.Term> for the same reason.
-      </p>
+    <VIS.Section id="sec-diff" title="How P5 differs from neighbours">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Task selection</th>
+          <th style={{textAlign:"left", padding:8}}>Model count</th>
+          <th style={{textAlign:"left", padding:8}}>User/item identity</th>
+        </tr></thead>
+        <tbody>
+          <tr><td style={{padding:8}}>Per-task DLRM stack</td><td style={{padding:8}}>Pick the right model</td><td style={{padding:8}}>One per task</td><td style={{padding:8}}>Embedding tables</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Multi-task head MMOE</td><td style={{padding:8}}>Task head routes</td><td style={{padding:8}}>One shared backbone, N heads</td><td style={{padding:8}}>Embedding tables</td></tr>
+          <tr><td style={{padding:8}}><strong>P5</strong></td><td style={{padding:8}}><strong>Prompt template</strong></td><td style={{padding:8}}><strong>One, no heads</strong></td><td style={{padding:8}}><strong>Token ids inside text</strong></td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>LLM-CDR (cross-domain)</td><td style={{padding:8}}>Domain selection, not task</td><td style={{padding:8}}>One</td><td style={{padding:8}}>Token ids</td></tr>
+          <tr><td style={{padding:8}}>RecBase (rec foundation model)</td><td style={{padding:8}}>Trained from scratch on rec signals</td><td style={{padding:8}}>One</td><td style={{padding:8}}>Embedding tables, not language tokens</td></tr>
+        </tbody>
+      </table>
+      <p>The point of difference: P5 picks &ldquo;task = prompt&rdquo; whereas every neighbour either picks per-task models or task heads or a different selection axis (domain, modality).</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick it / where it wins">
-      <p>
-        P5 wins in three settings. (1) Research and prototyping where you need to test "does multi-task transfer help my domain?" cheaply. (2) Small-catalog domains where item ID tokens are not a vocabulary explosion problem. (3) Surfaces where natural-language explanation is the headline feature, not raw ranking quality — P5's explanation task is genuinely useful and is hard to bolt onto a pure DLRM.
-      </p>
-      <p>
-        Pick a dedicated DLRM when you need calibrated CTR at scale, pick TIGER or HSTU-family when you want generative retrieval with cold-start support, and pick BERT4Rec/SASRec when you only care about next-item prediction.
-      </p>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 24 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the axis. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-gotchas" title="Limitations & gotchas">
-      <p>
-        Four persistent failure modes. <strong>Latency</strong> — autoregressive decoding of item-ID digit tokens is multiple forward passes vs a single dot-product in two-tower; throughput is an order of magnitude lower. <strong>Item-ID tokenization</strong> — encoding item IDs as digit sequences (e.g., item_4271 → "4","2","7","1") means semantically similar items have unrelated token prefixes; the cold-start property generative recs are praised for is absent here. <strong>Ranking quality</strong> — at fixed compute budget, a tuned DLRM typically beats P5 on NDCG and AUC by a meaningful margin. <strong>Prompt sensitivity</strong> — small prompt-template wording changes shift downstream metrics; you need a held-out prompt set for evaluation just like any few-shot LLM eval.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
-      <p style={{color:"#475569", marginBottom: 16}}>
-        Ten trap problems on P5's discriminating signals: where multi-task transfer actually helps, where digit-token IDs sabotage cold-start, and the production tradeoffs that explain why P5 is "great paper, rarely deployed."
-      </p>
-
-      <VIS.TrapProblem
-        id="p5-p1"
-        difficulty="hard"
-        title="P1 — Latency budget at 10k QPS"
-        scenario={<>You benchmark P5 (T5-base, 220M params) vs a two-tower DLRM at the same catalog scale. Retrieval p99 budget is <strong>40ms</strong>, target QPS 10k. Two-tower retrieval clocks p99 of 8ms; P5 clocks p99 of 220ms generating an item-ID token sequence of length 5. The eng lead asks for the one-line cause.</>}
+      <VIS.TrapProblem id="p5-p1" difficulty="hard"
+        title="P1 — P5 vs per-task DLRM stack: what is the load-bearing difference?"
+        scenario={<><em>Discriminating insight: a per-task DLRM stack runs N separate models with N sets of weights and N inference paths. P5 runs ONE model, and the task is selected by the prompt template that is fed in. This is amortisation at the model level, not at the task level.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"P5 is over-parameterized — shrink to T5-small."},
-          {key:"b", text:"Autoregressive decoding does one forward pass per ID token; a 5-token ID is five sequential model calls vs one dot product for two-tower retrieval.", correct:true},
-          {key:"c", text:"Two-tower benefits from caching; P5 cannot cache."},
-          {key:"d", text:"Beam search width is too large; reduce to 1."},
+          {key:"a", text:"P5 collapses N task-specific DLRMs into ONE encoder-decoder LLM whose only task-aware element is the prompt template. The model weights are shared across tasks; adding a task is writing a template (and fine-tuning), not adding a model.", correct:true},
+          {key:"b", text:"P5 is a per-task DLRM with a bigger embedding table."},
+          {key:"c", text:"P5 is a hard-routed mixture of N task-specific submodels."},
+          {key:"d", text:"P5 is equivalent to running per-task DLRMs in parallel."},
         ]}
-        trap={<>(a) is a generic answer that ignores the architectural cause. (c) inverts reality — P5's encoder output CAN be cached across the beam. (d) helps marginally but doesn't address the structural cost. The signal the senior should catch is that "generate item ID as digit tokens" is fundamentally O(token-length) forward passes; two-tower is O(1).</>}
-        lens={<>The structural cost is autoregressive decoding. Even with KV caching and batched decoding, P5 cannot reach a single dot-product's latency. This is why TIGER replaced digit-token IDs with short Semantic-ID tuples (K=3-4 codes) — shorter sequences mean fewer decoding steps.</>}
-        stretch={<>What's the shortest item-ID token sequence that gets P5 within 2x of two-tower latency?</>}
+        trap={<>(b) under-shoots — P5 is not a DLRM. (c) hard routing contradicts the prompt-template mechanism. (d) ignores weight sharing.</>}
+        lens={<>One model, five tasks, prompt selects the task.</>}
+        stretch={<>How does adding a sixth task work in principle vs in practice?</>}
       />
 
-      <VIS.TrapProblem
-        id="p5-p2"
-        difficulty="hard"
-        multiSelect
-        title="P2 — Why item-ID-as-digits sabotages cold-start"
-        scenario={<>A peer claims "P5 should have great cold-start because it is a language model." You disagree. The item vocabulary is 1M items, each encoded as a digit sequence like item_847291. A brand-new item gets item_1000001 the day it launches. Which of the following are true? Select all that apply.</>}
+      <VIS.TrapProblem id="p5-p2" difficulty="hard"
+        title="P2 — P5 vs MMOE multi-task head: definitional boundary"
+        scenario={<><em>Discriminating insight: MMOE keeps a shared backbone but routes through N task-specific heads — the architecture is still task-aware. P5 has NO task-specific architecture; the task is encoded in the text prompt. If you swap the prompt, you swap the task with the same parameters.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"The token sequence '1','0','0','0','0','0','1' shares no semantic structure with similar items' digit IDs.", correct:true},
-          {key:"b", text:"The cold-start property generative recs are praised for requires content-derived IDs (Semantic IDs); P5's digit IDs do not have it.", correct:true},
-          {key:"c", text:"P5 generalizes naturally to new items because LLMs handle out-of-vocabulary tokens."},
-          {key:"d", text:"Pretrained T5 has never seen item_1000001 before; its embedding is essentially random until fine-tuned.", correct:true},
-          {key:"e", text:"The cold-start fix for P5 is to expose item content (title, description) inside the prompt rather than rely on the ID token.", correct:true},
+          {key:"a", text:"MMOE still has N task heads; the architecture is task-aware. P5 has NO task-aware component in the model — the task lives in the prompt text. P5&apos;s claim is harder: ONE forward function for all tasks.", correct:true},
+          {key:"b", text:"P5 and MMOE are equivalent."},
+          {key:"c", text:"P5 is MMOE with shared heads."},
+          {key:"d", text:"MMOE is a special case of P5."},
         ]}
-        trap={<>(c) is the maximalist LLM-believer take that's wrong here — out-of-vocabulary handling matters at the subword level, not at the level of giving meaningful representations to digit-IDs the model has never seen. Many candidates pick (c) on reflex.</>}
-        lens={<>Four are true. Digit-token IDs carry no semantic structure between items (a), so the cold-start property requires content-derived IDs (b). New IDs sit on randomly-initialized embeddings (d). The practical fix is to put content in the prompt — title and description — not the bare ID (e). TIGER's Semantic IDs are the principled fix.</>}
-        stretch={<>If you replaced digit IDs with RQ-VAE Semantic IDs while keeping P5's prompt format, what changes in cold-start behavior?</>}
+        trap={<>(b) collapses the head distinction. (c) hybrid that doesn&apos;t exist. (d) reverses the relationship.</>}
+        lens={<>Task heads vs prompt templates — different locations for task awareness.</>}
+        stretch={<>What does P5 give up by refusing task heads?</>}
       />
 
-      <VIS.TrapProblem
-        id="p5-p3"
-        difficulty="hard"
-        title="P3 — Multi-task transfer: when does it help?"
-        scenario={<>You train two P5 variants on the same Amazon Books corpus. Variant A: single-task, just sequential rec. Variant B: full P5 multi-task (rating + sequential + explanation + review + direct). On sequential rec NDCG@10, Variant B beats A by 0.4 points (38.2 vs 37.8). You test on Amazon Beauty: Variant B beats A by 0.05 points (basically tied). What's the most likely cause of the difference?</>}
+      <VIS.TrapProblem id="p5-p3" difficulty="medium"
+        title="P3 — Without P5, what is the realistic fallback?"
+        scenario={<><em>Discriminating insight: fallbacks include (i) one DLRM per task (engineering cost), (ii) MMOE with N task heads on a shared backbone (cheaper engineering, less unification), (iii) a foundation rec model like RecBase trained on rec signals (different premise — no language interface). P5 sits at the &ldquo;maximum unification, language-native&rdquo; corner.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Beauty has fewer items, so transfer learning helps less."},
-          {key:"b", text:"Books has rich review/explanation data; Beauty does not. Multi-task transfer is bounded by how much auxiliary-task signal exists.", correct:true},
-          {key:"c", text:"P5 always beats single-task; the Beauty result is a bug."},
-          {key:"d", text:"Beauty has more class imbalance."},
+          {key:"a", text:"Per-task DLRMs (N models, max engineering), MMOE multi-task with N task heads (one backbone, N heads), or a rec foundation model trained from scratch (no language interface). P5 is the only option that unifies via prompt templates over a language model.", correct:true},
+          {key:"b", text:"Random recommendations are at parity."},
+          {key:"c", text:"You would skip recommendation entirely."},
+          {key:"d", text:"Use a single linear model for everything."},
         ]}
-        trap={<>(a) confuses dataset size with the actual mechanism. (c) is wishful — multi-task transfer is not free. (d) is a generic-sounding answer that doesn't engage with the question.</>}
-        lens={<>Multi-task transfer's benefit scales with the volume and quality of auxiliary-task data. Books has long reviews that the explanation task can extract structure from; Beauty has short reviews and sparser explanation data. The transfer signal is proportional to the auxiliary-task signal-to-noise ratio in the specific corpus.</>}
-        stretch={<>What evaluation would you run to predict whether multi-task helps on a new domain BEFORE training?</>}
+        trap={<>(b)(c) absurd lower bounds. (d) lacks expressive capacity.</>}
+        lens={<>P5 occupies the &ldquo;language-native unification&rdquo; corner among the realistic fallbacks.</>}
+        stretch={<>Which fallback wins at 10k QPS?</>}
       />
 
-      <VIS.TrapProblem
-        id="p5-p4"
-        difficulty="hard"
-        multiSelect
-        title="P4 — Where dedicated DLRMs still win"
-        scenario={<>A staff engineer pitches replacing your production stack (DLRM ranker + matrix factorization rating predictor + SASRec next-item model) with one P5. Which arguments against the migration are valid? Select all that apply.</>}
+      <VIS.TrapProblem id="p5-p4" difficulty="hard"
+        title="P4 — Compose P5 with prompt-tuning"
+        scenario={<><em>Discriminating insight: prompt-tuning learns soft (continuous) prompt vectors instead of hand-writing discrete templates. Composing prompt-tuning with P5 means each task has a learned soft prefix replacing or augmenting the hand-written template. The model stays unchanged; the task signal gets sharper.</em><br/>What does the stack achieve?</>}
         options={[
-          {key:"a", text:"P5's ranking quality at fixed compute is typically below a tuned DLRM on calibrated CTR.", correct:true},
-          {key:"b", text:"Decoding latency makes online ranking infeasible at the QPS this stack serves.", correct:true},
-          {key:"c", text:"Item-ID tokenization wastes the LLM's strength; the digit IDs are not semantic.", correct:true},
-          {key:"d", text:"Multi-task transfer is unproven on the surface; the Books-Beauty result generalizes poorly.", correct:true},
-          {key:"e", text:"P5 cannot do explanation generation."},
-          {key:"f", text:"DLRMs always win on every metric."},
+          {key:"a", text:"Prompt-tuning replaces hand-written templates with learned soft prompts; P5&apos;s &ldquo;one model many tasks&rdquo; premise is preserved while the task signal becomes parameterised and gradient-tuned. The model body never changes.", correct:true},
+          {key:"b", text:"Prompt-tuning conflicts with P5 because P5 needs discrete templates."},
+          {key:"c", text:"Prompt-tuning replaces P5 entirely."},
+          {key:"d", text:"Prompt-tuning forces P5 to add task heads."},
         ]}
-        trap={<>(e) is wrong — explanation IS a P5 task and is one of its actual strengths. (f) is too strong; DLRMs lose on explanation generation and on multi-task transfer in domains with rich auxiliary signal. The senior must pick the four arguments that are precise and defensible.</>}
-        lens={<>Four valid arguments. P5's ranking quality is below tuned DLRMs at fixed compute (a). Latency is the structural blocker (b). Digit IDs waste the LLM's representational strength (c). Multi-task transfer is corpus-dependent and not a guaranteed win (d). The honest pitch keeps P5 for explanations and prototype evaluation, not for production ranking.</>}
-        stretch={<>What single architectural change would make the P5-style multi-task framing viable for production?</>}
+        trap={<>(b)(c)(d) misread the composition.</>}
+        lens={<>Soft prompts strengthen the task signal without breaking the &ldquo;one model&rdquo; claim.</>}
+        stretch={<>How many soft-prompt tokens per task is enough?</>}
       />
 
-      <VIS.TrapProblem
-        id="p5-p5"
-        difficulty="medium"
-        title="P5 — Prompt sensitivity"
-        scenario={<>You publish your P5 results: NDCG@10 of 38.2 on the public Books split. A reviewer re-runs your code with the prompt template <code>Suggest the next book user_U will enjoy after HISTORY</code> instead of your original <code>Predict the next item for user_U given HISTORY</code>. They get NDCG@10 of 35.1. Why such a large gap from a small wording change?</>}
+      <VIS.TrapProblem id="p5-p5" difficulty="medium"
+        title="P5 — At what scale does P5 stop being attractive?"
+        scenario={<><em>Discriminating insight: P5&apos;s appeal collapses when raw LLM inference latency exceeds the surface budget. Retrieval surfaces at 100k QPS with 5ms p99 are out of P5&apos;s reach without distillation; P5 lives in research, prototyping, and offline scoring.</em><br/>Where is the boundary?</>}
         options={[
-          {key:"a", text:"They have a different random seed."},
-          {key:"b", text:"P5's behavior depends on the prompt template; text-to-text models are sensitive to wording, and there is no held-out prompt set in your reported eval.", correct:true},
-          {key:"c", text:"The reviewer trained on a different corpus."},
-          {key:"d", text:"Reviewer bug."},
+          {key:"a", text:"When the surface demands sub-10ms p99 at 10k+ QPS, raw P5 inference latency exceeds budget; P5 sits in research/prototyping/offline scoring. To deploy at production retrieval latency, you must distill or replace the architecture.", correct:true},
+          {key:"b", text:"P5 always wins."},
+          {key:"c", text:"P5 only works for tiny datasets."},
+          {key:"d", text:"Scale is irrelevant."},
         ]}
-        trap={<>(a) (c) (d) all blame circumstance instead of engaging with prompt sensitivity. The senior should recognize that text-to-text recsys inherit the same brittleness as LLM few-shot prompts.</>}
-        lens={<>Prompt-template wording materially shifts performance for text-to-text recsys. Reporting a single number without a held-out prompt set hides this sensitivity. The proper evaluation reports mean and std across a prompt-template set — the same discipline as LLM eval.</>}
-        stretch={<>How would you build a "held-out prompt set" for P5 evaluation?</>}
+        trap={<>(b)(c)(d) miss the latency contract.</>}
+        lens={<>Latency budget vs LLM inference cost is the boundary.</>}
+        stretch={<>What latency does a distilled P5 student reach?</>}
       />
 
-      <VIS.TrapProblem
-        id="p5-p6"
-        difficulty="hard"
-        title="P6 — P5 vs TIGER vs HSTU"
-        scenario={<>A new staff engineer is choosing between three generative recsys: P5, TIGER, and HSTU. Catalog is 50M e-commerce items with rich text + image. Cold-start is severe (50k new items/day). QPS is 5k, p99 budget 60ms. Which is the strongest fit?</>}
+      <VIS.TrapProblem id="p5-p6" difficulty="hard"
+        title="P6 — Pick the architecture for a unified recsys research prototype"
+        scenario={<><em>Discriminating insight: a research team wants to compare rating, sequential, explanation, review-summary, and direct-rec under one model to study cross-task transfer. Latency is not a constraint; engineering simplicity is. P5 is the canonical choice; per-task DLRMs and MMOE both fragment the comparison.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"P5 — multi-task is most flexible."},
-          {key:"b", text:"TIGER — Semantic IDs give cold-start, K=3-4 codes fit the latency budget, and constrained decoding handles a 50M catalog cleanly.", correct:true},
-          {key:"c", text:"HSTU — sequential attention is always best for retrieval."},
-          {key:"d", text:"Bench all three; never decide on paper."},
+          {key:"a", text:"P5 — one encoder-decoder LLM, five prompt templates, shared weights. Cross-task transfer studies become a single training run instead of N stacks. Latency is not the binding constraint in research.", correct:true},
+          {key:"b", text:"Per-task DLRMs — fragments the comparison and inflates engineering."},
+          {key:"c", text:"MMOE — task heads break the &ldquo;same model&rdquo; comparison."},
+          {key:"d", text:"BM25 + heuristics — no language reasoning."},
         ]}
-        trap={<>(a) ignores the latency and cold-start requirements. (c) confuses HSTU's role (a strong ranker/sequence model) with retrieval. (d) is a cop-out that ducks the question; the brief gives enough signal to make a defensible architectural choice.</>}
-        lens={<>The brief points to TIGER. Cold-start severity rules out digit-token IDs (P5). Latency budget rules out P5's autoregressive digit-decoding. HSTU is a sequence model that pairs with retrieval, not a retrieval architecture itself. TIGER's Semantic IDs give cold-start support and short decoder sequences.</>}
-        stretch={<>What would change in the brief that would tip the answer back toward P5?</>}
+        trap={<>(b)(c) fragment the comparison. (d) wrong capability.</>}
+        lens={<>Cross-task transfer studies need a single model with prompt-selectable tasks.</>}
+        stretch={<>How would you measure cross-task transfer?</>}
       />
 
-      <VIS.TrapProblem
-        id="p5-p7"
-        difficulty="hard"
-        multiSelect
-        title="P7 — Item-ID vocabulary blowup"
-        scenario={<>Your catalog has 50M items. P5's tokenizer needs to handle each item as a sequence. Two implementation choices: (i) treat each item as a single new vocabulary token (vocab grows by 50M), or (ii) encode IDs as digit sequences (vocab unchanged but sequence length grows). Which choices have problems? Select all that apply.</>}
+      <VIS.TrapProblem id="p5-p7" difficulty="hard"
+        title="P7 — Sounds reasonable: &ldquo;just bolt prompts onto a DLRM&rdquo;"
+        scenario={<><em>Discriminating insight: a DLRM has no language interface — its inputs are typed feature tensors, not tokens. You cannot &ldquo;bolt prompts onto a DLRM&rdquo; meaningfully because the DLRM does not consume text. P5&apos;s premise requires the LLM&apos;s tokenizer + text-to-text interface.</em><br/>Why is the shortcut wrong?</>}
         options={[
-          {key:"a", text:"(i) explodes the softmax output layer to 50M classes; memory and compute become infeasible.", correct:true},
-          {key:"b", text:"(i) suffers extreme sparsity per item ID; embeddings train slowly.", correct:true},
-          {key:"c", text:"(ii) makes decoding 7-8 sequential forward passes per item ID (item_12345678 → 8 digits).", correct:true},
-          {key:"d", text:"(ii) destroys any semantic structure between items.", correct:true},
-          {key:"e", text:"(i) is fine — modern GPUs handle 50M softmax classes."},
-          {key:"f", text:"(ii) is faster than (i)."},
+          {key:"a", text:"DLRMs ingest typed feature tensors (categorical embeddings, numeric features), not text tokens. Prompts only function inside a text-to-text architecture. To get P5&apos;s benefit you must adopt an LLM, not glue prompts onto a DLRM.", correct:true},
+          {key:"b", text:"DLRMs accept prompts natively."},
+          {key:"c", text:"Prompts are just numeric features in disguise."},
+          {key:"d", text:"DLRMs and LLMs have the same interface."},
         ]}
-        trap={<>(e) is wishful; 50M softmax classes is a real wall, both in memory and in compute. (f) is partially true but misleadingly imprecise — decoding (ii) is multi-step while (i) is one step but with a giant softmax; "faster" depends on the model size. The senior should engage with all four real problems.</>}
-        lens={<>Both naive approaches fail. The (i) single-token approach explodes the softmax. The (ii) digit-decode approach makes generation slow and semantically empty. This is exactly the problem TIGER's Semantic IDs solve: K=3-4 codes from codebooks of ~1024 entries gives short sequences AND semantic structure.</>}
-        stretch={<>What's the minimum K and codebook size that handles 50M items with 1% collision tolerance?</>}
+        trap={<>(b)(c)(d) collapse the interface distinction.</>}
+        lens={<>P5 requires a text-to-text interface; DLRMs lack it.</>}
+        stretch={<>What is the cheapest path from a DLRM stack to a P5 prototype?</>}
       />
 
-      <VIS.TrapProblem
-        id="p5-p8"
-        difficulty="hard"
-        title="P8 — Explanation generation: P5's actual strength"
-        scenario={<>Your CEO wants "Netflix-style 'because you watched X' explanations" on every recommendation. The current DLRM ranker is best-in-class but cannot generate text. Where does P5 fit in this stack?</>}
+      <VIS.TrapProblem id="p5-p8" difficulty="hard"
+        title="P8 — P5&apos;s anchor (one LLM, five tasks, prompt template): pitch it"
+        scenario={<><em>Discriminating insight: the anchor is &ldquo;one pretrained LLM, five recsys tasks, prompt template selects the task; user and item IDs are tokens.&rdquo; A correct pitch names all three pieces.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Replace the DLRM with P5 since P5 does ranking AND explanation."},
-          {key:"b", text:"Keep the DLRM for ranking; use a P5 fine-tuned on the explanation task only as a post-rank explainer over the top-N candidates.", correct:true},
-          {key:"c", text:"Use a generic LLM (Llama) instead of P5; it generates better text."},
-          {key:"d", text:"Skip explanations; CEO doesn't understand the tradeoffs."},
+          {key:"a", text:"P5 fine-tunes a T5-family LLM on five recsys tasks (rating, sequential, explanation, review, direct rec) using task-specific prompt templates. User and item IDs are tokens in the vocabulary. The same weights answer all five tasks; the prompt picks which one.", correct:true},
+          {key:"b", text:"P5 trains a separate LLM per task and ensembles them."},
+          {key:"c", text:"P5 is a cross-domain transfer learning method."},
+          {key:"d", text:"P5 is a retrieval index built on an LLM."},
         ]}
-        trap={<>(a) loses ranking quality. (c) ignores the fine-tuning advantage P5 has for in-domain explanations. (d) is dismissive. The senior recognizes that P5's explanation task is genuinely strong and can be deployed as a side car without disturbing the ranker.</>}
-        lens={<>P5-as-explainer is the production sweet spot for the multi-task framing. Keep the dedicated ranker for the headline metric; bolt on a fine-tuned P5 explanation head on the top-N. This is the pattern most "LLM-augmented" production recsys use in 2024-2025.</>}
-        stretch={<>How would you evaluate explanation quality without human review?</>}
+        trap={<>(b) loses the unified-model claim. (c) confuses with LLM-CDR. (d) confuses with LLM-as-retriever.</>}
+        lens={<>One model, five tasks, prompts pick the task — name all three.</>}
+        stretch={<>Which of the three pieces is hardest to engineer well?</>}
       />
 
-      <VIS.TrapProblem
-        id="p5-p9"
-        difficulty="hard"
-        title="P9 — Negative transfer in multi-task"
-        scenario={<>You train full P5 on a corpus where rating prediction is high-quality and abundant (10M ratings) but explanation data is small and noisy (50k explanations). After joint training, rating prediction NDCG drops 1.2 points vs single-task rating-only. What's the most likely cause?</>}
+      <VIS.TrapProblem id="p5-p9" difficulty="hard" multiSelect
+        title="P9 — When NOT to use P5. Select all that apply."
+        scenario={<><em>Discriminating insight: P5 needs (i) acceptance of LLM inference latency, (ii) text-tokenisable user/item identities, (iii) a task set that benefits from unification (cross-task transfer or shared knowledge). It is wrong for sub-10ms retrieval surfaces, opaque numeric-only feature spaces, and single-task production systems where a tuned DLRM already dominates.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Bug — multi-task always helps."},
-          {key:"b", text:"Negative transfer: the noisy explanation task contributes high-variance gradients that perturb shared parameters away from the rating-prediction optimum.", correct:true},
-          {key:"c", text:"P5 is undertrained; train longer."},
-          {key:"d", text:"Rating data is too clean to benefit from multi-task."},
+          {key:"a", text:"Sub-10ms retrieval surface at 100k QPS — LLM inference exceeds the latency budget.", correct:true},
+          {key:"b", text:"Opaque numeric-only feature space where user/item identity is not text-tokenisable.", correct:true},
+          {key:"c", text:"Single-task production system where a tuned DLRM already meets the metric and engineering budget.", correct:true},
+          {key:"d", text:"Research prototype comparing five recsys tasks under one model (P5&apos;s home turf)."},
+          {key:"e", text:"Domain with strict explainability mandates that forbid generative outputs.", correct:true},
         ]}
-        trap={<>(a) is wishful. (c) blames training when the problem is task balance. (d) is a clever-sounding answer that misreads how transfer works.</>}
-        lens={<>Multi-task learning is not free. Tasks with high noise can degrade tasks with low noise via shared gradients. The standard fix is task-weighting (downweight the noisy task), gradient surgery (PCGrad), or separate adapters per task that share only a frozen backbone.</>}
-        stretch={<>If you had to keep all five tasks active, which technique would you try first to mitigate negative transfer?</>}
+        trap={<>(d) is the canonical fit case.</>}
+        lens={<>P5 needs latency budget + tokenisable IDs + unification payoff.</>}
+        stretch={<>How would you ablate prompt templates to test task-prompt sensitivity?</>}
       />
 
-      <VIS.TrapProblem
-        id="p5-p10"
-        difficulty="hard"
-        multiSelect
-        title="P10 — Reading P5 the right way as a senior MLE"
-        scenario={<>Your team is doing a paper-reading on P5. A junior engineer concludes "P5 is the future of recsys; we should migrate everything." A staff engineer disagrees. What is the senior reading of P5's actual contribution? Select all that apply.</>}
+      <VIS.TrapProblem id="p5-p10" difficulty="hard"
+        title="P10 — Why does prompt-template engineering matter so much in P5?"
+        scenario={<><em>Discriminating insight: in P5 the prompt template IS the task interface. Poorly-worded templates conflate tasks (e.g., a rating template that reads like a direct-rec template confuses the decoder). Template engineering is not cosmetic — it is the task-routing mechanism, and ablation studies show large recall gaps from template wording alone.</em><br/>Why does template wording carry such weight?</>}
         options={[
-          {key:"a", text:"P5 demonstrates that text-to-text framing is viable for recsys — a research-direction result, not a production architecture.", correct:true},
-          {key:"b", text:"P5's specific instantiation (digit-token IDs, T5 backbone) is dominated in production by descendants like TIGER and HSTU-family.", correct:true},
-          {key:"c", text:"The multi-task transfer claim is corpus-dependent and needs replication on YOUR data.", correct:true},
-          {key:"d", text:"The explanation-generation task is genuinely useful as a sidecar in a production stack.", correct:true},
-          {key:"e", text:"P5's reported numbers are state-of-the-art on every benchmark in 2025."},
-          {key:"f", text:"You should replace your DLRM with P5 today."},
+          {key:"a", text:"The prompt template IS the task-routing mechanism in P5. There is no task head to disambiguate; if two templates phrase tasks similarly, the model conflates them. Template ablations show big metric gaps from wording changes alone.", correct:true},
+          {key:"b", text:"Templates are decorative; the model figures out the task on its own."},
+          {key:"c", text:"Templates only matter at training time."},
+          {key:"d", text:"Templates only matter at inference time."},
         ]}
-        trap={<>(e) and (f) are the junior's read. The senior recognizes P5 as a paradigm-defining paper whose specific architecture has been superseded by better instantiations of the same idea. The four correct points capture the nuanced reading.</>}
-        lens={<>P5's lasting contribution is the framing: recsys as language. The specific architecture is dominated. The multi-task claim needs per-corpus replication. The explanation task is genuinely deployable. This is the senior-vs-junior signal: distinguishing a paper's lasting idea from its specific implementation.</>}
-        stretch={<>Which 2024-2025 paper most directly extends P5's framing into a production-deployable architecture?</>}
+        trap={<>(b) ignores the task-routing role. (c)(d) split the role artificially.</>}
+        lens={<>The template is the task-routing mechanism, not a cosmetic prefix.</>}
+        stretch={<>What ablation isolates template wording from training data?</>}
       />
+
+      <VIS.TrapProblem id="p5-p11" difficulty="hard"
+        title="P11 — Loss composition during multi-task fine-tune"
+        scenario={<><em>Discriminating insight: all five tasks share a single text-generation cross-entropy loss because every task is a text-to-text problem. The differences live in the training-data mix and prompt templates, not in the loss function. This is what makes P5 simple at the loss level.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"A single text-generation cross-entropy loss over decoded tokens, shared across all five tasks. The five tasks differ in prompt template and target text format, not in the loss function. Task mixing happens via data sampling weights.", correct:true},
+          {key:"b", text:"Five separate task-specific losses summed with learned weights."},
+          {key:"c", text:"Contrastive loss between tasks."},
+          {key:"d", text:"Adversarial loss across templates."},
+        ]}
+        trap={<>(b) reintroduces per-task structure that P5 deliberately removes. (c)(d) wrong loss families.</>}
+        lens={<>Five tasks, one text-generation loss — the simplicity is the point.</>}
+        stretch={<>How does data-mixing weight affect cross-task transfer?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p12" difficulty="hard"
+        title="P12 — What does P5 deliberately drop vs a per-task DLRM stack?"
+        scenario={<><em>Discriminating insight: P5 forfeits raw retrieval/ranking latency — DLRMs serve at sub-millisecond p99 per query; P5 cannot match that without distillation. The gain is unified language reasoning over rec tasks; the loss is production-grade retrieval latency.</em><br/>What does P5 forfeit?</>}
+        options={[
+          {key:"a", text:"Production-grade retrieval latency. DLRMs serve at sub-millisecond per query; P5&apos;s LLM inference is one to three orders of magnitude slower without distillation. The gain is unification; the loss is raw serving speed.", correct:true},
+          {key:"b", text:"P5 forfeits the use of user/item IDs."},
+          {key:"c", text:"P5 forfeits multi-task capability."},
+          {key:"d", text:"P5 forfeits the ability to train."},
+        ]}
+        trap={<>(b)(c)(d) misread the trade.</>}
+        lens={<>Latency is the deliberate sacrifice for unification.</>}
+        stretch={<>Distillation budget needed to get within 2x of DLRM latency?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p13" difficulty="hard"
+        title="P13 — Most fragile knob"
+        scenario={<><em>Discriminating insight: prompt template wording dominates. Mis-set wording confuses the task router (the template itself). Sequence length and learning rate are secondary; the template family is the load-bearing knob because the template is the task router.</em><br/>Rank fragility.</>}
+        options={[
+          {key:"a", text:"Prompt template wording / length is most fragile (mis-set conflates tasks); training-data sampling weights are next (skew the model toward one task); learning rate is least fragile. Template choice is the load-bearing knob because the template is the task router.", correct:true},
+          {key:"b", text:"Number of training epochs is most fragile."},
+          {key:"c", text:"Batch size is most fragile."},
+          {key:"d", text:"Optimizer choice is most fragile."},
+        ]}
+        trap={<>(b)(c)(d) generic knobs that do not interact with the task-routing mechanism.</>}
+        lens={<>Templates route tasks; template wording is the fragile knob.</>}
+        stretch={<>Robust prompt-format checks at training time?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p14" difficulty="medium"
+        title="P14 — Data assumption violations"
+        scenario={<><em>Discriminating insight: P5 assumes user/item identities are TOKENISABLE in the LLM&apos;s vocabulary (either as special tokens or via a numeric-id vocab extension). If the catalog grows beyond the vocab budget or new items appear faster than vocab refresh, P5&apos;s identity layer breaks even though tasks are otherwise well-defined.</em><br/>Which violation is most direct?</>}
+        options={[
+          {key:"a", text:"Catalog growth outpaces the LLM&apos;s id-token vocabulary. New items lack tokens (or get mapped to a generic out-of-vocab token); P5 cannot distinguish them and recommendation collapses for the new-item slice.", correct:true},
+          {key:"b", text:"Off-by-one in user-id indexing."},
+          {key:"c", text:"Different tokenizer at inference."},
+          {key:"d", text:"Mismatched batch sizes."},
+        ]}
+        trap={<>(b) generic. (c) plausible but secondary. (d) generic.</>}
+        lens={<>Token vocabulary for IDs is the P5-specific identity contract.</>}
+        stretch={<>How do you handle a catalog with millions of items?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p15" difficulty="hard"
+        title="P15 — Intuitive but wrong: &ldquo;P5 needs no task awareness because the LLM figures it out&rdquo;"
+        scenario={<><em>Discriminating insight: the LLM never sees a task name explicitly — task awareness lives entirely in the prompt template. Without distinct templates the model cannot route. The naive belief that &ldquo;a big LLM will figure out the task from data alone&rdquo; ignores the routing role of the prompt.</em><br/>Why is the naive view wrong?</>}
+        options={[
+          {key:"a", text:"P5&apos;s task awareness is not emergent — it is engineered into the prompt template. The LLM has no other signal of which task is which. Drop the template distinctions and the model conflates tasks.", correct:true},
+          {key:"b", text:"P5&apos;s task awareness is fully emergent."},
+          {key:"c", text:"The LLM uses task heads internally."},
+          {key:"d", text:"Templates are not needed at fine-tune time."},
+        ]}
+        trap={<>(b)(c)(d) misplace the task-awareness mechanism.</>}
+        lens={<>Templates engineer the task signal; the LLM does not invent it.</>}
+        stretch={<>What does an ablation with identical templates show?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p16" difficulty="hard"
+        title="P16 — Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: assuming &ldquo;P5 is just an LLM doing rec&rdquo; cascades into (i) skipping prompt-template design (model conflates tasks), (ii) deploying raw P5 at production retrieval latency (misses the budget by 10-100x), (iii) treating IDs as natural language (catalog growth breaks identity).</em><br/>What breaks?</>}
+        options={[
+          {key:"a", text:"All three: prompt-template design, latency-aware deployment, and id-vocabulary management. Each is load-bearing; remove any one and P5 either regresses to a bad multi-task baseline or fails to serve.", correct:true},
+          {key:"b", text:"Only prompt design."},
+          {key:"c", text:"Only latency."},
+          {key:"d", text:"Nothing — P5 is just an LLM."},
+        ]}
+        trap={<>(d) the seductive misread.</>}
+        lens={<>Three load-bearing pieces — prompts, latency budget, id vocab.</>}
+        stretch={<>Which piece does the original P5 paper underspecify?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p17" difficulty="medium"
+        title="P17 — Senior vs junior framing"
+        scenario={<><em>Discriminating insight: a junior responds to a recall regression on one of the five tasks by collecting more data for that task. A senior first checks whether the prompt template for that task changed (or whether the data-sampling mix shifted, starving the task). The diagnostic is template plus sampling first, data volume last.</em><br/>Which lever first?</>}
+        options={[
+          {key:"a", text:"Check (i) whether the prompt template for the affected task was modified, (ii) whether the multi-task data-sampling weights shifted to under-sample this task. Only after these are ruled out is data volume the right lever. Template and sampling are P5-specific; data volume is generic.", correct:true},
+          {key:"b", text:"Collect more data for the affected task immediately."},
+          {key:"c", text:"Increase model size."},
+          {key:"d", text:"Switch to per-task DLRMs."},
+        ]}
+        trap={<>(b)(c) generic levers. (d) abandons P5.</>}
+        lens={<>Template plus sampling first; data volume is the late lever.</>}
+        stretch={<>What dashboard panel exposes data-sampling drift across the five tasks?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p18" difficulty="hard"
+        title="P18 — Plausible-misattribution: explanation-task BLEU drops after a tokenizer extension"
+        scenario={<><em>Discriminating insight: a team extended P5&apos;s vocabulary to add 50k new item-id tokens after a catalog refresh. The explanation task&apos;s BLEU dropped 4 points the next day. The engineers blame the explanation template. The actual cause is that the tokenizer extension added uninitialised embedding rows for the new tokens; the shared decoder pays the largest penalty on free-text generation where shared representations matter most. The other four tasks output mostly IDs and are less sensitive.</em><br/>BLEU on the explanation task fell after a vocabulary extension. Other four tasks held. Most likely cause?</>}
+        options={[
+          {key:"a", text:"The explanation prompt template was modified.", correct:false},
+          {key:"b", text:"Tokenizer/vocab extension added 50k uninitialised id tokens to the embedding table; the explanation decoder shares the embedding layer and pays the largest penalty because it generates free text where shared representations matter most. Fix: warm-start the new id embeddings (for example from category centroids) and retrain briefly.", correct:true},
+          {key:"c", text:"A regression in a sampling weight starved the explanation task during training.", correct:false},
+          {key:"d", text:"GPU thermal throttling slowed inference.", correct:false},
+        ]}
+        trap={<>(a) seductive — template changes are the default suspect, but here the templates were untouched. (c) plausible but does not explain why ONLY explanation fell. (d) infrastructure decoy with no link to vocab.</>}
+        lens={<>Vocab extensions reset embedding rows; free-text tasks pay the largest penalty.</>}
+        stretch={<>What CI gate would catch embedding-row reset on vocab extension?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p19" difficulty="hard"
+        title="P19 — Production gotcha: prompt-template drift across environments"
+        scenario={<><em>Discriminating insight: P5 fine-tuned with template T0 will silently degrade if production prompts use T1 (extra whitespace, different colon vs comma, different ID format). The model is sensitive to template surface form because the template is the task router; serving infra must enforce byte-for-byte template fidelity.</em><br/>What is the discipline?</>}
+        options={[
+          {key:"a", text:"Version-pin and hash the prompt template; CI-check that the serving template matches the training template byte-for-byte. P5 has no task head to absorb template drift; the template surface form IS the contract.", correct:true},
+          {key:"b", text:"Template fidelity does not matter."},
+          {key:"c", text:"Round templates on the fly."},
+          {key:"d", text:"Skip template versioning."},
+        ]}
+        trap={<>(b)(c)(d) miss the contract.</>}
+        lens={<>Template surface form is the task contract; pin and hash it.</>}
+        stretch={<>What CI assertion catches whitespace drift in templates?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p20" difficulty="hard"
+        title="P20 — Failure on Friday: sequential-rec recall fell to near random after a template refactor"
+        scenario={<><em>Discriminating insight: a team refactored the sequential-rec prompt template to be &ldquo;more readable&rdquo;, changing the position of the user-history block. The model was fine-tuned with history-then-question; the new template puts question-then-history. Because the template is the task contract, the model now treats the prompt as a different (unseen) task and outputs near-random. Recall regressed to chance overnight.</em><br/>3am page: sequential-rec recall fell to near random after a template refactor. Diagnosis?</>}
+        options={[
+          {key:"a", text:"The template refactor changed the surface form the model was fine-tuned against. Because P5 routes by template surface, the new template reads as a different (unseen) task and the model outputs near-random tokens. Roll back the template or fine-tune on the new template before deploying.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"Cache TTL changed."},
+          {key:"d", text:"Index disk full."},
+        ]}
+        trap={<>(b)(c)(d) miss the template-as-task-contract mechanism.</>}
+        lens={<>Refactoring a template without re-fine-tuning breaks the task router.</>}
+        stretch={<>What runbook entry covers template-refactor rollouts?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p21" difficulty="medium"
+        title="P21 — Library default that bites: greedy decoding for direct-rec"
+        scenario={<><em>Discriminating insight: HuggingFace text-generation defaults are often greedy or low-beam decoding. For direct-rec, greedy decoding collapses diversity — the model always picks the highest-prob item, which destroys exposure across the long tail. Beam search or top-k sampling is needed for diverse direct-rec outputs.</em><br/>Where does the default break P5?</>}
+        options={[
+          {key:"a", text:"Default greedy decoding collapses direct-rec output diversity — the model always picks the highest-prob item, starving the long tail. Switch to beam search or top-k sampling for the direct-rec task; greedy is acceptable for rating prediction where the output is a scalar.", correct:true},
+          {key:"b", text:"Default LR is wrong."},
+          {key:"c", text:"Default batch size is wrong."},
+          {key:"d", text:"Default optimizer is wrong."},
+        ]}
+        trap={<>(b)(c)(d) generic knobs.</>}
+        lens={<>Decoding strategy must match the task — direct-rec needs diversity.</>}
+        stretch={<>What decoding budget balances diversity and latency?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p22" difficulty="hard" ordered
+        title="P22 — Order the P5 rollout"
+        scenario={<><em>Discriminating insight: rollout is (1) tokenise user/item IDs into the LLM vocab, (2) write task-specific prompt templates, (3) multi-task fine-tune T5 on the five tasks, (4) per-task offline eval against per-task baselines, (5) prototype-only serving (or distill before production). Starting with serving before per-task eval is the classic mistake.</em><br/>Order.</>}
+        options={[
+          {key:"a", text:"Tokenise user/item IDs into the LLM vocab → write prompt templates → multi-task fine-tune T5 → per-task offline eval against per-task baselines → prototype-only serving or distill", correct:true},
+          {key:"b", text:"Skip ID tokenisation."},
+          {key:"c", text:"Serve before evaluating."},
+          {key:"d", text:"Train with no templates first."},
+        ]}
+        trap={<>(b)(c)(d) lose stage diagnostics.</>}
+        lens={<>IDs → templates → fine-tune → eval → serve.</>}
+        stretch={<>Why per-task offline eval before serving?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p23" difficulty="hard"
+        title="P23 — Smallest input that breaks P5&apos;s claimed advantage"
+        scenario={<><em>Discriminating insight: a single-task production setting (e.g., only direct-rec at 100k QPS) eliminates the multi-task unification that justifies P5. A tuned DLRM trained on that one task will beat P5 on both latency and metric, because P5&apos;s gains come from cross-task transfer that is not available when there is only one task.</em><br/>Construct the edge case.</>}
+        options={[
+          {key:"a", text:"A single-task production setting (e.g., only direct-rec at 100k QPS). With one task there is no cross-task transfer, and the latency budget rules out raw LLM inference. A tuned DLRM beats P5 on both metric and latency. P5&apos;s premise is violated.", correct:true},
+          {key:"b", text:"Five tasks under one model in a research prototype (canonical fit)."},
+          {key:"c", text:"100M users."},
+          {key:"d", text:"Catalog of 50M items."},
+        ]}
+        trap={<>(b) canonical fit case. (c)(d) scale red herrings.</>}
+        lens={<>Single-task settings remove P5&apos;s unification payoff.</>}
+        stretch={<>What hybrid covers the multi-task research workflow but serves a single task?</>}
+      />
+
+      <VIS.TrapProblem id="p5-p24" difficulty="hard"
+        title="P24 — Paper-named failure: explanation task degeneration"
+        scenario={<><em>Discriminating insight: the P5 paper itself flags explanation-task generation as the most fragile of the five — it generates free text and is sensitive to template wording and decoder calibration. Recall regressions on the other four tasks often track template/sampling issues, but the explanation task can degenerate (repetitive, generic) even when the others are healthy.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Explanation-task degeneration: repetitive or generic free text even when rating/sequential/review/direct-rec tasks hold their metric. The fix is decoder hyperparameters (repetition penalty, temperature) plus richer explanation training signal — not architecture.", correct:true},
+          {key:"b", text:"Latency is the dominant failure across all tasks."},
+          {key:"c", text:"Rating prediction is the most fragile task."},
+          {key:"d", text:"There are no failures."},
+        ]}
+        trap={<>(b) wrong axis. (c) wrong task. (d) overstates.</>}
+        lens={<>Free-text tasks (explanation) degenerate first under P5.</>}
+        stretch={<>Decoder hyperparameter sweep that catches degeneration?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://arxiv.org/abs/2203.13366" target="_blank" rel="noopener"><strong>Geng et al. — Recommendation as Language Processing (P5)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper, RecSys 2022)</span><br/>The original P5 paper. Read the multi-task ablation and the prompt-template table — these are where the actual claims live.</li>
-        <li><a href="https://eugeneyan.com/writing/recsys-llm/" target="_blank" rel="noopener"><strong>Eugene Yan — LLMs for recommender systems</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Best practitioner survey of where P5 sits among LLM-based recsys; clear on what each approach is actually good for.</li>
-        <li><a href="https://arxiv.org/abs/2305.05065" target="_blank" rel="noopener"><strong>Rajput et al. — Recommender Systems with Generative Retrieval (TIGER)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2023)</span><br/>The direct successor that fixes P5's two biggest problems (digit-token IDs and lack of cold-start) with Semantic IDs.</li>
-        <li><a href="https://arxiv.org/abs/2402.17152" target="_blank" rel="noopener"><strong>Zhai et al. — Actions Speak Louder than Words (HSTU)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper, Meta 2024)</span><br/>The production-scale generative recsys at Meta; useful contrast to P5's research framing.</li>
-        <li><a href="https://github.com/jeykigung/P5" target="_blank" rel="noopener"><strong>Official P5 implementation (GitHub)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(code)</span><br/>Read the prompt-template definitions; that is where most of the "magic" lives.</li>
+        <li><a href="https://arxiv.org/abs/2203.13366" target="_blank" rel="noopener">Geng et al., <em>Recommendation as Language Processing (P5)</em> (RecSys 2022)</a> — the canonical P5 paper. Read sections 3 (prompt templates) and 4 (multi-task fine-tune) before anything else.</li>
+        <li><a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">Jay Alammar — <em>The Illustrated Transformer</em> (blog)</a> — best background on the encoder-decoder backbone P5 uses.</li>
+        <li><a href="https://lilianweng.github.io/posts/2023-03-15-prompt-engineering/" target="_blank" rel="noopener">Lilian Weng — <em>Prompt Engineering</em> (blog)</a> — practitioner reference on how prompt wording changes model behaviour, which is exactly the lever P5 relies on.</li>
+        <li><a href="https://arxiv.org/abs/1910.10683" target="_blank" rel="noopener">Raffel et al., <em>Exploring the Limits of Transfer Learning with T5</em> (JMLR 2020)</a> — T5 is P5&apos;s starting backbone; read sections on text-to-text framing.</li>
+        <li><a href="https://eugeneyan.com/writing/llm-patterns/" target="_blank" rel="noopener">Eugene Yan — <em>Patterns for Building LLM-based Systems and Products</em> (blog)</a> — practitioner framing of LLM-in-the-loop production constraints that explain why raw P5 rarely ships.</li>
       </ul>
     </VIS.Section>
   </main>
 );
-
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>

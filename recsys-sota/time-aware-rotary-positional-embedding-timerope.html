@@ -1414,255 +1414,432 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// TimeRoPE — Time-aware Rotary Positional Embedding for sequential recsys.
-// Industry / arXiv posts 2024-2025; emergentmind topic page tracks the line.
+// REDO v2 — RecSys-SOTA batch 16
+// TimeRoPE — Time-aware Rotary Positional Embedding
+// Unique mechanism: replace RoPE's INTEGER POSITION index with the actual
+// EVENT TIMESTAMP. The rotation angle in each attention head becomes a function
+// of t_i (real time) instead of i (sequence index). So a one-hour gap and a
+// one-month gap rotate by different amounts; the attention dot-product encodes
+// inter-event time-deltas in CONTINUOUS time.
+// Temporal-trio caution (this batch):
+//   - TimeRoPE    = POSITIONAL-ENCODING layer (architectural)            [THIS]
+//   - TimeWeaver  = DUAL-STREAM architecture (one stream per temporal axis)
+//   - Time-aware Prompting = PROMPT-engineering layer (LLM input text)
+// "Temporal info matters" is the generic version; each visual must anchor on
+// its own structural location for time.
+// Anchor that survives §2a redaction: "RoPE rotation angle becomes a function
+// of TIMESTAMP, not of integer position; attention dot-product encodes
+// real time-deltas, not integer index gaps."
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Time-aware recommendation"
+      pill="RecSys SOTA · Time-aware sequential rec"
       title="TimeRoPE — Time-aware Rotary Positional Embedding"
-      subtitle="Replace RoPE's integer step index with actual timestamps so attention encodes inter-event time gaps natively."
+      subtitle="Standard RoPE rotates query/key vectors by an angle proportional to the integer position i. TimeRoPE rotates by an angle proportional to the timestamp t_i. The attention dot-product then encodes real inter-event time-deltas (one hour vs one month) instead of integer index gaps (k=1 vs k=30)."
       byline={[
-        {label: "Source", value: "Industry posts 2024-2025"},
-        {label: "Domain", value: "Sequential transformer rec"},
-        {label: "Topic page", value: "emergentmind"},
+        {label: "Source", value: "Industry / arXiv posts 2024-2025; emergentmind topic page; commonly cited in time-aware transformer recsys"},
+        {label: "Surface", value: "Transformer sequential recsys on irregular event streams (clicks, purchases, plays)"},
+        {label: "Anchor that survives redaction", value: "RoPE rotation angle becomes a function of TIMESTAMP, not integer position — attention encodes real time-deltas in continuous time"},
       ]}/>
 
     <VIS.TLDR>
-      Standard <VIS.Term def="Rotary Positional Embedding (Su et al. 2021). Encodes position by rotating query/key vectors by an angle proportional to the integer token index. Makes attention sensitive to relative position via dot-product geometry.">RoPE</VIS.Term> uses integer token positions (0, 1, 2, ...) so a 1-hour gap and a 1-month gap look identical. TimeRoPE swaps the integer index for the real <VIS.Term def="The actual wall-clock time when the event happened, possibly transformed (log, linear, quantile-binned) to bound the rotation angles. Replaces RoPE's integer step index.">timestamp</VIS.Term> — attention's dot-product geometry now naturally reflects time elapsed. Source: <a href="https://www.emergentmind.com/topics/time-aware-rotary-positional-embedding" target="_blank" rel="noopener">emergentmind topic</a>.
+      In a standard transformer recsys (SASRec, BERT4Rec), the positional encoding tells the attention layer that item #5 is &ldquo;5 steps&rdquo; after item #1 — but it has no idea whether those five steps spanned an hour or a year. TimeRoPE fixes the encoding itself: the rotation angle that RoPE applies to the query and key vectors is computed from the actual event TIMESTAMP, not from the integer index. The attention dot-product between two events therefore depends on their TIME-DELTA, not their index gap. Senior trap: this is NOT &ldquo;concatenate a timestamp feature&rdquo; (which would touch the input embedding but leave the position math untouched), and NOT &ldquo;use a time-aware attention bias&rdquo; (which adds a learned scalar). It is a surgical replacement of RoPE&apos;s position function.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        RoPE rotates query and key vectors by an angle <code>m·θ</code> where <code>m</code> is the integer token position. The dot product of two RoPE-rotated vectors then depends on <code>m1 - m2</code>, giving relative-position-aware attention. TimeRoPE keeps the exact same rotation machinery but replaces <code>m</code> with the timestamp <code>t</code> (typically log-normalized or quantile-binned so the angles stay in a useful range). The dot product now depends on <code>t1 - t2</code> — the actual time elapsed between two events.
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  S["User event sequence"]
-  S --> P["Standard RoPE: index 0,1,2,3,4"]
-  S --> T["TimeRoPE: timestamps t0,t1,t2,t3,t4"]
-  P --> A1["Attention: relative position m_i - m_j"]
-  T --> A2["Attention: real time gap t_i - t_j"]
-  style T fill:#dbeafe,stroke:#1e40af,stroke-width:2px
-  style A2 fill:#dbeafe,stroke:#1e40af,stroke-width:2px
-      `} />
-      <p>
-        The rotation matrix is unchanged. Only the scalar fed into the rotation angle changes. This is what makes TimeRoPE a near-drop-in replacement for RoPE in any existing transformer sequential recsys.
-      </p>
+    <VIS.Section id="sec-what" title="What it is — RoPE rotation by timestamp, not integer index">
+      <VIS.Mermaid chart={`flowchart TB
+  EV["Event sequence with timestamps"]
+  IDX["Integer index i (0,1,2,...)"]
+  TS["Timestamp t_i (Unix seconds)"]
+  ROPE["Standard RoPE: rotate by f(i)"]
+  TROPE["TimeRoPE: rotate by f(t_i)"]
+  ATT["Attention dot-product"]
+  EV --> IDX
+  EV --> TS
+  IDX --> ROPE
+  TS --> TROPE
+  ROPE --> ATT
+  TROPE --> ATT`} />
+      <ul>
+        <li><strong>RoPE recap.</strong> Standard RoPE multiplies pairs of dimensions in the query/key by a 2D rotation matrix whose angle is theta_i = i * base ^ (-2k/d). The attention dot-product q_i · k_j depends only on the gap (i - j) — integer index gap.</li>
+        <li><strong>TimeRoPE swap.</strong> The angle becomes theta_i = t_i * base ^ (-2k/d), where t_i is the event timestamp (often normalised by log or quantile). The attention dot-product now depends on the time-delta (t_i - t_j) — continuous time gap.</li>
+        <li><strong>Drop-in for the position function only.</strong> Tokens, embeddings, FFNs, and the attention softmax are unchanged. Only the rotation angles change.</li>
+        <li><strong>Normalisation matters.</strong> Raw Unix seconds rotate too fast; log(t) or quantile normalisation keeps the angle range similar to standard RoPE.</li>
+      </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <p>
-        <strong>Standard RoPE in SASRec / BERT4Rec (the baseline).</strong> Token at index <code>m</code> rotates by <code>m·θ</code>. Two consecutive events get rotation angles that differ by exactly <code>θ</code> no matter whether they happened one minute apart or one year apart. The model has no native way to feel the time gap; you have to bolt timestamp features in via concatenated embeddings or special tokens.
-      </p>
-      <p>
-        <strong>TimeRoPE (the delta).</strong> The rotation angle is now <code>t·θ</code> where <code>t</code> is the (normalized) timestamp. Two events one minute apart get nearly identical rotations; two events one year apart get wildly different ones. Attention's dot-product magnitude between Q at <code>t1</code> and K at <code>t2</code> falls off naturally with the time gap.
-      </p>
-      <p>
-        <strong>What changes operationally.</strong> The time normalization choice (linear, log, quantile, learned) becomes a tuning knob. Linear normalization treats hour and year gaps proportionally — usually too aggressive a falloff. Log normalization handles bursty patterns better but compresses recent events. Quantile bins are most robust across users but require a global statistic that's expensive to recompute.
-      </p>
+    <VIS.Section id="sec-diff" title="How TimeRoPE differs from neighbours">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Where time enters</th>
+          <th style={{textAlign:"left", padding:8}}>Attention depends on</th>
+          <th style={{textAlign:"left", padding:8}}>Cost</th>
+        </tr></thead>
+        <tbody>
+          <tr><td style={{padding:8}}>Standard RoPE (SASRec)</td><td style={{padding:8}}>No time signal</td><td style={{padding:8}}>Integer index gap</td><td style={{padding:8}}>Same as RoPE</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Timestamp as input feature</td><td style={{padding:8}}>Concatenated to embedding</td><td style={{padding:8}}>Integer index gap (position math unchanged)</td><td style={{padding:8}}>Slight embedding cost</td></tr>
+          <tr><td style={{padding:8}}>Time-aware attention bias (TiSASRec)</td><td style={{padding:8}}>Learned scalar bias in attention logits</td><td style={{padding:8}}>Index gap + learned time bias</td><td style={{padding:8}}>O(L^2) bias matrix</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}><strong>TimeRoPE</strong></td><td style={{padding:8}}><strong>Rotation angle of RoPE</strong></td><td style={{padding:8}}><strong>Continuous time-delta</strong></td><td style={{padding:8}}><strong>Same as RoPE</strong></td></tr>
+          <tr><td style={{padding:8}}>TimeWeaver dual-stream</td><td style={{padding:8}}>Separate temporal stream + fusion</td><td style={{padding:8}}>Stream-level fusion</td><td style={{padding:8}}>Higher (two streams)</td></tr>
+        </tbody>
+      </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick it / where it wins">
-      <p>
-        TimeRoPE wins on transformer sequential recsys where (a) timestamps are present and reliable, (b) the inter-event gap distribution is wide (sessions then dormant periods, or seasonal patterns), and (c) you already use RoPE-based positional encoding. The architectural change is minimal — a few lines around the rotation-angle computation — so the cost of trying it is low.
-      </p>
-      <p>
-        Standard RoPE is the right choice when events are uniformly spaced (token-by-token in text, frame-by-frame in video), when timestamps are unreliable or missing, or when downstream layers already handle time via dedicated time-bucket features that you don't want to remove.
-      </p>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 24 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the axis. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-gotchas" title="Limitations & gotchas">
-      <p>
-        Three failure modes worth memorizing. <strong>Time normalization choice</strong> — linear, log, quantile, learned — each is a hyperparameter that meaningfully shifts metrics; you need an offline sweep per surface. <strong>Long-tail gaps</strong> — a 5-year-old event mixed with a 5-second-old event in the same sequence creates a numerical issue with the rotation if normalization is naive; clip or log-scale. <strong>Train-serve skew</strong> — if you normalize using a global statistic computed at train time, but the statistic drifts at serve time, the rotation angles silently shift; pin the normalization parameters and re-fit on schedule.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
-      <p style={{color:"#475569", marginBottom: 16}}>
-        Ten trap problems on TimeRoPE's discriminating signals: why standard RoPE is wrong for irregular event streams, which time-normalization to pick, and the production gotchas that distinguish a working deployment from one that silently underperforms.
-      </p>
-
-      <VIS.TrapProblem
-        id="trope-p1"
-        difficulty="hard"
-        title="P1 — Why standard RoPE fails on irregular logs"
-        scenario={<>A streaming-music recsys uses SASRec with standard RoPE. User sequences have wild inter-event gaps: a typical user has a 30-minute session today, then nothing for 2 weeks, then a 1-hour session. On the next-item task, the model treats the "2-week gap" event exactly the same as a "1-minute gap" event. What's the structural cause?</>}
+      <VIS.TrapProblem id="tr-p1" difficulty="hard"
+        title="P1 — TimeRoPE vs standard RoPE: what is the load-bearing difference?"
+        scenario={<><em>Discriminating insight: standard RoPE rotates by an angle proportional to the integer position i; TimeRoPE rotates by an angle proportional to the actual timestamp t_i. The attention dot-product between events therefore depends on continuous time-deltas instead of integer index gaps.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"RoPE has a bug at long gaps."},
-          {key:"b", text:"Standard RoPE rotates by integer step index; consecutive events get the same rotation increment regardless of real time elapsed.", correct:true},
-          {key:"c", text:"SASRec's attention is too narrow."},
-          {key:"d", text:"The session boundary should be a special token; the model can infer the gap."},
+          {key:"a", text:"TimeRoPE replaces RoPE&apos;s integer position function with the event timestamp. Attention dot-products then depend on continuous time-deltas (one hour vs one month) instead of integer index gaps. The change is surgical: position math only, embeddings unchanged.", correct:true},
+          {key:"b", text:"TimeRoPE adds a timestamp feature to the input embedding."},
+          {key:"c", text:"TimeRoPE adds a learned bias to the attention logits."},
+          {key:"d", text:"TimeRoPE replaces the softmax with a time-weighted softmax."},
         ]}
-        trap={<>(a) blames the algorithm. (c) blames architecture capacity. (d) is the "feature engineering" workaround that works less well than fixing the underlying encoding. The senior must recognize that the integer step index is the structural issue.</>}
-        lens={<>RoPE's rotation angle depends on integer step index, not wall-clock time. Two consecutive events get the same rotation increment regardless of whether they happened 1 minute or 2 weeks apart. TimeRoPE replaces the step index with timestamp so the rotation tracks real elapsed time.</>}
-        stretch={<>If timestamps are unreliable in your logs, does TimeRoPE still help over RoPE?</>}
+        trap={<>(b) input-feature confusion. (c) attention-bias confusion (that is TiSASRec). (d) wrong layer altogether.</>}
+        lens={<>RoPE&apos;s position function is the surgical site.</>}
+        stretch={<>Why does the rotation-angle change suffice when an input feature does not?</>}
       />
 
-      <VIS.TrapProblem
-        id="trope-p2"
-        difficulty="hard"
-        multiSelect
-        title="P2 — Time normalization choice"
-        scenario={<>You implement TimeRoPE and now must pick a time normalization. Your sequences span minute-to-year gaps. Which normalization strategies have which tradeoffs? Select all true statements.</>}
+      <VIS.TrapProblem id="tr-p2" difficulty="hard"
+        title="P2 — TimeRoPE vs timestamp-as-input-feature: definitional boundary"
+        scenario={<><em>Discriminating insight: concatenating a timestamp to the input embedding does NOT change the attention dot-product&apos;s dependence on integer index gaps — the position math is untouched. TimeRoPE changes the position math itself, so the attention computation natively encodes time-deltas.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Linear normalization (t / t_max) treats 1-minute and 1-year gaps proportionally; usually too aggressive a falloff for recent events.", correct:true},
-          {key:"b", text:"Log normalization compresses long gaps and gives near-uniform spacing across orders of magnitude; common default.", correct:true},
-          {key:"c", text:"Quantile normalization is most robust across users but requires a global statistic that's expensive to recompute.", correct:true},
-          {key:"d", text:"Learned normalization (a tiny MLP on timestamp) is most expressive but risks overfitting the time-encoding.", correct:true},
-          {key:"e", text:"Time normalization choice does not affect downstream metrics."},
+          {key:"a", text:"Timestamp-as-input-feature only enriches the input embedding; the position math (RoPE rotation by integer index) is unchanged, so attention still mixes events by integer-step distance. TimeRoPE changes the position math itself; attention natively mixes by time-delta.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"Input-feature approach is strictly better."},
+          {key:"d", text:"TimeRoPE is a special case of input-feature approach."},
         ]}
-        trap={<>(e) is the lazy answer that the senior must reject — time normalization is a real tuning knob, often worth 1-2 points NDCG. Many candidates pick (e) on the assumption that "the architecture handles it" but it doesn't.</>}
-        lens={<>Four true statements, each capturing a real tradeoff. The standard default is log normalization for its robustness across order-of-magnitude gaps; quantile bins beat log when you have a stable training corpus and can afford the statistic recomputation cost.</>}
-        stretch={<>How would you sweep time-normalization choices efficiently without retraining the full model each time?</>}
+        trap={<>(b) ignores where time enters. (c)(d) reverse or collapse the relationship.</>}
+        lens={<>Time at the input vs time at the position function — different layers.</>}
+        stretch={<>Why does the position-function location matter for irregular event spacing?</>}
       />
 
-      <VIS.TrapProblem
-        id="trope-p3"
-        difficulty="hard"
-        title="P3 — Train-serve skew via global statistic"
-        scenario={<>You ship TimeRoPE with quantile normalization computed on the training corpus. Three months later, val NDCG is fine but online metrics have drifted down 0.8 points. The team is stumped. The session-gap distribution at serve time has shifted (more weekend traffic, longer gaps). What's the most likely cause?</>}
+      <VIS.TrapProblem id="tr-p3" difficulty="medium"
+        title="P3 — Without TimeRoPE, what is the realistic fallback?"
+        scenario={<><em>Discriminating insight: fallbacks include standard RoPE (no time signal), timestamp-as-input-feature (time at the input layer, position math unchanged), TiSASRec-style learned time bias (extra O(L^2) bias matrix), or TimeWeaver dual-stream (architectural). TimeRoPE is the cheapest position-level intervention.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"The model is undertrained."},
-          {key:"b", text:"The quantile normalization parameters are pinned to a 3-month-old distribution; serve-time gaps map to different quantiles than train-time, silently shifting rotation angles.", correct:true},
-          {key:"c", text:"Beam width is wrong."},
-          {key:"d", text:"Weekend traffic has lower base CTR; it's a population shift, not a model issue."},
+          {key:"a", text:"Standard RoPE (ignores time), timestamp-as-input-feature (touches input embedding only), TiSASRec-style learned time bias (extra O(L^2) bias matrix), or TimeWeaver dual-stream (architectural). TimeRoPE is the position-level swap with the same cost as standard RoPE.", correct:true},
+          {key:"b", text:"Random ordering is at parity."},
+          {key:"c", text:"Skip sequential modelling entirely."},
+          {key:"d", text:"Use a linear model."},
         ]}
-        trap={<>(a) and (c) blame architecture knobs. (d) is a plausible-sounding deflection. The trap is that the quantile-based normalization makes the model's time-encoding silently dependent on a stale corpus statistic; the right fix is recompute and re-fit.</>}
-        lens={<>Quantile normalization couples the model's time-encoding to a global statistic that must be kept fresh. When the gap distribution shifts at serve time, the same wall-clock gap now maps to a different quantile and produces a different rotation. Schedule the statistic recomputation; consider monitoring gap-distribution drift as a model-health metric.</>}
-        stretch={<>What is the cheapest replacement for quantile normalization that avoids this drift problem?</>}
+        trap={<>(b)(c) absurd. (d) lacks expressive capacity.</>}
+        lens={<>Multiple layers can carry time; TimeRoPE picks the position layer.</>}
+        stretch={<>When does the O(L^2) bias matrix dominate?</>}
       />
 
-      <VIS.TrapProblem
-        id="trope-p4"
-        difficulty="medium"
-        title="P4 — TimeRoPE vs adding a time-bucket feature"
-        scenario={<>A peer suggests "Don't bother with TimeRoPE; just concatenate a bucketed timestamp feature to every input embedding." Why is TimeRoPE structurally different?</>}
+      <VIS.TrapProblem id="tr-p4" difficulty="hard"
+        title="P4 — Compose TimeRoPE with TiSASRec-style attention bias"
+        scenario={<><em>Discriminating insight: TimeRoPE puts time at the position function (rotation angle); TiSASRec puts it at the attention logit (learned scalar bias). They are orthogonal mechanisms and can stack. The stack lets the model encode both continuous time-deltas (TimeRoPE) and learned head-specific time preferences (TiSASRec).</em><br/>What does the stack achieve?</>}
         options={[
-          {key:"a", text:"TimeRoPE encodes time INSIDE the dot-product attention geometry; a concatenated feature is just one more dimension the model has to learn to use.", correct:true},
-          {key:"b", text:"Concatenated time features are slower."},
-          {key:"c", text:"TimeRoPE is just notation for a concatenated feature."},
-          {key:"d", text:"Concatenated features overflow the embedding budget."},
+          {key:"a", text:"TimeRoPE encodes continuous time-delta into the position math; TiSASRec adds a learned head-specific scalar bias to the attention logits. They occupy different layers and can stack; the combined model has both continuous and learned time signals.", correct:true},
+          {key:"b", text:"They are mutually exclusive."},
+          {key:"c", text:"They are equivalent."},
+          {key:"d", text:"Stacking forces a softmax change."},
         ]}
-        trap={<>(c) is wrong — the geometric encoding is fundamentally different. (b) and (d) are weak speculative answers. The senior must articulate why baking time INTO attention beats bolting it on as a feature.</>}
-        lens={<>TimeRoPE puts time into the attention dot-product directly: Q dotted with K at a different time-rotation gives an inner product whose magnitude tracks the time gap. A concatenated feature is just one more dimension the model has to learn to use; the inductive bias is weaker. Standard RoPE works for the same reason — encoding position via rotation is a stronger inductive bias than a positional embedding lookup.</>}
-        stretch={<>When is the concatenation approach actually better than TimeRoPE?</>}
+        trap={<>(b)(c)(d) confuse the layers.</>}
+        lens={<>Different layers carrying time can stack.</>}
+        stretch={<>Which layer&apos;s time signal dominates in practice?</>}
       />
 
-      <VIS.TrapProblem
-        id="trope-p5"
-        difficulty="hard"
-        multiSelect
-        title="P5 — Where TimeRoPE wins, where it loses"
-        scenario={<>Four surfaces. (i) Streaming-music sequence model with bursty session patterns. (ii) Text language model on Wikipedia. (iii) Video frame predictor at 30fps. (iv) E-commerce next-purchase model with multi-day to multi-month gaps. On which surfaces does TimeRoPE meaningfully beat standard RoPE? Select all that apply.</>}
+      <VIS.TrapProblem id="tr-p5" difficulty="medium"
+        title="P5 — When does TimeRoPE stop helping?"
+        scenario={<><em>Discriminating insight: TimeRoPE&apos;s value comes from heterogeneous event spacing. On a perfectly regular log (e.g., one event per hour, no gaps), the integer index IS the time-delta up to a constant, and standard RoPE is equivalent. TimeRoPE&apos;s gain collapses on uniform-time streams.</em><br/>Where is the boundary?</>}
         options={[
-          {key:"a", text:"(i) — bursty session patterns make inter-event gaps highly variable; TimeRoPE adds the right inductive bias.", correct:true},
-          {key:"b", text:"(ii) — Wikipedia text has uniformly-spaced tokens; standard RoPE is correct.", correct:false},
-          {key:"c", text:"(iii) — 30fps frames are uniformly spaced; standard RoPE is correct.", correct:false},
-          {key:"d", text:"(iv) — multi-day to multi-month gaps are exactly the regime TimeRoPE was built for.", correct:true},
-          {key:"e", text:"TimeRoPE always beats RoPE."},
+          {key:"a", text:"On a uniform-time stream (one event per fixed interval, no gaps), the integer index equals the time index up to a constant; standard RoPE is equivalent to TimeRoPE. The mechanism wins only when inter-event spacing is heterogeneous.", correct:true},
+          {key:"b", text:"TimeRoPE always wins."},
+          {key:"c", text:"TimeRoPE only works on short sequences."},
+          {key:"d", text:"Spacing is irrelevant."},
         ]}
-        trap={<>(e) is the maximalist answer that the senior must reject. The (b) and (c) options are correct as STATEMENTS but they are not surfaces where TimeRoPE wins — they describe surfaces where it doesn't. Read the question carefully: it asks where TimeRoPE WINS.</>}
-        lens={<>Two clear wins: bursty sessions (i) and multi-day to multi-month e-commerce (iv). The losses are uniformly-spaced regimes (text, frame-rate-locked video) where the integer index already encodes the right notion of "position." TimeRoPE is not free — it adds the time-normalization tuning surface — so apply where the gap distribution is meaningfully variable.</>}
-        stretch={<>What single statistic of the gap distribution would tell you ahead of time whether TimeRoPE will help?</>}
+        trap={<>(b)(c)(d) miss the irregularity contract.</>}
+        lens={<>Heterogeneous inter-event spacing is TimeRoPE&apos;s premise.</>}
+        stretch={<>How would you quantify the heterogeneity that justifies TimeRoPE?</>}
       />
 
-      <VIS.TrapProblem
-        id="trope-p6"
-        difficulty="hard"
-        title="P6 — TimeRoPE vs TimeWeaver"
-        scenario={<>A peer says "TimeRoPE and TimeWeaver are the same thing — both add time to a sequential recsys." How are they architecturally different?</>}
+      <VIS.TrapProblem id="tr-p6" difficulty="hard"
+        title="P6 — Pick the position encoding for a bursty click log"
+        scenario={<><em>Discriminating insight: a streaming platform with click logs where users binge for an hour then go quiet for weeks. Standard RoPE treats &ldquo;binge sequence&rdquo; the same as &ldquo;sparse plays over months&rdquo; if the index gaps match. TimeRoPE distinguishes them because the rotation angles differ by the actual time-delta.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"They are the same."},
-          {key:"b", text:"TimeRoPE modifies RoPE's rotation angle to depend on timestamp; TimeWeaver uses a dual-stream architecture with separate absolute and relative time streams concatenated/combined.", correct:true},
-          {key:"c", text:"TimeWeaver is faster than TimeRoPE."},
-          {key:"d", text:"TimeRoPE is for transformers, TimeWeaver is for RNNs."},
+          {key:"a", text:"TimeRoPE — the rotation angle reflects actual time-delta, so a 1-minute binge sequence rotates very differently from a 1-month sparse sequence even if the index gaps are equal. The model learns binge vs dormant patterns natively.", correct:true},
+          {key:"b", text:"Standard RoPE — ignores the burst structure."},
+          {key:"c", text:"No position encoding — loses sequence."},
+          {key:"d", text:"Learned absolute embedding per integer position — same blindness as RoPE."},
         ]}
-        trap={<>(a) is the lazy answer. (c) and (d) are speculation. The senior should distinguish "modify the rotation angle inside attention" (TimeRoPE) from "add a dual-stream side channel" (TimeWeaver).</>}
-        lens={<>TimeRoPE is a minimal change to RoPE's rotation-angle scalar. TimeWeaver adds dedicated time streams (absolute + relative interval) that are combined with the token stream. TimeRoPE is the drop-in for RoPE-based architectures; TimeWeaver is more invasive but exposes finer control over absolute vs relative time signal.</>}
-        stretch={<>If your architecture already uses RoPE, which is the cheaper migration?</>}
+        trap={<>(b)(d) ignore the burst. (c) loses sequence entirely.</>}
+        lens={<>Bursty + dormant patterns require continuous-time encoding.</>}
+        stretch={<>How do you visualise &ldquo;burst-ness&rdquo; pre vs post TimeRoPE?</>}
       />
 
-      <VIS.TrapProblem
-        id="trope-p7"
-        difficulty="hard"
-        title="P7 — Numerical instability at extreme gaps"
-        scenario={<>You train TimeRoPE with linear normalization (t / t_max where t_max is the training-corpus maximum timestamp). One user has a 5-year-old event and a 5-second-old event in the same sequence. Training loss spikes on batches with this user. What's the structural cause?</>}
+      <VIS.TrapProblem id="tr-p7" difficulty="hard"
+        title="P7 — Sounds reasonable: &ldquo;just feed raw Unix seconds as the rotation angle&rdquo;"
+        scenario={<><em>Discriminating insight: raw Unix seconds are on the order of 10^9; the rotation angle would wrap around many times even within a single second. The model cannot recover meaningful angle differences. Normalisation (log, quantile, or subtract a baseline) is mandatory.</em><br/>Why is the shortcut wrong?</>}
         options={[
-          {key:"a", text:"Model is memorizing the user."},
-          {key:"b", text:"Linear normalization compresses 5 years and 5 seconds onto a tiny range; rotation angles for the recent event become near-zero while the old event is near t_max, producing extreme magnitudes in the rotated vectors.", correct:true},
-          {key:"c", text:"Random batch order."},
-          {key:"d", text:"User is an outlier; downsample."},
+          {key:"a", text:"Raw Unix seconds are ~10^9 — multiplying by any base raises the angle far beyond 2π, causing rotation aliasing. The model cannot distinguish events. Normalise: log(t), quantile, or subtract a baseline so the angle range matches standard RoPE&apos;s usable range.", correct:true},
+          {key:"b", text:"Raw Unix seconds work fine."},
+          {key:"c", text:"Quantization of Unix seconds is the only fix."},
+          {key:"d", text:"Normalisation is cosmetic."},
         ]}
-        trap={<>(a) is wrong cause. (c) is random-blame. (d) hides the problem rather than fixing it. The senior should recognize that linear normalization is the structural cause.</>}
-        lens={<>Linear normalization is the wrong choice when gaps span order-of-magnitude scales. Use log or quantile normalization; clip extreme timestamps; or use a learned normalization with bounded outputs (e.g., tanh applied to log time). The failure is in the encoding, not in the data.</>}
-        stretch={<>What is the simplest robust default for time normalization in TimeRoPE?</>}
+        trap={<>(b)(c)(d) miss the angle-range constraint.</>}
+        lens={<>Rotation angles must stay in a usable range; normalise.</>}
+        stretch={<>Log vs quantile normalisation — when does each win?</>}
       />
 
-      <VIS.TrapProblem
-        id="trope-p8"
-        difficulty="medium"
-        title="P8 — Drop-in migration check"
-        scenario={<>You want to migrate from RoPE to TimeRoPE in a production SASRec deployment. What is the minimum change to the codebase?</>}
+      <VIS.TrapProblem id="tr-p8" difficulty="hard"
+        title="P8 — TimeRoPE&apos;s anchor (rotation by timestamp, not integer index): pitch it"
+        scenario={<><em>Discriminating insight: the anchor is &ldquo;RoPE rotation angle becomes a function of TIMESTAMP, not integer position; attention dot-product encodes continuous time-delta; the change is surgical to the position function.&rdquo; Pitch should name all three.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Rewrite the entire attention layer."},
-          {key:"b", text:"Replace the integer step index passed into the rotation-angle computation with a (normalized) timestamp tensor; rotation matrix is unchanged.", correct:true},
-          {key:"c", text:"Add a new transformer encoder."},
-          {key:"d", text:"Re-train from scratch on a different corpus."},
+          {key:"a", text:"TimeRoPE rotates the query/key vectors by an angle proportional to the event TIMESTAMP (after normalisation), not by the integer position. The attention dot-product then encodes the real inter-event time-delta. Only the position function changes; embeddings, FFNs, and the softmax are untouched.", correct:true},
+          {key:"b", text:"TimeRoPE adds a timestamp feature to the input embedding."},
+          {key:"c", text:"TimeRoPE replaces attention with a time-weighted recurrent layer."},
+          {key:"d", text:"TimeRoPE uses two separate streams for time and content."},
         ]}
-        trap={<>(a) (c) (d) all overstate the change. The senior recognizes TimeRoPE is a near-drop-in modification.</>}
-        lens={<>The rotation machinery in RoPE is unchanged. Only the scalar fed into the rotation angle changes — integer index becomes normalized timestamp. The migration is ~10-20 lines of code plus a time-normalization choice and a finetune.</>}
-        stretch={<>Can you keep RoPE-trained weights and just finetune to TimeRoPE, or do you need to retrain from scratch?</>}
+        trap={<>(b) wrong layer. (c) wrong architecture. (d) confuses with TimeWeaver.</>}
+        lens={<>Position function, timestamp angle, time-delta dot-product — all three.</>}
+        stretch={<>Which neighbour is closest to TimeRoPE in spirit?</>}
       />
 
-      <VIS.TrapProblem
-        id="trope-p9"
-        difficulty="hard"
-        multiSelect
-        title="P9 — Offline metrics flat, online metrics up"
-        scenario={<>You ship TimeRoPE. Offline NDCG is flat (same as RoPE). Online CTR is up 1.1%. Several teammates think the online win is noise. What evidence would actually validate the online win? Select all true statements.</>}
+      <VIS.TrapProblem id="tr-p9" difficulty="hard" multiSelect
+        title="P9 — When NOT to use TimeRoPE. Select all that apply."
+        scenario={<><em>Discriminating insight: TimeRoPE needs (i) timestamped data, (ii) heterogeneous inter-event spacing, (iii) a transformer that already uses RoPE-style rotation. It is wrong for uniform-time streams, untimestamped logs, RNN/MLP rec, and ranker stages where the position layer is not RoPE.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Offline eval likely lacks the bursty long-tail sequences where TimeRoPE actually changes behavior; aggregate NDCG averages over the bulk where TimeRoPE matches RoPE.", correct:true},
-          {key:"b", text:"Slice the offline eval by gap-distribution decile; TimeRoPE should win the bursty deciles even if it ties on average.", correct:true},
-          {key:"c", text:"Validate the online win with a proper A/B at sufficient sample size and run for at least one weekly cycle.", correct:true},
-          {key:"d", text:"Treat the 1.1% online win as definitive without further checks."},
-          {key:"e", text:"Roll back since offline didn't show the win."},
+          {key:"a", text:"Untimestamped catalogue data (only ordering, no timestamps available).", correct:true},
+          {key:"b", text:"Uniform-time streams (one event per fixed interval, no gaps).", correct:true},
+          {key:"c", text:"RNN-based sequential recommender (no RoPE layer to modify).", correct:true},
+          {key:"d", text:"Bursty click log with heterogeneous gaps on a RoPE transformer (canonical fit)."},
+          {key:"e", text:"Catalogue search ranker that re-ranks pre-retrieved candidates with rich timestamps and uses RoPE attention."},
         ]}
-        trap={<>(d) overclaims. (e) underclaims. The senior must engage with the gap between offline aggregate metrics (where TimeRoPE may tie) and online behavior (where the bursty long-tail dominates).</>}
-        lens={<>Three correct moves. Offline aggregate metrics often miss TimeRoPE's wins because the bulk of sequences are not bursty (a); slice the eval by gap-decile to find the wins (b); validate online with proper statistical rigor (c). This is the senior pattern: aggregate metrics hide localized wins.</>}
-        stretch={<>What aggregate offline metric would correlate best with TimeRoPE's online win?</>}
+        trap={<>(d) is canonical fit.</>}
+        lens={<>TimeRoPE needs timestamps + irregularity + RoPE-style attention.</>}
+        stretch={<>Architecture-level alternatives when RoPE is not available?</>}
       />
 
-      <VIS.TrapProblem
-        id="trope-p10"
-        difficulty="hard"
-        title="P10 — Reading TimeRoPE the right way"
-        scenario={<>Your team is doing a paper reading on TimeRoPE. A junior asks "Why is this only a 2024 idea? Wasn't time-awareness obvious?" What is the senior framing of why TimeRoPE only emerged once RoPE took over?</>}
+      <VIS.TrapProblem id="tr-p10" difficulty="hard"
+        title="P10 — Why is the rotation-angle substitution mathematically clean?"
+        scenario={<><em>Discriminating insight: RoPE&apos;s key property is that the attention dot-product q_i · k_j depends ONLY on the difference of rotation angles theta_i - theta_j. Swapping theta from f(i) to f(t_i) preserves this property — the dot-product depends on (t_i - t_j) instead of (i - j). No other formula has to change.</em><br/>Why is the swap clean?</>}
         options={[
-          {key:"a", text:"It was always obvious; the paper is incremental."},
-          {key:"b", text:"TimeRoPE only made sense after RoPE became the standard positional encoding in recsys transformers; pre-RoPE positional embeddings did not have a natural angle scalar to swap in a timestamp.", correct:true},
-          {key:"c", text:"The compute wasn't available until 2024."},
-          {key:"d", text:"Earlier transformers handled time correctly already."},
+          {key:"a", text:"RoPE&apos;s dot-product depends only on the difference of rotation angles. Swapping theta(i) → theta(t_i) preserves this property; the dot-product now depends on (t_i - t_j) instead of (i - j). The change ripples nowhere else in the attention computation.", correct:true},
+          {key:"b", text:"The swap requires changing the softmax."},
+          {key:"c", text:"The swap requires modifying the FFN."},
+          {key:"d", text:"The swap requires a separate attention head per timestamp."},
         ]}
-        trap={<>(a) and (d) miss the dependency on RoPE. (c) is generic. The senior should articulate that TimeRoPE is a natural extension that was only invitable once RoPE displaced absolute positional embeddings.</>}
-        lens={<>TimeRoPE is a one-line extension to RoPE that only became low-friction once RoPE was the default. Pre-RoPE positional encodings (sinusoidal absolute, learned absolute) didn't expose a clean angle scalar to swap. This is a common pattern: ideas are "inevitable" only after their host architecture wins.</>}
-        stretch={<>What other RoPE extensions can you predict will become standard by 2026?</>}
+        trap={<>(b)(c)(d) misread the locality of the change.</>}
+        lens={<>RoPE&apos;s difference-only property makes the swap surgical.</>}
+        stretch={<>What proof shows the dot-product depends only on the angle difference?</>}
       />
+
+      <VIS.TrapProblem id="tr-p11" difficulty="hard"
+        title="P11 — Normalisation choice (log vs linear vs quantile)"
+        scenario={<><em>Discriminating insight: log normalisation captures multiplicative time scale (hours vs months) elegantly but compresses very recent events. Linear preserves arithmetic differences but blows up the angle range on Unix seconds. Quantile is empirically robust but breaks if the time distribution shifts. The choice is the most fragile knob.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Log captures multiplicative scale (hours vs months) and is the common default; linear preserves arithmetic differences but needs aggressive scaling to fit the angle range; quantile is empirically robust but tied to the training time distribution and breaks under distribution shift.", correct:true},
+          {key:"b", text:"Linear without scaling is the safe default."},
+          {key:"c", text:"Quantile is the only option that ever works."},
+          {key:"d", text:"Normalisation choice does not matter."},
+        ]}
+        trap={<>(b) breaks angle range. (c) overstates. (d) ignores fragility.</>}
+        lens={<>Normalisation choice trades off scale, distribution shift, and angle range.</>}
+        stretch={<>How to detect when the training time distribution shifts under quantile?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p12" difficulty="hard"
+        title="P12 — What does TimeRoPE deliberately drop vs TiSASRec?"
+        scenario={<><em>Discriminating insight: TiSASRec adds a learned O(L^2) attention bias matrix that captures arbitrary pairwise time relationships, head-by-head. TimeRoPE forfeits that flexibility — its time signal is the same continuous function across all heads. The gain is no extra parameters and no O(L^2) memory; the loss is head-specific learning of time preferences.</em><br/>What does TimeRoPE forfeit?</>}
+        options={[
+          {key:"a", text:"Head-specific learned time preferences. TiSASRec&apos;s O(L^2) bias matrix is per-head and learned; TimeRoPE&apos;s time signal is a fixed continuous function shared across heads. Gain: no extra parameters or O(L^2) memory. Loss: per-head flexibility.", correct:true},
+          {key:"b", text:"TimeRoPE forfeits the use of timestamps."},
+          {key:"c", text:"TimeRoPE forfeits attention entirely."},
+          {key:"d", text:"TimeRoPE forfeits training stability."},
+        ]}
+        trap={<>(b)(c)(d) misread the trade.</>}
+        lens={<>Per-head learned bias vs shared continuous angle — cost vs flexibility.</>}
+        stretch={<>When does per-head learned time signal matter?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p13" difficulty="hard"
+        title="P13 — Most fragile knob"
+        scenario={<><em>Discriminating insight: time-normalisation choice dominates. Mis-set normalisation either wraps angles past 2π (aliasing) or compresses the time dimension below useful resolution. Base wavelength is secondary; embedding dimension is robust.</em><br/>Rank fragility.</>}
+        options={[
+          {key:"a", text:"Time normalisation (log/linear/quantile) is most fragile — mis-set causes angle aliasing or compression. RoPE base wavelength is next. Embedding dimension is most robust within typical ranges.", correct:true},
+          {key:"b", text:"Embedding dimension is most fragile."},
+          {key:"c", text:"Number of attention heads is most fragile."},
+          {key:"d", text:"Batch size is most fragile."},
+        ]}
+        trap={<>(b)(c)(d) miss the angle-range mechanism.</>}
+        lens={<>Normalisation drives the angle range; angle range gates everything.</>}
+        stretch={<>How to monitor angle-range drift in production?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p14" difficulty="medium"
+        title="P14 — Data assumption violations"
+        scenario={<><em>Discriminating insight: TimeRoPE assumes the event timestamps are MONOTONIC and TRUSTED. Out-of-order ingestion (clock skew across regions, retroactive backfills) breaks the rotation angle relationship between adjacent tokens, because the model expects t_{i+1} ≥ t_i. The angle calculation is mathematically still defined but the trained pattern is gone.</em><br/>Which violation is most direct?</>}
+        options={[
+          {key:"a", text:"Out-of-order timestamps from clock skew or retroactive ingestion. The model was trained on monotonic event timestamps; non-monotonic inputs produce rotation angles that do not match the trained pattern, even though the math is well-defined.", correct:true},
+          {key:"b", text:"Mismatched batch sizes."},
+          {key:"c", text:"Different tokenizer."},
+          {key:"d", text:"Off-by-one on item-id indexing."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Monotonic timestamps are the TimeRoPE-specific data contract.</>}
+        stretch={<>How to detect non-monotonic timestamp ingestion at training time?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p15" difficulty="hard"
+        title="P15 — Intuitive but wrong: &ldquo;TimeRoPE is just RoPE with bigger numbers&rdquo;"
+        scenario={<><em>Discriminating insight: the naive view treats Unix seconds as bigger integers and assumes RoPE will figure it out. In practice the angle wraps past 2π many times within a single second; the model cannot recover any meaningful pattern. The substitution is conceptually clean but requires normalisation to be useful.</em><br/>Why is the naive view wrong?</>}
+        options={[
+          {key:"a", text:"Raw timestamps are 10^9-scale; the rotation angle aliases past 2π many times per second. TimeRoPE is not &ldquo;RoPE with bigger numbers&rdquo;; it is RoPE with a normalised time function whose output sits in a usable angle range.", correct:true},
+          {key:"b", text:"RoPE handles any magnitude natively."},
+          {key:"c", text:"Normalisation reduces accuracy."},
+          {key:"d", text:"The naive view is correct."},
+        ]}
+        trap={<>(b)(c)(d) misread the angle-range constraint.</>}
+        lens={<>Normalisation is what makes TimeRoPE work, not raw timestamps.</>}
+        stretch={<>What is the upper bound on usable angle range?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p16" difficulty="hard"
+        title="P16 — Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: assuming &ldquo;TimeRoPE is just RoPE with timestamps plugged in&rdquo; cascades into (i) skipping normalisation (angle aliasing), (ii) using non-monotonic timestamps (broken trained pattern), (iii) testing only on uniform-time data (no measurable lift).</em><br/>What breaks?</>}
+        options={[
+          {key:"a", text:"All three: normalisation choice, monotonic timestamp ingestion, and irregularity-sensitive evaluation. Each is load-bearing; remove any one and TimeRoPE either fails to train, fails to serve, or fails to show a lift.", correct:true},
+          {key:"b", text:"Only normalisation."},
+          {key:"c", text:"Only monotonicity."},
+          {key:"d", text:"Nothing — it really is just RoPE with timestamps."},
+        ]}
+        trap={<>(d) the seductive misread.</>}
+        lens={<>Normalisation + monotonic timestamps + irregularity-sensitive eval.</>}
+        stretch={<>Which piece is most often skipped in papers?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p17" difficulty="medium"
+        title="P17 — Senior vs junior framing"
+        scenario={<><em>Discriminating insight: a junior responds to flat lift over RoPE by increasing the embedding dimension. A senior first checks (i) inter-event time-deltas in the eval set — if the data is near-uniform, there is no lift to capture; and (ii) the normalisation choice — log vs linear shifts results dramatically.</em><br/>Which lever first?</>}
+        options={[
+          {key:"a", text:"Check (i) the distribution of inter-event time-deltas in eval — if near-uniform, TimeRoPE has nothing to add; (ii) the normalisation function — mis-set normalisation kills the gain. Both are TimeRoPE-specific. Embedding-dimension lift is generic and rarely the cause.", correct:true},
+          {key:"b", text:"Increase embedding dimension immediately."},
+          {key:"c", text:"Increase number of heads."},
+          {key:"d", text:"Switch to RNN."},
+        ]}
+        trap={<>(b)(c) generic. (d) abandons the architecture.</>}
+        lens={<>Data irregularity + normalisation are the TimeRoPE-specific levers.</>}
+        stretch={<>What dashboard exposes inter-event-delta drift?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p18" difficulty="hard"
+        title="P18 — Plausible-misattribution: recall regressed after a daylight-saving-time changeover"
+        scenario={<><em>Discriminating insight: NDCG dropped on the autumn DST changeover (clocks fall back one hour). For one hour, two distinct real-time events share the same wall-clock timestamp. Engineers blame &ldquo;model drift&rdquo;. The actual cause: the normalisation function in TimeRoPE assumes strictly increasing wall-clock timestamps; the DST event creates duplicate or non-monotonic timestamps, breaking the rotation-angle pattern for those events. The fix is to use UTC end-to-end (no DST), not to retrain.</em><br/>NDCG fell on the DST changeover day. Most likely cause?</>}
+        options={[
+          {key:"a", text:"Model drift — retrain on recent data.", correct:false},
+          {key:"b", text:"DST changeover produced duplicate or non-monotonic wall-clock timestamps. The TimeRoPE rotation depends on monotonic timestamps; the duplicate hour breaks the trained pattern for events in that window. Fix: ingest UTC end-to-end so wall-clock anomalies never reach the position function.", correct:true},
+          {key:"c", text:"Cache TTL changed.", correct:false},
+          {key:"d", text:"Index disk full.", correct:false},
+        ]}
+        trap={<>(a) seductive — drift is the default suspect, but the regression is too localised and too punctual. (c)(d) infra decoys.</>}
+        lens={<>DST and timezone bugs break the monotonic-timestamp contract.</>}
+        stretch={<>What ingestion gate enforces UTC-only timestamps?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p19" difficulty="hard"
+        title="P19 — Production gotcha: normalisation function mismatch between training and serving"
+        scenario={<><em>Discriminating insight: TimeRoPE&apos;s rotation depends on a normalisation function f(t). If training uses log normalisation and serving uses linear, the rotation angles diverge and attention does not generalise. The normalisation function must be version-pinned and replicated byte-for-byte across environments.</em><br/>What is the discipline?</>}
+        options={[
+          {key:"a", text:"Version-pin the normalisation function and its parameters (log base, quantile boundaries, baseline subtraction). CI-check that serving uses the same function as training. The rotation angle&apos;s usable range depends on this function; a swap silently breaks attention.", correct:true},
+          {key:"b", text:"Normalisation is environment-agnostic."},
+          {key:"c", text:"Quantile boundaries can be recomputed at serving time."},
+          {key:"d", text:"Skip versioning of the normalisation function."},
+        ]}
+        trap={<>(b)(c)(d) miss the contract.</>}
+        lens={<>The normalisation function is the contract; pin it.</>}
+        stretch={<>What CI test catches normalisation function drift?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p20" difficulty="hard"
+        title="P20 — Failure on Friday: recall cratered after a timestamp-normalisation refactor"
+        scenario={<><em>Discriminating insight: a team replaced log normalisation with quantile normalisation to &ldquo;handle outliers better&rdquo; — but the quantile boundaries were computed from a snapshot taken weeks ago, while serving data has drifted into a slightly different distribution. The rotation angles at serving fall outside the trained range; recall craters.</em><br/>3am page: recall down 30% after a normalisation refactor. Diagnosis?</>}
+        options={[
+          {key:"a", text:"Quantile normalisation used stale quantile boundaries from a snapshot that no longer matches serving traffic. The rotation angles at serving fell outside the trained range, breaking attention. Roll back to the old normalisation or recompute quantile boundaries from current traffic and retrain.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"Cache TTL changed."},
+          {key:"d", text:"Index disk full."},
+        ]}
+        trap={<>(b)(c)(d) miss the normalisation-distribution mechanism.</>}
+        lens={<>Quantile normalisation is tied to the training distribution.</>}
+        stretch={<>Runbook for normalisation refactors?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p21" difficulty="medium"
+        title="P21 — Library default that bites: HuggingFace RoPE base wavelength"
+        scenario={<><em>Discriminating insight: HuggingFace RoPE defaults a base wavelength (10000) tuned for integer positions. With timestamps the effective frequency range is very different; the default wavelength may produce angles that are either too smooth (everything looks alike) or too aliased. Tuning the base alongside normalisation is necessary.</em><br/>Where does the default break TimeRoPE?</>}
+        options={[
+          {key:"a", text:"The default base wavelength (10000) was tuned for integer sequence positions. After substituting normalised timestamps, the effective frequency range is different and the default may oversmooth or alias. Tune the base wavelength together with the normalisation function.", correct:true},
+          {key:"b", text:"Default LR is wrong."},
+          {key:"c", text:"Default batch size is wrong."},
+          {key:"d", text:"Default optimizer is wrong."},
+        ]}
+        trap={<>(b)(c)(d) generic knobs.</>}
+        lens={<>Base wavelength must match the normalised timestamp range.</>}
+        stretch={<>Heuristic for picking a TimeRoPE base wavelength?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p22" difficulty="hard" ordered
+        title="P22 — Order the TimeRoPE rollout"
+        scenario={<><em>Discriminating insight: rollout is (1) audit inter-event time-delta distribution, (2) pick and freeze the normalisation function, (3) swap RoPE → TimeRoPE in the position function only, (4) tune base wavelength, (5) offline eval against RoPE baseline on irregularity-sensitive metrics, (6) shadow A/B. Starting with base wavelength tuning before normalisation is the classic mistake.</em><br/>Order.</>}
+        options={[
+          {key:"a", text:"Audit inter-event time-delta distribution → freeze normalisation function → swap RoPE → TimeRoPE in position function → tune base wavelength → offline eval on irregularity-sensitive slices → shadow A/B", correct:true},
+          {key:"b", text:"Tune base wavelength first."},
+          {key:"c", text:"Swap RoPE before auditing data."},
+          {key:"d", text:"Skip normalisation."},
+        ]}
+        trap={<>(b)(c)(d) lose stage diagnostics.</>}
+        lens={<>Data audit → normalisation → swap → tune → eval → ramp.</>}
+        stretch={<>Why audit time-deltas before swapping?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p23" difficulty="hard"
+        title="P23 — Smallest input that breaks TimeRoPE&apos;s claimed advantage"
+        scenario={<><em>Discriminating insight: a stream where every event arrives at exactly the same time interval (sensor reading every second, no jitter) makes integer index equal time index up to a constant. TimeRoPE produces identical rotation angles to standard RoPE. The lift collapses.</em><br/>Construct the edge case.</>}
+        options={[
+          {key:"a", text:"A perfectly uniform-time stream (sensor reading every second, no jitter). Integer index equals time index up to a constant; rotation angles match standard RoPE. TimeRoPE&apos;s premise — heterogeneous spacing — is violated.", correct:true},
+          {key:"b", text:"Bursty click log with heterogeneous gaps (canonical fit)."},
+          {key:"c", text:"100M users."},
+          {key:"d", text:"Catalog of 50M items."},
+        ]}
+        trap={<>(b) canonical fit. (c)(d) scale red herrings.</>}
+        lens={<>Uniform spacing collapses TimeRoPE to RoPE.</>}
+        stretch={<>How would you detect uniform-time slices in production?</>}
+      />
+
+      <VIS.TrapProblem id="tr-p24" difficulty="hard"
+        title="P24 — Paper-named failure: normalisation sensitivity"
+        scenario={<><em>Discriminating insight: papers on TimeRoPE consistently flag time-normalisation choice as the dominant failure mode. Recall regressions track normalisation changes more often than any architectural variable. Fix: treat the normalisation function as a first-class model artifact.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Normalisation function choice is the dominant failure mode. Recall regressions track normalisation changes more often than embedding dim, head count, or learning rate. The fix is to treat the normalisation function as a versioned, monitored model artifact — not a preprocessing detail.", correct:true},
+          {key:"b", text:"Number of heads is the dominant failure."},
+          {key:"c", text:"Latency is the dominant failure."},
+          {key:"d", text:"There are no failures."},
+        ]}
+        trap={<>(b)(c)(d) misread the failure surface.</>}
+        lens={<>Normalisation is a first-class artifact, not a preprocessing detail.</>}
+        stretch={<>What monitoring policy treats normalisation as a model artifact?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://www.emergentmind.com/topics/time-aware-rotary-positional-embedding" target="_blank" rel="noopener"><strong>EmergentMind — Time-aware Rotary Positional Embedding (topic page)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(survey)</span><br/>The clearest single landing page tracking the TimeRoPE line; cites the source papers and benchmarks.</li>
-        <li><a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener"><strong>Su et al. — RoFormer: Enhanced Transformer with Rotary Positional Embedding</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper)</span><br/>The original RoPE paper. Read this first; TimeRoPE is incoherent without the RoPE rotation-angle setup.</li>
-        <li><a href="https://eugeneyan.com/writing/recsys-llm/" target="_blank" rel="noopener"><strong>Eugene Yan — LLMs for recommender systems</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Best practitioner survey covering how positional / time encodings interact with sequential rec architecture choices.</li>
-        <li><a href="https://www.mdpi.com/2079-8954/13/10/857" target="_blank" rel="noopener"><strong>TimeWeaver — Time-Aware Sequential Recommender via Dual-Stream Temporal Network</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper, MDPI 2025)</span><br/>The dual-stream alternative to TimeRoPE; useful contrast.</li>
-        <li><a href="https://blog.eleuther.ai/rotary-embeddings/" target="_blank" rel="noopener"><strong>EleutherAI — Rotary Embeddings: A Comprehensive Explanation</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Best intuition-builder for why RoPE's geometry works; TimeRoPE's swap-in becomes obvious once you understand the rotation math.</li>
+        <li><a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">Su et al., <em>RoFormer: Enhanced Transformer with Rotary Position Embedding</em> (arXiv 2021)</a> — the canonical RoPE paper. Read this BEFORE TimeRoPE to ground the rotation-angle property.</li>
+        <li><a href="https://blog.eleuther.ai/rotary-embeddings/" target="_blank" rel="noopener">EleutherAI — <em>Rotary Embeddings: A Relative Revolution</em> (blog)</a> — the best practitioner explanation of why RoPE&apos;s difference-only property matters. TimeRoPE preserves this property with a different angle function.</li>
+        <li><a href="https://www.emergentmind.com/topics/time-aware-rotary-positional-embedding" target="_blank" rel="noopener">Emergent Mind — <em>Time-aware Rotary Positional Embedding</em> (topic page)</a> — pointer page tracking TimeRoPE variants in 2024-2025 industry posts.</li>
+        <li><a href="https://arxiv.org/abs/2002.07526" target="_blank" rel="noopener">Li et al., <em>Time Interval Aware Self-Attention (TiSASRec)</em> (WSDM 2020)</a> — the neighbour that puts time in the attention bias rather than the position function.</li>
+        <li><a href="https://lilianweng.github.io/posts/2018-06-24-attention/" target="_blank" rel="noopener">Lilian Weng — <em>Attention? Attention!</em> (blog)</a> — best background on attention dot-product before you start mutating its inputs.</li>
       </ul>
     </VIS.Section>
   </main>
 );
-
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
