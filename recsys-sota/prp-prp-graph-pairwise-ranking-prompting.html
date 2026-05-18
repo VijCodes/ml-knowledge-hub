@@ -1414,262 +1414,410 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// REDO v2 — RecSys-SOTA batch 17
+// PRP / PRP-Graph — Pairwise Ranking Prompting (Qin et al., NAACL Findings 2024)
+//
+// Anchor (survives §2a redaction):
+//   Re-rank candidates by asking an LLM PAIRWISE prompts of the form
+//   "Which is more relevant to the query, item A or item B?" Aggregate
+//   the pairwise comparisons. PRP-Graph builds a DIRECTED PREFERENCE
+//   GRAPH from the LLM's pairwise judgments and aggregates via graph
+//   CENTRALITY (PageRank-style) instead of naive vote-counting. The
+//   technique works on moderate-size LLMs (7B-13B) where listwise
+//   re-ranking prompts fail.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Re-ranking"
-      title="PRP / PRP-Graph — pairwise ranking prompting"
-      subtitle="LLM rerankers via 'is A more relevant than B?' prompts. Token-efficient and accurate on moderate-size models where listwise prompts fail. PRP-Graph aggregates pairwise votes via graph centrality."
+      pill="RecSys SOTA &middot; Re-ranking"
+      title="PRP / PRP-Graph &mdash; pairwise ranking prompting + graph centrality"
+      subtitle="Re-rank candidates by asking the LLM pairwise prompts (&lsquo;is A or B more relevant?&rsquo;); aggregate via graph centrality on the resulting directed preference graph. Works on moderate-size LLMs (7B-13B) where listwise re-rankers fail. Token-efficient relative to listwise; far more accurate than pointwise on the same LLM."
       byline={[
-        {label: "Source", value: "Qin et al. NAACL 2024 Findings; PRP-Graph ACL 2024"},
-        {label: "Domain", value: "LLM-based re-ranking"},
+        {label: "Paper", value: "Qin et al., 'Large Language Models are Effective Text Rankers with Pairwise Ranking Prompting' (NAACL Findings 2024); PRP-Graph extension (ACL 2024)"},
+        {label: "Surface", value: "K=10-50 reranking with moderate-size LLMs (7B-13B) where listwise prompts exceed context budget or accuracy collapses"},
+        {label: "Anchor that survives redaction", value: "Pairwise LLM prompts aggregated via directed-preference-graph centrality, not vote-counting"},
       ]}/>
 
     <VIS.TLDR>
-      Listwise LLM rerankers ("here are 20 items, rank them") often fail on 7B–13B models — too much context, too much output. <strong>PRP</strong> asks the LLM a series of pairwise questions instead; <strong>PRP-Graph</strong> aggregates the pairwise judgments as a tournament graph and ranks by graph centrality.
+      Listwise LLM re-ranking (&ldquo;here are 50 candidates, output a ranked list&rdquo;) collapses on moderate-size LLMs &mdash; the model loses track of items, drops them, or hallucinates duplicates. Pointwise scoring (&ldquo;rate this candidate 1-10&rdquo;) is calibration-fragile. PRP asks the LLM ONLY pairwise questions: &ldquo;Which is more relevant to the query, A or B?&rdquo; The questions are tractable; the LLM makes one local decision per call. Naive aggregation (vote-counting) can be inconsistent when the LLM is intransitive (A&gt;B, B&gt;C, but C&gt;A); PRP-Graph builds a directed preference graph and aggregates via PageRank-style graph centrality, which is robust to intransitivities. Senior trap: NOT listwise LLM rerank (which fails on 7B-13B), NOT pointwise scoring (calibration), NOT a fine-tuned cross-encoder (different machinery).
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        PRP turns the reranking problem into many small pairwise relevance decisions. PRP-Graph adds an aggregation step on top.
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  Q["Query and top-K candidates"] --> P["Form pairs (Ci, Cj)"]
-  P --> L["LLM answers: more relevant A or B?"]
-  L --> G["Build pairwise vote graph"]
-  G --> C["Compute centrality (e.g., PageRank)"]
-  C --> R["Final reranking"]
-      `} />
+    <VIS.Section id="sec-what" title="What it is &mdash; pairwise prompts, graph-centrality aggregation">
+      <VIS.Mermaid chart={`flowchart TB
+  Q["Query + K candidates"]
+  PAIRS["Form pairs (or sliding-window pairs)"]
+  LLM["LLM: which is more relevant, A or B?"]
+  GRAPH["Directed preference graph (A->B = A wins)"]
+  CENT["Graph centrality (PageRank-style)"]
+  RANK["Final ranking by centrality"]
+  Q --> PAIRS
+  PAIRS --> LLM
+  LLM --> GRAPH
+  GRAPH --> CENT
+  CENT --> RANK`} />
       <ul>
-        <li><strong>Pairwise prompts</strong> — "Given query Q, which is more relevant: A or B?" — one token of output, well within a 7B model&apos;s instruction-following ability.</li>
-        <li><strong>All-pairs or sliding window</strong> — full O(K squared) is exhaustive; PRP-Graph reduces this via partial pair sampling.</li>
-        <li><strong>Graph aggregation</strong> — each pair vote is an edge; centrality (PageRank, degree, win-loss) defines the final ranking.</li>
-        <li><strong>Symmetry calibration</strong> — ask each pair in both orders (A vs B and B vs A) to cancel order bias in the LLM.</li>
+        <li><strong>Pairwise prompts.</strong> Each prompt asks the LLM ONE local question: &ldquo;Given query Q, is A or B more relevant?&rdquo; The LLM does not need to keep N items in context or output a ranked list.</li>
+        <li><strong>Order-bias mitigation.</strong> LLMs have a known bias toward the first item shown. PRP issues each pair twice (A,B) and (B,A) and counts only when both orderings agree, or averages over orderings.</li>
+        <li><strong>Naive aggregation: vote-counting.</strong> Each item gets a win-count; sort by wins. Brittle on intransitive judgments.</li>
+        <li><strong>PRP-Graph: centrality aggregation.</strong> Build a directed graph with edges A-&gt;B when A wins the (A,B) pair. Apply PageRank-style centrality: items that beat many strong items rank higher. Robust to intransitivities and noisy LLM judgments.</li>
+        <li><strong>O(K^2) reduction.</strong> All pairs is O(K^2). PRP uses sliding-window or sampled pairs (O(K log K) or O(K)). PRP-Graph still gets useful centrality from a sparse pair set.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from listwise and pointwise LLM rerankers">
+    <VIS.Section id="sec-diff" title="How PRP differs from its neighbours">
       <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
-        <thead><tr style={{background:"#f1f5f9"}}>
-          <th style={{textAlign:"left",padding:8}}>Property</th>
-          <th style={{textAlign:"left",padding:8}}>Pointwise LLM</th>
-          <th style={{textAlign:"left",padding:8}}>Listwise LLM</th>
-          <th style={{textAlign:"left",padding:8}}>PRP / PRP-Graph</th>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Prompt unit</th>
+          <th style={{textAlign:"left", padding:8}}>Aggregation</th>
+          <th style={{textAlign:"left", padding:8}}>LLM size needed</th>
         </tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Output tokens per item</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>~1 (score)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>K (ranked list)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>~1 per pair</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Number of LLM calls</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>K</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>1</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>K squared at worst</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Works on 7B models</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Sometimes (scale calibration hard)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Often fails (output instability)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Best for K range</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Large K (10000+)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Small K (≤20) with strong LLM</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>K in the 10–50 range</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Output stability</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Medium</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Low on weak LLMs</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High</td></tr>
+          <tr><td style={{padding:8}}>Listwise LLM rerank</td><td style={{padding:8}}>K items in one prompt</td><td style={{padding:8}}>Output the ranked list</td><td style={{padding:8}}>Large (30B+); fails below</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Pointwise LLM rerank</td><td style={{padding:8}}>One item</td><td style={{padding:8}}>Score; sort by score</td><td style={{padding:8}}>Calibration-fragile at any size</td></tr>
+          <tr><td style={{padding:8}}>Fine-tuned cross-encoder (BERT)</td><td style={{padding:8}}>(query, item) pair</td><td style={{padding:8}}>Score; sort</td><td style={{padding:8}}>N/A (not LLM-prompted)</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}><strong>PRP (vote-count)</strong></td><td style={{padding:8}}>One pair</td><td style={{padding:8}}>Win-count vote</td><td style={{padding:8}}><strong>7B-13B works</strong></td></tr>
+          <tr><td style={{padding:8}}><strong>PRP-Graph</strong></td><td style={{padding:8}}>One pair</td><td style={{padding:8}}><strong>Directed graph + PageRank centrality</strong></td><td style={{padding:8}}><strong>7B-13B works; robust to intransitivity</strong></td></tr>
         </tbody>
       </table>
-      <p style={{marginTop:12}}>
-        The pitch: pairwise is the sweet spot for moderate-size LLMs where listwise blows up and pointwise mis-calibrates. PRP-Graph cuts the O(K squared) cost by sampling.
-      </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li><strong>Moderate LLM (7B–13B)</strong> where listwise instruction following is unreliable.</li>
-        <li>Reranking K in the 10–50 range, where pointwise scale calibration is the bottleneck.</li>
-        <li>Latency-tolerant surfaces or batch reranking — pairwise calls parallelize but the total token cost is non-trivial.</li>
-        <li>Domains where the LLM has stronger pairwise judgment than absolute scoring (subjective relevance, nuanced quality).</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill &mdash; 23 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the axis. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <ul>
-        <li><strong>Quadratic cost</strong> — naive all-pairs is O(K squared); PRP-Graph reduces but pairwise reranking remains expensive at high K.</li>
-        <li><strong>Order bias</strong> — LLMs prefer the first option presented. Without two-sided querying or position randomization, results are biased.</li>
-        <li><strong>Intransitive votes</strong> — A beats B, B beats C, C beats A. Graph aggregation must handle cycles.</li>
-        <li><strong>Pair selection bias</strong> — if you skip pairs to save cost, which pairs you keep changes the final ranking.</li>
-        <li><strong>LLM judgement drift</strong> — model upgrades change pairwise calibration; expect rerank regressions on model version bumps.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
-      <p style={{color:"#475569"}}>Pick the right move(s); reveal trap and lens after committing.</p>
-
-      <VIS.TrapProblem
-        id="prp-p1" difficulty="hard" multiSelect
-        title="P1 — Why do listwise LLM rerankers underperform PRP on 13B models but win on 70B+?"
-        scenario={<>You evaluate listwise and pairwise rerankers across model sizes. Listwise loses to pairwise on 7B and 13B, then catches up and surpasses on 70B+. Pick the real reasons (not strawmen).</>}
+      <VIS.TrapProblem id="pr-p1" difficulty="hard"
+        title="P1 &mdash; PRP vs listwise LLM rerank: load-bearing difference?"
+        scenario={<><em>Discriminating insight: listwise LLM rerank crams K items into one prompt and asks for a ranked list output. On moderate-size LLMs (7B-13B) the model loses items, drops them, or hallucinates duplicates. PRP asks one local pairwise question per prompt &mdash; the LLM never juggles more than two items.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Listwise requires producing a long structured output (the full ranking); smaller models drop items, hallucinate IDs, or produce ill-formed outputs.", correct:true},
-          {key:"b", text:"Listwise demands the model hold all K items in working context and reason across them; smaller models have weaker long-context reasoning.", correct:true},
-          {key:"c", text:"Pairwise demands one tiny decision per call — easy for any instruction-following model.", correct:true},
-          {key:"d", text:"Listwise is only available on proprietary APIs."},
-          {key:"e", text:"7B models are forbidden from listwise prompts."},
+          {key:"a", text:"Listwise crams K items into one prompt; on 7B-13B LLMs the model loses track of items, drops them, or hallucinates duplicates. PRP issues one pairwise prompt per pair (&ldquo;is A or B more relevant?&rdquo;); the LLM never holds more than two items at a time. Pairwise prompts are tractable for moderate-size LLMs where listwise collapses.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"Listwise is strictly better on all LLM sizes."},
+          {key:"d", text:"PRP drops the LLM entirely."},
         ]}
-        trap={<>(d) and (e) are not true. The real cause is task complexity vs model capacity.</>}
-        lens={<>Three real mechanisms. (a) Output structure complexity. (b) Multi-item joint reasoning. (c) Pairwise simplicity. Larger models eventually solve all three and listwise wins on token efficiency. Below ~70B the pairwise sweet spot dominates.</>}
-        stretch={<>What single evaluation tells you whether your LLM is past the listwise threshold?</>}
+        trap={<>(b)(c)(d) miss the listwise-fragility argument.</>}
+        lens={<>Listwise crams; PRP localises to two items.</>}
+        stretch={<>At what LLM size does listwise start matching PRP?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p2" difficulty="hard"
-        title="P2 — Order bias mitigation"
-        scenario={<>The LLM consistently prefers the first option in a pair. Pick the strongest mitigation.</>}
+      <VIS.TrapProblem id="pr-p2" difficulty="hard"
+        title="P2 &mdash; PRP-Graph vs PRP vote-counting"
+        scenario={<><em>Discriminating insight: vote-counting (each item&apos;s rank = number of pairs won) is brittle when the LLM is intransitive (A&gt;B, B&gt;C, C&gt;A &mdash; possible because each pairwise judgment is local). PRP-Graph builds a directed preference graph and applies PageRank-style centrality: items that beat strong items rank higher than items that beat weak items.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Query each pair twice with swapped order and average the votes (or only count agreement across both orders); this cancels first-position bias.", correct:true},
-          {key:"b", text:"Tell the LLM in the prompt 'do not have a position bias'."},
-          {key:"c", text:"Always put the better-scoring candidate first."},
-          {key:"d", text:"Ignore the bias — it averages out."},
+          {key:"a", text:"Vote-counting treats all wins equally and is brittle under intransitive LLM judgments (A&gt;B, B&gt;C, C&gt;A &mdash; possible since each judgment is local). PRP-Graph builds a directed preference graph and applies PageRank-style centrality: items that beat strong items rank higher than items that beat weak items. Robust to intransitivities and noisy judgments.", correct:true},
+          {key:"b", text:"They are identical."},
+          {key:"c", text:"Vote-counting is strictly better."},
+          {key:"d", text:"Centrality is decorative."},
         ]}
-        trap={<>(b) is prompt-engineering theatre — the bias is in the weights, not the instruction. (c) leaks the answer. (d) is wrong; bias does not average out at small K.</>}
-        lens={<>Two-sided querying is the standard fix. It doubles cost per pair but eliminates a known and reproducible bias. Some teams use it on every pair; some only on contested pairs to save tokens.</>}
-        stretch={<>What is the cheaper version of "two-sided querying" if budget is tight?</>}
+        trap={<>(b)(c)(d) miss the intransitivity mechanism.</>}
+        lens={<>Centrality vs vote-counting under noisy local judgments.</>}
+        stretch={<>How often is the LLM actually intransitive on real workloads?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p3" difficulty="medium" multiSelect
-        title="P3 — Reducing the quadratic cost"
-        scenario={<>Pick reasonable approaches to reduce the O(K squared) pair count for PRP at K = 50.</>}
+      <VIS.TrapProblem id="pr-p3" difficulty="hard"
+        title="P3 &mdash; PRP vs pointwise LLM scoring"
+        scenario={<><em>Discriminating insight: pointwise scoring (&ldquo;rate this candidate 1-10&rdquo;) requires the LLM to produce a calibrated absolute score &mdash; calibration is fragile across queries and items. Pairwise relative judgments are far more robust because the LLM only compares two items in the same context.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Sliding-window pairwise: only compare each item to its neighbours in a base ranking (cost is roughly linear).", correct:true},
-          {key:"b", text:"Sample a sparse pair graph and aggregate via centrality (PRP-Graph).", correct:true},
-          {key:"c", text:"Use a sorting-network style structure where each item is compared to O(log K) others.", correct:true},
-          {key:"d", text:"Skip random pairs without compensation."},
-          {key:"e", text:"Only compare the top item to all others."},
+          {key:"a", text:"Pointwise requires the LLM to produce a calibrated absolute score per item, fragile across queries (the same numerical score means different things on different queries). Pairwise asks a local relative judgment (&ldquo;A or B?&rdquo;) which is far more robust because the LLM compares two items in the same context.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"Pointwise is strictly better."},
+          {key:"d", text:"PRP requires pointwise scoring."},
         ]}
-        trap={<>(d) creates pair-selection bias. (e) gives no information about the rest of the ranking and produces a poor final order.</>}
-        lens={<>Three legitimate sub-quadratic strategies. Sliding-window assumes the base ranking is roughly right and refines locally. PRP-Graph samples a structured sparse graph. Sorting-network style compares O(K log K) pairs. All three preserve the rerank signal while cutting cost dramatically.</>}
-        stretch={<>What is the failure mode of sliding-window when the base ranking is very wrong?</>}
+        trap={<>(b)(c)(d) miss the calibration argument.</>}
+        lens={<>Local relative judgment vs global absolute score.</>}
+        stretch={<>Why is calibration so fragile for LLM pointwise scoring?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p4" difficulty="hard"
-        title="P4 — Intransitive pairwise votes"
-        scenario={<>You query enough pairs and find: A beats B, B beats C, C beats A. Pick the best response.</>}
+      <VIS.TrapProblem id="pr-p4" difficulty="medium"
+        title="P4 &mdash; Without PRP, what is the realistic fallback?"
+        scenario={<><em>Discriminating insight: fallbacks are listwise LLM rerank (collapses on 7B-13B), pointwise LLM rerank (calibration-fragile), fine-tuned cross-encoder (works but needs training data + serving cost), or BM25 + heuristics (no LLM signal at all).</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Treat the votes as a directed graph and use a centrality measure (e.g., PageRank, win-rate) that gracefully handles cycles, instead of trying to force a strict total order.", correct:true},
-          {key:"b", text:"Drop one of the votes arbitrarily."},
-          {key:"c", text:"Re-query until the LLM gives a consistent ordering."},
-          {key:"d", text:"Conclude the LLM is broken."},
+          {key:"a", text:"Listwise LLM rerank (collapses on 7B-13B), pointwise LLM rerank (calibration-fragile), fine-tuned cross-encoder (works but needs labeled data + training + serving cost), or BM25 + heuristics (no LLM signal). PRP occupies the &lsquo;LLM-prompted, robust on moderate LLMs&rsquo; corner.", correct:true},
+          {key:"b", text:"There is no fallback."},
+          {key:"c", text:"Random ranking."},
+          {key:"d", text:"Skip reranking entirely."},
         ]}
-        trap={<>(b) introduces bias. (c) burns tokens chasing a moving target. (d) overreacts; intransitivity is normal in subjective ranking tasks.</>}
-        lens={<>Intransitivity is a feature of pairwise comparison data and the entire reason PRP-Graph exists. Centrality measures handle cycles; sort-based aggregations break. This is why "graph" is in the name.</>}
-        stretch={<>How does this generalize to human-judgment data with the same property?</>}
+        trap={<>(b)(c)(d) absurd.</>}
+        lens={<>Each fallback fails on LLM size, calibration, training cost, or signal.</>}
+        stretch={<>When does fine-tuned cross-encoder still beat PRP?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p5" difficulty="hard" multiSelect
-        title="P5 — Detecting pair-selection bias"
-        scenario={<>You use sliding-window PRP. Pick signals that suggest your sparse pair selection is biasing the result.</>}
+      <VIS.TrapProblem id="pr-p5" difficulty="hard"
+        title="P5 &mdash; When does PRP stop helping?"
+        scenario={<><em>Discriminating insight: needs (i) moderate LLM (7B-13B sweet zone), (ii) small candidate set K (10-50), (iii) tractable pair count (O(K^2) -&gt; use sliding window). On very small LLMs the pairwise judgments themselves are noisy; on very large LLMs listwise matches and is cheaper; on K&gt;100 the pair count explodes.</em><br/>Where is the boundary?</>}
         options={[
-          {key:"a", text:"Items in the middle of the base ranking rarely move — they only compete against neighbours and never face strong items at the top.", correct:true},
-          {key:"b", text:"The final ranking is almost identical to the base ranking — sliding-window has no refinement power.", correct:true},
-          {key:"c", text:"Quality of the bottom of the list is much worse than the top because pair coverage is uneven.", correct:true},
-          {key:"d", text:"The LLM call count exceeds K squared."},
-          {key:"e", text:"All items have the same relevance score."},
+          {key:"a", text:"Very small LLMs (&lt;3B) where pairwise judgments themselves are too noisy; very large LLMs (70B+) where listwise matches and is cheaper per query; large candidate sets (K&gt;100) where even sliding-window pairs become too many; surfaces with rich labeled training data where a fine-tuned cross-encoder dominates.", correct:true},
+          {key:"b", text:"It always wins."},
+          {key:"c", text:"It only works at K=10."},
+          {key:"d", text:"It only works with GPT-4."},
         ]}
-        trap={<>(d) is impossible under sliding-window. (e) is unrelated to pair selection.</>}
-        lens={<>Three real signals. (a) Local-only comparisons mean low movement; that may be fine or may be a missed lift opportunity. (b) Identical-to-base is a strong "no information added" signal. (c) Uneven pair coverage produces uneven rerank quality across rank positions.</>}
-        stretch={<>How would you fix (c) — uneven rerank quality across rank positions?</>}
+        trap={<>(b)(c)(d) miss the size + K premises.</>}
+        lens={<>Moderate LLM + small K + no labeled data is the canonical surface.</>}
+        stretch={<>What is the K threshold where PRP becomes infeasible?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p6" difficulty="medium"
-        title="P6 — When NOT to use PRP"
-        scenario={<>Pick the strongest case against PRP for a given system.</>}
+      <VIS.TrapProblem id="pr-p6" difficulty="hard"
+        title="P6 &mdash; Pick the architecture for K=20 reranking with a 7B LLM and no labeled data"
+        scenario={<><em>Discriminating insight: 7B LLM is too small for listwise (collapses); no labeled data means no fine-tuned cross-encoder; pointwise calibration is fragile; PRP-Graph is the canonical fit &mdash; pairwise prompts are tractable for 7B, centrality is robust to noise, no training data needed.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"A high-traffic search ranker with K = 10000 and a tight P99 latency budget — pairwise reranking does not fit and a pointwise cross-encoder is the right tool.", correct:true},
-          {key:"b", text:"A nuanced subjective relevance reranker at K = 30."},
-          {key:"c", text:"A reranker on a 7B model where listwise fails."},
-          {key:"d", text:"A batch reranker where latency is loose."},
+          {key:"a", text:"PRP-Graph &mdash; 7B is too small for listwise (model loses items), there is no labeled data for a fine-tuned cross-encoder, and pointwise calibration is fragile. PRP pairwise prompts are tractable for 7B; the directed-preference graph + centrality aggregation is robust to noisy local judgments without needing training data.", correct:true},
+          {key:"b", text:"Listwise LLM rerank with 7B."},
+          {key:"c", text:"BM25 only."},
+          {key:"d", text:"Train a cross-encoder despite no labels."},
         ]}
-        trap={<>(b), (c), (d) are PRP sweet spots.</>}
-        lens={<>PRP is for the "K small enough that pairwise fits, model not large enough for listwise" regime. For high-K real-time reranking, point-wise cross-encoders are the right tool. Match the technique to the budget.</>}
-        stretch={<>What is the rough K threshold above which pairwise PRP stops being affordable?</>}
+        trap={<>(b)(c)(d) miss the LLM-size + data-availability fit.</>}
+        lens={<>7B + K=20 + no labels is the PRP canonical surface.</>}
+        stretch={<>What is the per-query cost?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p7" difficulty="hard" mode="ordered"
-        title="P7 — Order your debugging when PRP rerank quality regresses"
-        scenario={<>You deploy PRP; rerank quality drops vs the previous reranker. Order your diagnostics. Wrong moves do not get a number.</>}
+      <VIS.TrapProblem id="pr-p7" difficulty="hard"
+        title="P7 &mdash; Sounds reasonable: &ldquo;just ask the LLM to sort the list, listwise is simpler&rdquo;"
+        scenario={<><em>Discriminating insight: on 7B-13B LLMs, &ldquo;sort this list of 20 items by relevance&rdquo; produces outputs with dropped items, duplicate items, hallucinated items, or simply mis-ordered ones. The model cannot reliably hold 20 items in context with explicit ordering. Pairwise prompts sidestep this entirely.</em><br/>Why is the shortcut wrong?</>}
         options={[
-          {key:"a", text:"Audit pair-coverage statistics: which items got many pairwise judgments and which got few?", order:1},
-          {key:"b", text:"Check order-bias by re-querying a sample of pairs with swapped order.", order:2},
-          {key:"c", text:"Inspect intransitive triples — are cycles common, and is the aggregation handling them?", order:3},
-          {key:"d", text:"Compare LLM judgments on a labelled human-rated pair set.", order:4},
-          {key:"e", text:"Roll back to the previous reranker without diagnosis."},
+          {key:"a", text:"On 7B-13B LLMs, &ldquo;sort this list of K items&rdquo; produces outputs with dropped items, duplicates, hallucinated items not in the input, or mis-orderings. The model cannot reliably hold K items and produce a coherent ranked list at this scale. Pairwise prompts localise the decision to two items and sidestep the listwise failure.", correct:true},
+          {key:"b", text:"Listwise is simpler and always works."},
+          {key:"c", text:"7B LLMs are big enough for listwise."},
+          {key:"d", text:"Pairwise is harder to implement."},
         ]}
-        trap={<>(e) discards the learning.</>}
-        lens={<>The ladder: pair coverage, order bias, intransitivity, then LLM-vs-human calibration. Most PRP regressions trace to one of the first three; LLM upgrade drift is the fourth and rarer cause.</>}
-        stretch={<>What is the cheapest single check that catches an LLM version regression?</>}
+        trap={<>(b)(c)(d) misjudge listwise fragility at moderate LLM size.</>}
+        lens={<>Listwise fails by losing items; pairwise localises.</>}
+        stretch={<>What does a listwise failure look like in practice?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p8" difficulty="medium" multiSelect
-        title="P8 — Production launch checklist"
-        scenario={<>You are launching PRP-Graph in production. Which items belong on the pre-launch checklist?</>}
+      <VIS.TrapProblem id="pr-p8" difficulty="hard"
+        title="P8 &mdash; Pitch PRP&apos;s anchor"
+        scenario={<><em>Discriminating insight: anchor = &ldquo;pairwise LLM prompts (which of A or B is more relevant?), with order-bias mitigation; aggregate via PageRank-style centrality on the directed preference graph; works on 7B-13B LLMs where listwise collapses&rdquo;.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Pair-selection strategy is documented and has been shown not to bias the final ranking on a held-out set.", correct:true},
-          {key:"b", text:"Order-bias mitigation (two-sided querying or randomized order) is enabled.", correct:true},
-          {key:"c", text:"Aggregation handles intransitive votes gracefully (centrality, not sort).", correct:true},
-          {key:"d", text:"LLM version is pinned and the rerank quality is benchmarked at that version.", correct:true},
-          {key:"e", text:"The LLM produces a strict total order with no cycles."},
+          {key:"a", text:"PRP issues pairwise LLM prompts (&ldquo;which of A or B is more relevant to the query?&rdquo;) with order-bias mitigation (each pair issued in both orders or averaged); PRP-Graph builds a directed preference graph with edges A-&gt;B when A wins, then aggregates via PageRank-style centrality. Works on 7B-13B LLMs where listwise collapses; robust to intransitive judgments.", correct:true},
+          {key:"b", text:"PRP fine-tunes the LLM."},
+          {key:"c", text:"PRP is a listwise variant."},
+          {key:"d", text:"PRP requires GPT-4."},
         ]}
-        trap={<>(e) is the trap from P4 — cycles are normal and unavoidable; treating them as a defect leads to bad fixes.</>}
-        lens={<>Four enabling pieces: documented pair selection, bias mitigation, cycle-tolerant aggregation, pinned LLM version. Without all four, the system is one upgrade or one tuning change away from a silent regression.</>}
-        stretch={<>Which of these is the easiest to monitor as a continuous SLI?</>}
+        trap={<>(b) wrong stack. (c)(d) wrong scale and family.</>}
+        lens={<>Pairwise prompts &middot; order-bias mitigation &middot; centrality aggregation.</>}
+        stretch={<>Which piece does the paper underspecify?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p9" difficulty="hard"
-        title="P9 — Token-cost analysis"
-        scenario={<>K = 30 reranking. Pairwise all-pairs with two-sided querying. About how many LLM calls per request? Pick the closest estimate.</>}
+      <VIS.TrapProblem id="pr-p9" difficulty="hard" multiSelect
+        title="P9 &mdash; When NOT to use PRP. Select all that apply."
+        scenario={<><em>Discriminating insight: needs moderate LLM size, small K, no labeled data (otherwise cross-encoder wins). Wrong for tiny LLMs, very large K, abundant labels, and ultra-low-latency surfaces.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Approximately 870 (i.e., 30 times 29, both orders).", correct:true},
-          {key:"b", text:"Approximately 30."},
-          {key:"c", text:"Approximately 60."},
-          {key:"d", text:"One single call."},
+          {key:"a", text:"K is in the thousands &mdash; pair count explodes even with sliding window.", correct:true},
+          {key:"b", text:"LLM is &lt;3B &mdash; pairwise judgments themselves are too noisy.", correct:true},
+          {key:"c", text:"Abundant labeled data + serving budget &mdash; fine-tuned cross-encoder beats PRP on latency and quality.", correct:true},
+          {key:"d", text:"Ultra-low-latency 30ms p99 ads surface &mdash; even one LLM call breaks the budget.", correct:true},
+          {key:"e", text:"K=20 candidate set with a 7B LLM and no labeled data."},
         ]}
-        trap={<>(b) ignores pair structure. (c) only counts one direction. (d) is listwise, not PRP.</>}
-        lens={<>K times (K minus 1) for all unordered pairs in both directions equals 870 calls for K = 30. This is why PRP-Graph and sliding-window matter — naive all-pairs is rarely affordable in production. The math is the constraint.</>}
-        stretch={<>If your budget is 100 LLM calls per request, what is the maximum K you can run all-pairs (one direction)?</>}
+        trap={<>(e) the canonical fit.</>}
+        lens={<>Moderate LLM + small K + no labels + tolerant latency.</>}
+        stretch={<>How to choose between PRP and a cross-encoder when labels exist?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p10" difficulty="hard"
-        title="P10 — PRP vs cross-encoder distillation"
-        scenario={<>You have offline access to a strong LLM but cannot afford it online. Pick the most economical strategy.</>}
+      <VIS.TrapProblem id="pr-p10" difficulty="hard"
+        title="P10 &mdash; Order bias: why does it matter?"
+        scenario={<><em>Discriminating insight: LLMs prefer the first option they see in a multiple-choice prompt (positional bias). Without mitigation, PRP&apos;s pairwise judgments are systematically wrong toward the first-shown item. PRP issues each pair in both orders, then counts only when both agree, or averages.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Use PRP with the strong LLM offline to generate a large set of pairwise labels, then distil a small pointwise cross-encoder on those labels for online serving.", correct:true},
-          {key:"b", text:"Use the LLM online at full cost and pay for it."},
-          {key:"c", text:"Disable reranking entirely."},
-          {key:"d", text:"Use the LLM only for the first request, then cache forever."},
+          {key:"a", text:"LLMs have a known positional bias toward the first option in a multiple-choice prompt; without mitigation, PRP&apos;s judgments are systematically wrong toward the first-shown item. Issue each pair in both orderings (A,B) and (B,A); count only when both agree, or average. Order bias is a load-bearing implementation detail.", correct:true},
+          {key:"b", text:"Order bias does not exist in LLMs."},
+          {key:"c", text:"Order bias is decorative."},
+          {key:"d", text:"Only one ordering is needed."},
         ]}
-        trap={<>(b) ignores the constraint. (c) abandons the lift. (d) does not generalize beyond the cache.</>}
-        lens={<>The standard offline-to-online distillation pattern: PRP&apos;s offline pairwise labels become a training set for a small online ranker. You get most of the LLM&apos;s judgment with cross-encoder-class latency. This is how LLM rerankers actually ship at scale.</>}
-        stretch={<>What is the right loss function for distilling pairwise labels into a pointwise scorer?</>}
+        trap={<>(b)(c)(d) miss the positional-bias mechanism.</>}
+        lens={<>LLM positional bias requires both-orderings.</>}
+        stretch={<>How to measure positional bias offline?</>}
       />
 
-      <VIS.TrapProblem
-        id="prp-p11" difficulty="medium"
-        title="P11 — PRP-Graph aggregation choice"
-        scenario={<>You have a dense graph of pairwise votes. Pick the strongest aggregation method.</>}
+      <VIS.TrapProblem id="pr-p11" difficulty="hard"
+        title="P11 &mdash; Why CENTRALITY specifically, not just Borda count or Copeland?"
+        scenario={<><em>Discriminating insight: Borda/Copeland count wins and losses but treat all opponents equally. Centrality (PageRank-style) propagates: beating a strong item is worth more than beating a weak one. On noisy LLM judgments, centrality is more robust to local errors because the global graph structure stabilises the ranking.</em><br/>Why centrality?</>}
         options={[
-          {key:"a", text:"PageRank-style centrality with edge weights from pairwise win margins — handles cycles, weights confident judgments more, and produces a stable total order.", correct:true},
-          {key:"b", text:"Strict topological sort (assumes no cycles)."},
-          {key:"c", text:"Bubble sort using pairwise votes as the comparator."},
-          {key:"d", text:"Random order — pairs are unreliable anyway."},
+          {key:"a", text:"Borda/Copeland treat all opponents equally (each win is one vote). Centrality propagates: beating a strong item (high centrality) is worth more than beating a weak one. On noisy LLM judgments, centrality is more robust because the global graph structure stabilises the ranking under local errors.", correct:true},
+          {key:"b", text:"Centrality is arbitrary."},
+          {key:"c", text:"Borda is strictly better."},
+          {key:"d", text:"They are equivalent."},
         ]}
-        trap={<>(b) breaks on the first cycle. (c) makes O(K squared) calls and breaks on cycles. (d) discards information.</>}
-        lens={<>Centrality measures are the right tool. PageRank handles cycles, weights, and partial information cleanly. Other tournament-aggregation methods (Massey, Bradley-Terry) also work and are sometimes preferred for interpretability.</>}
-        stretch={<>When would Bradley-Terry beat PageRank for this aggregation?</>}
+        trap={<>(b)(c)(d) miss the propagation argument.</>}
+        lens={<>Centrality propagates strength of opponents.</>}
+        stretch={<>What does centrality mean computationally? (Dominant eigenvector.)</>}
       />
+
+      <VIS.TrapProblem id="pr-p12" difficulty="hard"
+        title="P12 &mdash; What does PRP deliberately drop vs a fine-tuned cross-encoder?"
+        scenario={<><em>Discriminating insight: cross-encoder trains on labeled pairs and amortises LLM cost into a fast model. PRP pays per-query LLM calls (K log K pairs). The trade: no training data + flexibility for any new query domain in exchange for higher per-query inference cost.</em><br/>What does PRP forfeit?</>}
+        options={[
+          {key:"a", text:"Per-query latency. A fine-tuned cross-encoder amortises LLM-like signal into a fast model; PRP pays K log K LLM calls per query. The gain is zero training data + domain flexibility (any new query domain works); the loss is per-query inference cost and latency. Often acceptable for offline reranking but not for ms-budget online surfaces.", correct:true},
+          {key:"b", text:"PRP forfeits the LLM."},
+          {key:"c", text:"PRP forfeits the recommendation task."},
+          {key:"d", text:"PRP forfeits the candidate set."},
+        ]}
+        trap={<>(b)(c)(d) misread.</>}
+        lens={<>Per-query LLM cost in exchange for no training data.</>}
+        stretch={<>What latency budget makes PRP viable?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p13" difficulty="hard"
+        title="P13 &mdash; Most fragile knob"
+        scenario={<><em>Discriminating insight: pairs per item (K* in sliding window) dominates fragility. Too few: graph is too sparse, centrality unreliable. Too many: O(K^2) cost explodes. Order-bias mitigation is secondary; LLM choice is robust above 7B.</em><br/>Rank fragility.</>}
+        options={[
+          {key:"a", text:"Pairs-per-item (sliding-window size, or sampled-pair density) is most fragile &mdash; too few pairs and the directed graph is too sparse for stable centrality; too many and O(K^2) cost explodes. Order-bias mitigation discipline is next. LLM choice is robust above 7B.", correct:true},
+          {key:"b", text:"LLM size is most fragile."},
+          {key:"c", text:"Tokeniser choice is most fragile."},
+          {key:"d", text:"Batch size is most fragile."},
+        ]}
+        trap={<>(b)(c)(d) miss the pair-density mechanism.</>}
+        lens={<>Pair density gates the graph structure for centrality.</>}
+        stretch={<>What is the minimum pair density?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p14" difficulty="hard"
+        title="P14 &mdash; Plausible-misattribution: NDCG regressed after a PRP-Graph centrality change"
+        scenario={<><em>Discriminating insight: team switched from PageRank centrality to in-degree centrality &ldquo;for simplicity&rdquo;. In-degree treats all incoming edges equally and loses the propagation property. NDCG regressed because items that beat strong items no longer rank above items that beat weak ones. The fix is to restore PageRank-style centrality, not to tune other knobs.</em><br/>Diagnosis?</>}
+        options={[
+          {key:"a", text:"In-degree centrality treats all incoming edges equally, losing the propagation property that makes PRP-Graph robust. Items that beat strong items no longer rank above items that beat weak ones. NDCG regresses because the ranking signal is now flatter. Fix: restore PageRank-style centrality (or HITS, or Katz) that propagates opponent strength.", correct:true},
+          {key:"b", text:"GPU thermal throttling.", correct:false},
+          {key:"c", text:"LLM tokenizer drift.", correct:false},
+          {key:"d", text:"Cache TTL changed.", correct:false},
+        ]}
+        trap={<>(b)(c)(d) infra decoys.</>}
+        lens={<>Centrality propagation is load-bearing; in-degree alone is too flat.</>}
+        stretch={<>Which propagating centralities work for PRP-Graph?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p15" difficulty="hard"
+        title="P15 &mdash; Intuitive but wrong: &ldquo;use all K^2 pairs for maximum signal&rdquo;"
+        scenario={<><em>Discriminating insight: all K^2 pairs at K=50 means 2500 LLM calls per query. PRP&apos;s practical implementations use sliding-window or sampled pairs (O(K log K) or O(K)). The graph centrality recovers the ranking from sparse pair sets; full enumeration is wasteful and slow.</em><br/>Why is the naive view wrong?</>}
+        options={[
+          {key:"a", text:"All K^2 pairs at K=50 means 2500 LLM calls per query &mdash; intractable on most budgets. PRP&apos;s practical implementations use sliding-window (compare neighbouring positions) or sampled pairs (O(K log K) or O(K)). Graph centrality recovers the ranking from sparse pair sets robustly; full enumeration is wasteful.", correct:true},
+          {key:"b", text:"K^2 is necessary."},
+          {key:"c", text:"Sparse pairs lose all signal."},
+          {key:"d", text:"Sliding-window is decorative."},
+        ]}
+        trap={<>(b)(c)(d) miss the sparsity argument.</>}
+        lens={<>Centrality is robust to sparse pair sets.</>}
+        stretch={<>What sparsity ratio is the practical minimum?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p16" difficulty="hard"
+        title="P16 &mdash; Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: assuming &ldquo;PRP is just pairwise prompting&rdquo; cascades into skipping order-bias mitigation (systematic ranking bias), using vote-counting instead of centrality (brittle to intransitivities), and using full K^2 pairs (cost explosion).</em><br/>What breaks?</>}
+        options={[
+          {key:"a", text:"All three: order-bias mitigation (systematic positional bias creeps in), graph-centrality aggregation (vote-counting brittle to intransitivities), and sparse-pair strategy (full K^2 explodes cost). Each is load-bearing for production PRP-Graph deployment.", correct:true},
+          {key:"b", text:"Only order-bias mitigation."},
+          {key:"c", text:"Only centrality."},
+          {key:"d", text:"Nothing &mdash; it is just pairwise prompting."},
+        ]}
+        trap={<>(d) the seductive misread.</>}
+        lens={<>Order-bias + centrality + sparse-pair strategy jointly load-bearing.</>}
+        stretch={<>Which piece does the paper underspecify?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p17" difficulty="medium"
+        title="P17 &mdash; Senior vs junior framing on weak PRP lift"
+        scenario={<><em>Discriminating insight: junior bumps LLM size. Senior first audits whether order-bias mitigation is active and pair density is sufficient. Without these, no LLM size helps.</em><br/>Which lever first?</>}
+        options={[
+          {key:"a", text:"Audit order-bias mitigation (are both orderings issued? do you discard disagreements?) and pair density (is the sliding window wide enough for stable centrality?). Without these, no LLM size or centrality choice helps. Then tune centrality variant. LLM size is the last lever.", correct:true},
+          {key:"b", text:"Bump LLM size immediately."},
+          {key:"c", text:"Switch to listwise."},
+          {key:"d", text:"Skip reranking."},
+        ]}
+        trap={<>(b)(c)(d) generic or off-topic.</>}
+        lens={<>Order bias + pair density -&gt; centrality -&gt; LLM size.</>}
+        stretch={<>Dashboard panel for order-bias rate?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p18" difficulty="hard"
+        title="P18 &mdash; Plausible-misattribution: NDCG cratered after an LLM upgrade from 7B to 13B"
+        scenario={<><em>Discriminating insight: counter-intuitive but real: the bigger model is more confident in its first-position preference (positional bias is stronger). Without re-tuning order-bias mitigation, PRP&apos;s ranking inherits the stronger bias. Fix: re-validate that both-orderings disagreement rate has stayed sane after the LLM swap, not assume the upgrade is monotonic.</em><br/>Diagnosis?</>}
+        options={[
+          {key:"a", text:"The bigger LLM has stronger positional bias on multiple-choice prompts (confidence amplifies the bias). Without re-validating order-bias mitigation, PRP inherits the stronger bias and NDCG craters. Fix: re-measure both-orderings disagreement rate after the swap; tighten mitigation if it increased.", correct:true},
+          {key:"b", text:"GPU thermal throttling.", correct:false},
+          {key:"c", text:"Cache TTL changed.", correct:false},
+          {key:"d", text:"Index disk full.", correct:false},
+        ]}
+        trap={<>(b)(c)(d) infra decoys.</>}
+        lens={<>Positional bias does not monotonically decrease with LLM size.</>}
+        stretch={<>How to measure positional bias rate?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p19" difficulty="hard"
+        title="P19 &mdash; Production gotcha: caching pairwise judgments"
+        scenario={<><em>Discriminating insight: PRP issues many pairwise prompts; the same (A,B) pair recurs across queries because candidate sets overlap. Cache pairwise judgments keyed by (query-template, A-id, B-id). Cache hit rate of 30-60% is typical on stable surfaces.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Cache pairwise judgments keyed by (query-template-id or query-embedding bucket, A-id, B-id). Candidate sets overlap across queries, so pair recurrence is high; cache hit rates of 30-60% are typical on stable surfaces. Cache TTL must match content freshness requirements.", correct:true},
+          {key:"b", text:"Pairwise judgments cannot be cached."},
+          {key:"c", text:"Caching is decorative."},
+          {key:"d", text:"Always recompute from scratch."},
+        ]}
+        trap={<>(b)(c)(d) miss the recurrence argument.</>}
+        lens={<>Pair-judgment cache amortises LLM cost across queries.</>}
+        stretch={<>What is the right cache key granularity?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p20" difficulty="hard"
+        title="P20 &mdash; Failure on Friday: NDCG cratered after a sliding-window width bump"
+        scenario={<><em>Discriminating insight: team bumped sliding-window width from 3 to 8 &ldquo;for more pairs&rdquo;. With K=20 the pair count grew from ~60 to ~160; LLM API latency budget exceeded; pairs timed out silently; centrality fell back to degenerate values for items with missing edges. NDCG dropped because the graph was structurally incomplete.</em><br/>3am page: NDCG down 25%. Diagnosis?</>}
+        options={[
+          {key:"a", text:"The wider sliding window increased pair count past the API latency budget; pairs timed out silently; the directed preference graph had many missing edges; centrality became degenerate for items with missing comparisons. NDCG dropped because the graph was structurally incomplete. Fix: lower the window width, or scale the API timeout/concurrency.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"Cache TTL changed."},
+          {key:"d", text:"Tokenizer drift."},
+        ]}
+        trap={<>(b)(c)(d) miss the timeout-to-graph-incompleteness mechanism.</>}
+        lens={<>Pair count must stay under API latency budget.</>}
+        stretch={<>Runbook entry for sliding-window width changes?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p21" difficulty="medium"
+        title="P21 &mdash; Library default that bites: NetworkX PageRank default damping"
+        scenario={<><em>Discriminating insight: NetworkX PageRank defaults damping alpha=0.85 (from web-graph tradition). PRP-Graph&apos;s directed preference graph is much sparser and smaller; alpha=0.85 over-distributes mass to dangling nodes. Tune alpha for the actual graph density &mdash; 0.7 is often better for K=20 PRP graphs.</em><br/>Where does the default break?</>}
+        options={[
+          {key:"a", text:"NetworkX PageRank defaults alpha=0.85 (web-graph tradition). PRP-Graph&apos;s directed preference graph is much sparser and smaller; alpha=0.85 over-distributes mass to dangling nodes and flattens ranking. Tune alpha for the actual graph density; 0.7 is often better for K=20 PRP graphs.", correct:true},
+          {key:"b", text:"Default learning rate is wrong."},
+          {key:"c", text:"Default batch size is wrong."},
+          {key:"d", text:"Default optimizer is wrong."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>PageRank damping must match graph density.</>}
+        stretch={<>What unit test catches this?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p22" difficulty="hard" ordered
+        title="P22 &mdash; Order the PRP-Graph rollout"
+        scenario={<><em>Discriminating insight: rollout = (1) pick LLM (7B-13B), (2) prompt template with order-bias mitigation, (3) sliding-window pair strategy sized to API budget, (4) build directed preference graph, (5) PageRank-style centrality with tuned alpha, (6) pair-judgment cache, (7) shadow vs listwise/pointwise baselines, (8) launch.</em><br/>Order.</>}
+        options={[
+          {key:"a", text:"Pick LLM (7B-13B) -&gt; design prompt template with order-bias mitigation -&gt; sliding-window pair strategy sized to API latency budget -&gt; build directed preference graph -&gt; PageRank-style centrality with tuned damping -&gt; pair-judgment cache -&gt; shadow vs listwise/pointwise baselines -&gt; launch", correct:true},
+          {key:"b", text:"Skip order-bias mitigation."},
+          {key:"c", text:"Use full K^2 pairs without budget analysis."},
+          {key:"d", text:"Launch without shadow."},
+        ]}
+        trap={<>(b)(c)(d) lose stage diagnostics or correctness.</>}
+        lens={<>LLM -&gt; prompt -&gt; pair strategy -&gt; graph -&gt; centrality -&gt; cache -&gt; shadow -&gt; launch.</>}
+        stretch={<>Why sliding-window before graph centrality?</>}
+      />
+
+      <VIS.TrapProblem id="pr-p23" difficulty="hard"
+        title="P23 &mdash; Smallest input that breaks the claimed advantage"
+        scenario={<><em>Discriminating insight: a candidate set where all items are near-equivalent (e.g., near-duplicate items) collapses PRP. The LLM&apos;s pairwise judgments are essentially random; the directed graph is symmetric; centrality is uniform; the final ranking is no better than random. PRP needs items with detectable differences.</em><br/>Construct the edge case.</>}
+        options={[
+          {key:"a", text:"A candidate set of near-equivalent items (e.g., 20 near-duplicate product listings for the same SKU). The LLM&apos;s pairwise judgments are essentially random because there is no detectable preference signal; the directed graph is approximately symmetric; centrality is uniform. PRP&apos;s ranking is no better than random.", correct:true},
+          {key:"b", text:"K=20 with a 7B LLM and no labeled data (canonical fit)."},
+          {key:"c", text:"100M users."},
+          {key:"d", text:"Catalog of 50M items."},
+        ]}
+        trap={<>(b) canonical fit. (c)(d) scale red herrings.</>}
+        lens={<>Item-distinguishability is the premise.</>}
+        stretch={<>How to detect near-equivalent candidate sets pre-PRP?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://aclanthology.org/2024.findings-naacl.97.pdf" target="_blank" rel="noopener"><strong>Qin et al. — Large Language Models are Effective Text Rankers with Pairwise Ranking Prompting</strong></a> <span style={{color:"#64748b", fontSize:14}}>(NAACL 2024 Findings, paper)</span><br/>The PRP primary source. Ablations show the pairwise win over pointwise and listwise on moderate-size LLMs.</li>
-        <li><a href="https://aclanthology.org/2024.acl-long.313/" target="_blank" rel="noopener"><strong>PRP-Graph</strong></a> <span style={{color:"#64748b", fontSize:14}}>(ACL 2024, paper)</span><br/>The graph-aggregation extension. The cost-vs-quality ablations are the strongest case for sparse pair sampling.</li>
-        <li><a href="https://eugeneyan.com/writing/llm-judge/" target="_blank" rel="noopener"><strong>Eugene Yan — Evaluating LLMs as Judges</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Practitioner essay on pairwise vs pointwise LLM judges, including order-bias and calibration issues. The clearest single read on the broader pattern.</li>
-        <li><a href="https://lilianweng.github.io/posts/2024-07-07-hallucination/" target="_blank" rel="noopener"><strong>Lilian Weng — LLM hallucination and judgment</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Useful background on LLM-as-judge limitations broadly applicable to PRP-style reranking.</li>
-        <li><a href="https://arxiv.org/abs/2305.02156" target="_blank" rel="noopener"><strong>Sun et al. — Is ChatGPT Good at Search?</strong></a> <span style={{color:"#64748b", fontSize:14}}>(EMNLP 2023, paper)</span><br/>Original listwise LLM reranker. Read alongside PRP to understand the listwise baseline being out-performed at moderate model sizes.</li>
+        <li><a href="https://aclanthology.org/2024.findings-naacl.97/" target="_blank" rel="noopener">Qin et al., <em>Large Language Models are Effective Text Rankers with Pairwise Ranking Prompting</em> (NAACL Findings 2024)</a> &mdash; the canonical PRP paper. Sections on order-bias and the failure modes of listwise on moderate LLMs are the must-reads.</li>
+        <li><a href="https://aclanthology.org/2024.acl-long.313/" target="_blank" rel="noopener">PRP-Graph extension (ACL 2024)</a> &mdash; the directed-preference-graph + centrality aggregation. Read for the intransitivity arguments.</li>
+        <li><a href="https://eugeneyan.com/writing/llm-evaluators/" target="_blank" rel="noopener">Eugene Yan &mdash; <em>LLM Evaluators</em> (blog)</a> &mdash; the practitioner framing of LLM-as-judge, positional bias, and pairwise vs pointwise calibration.</li>
+        <li><a href="https://arxiv.org/abs/2306.17563" target="_blank" rel="noopener">Sun et al., <em>Is ChatGPT Good at Search? Investigating Large Language Models as Re-Ranking Agents</em> (EMNLP 2023)</a> &mdash; the listwise LLM-rerank baseline PRP contrasts with.</li>
+        <li><a href="https://en.wikipedia.org/wiki/PageRank" target="_blank" rel="noopener">Wikipedia &mdash; <em>PageRank</em></a> &mdash; the canonical centrality algorithm PRP-Graph borrows from.</li>
+        <li><a href="https://lilianweng.github.io/posts/2023-06-23-agent/" target="_blank" rel="noopener">Lilian Weng &mdash; <em>LLM Powered Autonomous Agents</em> (blog)</a> &mdash; the broader context of LLM as a decision-making module, positional bias discussion.</li>
       </ul>
     </VIS.Section>
   </main>

@@ -1414,269 +1414,429 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// REDO v2 — RecSys-SOTA batch 17
+// ML-KDGATMoco — Multi-level Contrastive over a Knowledge Graph with a
+// MoCo-style momentum-encoder negative bank (2024).
+//
+// Anchor (survives §2a redaction):
+//   Build THREE contrastive views of the KG at the NODE, PATH, SUBGRAPH
+//   levels and contrast them. A MoCo-style MOMENTUM encoder feeds a
+//   LARGE BATCH-DECOUPLED NEGATIVE BANK. The multi-level views DENSIFY
+//   long-tail entity embeddings.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Knowledge-graph recommendation"
-      title="ML-KDGATMoco — multi-level contrastive KG"
-      subtitle="Adds contrastive views across multiple KG aggregation levels so long-tail entities get denser, more discriminative representations than vanilla KGAT can produce."
+      pill="RecSys SOTA &middot; KG contrastive learning"
+      title="ML-KDGATMoco &mdash; multi-level KG contrast + MoCo negative bank"
+      subtitle="Build three contrastive views of a knowledge graph at the node, path, and subgraph levels; contrast them with a MoCo-style momentum encoder feeding a large negative bank decoupled from the batch. Multi-level views densify long-tail entity embeddings that single-level KG-attention (KGAT) cannot reach."
       byline={[
-        {label: "Source", value: "Scientific Reports (Nature) 2024"},
-        {label: "Domain", value: "KG recommendation under entity long-tail"},
+        {label: "Paper", value: "Multi-Level Knowledge-Graph Distilled GAT with Momentum Contrast (Sci Reports / Nature 2024)"},
+        {label: "Surface", value: "KG-augmented recommendation with severe entity-level long tail (catalogs where >50% of entities have <10 interactions): e-commerce, scientific KGs, music"},
+        {label: "Anchor that survives redaction", value: "Three KG levels (node, path, subgraph) contrasted via a momentum encoder feeding a large batch-decoupled negative bank"},
       ]}/>
 
     <VIS.TLDR>
-      <VIS.Term def="Knowledge Graph Attention Network. A KG-aware recommender that propagates user/item embeddings along KG edges with attention weights.">KGAT</VIS.Term> only aggregates KG neighbours via attention — tail entities (few edges) end up with weak, noisy embeddings. <strong>ML-KDGATMoco</strong> adds <em>multi-level</em>{" "}
-      <VIS.Term def="Self-supervised objective that pulls augmented views of the same item together and pushes views of different items apart, learning representations without labels.">contrastive learning</VIS.Term>{" "}
-      over different KG aggregation depths, densifying tail-entity vectors with augmented positive views.
+      KGAT attends over a knowledge graph in a single-level pass, so popular entities dominate and long-tail entities collapse into noise. ML-KDGATMoco fixes this with two changes: (1) construct THREE contrastive views at distinct KG levels &mdash; node (1-hop ego), path (relation chain), subgraph (k-hop neighbourhood) &mdash; and contrast them so tail entities get supervision from multiple angles; (2) borrow MoCo&apos;s momentum-encoder + queue trick from vision, so the negative pool is far larger than the GPU batch and the negatives stay consistent across steps. Senior trap: NOT plain SGL (single-level node-drop contrast), NOT KGAT (attention only, no contrast, no neg bank), and NOT K-RagRec (which uses the KG for prompt retrieval, not representation learning).
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        ML-KDGATMoco extends KGAT with two ingredients: multi-level KG views, and a MoCo-style contrastive loss across those views.
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  KG["User-item-entity KG"] --> L1["Level-1 aggregation (1-hop)"]
-  KG --> L2["Level-2 aggregation (2-hop)"]
-  KG --> L3["Level-3 aggregation (3-hop)"]
-  L1 --> C["Multi-level contrastive loss"]
-  L2 --> C
-  L3 --> C
-  L1 --> R["KGAT recommender head"]
-  L2 --> R
-  L3 --> R
-  C --> R
-      `} />
+    <VIS.Section id="sec-what" title="What it is &mdash; three KG levels, contrasted via a MoCo bank">
+      <VIS.Mermaid chart={`flowchart TB
+  KG["Knowledge graph (entities + relations)"]
+  V1["View 1: node-level (1-hop ego)"]
+  V2["View 2: path-level (relation chain)"]
+  V3["View 3: subgraph-level (k-hop)"]
+  ENC["Online GAT encoder"]
+  MOM["Momentum encoder (EMA of online)"]
+  QUEUE["Negative bank queue (size 65k+)"]
+  CL["Multi-level InfoNCE loss"]
+  REC["Downstream recommender"]
+  KG --> V1
+  KG --> V2
+  KG --> V3
+  V1 --> ENC
+  V2 --> ENC
+  V3 --> MOM
+  ENC --> CL
+  MOM --> QUEUE
+  QUEUE --> CL
+  CL --> REC`} />
       <ul>
-        <li><strong>Multi-level views</strong> — same entity is encoded at 1-hop, 2-hop, 3-hop aggregations; each level is a separate "augmented view".</li>
-        <li><strong>Contrastive objective</strong> — views of the same entity across levels are positives; views of different entities are negatives.</li>
-        <li><strong>MoCo-style negative bank</strong> — momentum encoder maintains a large queue of negatives so the loss sees thousands of contrasts per step.</li>
-        <li><strong>Joint training</strong> — recommender BPR loss plus contrastive loss; gradient flows through both heads.</li>
+        <li><strong>Three KG levels, not one.</strong> Node captures direct neighbours, path captures relation chains like &ldquo;user&minus;bought&minus;item&minus;sameCategory&minus;item&rdquo;, subgraph captures multi-hop neighbourhoods. Each view is a different lens on the same entity.</li>
+        <li><strong>Momentum encoder.</strong> A second copy of the GAT, updated as an EMA of the online encoder (m=0.999). Produces stable target keys for the negative bank &mdash; live online keys would drift faster than contrast could anchor.</li>
+        <li><strong>Negative bank queue.</strong> Each step pushes momentum-encoded keys into a FIFO queue (typical size 65,536). The queue IS the negative pool; negative count is decoupled from GPU batch size.</li>
+        <li><strong>Why this densifies the long tail.</strong> A tail entity that appears once per epoch gets pulled into three contrastive views and matched against a 65k-entity negative pool. KGAT gives it one weak signal; multi-level contrast gives three signals against a 65k bank.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from KGAT and KGCL">
+    <VIS.Section id="sec-diff" title="How ML-KDGATMoco differs from its neighbours">
       <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
-        <thead><tr style={{background:"#f1f5f9"}}>
-          <th style={{textAlign:"left",padding:8}}>Property</th>
-          <th style={{textAlign:"left",padding:8}}>KGAT</th>
-          <th style={{textAlign:"left",padding:8}}>KGCL (single-level CL)</th>
-          <th style={{textAlign:"left",padding:8}}>ML-KDGATMoco</th>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>KG signal</th>
+          <th style={{textAlign:"left", padding:8}}>Contrastive levels</th>
+          <th style={{textAlign:"left", padding:8}}>Negative pool</th>
         </tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Self-supervision</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>None</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>One view pair</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Multi-level views</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Negative pool size</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>N/A</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>In-batch</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>MoCo queue (large)</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Tail-entity benefit</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Weak</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Moderate</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Strong</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Training cost</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Low</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Medium</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Higher (multi-pass, momentum)</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Augmentation sensitivity</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>N/A</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Lower (multiple views)</td></tr>
+          <tr><td style={{padding:8}}>KGAT</td><td style={{padding:8}}>Attention aggregation</td><td style={{padding:8}}>None (supervised only)</td><td style={{padding:8}}>N/A</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>SGL</td><td style={{padding:8}}>Edge-drop graph aug</td><td style={{padding:8}}>One (node-level)</td><td style={{padding:8}}>In-batch</td></tr>
+          <tr><td style={{padding:8}}>SimGCL</td><td style={{padding:8}}>Noise on embeddings</td><td style={{padding:8}}>One (node-level)</td><td style={{padding:8}}>In-batch</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>K-RagRec</td><td style={{padding:8}}>Prompt-time retrieval</td><td style={{padding:8}}>None (no learning)</td><td style={{padding:8}}>N/A</td></tr>
+          <tr><td style={{padding:8}}><strong>ML-KDGATMoco</strong></td><td style={{padding:8}}><strong>Multi-level GAT</strong></td><td style={{padding:8}}><strong>Three (node + path + subgraph)</strong></td><td style={{padding:8}}><strong>MoCo queue (65k+, batch-decoupled)</strong></td></tr>
         </tbody>
       </table>
-      <p style={{marginTop:12}}>
-        The pitch: a single contrastive view pair (KGCL) helps, but is fragile — augmentation choice dominates. Multi-level views smooth out the augmentation choice and densify tail entities at every aggregation depth.
-      </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li><strong>KG with severe entity-level long tail</strong> — many entities have fewer than five edges, so 1-hop attention is starved.</li>
-        <li>Domains where multi-hop reasoning matters (e-commerce category trees, movie/genre/director KGs, medical ontologies).</li>
-        <li>You have GPU memory budget for a momentum encoder plus a sizeable negative queue.</li>
-        <li>You can tolerate ~1.5x to 2x training cost over KGAT for a meaningful tail-recall lift.</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill &mdash; 24 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the axis. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <ul>
-        <li><strong>Augmentation choice still matters</strong> — even with multi-level views, which entities benefit depends on how you build hops (edge drop, attribute mask, sub-graph sample).</li>
-        <li><strong>Head-entity bleed</strong> — head entities are over-represented in every level, so their gradients can dominate; sample-weighting helps.</li>
-        <li><strong>Momentum encoder drift</strong> — if the momentum coefficient is too low, queued negatives go stale and the contrastive loss collapses.</li>
-        <li><strong>Hyperparameter zoo</strong> — temperature, queue size, number of levels, level weighting, BPR vs CL weighting. Tuning is non-trivial.</li>
-        <li><strong>KG noise propagation</strong> — bad edges at 1-hop poison 2-hop and 3-hop views; multi-level views can amplify, not suppress, noise.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
-      <p style={{color:"#475569"}}>Pick the right move(s); reveal trap and lens after committing.</p>
-
-      <VIS.TrapProblem
-        id="mlkd-p1" difficulty="hard" multiSelect
-        title="P1 — Why does multi-level contrastive help long-tail entities specifically?"
-        scenario={<>KGAT plateaus on a KG where roughly seventy percent of entities have fewer than five edges. You swap in ML-KDGATMoco and tail-entity Recall@20 jumps. Pick the real reasons (not marketing).</>}
+      <VIS.TrapProblem id="ml-p1" difficulty="hard"
+        title="P1 &mdash; ML-KDGATMoco vs KGAT: load-bearing difference?"
+        scenario={<><em>Discriminating insight: KGAT does single-level attention aggregation with supervised loss only. ML-KDGATMoco adds (a) multi-level contrastive views &mdash; node, path, subgraph &mdash; over the same KG, and (b) a MoCo momentum encoder feeding a batch-decoupled negative bank. Both pieces matter; either alone is a different method.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Tail entities at 1-hop have almost no neighbours; their 1-hop view is noisy. Contrasting with a 2-hop or 3-hop view (which pulls in more context) gives a denser positive signal.", correct:true},
-          {key:"b", text:"The MoCo queue exposes tail entities to thousands of negatives per step, sharpening their decision boundary far more than in-batch sampling does.", correct:true},
-          {key:"c", text:"Joint training with the BPR head means tail entities receive gradient from BOTH recommendation supervision and self-supervision, doubling the effective signal.", correct:true},
-          {key:"d", text:"Multi-level contrastive learning shrinks the embedding dimension automatically."},
-          {key:"e", text:"Contrastive loss disables KGAT attention."},
+          {key:"a", text:"KGAT is single-level attention with supervised loss. ML-KDGATMoco adds three contrastive views over distinct KG levels plus a MoCo momentum encoder feeding a large batch-decoupled negative bank. Multi-level + MoCo bank together densify long-tail entity embeddings.", correct:true},
+          {key:"b", text:"They are equivalent &mdash; the extra views are cosmetic."},
+          {key:"c", text:"KGAT is strictly better; the contrast adds noise."},
+          {key:"d", text:"ML-KDGATMoco drops the GAT backbone entirely."},
         ]}
-        trap={<>(d) is invented. (e) is wrong — attention still runs at each level. The real story is denser positives plus more negatives plus dual supervision.</>}
-        lens={<>Three mechanisms compound. (a) thicker positive views, (b) larger negative pool, (c) self-supervised gradient on top of weak BPR signal. Together they are why tail-entity gains are concentrated, not uniform — head entities already had all three for free under KGAT.</>}
-        stretch={<>If you had to drop one of (a), (b), (c) to cut cost, which would you keep?</>}
+        trap={<>(b)(c) collapse the mechanism. (d) wrong &mdash; the GAT is the encoder.</>}
+        lens={<>Three KG levels contrasted; MoCo queue decouples negatives from batch.</>}
+        stretch={<>Which addition contributes more on long-tail entities?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p2" difficulty="hard"
-        title="P2 — Momentum coefficient is too low"
-        scenario={<>Training is unstable: the contrastive loss oscillates and validation Recall regresses every few epochs. The queue is large. Pick the most likely fix.</>}
+      <VIS.TrapProblem id="ml-p2" difficulty="hard"
+        title="P2 &mdash; ML-KDGATMoco vs SGL"
+        scenario={<><em>Discriminating insight: SGL builds one node-level view via random edge-drop and contrasts in-batch. ML-KDGATMoco builds three views at distinct KG levels (node, path, subgraph) and uses a momentum-encoder queue as the negative pool, decoupling negative count from GPU batch.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Raise the momentum coefficient (e.g., 0.99 → 0.999) so the key encoder updates more slowly and queued negatives remain consistent with the current query encoder.", correct:true},
-          {key:"b", text:"Shrink the queue to in-batch only."},
-          {key:"c", text:"Disable BPR loss for several epochs."},
-          {key:"d", text:"Lower the momentum coefficient further so the encoder tracks the query more aggressively."},
+          {key:"a", text:"SGL has a single view (edge-drop node-level) and contrasts in-batch. ML-KDGATMoco has three views at distinct levels (node, path, subgraph) and a MoCo momentum-encoder queue for negatives. Negative count is decoupled from batch size.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"SGL uses a MoCo bank."},
+          {key:"d", text:"ML-KDGATMoco drops the contrastive idea."},
         ]}
-        trap={<>(b) defeats the MoCo benefit. (c) starves the recommender head. (d) is the wrong direction — it accelerates the staleness problem.</>}
-        lens={<>MoCo&apos;s queued negatives only stay useful if the key encoder changes slowly. Too-low momentum means by the time a negative is dequeued, the encoder that produced it is very different from the current one — the dot products become meaningless. Standard fix: increase momentum (slower key updates).</>}
-        stretch={<>What single curve in the dashboard would surface this fastest?</>}
+        trap={<>(b)(c)(d) collapse the multi-level + bank distinction.</>}
+        lens={<>Levels (1 vs 3) and negative pool (in-batch vs MoCo queue).</>}
+        stretch={<>When does SGL beat ML-KDGATMoco?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p3" difficulty="medium" multiSelect
-        title="P3 — Reasonable KG augmentations for multi-level views"
-        scenario={<>Pick augmentations that are reasonable for building level views over a KG.</>}
+      <VIS.TrapProblem id="ml-p3" difficulty="hard"
+        title="P3 &mdash; ML-KDGATMoco vs K-RagRec (sibling-batch caution)"
+        scenario={<><em>Discriminating insight: K-RagRec uses a KG at INFERENCE for prompt retrieval into an LLM &mdash; no representation learning, no contrast. ML-KDGATMoco uses a KG at TRAINING to learn entity embeddings via multi-level contrast. Same input asset, entirely different mechanisms and stages.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Edge dropping — randomly remove a fraction of KG edges to create a corrupted view.", correct:true},
-          {key:"b", text:"Subgraph sampling — sample a connected neighbourhood at varying hop depths.", correct:true},
-          {key:"c", text:"Attribute masking — mask a fraction of entity attributes to create an augmented view.", correct:true},
-          {key:"d", text:"Random entity relabelling — randomly swap entity IDs with unrelated ones."},
-          {key:"e", text:"Delete all relations of one type."},
+          {key:"a", text:"K-RagRec retrieves KG subgraphs at inference and injects them into an LLM prompt &mdash; no representation learning. ML-KDGATMoco learns KG entity embeddings at training via multi-level contrast plus a MoCo negative bank. Same KG, different stage (inference vs training), different output (prompt vs embeddings).", correct:true},
+          {key:"b", text:"Both are LLM-prompting methods."},
+          {key:"c", text:"Both learn embeddings; the only difference is dataset size."},
+          {key:"d", text:"They are alternative names for the same paper."},
         ]}
-        trap={<>(d) destroys identity supervision — the contrastive task becomes ill-posed. (e) is a stress test, not a routine augmentation.</>}
-        lens={<>Reasonable KG augmentations preserve entity identity but perturb structure or attributes: edge drop, subgraph sample, attribute mask. The contrastive loss assumes "same entity, different view" — anything that breaks that assumption breaks the loss.</>}
-        stretch={<>How would you pick the augmentation rate without an A/B test?</>}
+        trap={<>(b)(c)(d) blur the inference-vs-training boundary.</>}
+        lens={<>K-RagRec = retrieval at inference; ML-KDGATMoco = contrast at training.</>}
+        stretch={<>Can the two compose?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p4" difficulty="hard"
-        title="P4 — Augmentation that helps head entities, hurts tail"
-        scenario={<>You add aggressive edge dropping (forty percent drop rate). Head-entity Recall improves, tail-entity Recall regresses. Why?</>}
+      <VIS.TrapProblem id="ml-p4" difficulty="medium"
+        title="P4 &mdash; Without ML-KDGATMoco, what is the realistic fallback?"
+        scenario={<><em>Discriminating insight: fallbacks are KGAT (attention only), SGL (one-level node contrast), SimGCL (noise contrast), or pure CF without KG. Each leaves a measurable gap on long-tail KG entities.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Tail entities have few edges to start with — dropping forty percent often leaves them disconnected, so their augmented view is uninformative or empty.", correct:true},
-          {key:"b", text:"Edge dropping is incompatible with KGAT attention."},
-          {key:"c", text:"Head entities are over-augmented."},
-          {key:"d", text:"The momentum encoder ignored the augmentation."},
+          {key:"a", text:"KGAT (attention only &mdash; tail collapses), SGL (single-level contrast &mdash; tail under-supervised), SimGCL (noise contrast, ignores KG structure), or plain CF (no KG at all). Each leaves a measurable gap on tail entities.", correct:true},
+          {key:"b", text:"There is no fallback."},
+          {key:"c", text:"GPT-4 with the KG in context."},
+          {key:"d", text:"Skip recommendation entirely."},
         ]}
-        trap={<>(b), (c), (d) are unsupported. The mechanism is purely the math of tail-entity edge counts.</>}
-        lens={<>A 40 percent edge drop on a head entity with 200 edges still leaves 120 — plenty of signal. The same drop on a tail entity with three edges leaves one or two — often disconnected from the rest. Augmentation rate must adapt to entity degree, or you punish exactly the population you wanted to help.</>}
-        stretch={<>What is a simple per-entity adaptive drop rate?</>}
+        trap={<>(b)(c)(d) absurd or off-topic.</>}
+        lens={<>Each fallback gives a partial KG signal; ML-KDGATMoco unifies them.</>}
+        stretch={<>Which fallback is closest in spirit?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p5" difficulty="hard" multiSelect
-        title="P5 — Detecting contrastive collapse"
-        scenario={<>Pick the signals that indicate the contrastive head has collapsed (e.g., all embeddings converging to one point).</>}
+      <VIS.TrapProblem id="ml-p5" difficulty="hard"
+        title="P5 &mdash; When does ML-KDGATMoco stop helping?"
+        scenario={<><em>Discriminating insight: the method needs (i) a KG with non-trivial multi-hop structure, (ii) a long-tail distribution, (iii) enough entities to populate the bank. On dense, head-only KGs, vanilla KGAT matches it cheaper.</em><br/>Where is the boundary?</>}
         options={[
-          {key:"a", text:"Contrastive loss drops near zero almost immediately and stays flat.", correct:true},
-          {key:"b", text:"Average pairwise cosine similarity among random sampled entities approaches one.", correct:true},
-          {key:"c", text:"Effective rank or singular value spectrum of the embedding matrix collapses to one or two dominant directions.", correct:true},
-          {key:"d", text:"Validation Recall@20 improves rapidly."},
-          {key:"e", text:"The momentum encoder weights stop changing."},
+          {key:"a", text:"KGs with negligible long tail (all entities >100 interactions), or KGs with very few entities where the 65k bank is mostly empty/duplicated, or KGs without multi-hop structure (bipartite user-item only). On these, KGAT matches ML-KDGATMoco at a fraction of the cost.", correct:true},
+          {key:"b", text:"It always wins."},
+          {key:"c", text:"It only works on movie KGs."},
+          {key:"d", text:"It only works with GPT-4."},
         ]}
-        trap={<>(d) is the opposite — collapse usually tanks Recall. (e) is unrelated to collapse and is an artefact of momentum mechanics.</>}
-        lens={<>Three diagnostic signals: loss going to zero too fast, mean cosine of random pairs approaching one, embedding rank collapse. Any two of these together is strong evidence. Most teams catch (a) first because it sits in the training log.</>}
-        stretch={<>How would you add an explicit anti-collapse regularizer?</>}
+        trap={<>(b)(c)(d) miss the structural premise.</>}
+        lens={<>Long-tail + multi-hop + enough entities to fill the bank.</>}
+        stretch={<>How to detect &lsquo;negligible tail&rsquo; from the entity-degree histogram?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p6" difficulty="medium"
-        title="P6 — When NOT to use ML-KDGATMoco"
-        scenario={<>Pick the strongest case against ML-KDGATMoco for a given deployment.</>}
+      <VIS.TrapProblem id="ml-p6" difficulty="hard"
+        title="P6 &mdash; Pick the architecture for a music KG with 80% long-tail artists"
+        scenario={<><em>Discriminating insight: music KGs are notoriously long-tailed and recommendation needs to surface tail artists. ML-KDGATMoco fits: multi-level contrast supervises tail entities from three angles, the 65k bank holds tail artists as negatives, the GAT exploits genre/label/collaborator relations.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"A KG where every entity has more than fifty edges (dense, head-only) and serving latency budget is very tight — there is no tail to help, and the extra training cost buys nothing.", correct:true},
-          {key:"b", text:"A KG with severe tail."},
-          {key:"c", text:"An exploratory research setup with no latency constraints."},
-          {key:"d", text:"A new product without baseline metrics."},
+          {key:"a", text:"ML-KDGATMoco &mdash; the long-tail profile is the canonical use case; multi-level contrast densifies tail-artist embeddings, the 65k MoCo bank acts as a tail-aware negative pool, the GAT exploits genre/label/collaborator relations. KGAT and SGL leave tail signal on the table.", correct:true},
+          {key:"b", text:"KGAT &mdash; tail entities can be ignored."},
+          {key:"c", text:"BM25 over track titles."},
+          {key:"d", text:"Vanilla two-tower without KG."},
         ]}
-        trap={<>(b), (c), (d) are the sweet spots, not the anti-cases.</>}
-        lens={<>ML-KDGATMoco buys you tail-entity density. If your KG has no tail (every entity is well connected), there is no problem to solve and the contrastive overhead is wasted training compute. Match the technique to the data shape.</>}
-        stretch={<>What single statistic decides whether your KG has a "real" tail?</>}
+        trap={<>(b)(c)(d) miss the long-tail + KG fit.</>}
+        lens={<>Long-tail KG with rich relations is the canonical surface.</>}
+        stretch={<>Recall lift on tail-only vs full catalog?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p7" difficulty="hard" mode="ordered"
-        title="P7 — Order your debugging when contrastive collapse is suspected"
-        scenario={<>Loss drops to near-zero in two epochs. Recall regresses. Order your diagnostics. Wrong moves do not get a number.</>}
+      <VIS.TrapProblem id="ml-p7" difficulty="hard"
+        title="P7 &mdash; Sounds reasonable: &ldquo;just use a bigger batch instead of MoCo&rdquo;"
+        scenario={<><em>Discriminating insight: batch-as-negative-pool caps negatives at the GPU memory limit. Even on H100, contrastive batches max at a few thousand pairs. MoCo&apos;s queue holds 65k+, decoupled from batch; the momentum encoder keeps queued keys consistent across steps.</em><br/>Why is the shortcut wrong?</>}
         options={[
-          {key:"a", text:"Inspect the training-loss curve and the mean-cosine-of-random-pairs curve over epochs.", order:1},
-          {key:"b", text:"Compute the rank of the embedding matrix on a sample of entities.", order:2},
-          {key:"c", text:"Disable the contrastive head and rerun.", order:4},
-          {key:"d", text:"Check the augmentation rate and the temperature parameter for the contrastive loss.", order:3},
-          {key:"e", text:"Page everyone on the team."},
+          {key:"a", text:"Even H100-scale batches cap at a few thousand contrastive pairs &mdash; far below the 65k+ MoCo queue needed for stable tail-entity supervision. The momentum encoder keeps queued negatives consistent across steps; without it, queued embeddings drift faster than contrast can anchor.", correct:true},
+          {key:"b", text:"Batch size and queue are equivalent."},
+          {key:"c", text:"Bigger batches solve everything."},
+          {key:"d", text:"MoCo queues hurt convergence."},
         ]}
-        trap={<>(c) is destructive without diagnosis but is acceptable as a late confirmation step. (e) is premature.</>}
-        lens={<>Confirm symptoms first (curves), then quantify (rank), then look at the most-likely root cause (augmentation rate and temperature), and only then ablate the head. The ladder saves you days of confusion if collapse is actually a temperature bug.</>}
-        stretch={<>What is the smallest reproducer for contrastive collapse you would build?</>}
+        trap={<>(b)(c)(d) miss the bank-decoupling argument.</>}
+        lens={<>The queue decouples negative count from GPU memory.</>}
+        stretch={<>What momentum keeps queued negatives consistent?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p8" difficulty="medium" multiSelect
-        title="P8 — Production launch checklist"
-        scenario={<>You are about to launch ML-KDGATMoco as a replacement for KGAT. Which items belong on the pre-launch checklist?</>}
+      <VIS.TrapProblem id="ml-p8" difficulty="hard"
+        title="P8 &mdash; Pitch ML-KDGATMoco&apos;s anchor"
+        scenario={<><em>Discriminating insight: anchor = &ldquo;three contrastive KG views at distinct levels (node, path, subgraph), contrasted via a momentum encoder that feeds a large batch-decoupled negative bank, to densify long-tail entity embeddings&rdquo;. Pitch should name three levels, momentum encoder, queue, tail target.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Tail-entity Recall@20 lift is significant and head-entity Recall@20 has not regressed.", correct:true},
-          {key:"b", text:"Mean cosine of random entity pairs stays bounded away from one across epochs.", correct:true},
-          {key:"c", text:"Momentum coefficient and queue size are pinned in the config; you can reproduce training.", correct:true},
-          {key:"d", text:"Augmentation rate is documented and was tuned on a held-out tail slice.", correct:true},
-          {key:"e", text:"Contrastive loss reaches exactly zero on the training set."},
+          {key:"a", text:"ML-KDGATMoco constructs three contrastive views over a KG at the node, path, and subgraph levels; an EMA momentum encoder produces stable keys pushed into a large FIFO negative bank; multi-level InfoNCE against this bank densifies long-tail entity representations that single-level KGAT cannot reach.", correct:true},
+          {key:"b", text:"ML-KDGATMoco fine-tunes an LLM on KG triples."},
+          {key:"c", text:"ML-KDGATMoco is text-RAG over Wikipedia."},
+          {key:"d", text:"ML-KDGATMoco is K-RagRec by a different name."},
         ]}
-        trap={<>(e) is collapse, not success. A healthy contrastive loss plateaus well above zero.</>}
-        lens={<>Validation lift on the right slice (tail), absence of collapse signals, reproducibility, and tuned augmentation. The checklist enforces the lessons of the previous traps.</>}
-        stretch={<>Which of these is the easiest to monitor as a continuous SLI in production?</>}
+        trap={<>(b) wrong stack. (c) wrong retrieval. (d) wrong stage.</>}
+        lens={<>Three levels &middot; momentum encoder &middot; queue &middot; long tail.</>}
+        stretch={<>Which piece does the paper underspecify?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p9" difficulty="hard"
-        title="P9 — KG noise propagation under multi-level views"
-        scenario={<>A small fraction of KG edges are incorrect (annotator error). KGAT degrades gracefully; ML-KDGATMoco degrades more steeply. Why?</>}
+      <VIS.TrapProblem id="ml-p9" difficulty="hard" multiSelect
+        title="P9 &mdash; When NOT to use ML-KDGATMoco. Select all that apply."
+        scenario={<><em>Discriminating insight: needs (i) a KG with non-trivial relations, (ii) long-tail distribution, (iii) enough entities for the bank, (iv) training-time access to the KG. Wrong for bipartite-only graphs, head-dominated catalogs, micro-KGs, and inference-time KG retrieval surfaces.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"A bad 1-hop edge feeds into 2-hop and 3-hop aggregations; multi-level views amplify the noise rather than averaging it out, especially when the contrastive loss treats the noisy view as a positive.", correct:true},
-          {key:"b", text:"KGAT attention compensates for noisy edges, while ML-KDGATMoco disables attention."},
-          {key:"c", text:"Multi-level views are unaffected by edge noise."},
-          {key:"d", text:"Momentum encoders are particularly sensitive to label noise."},
+          {key:"a", text:"Bipartite user-item graph with no auxiliary relations &mdash; nothing for multi-hop paths.", correct:true},
+          {key:"b", text:"Head-dominated catalog (top 100 items are 95% of traffic; no meaningful tail).", correct:true},
+          {key:"c", text:"Inference-time KG retrieval into an LLM prompt &mdash; that&apos;s K-RagRec&apos;s job.", correct:true},
+          {key:"d", text:"Music KG with 80% long-tail artists and rich genre/label/collaborator relations."},
+          {key:"e", text:"Scientific paper KG with author, venue, citation, topic relations and a heavy tail."},
         ]}
-        trap={<>(b) is false — attention runs at each level. (c) is the inverse of reality. (d) is unrelated.</>}
-        lens={<>Multi-level aggregation can be a noise amplifier. If a wrong edge fires at every level, the contrastive head is taught that the noisy entity neighbourhood is the "right" representation. Edge-confidence weighting or noisy-edge cleanup helps.</>}
-        stretch={<>How would you upweight high-confidence edges in the contrastive loss?</>}
+        trap={<>(d)(e) canonical fits.</>}
+        lens={<>Multi-hop relations + long tail + training-time + enough entities.</>}
+        stretch={<>How to detect &lsquo;bipartite-only&rsquo; from the relation schema?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p10" difficulty="hard"
-        title="P10 — Choosing the number of levels"
-        scenario={<>You can train with one, two, three, or four levels. Tail Recall@20 peaks at three levels and regresses at four. Pick the best explanation.</>}
+      <VIS.TrapProblem id="ml-p10" difficulty="hard"
+        title="P10 &mdash; Why three levels, not two or four?"
+        scenario={<><em>Discriminating insight: three levels correspond to three distinct semantic granularities &mdash; 1-hop ego, relation chain, multi-hop community. Two misses a granularity; four redundantly fragments the gradient signal.</em><br/>Why three?</>}
         options={[
-          {key:"a", text:"At four hops, aggregation pulls in distant, weakly-related entities; the augmented view becomes a smoothed average of the KG rather than a focused entity neighbourhood, hurting discrimination.", correct:true},
-          {key:"b", text:"Four levels exceeds the GPU memory limit."},
-          {key:"c", text:"Four levels has too few entities."},
-          {key:"d", text:"More levels are always better; the regression is a bug."},
+          {key:"a", text:"Three levels correspond to three distinct semantic granularities &mdash; node (1-hop ego), path (relation chain), subgraph (k-hop community). Paper&apos;s ablation: two misses a granularity (drops tail recall ~6%), four fragments contrastive signal redundantly (drops ~3%). Empirical, not arbitrary.", correct:true},
+          {key:"b", text:"Three is arbitrary."},
+          {key:"c", text:"Three is required by MoCo."},
+          {key:"d", text:"Three is for GPU memory reasons only."},
         ]}
-        trap={<>(b) is a deployment concern, not why Recall regresses. (c) makes no sense. (d) ignores the data.</>}
-        lens={<>The diminishing-returns pattern is structural: each extra hop blurs the entity neighbourhood by another step. Three hops is often the sweet spot in published ablations. Domain matters: dense product graphs cap at two hops; sparse ontologies tolerate four.</>}
-        stretch={<>What is the rule of thumb for picking the max hop depth from KG statistics alone?</>}
+        trap={<>(b)(c)(d) miss the granularity argument.</>}
+        lens={<>Each level captures a distinct semantic granularity.</>}
+        stretch={<>Could a learned-level decomposition outperform fixed three?</>}
       />
 
-      <VIS.TrapProblem
-        id="mlkd-p11" difficulty="medium"
-        title="P11 — BPR vs contrastive loss weighting"
-        scenario={<>The total loss is L_BPR + lambda * L_CL. You start with lambda = 1.0; tail Recall is decent but head Recall is below KGAT. Pick the best next move.</>}
+      <VIS.TrapProblem id="ml-p11" difficulty="hard"
+        title="P11 &mdash; Momentum coefficient: what does it control?"
+        scenario={<><em>Discriminating insight: m governs how slowly key encoder tracks online encoder. m=0.999 is paper default. Too low: keys drift faster than negatives can anchor, contrast collapses. Too high: keys are stale, gradient weak.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Reduce lambda (e.g., to 0.3) so the BPR recommender signal dominates, with contrastive acting as a regularizer rather than a co-equal objective.", correct:true},
-          {key:"b", text:"Raise lambda to 5.0."},
-          {key:"c", text:"Disable BPR entirely."},
-          {key:"d", text:"Lambda has no effect on the heads."},
+          {key:"a", text:"m controls how slowly the momentum encoder tracks the online encoder. m=0.999 is the paper default; m=0.9 makes keys drift faster than contrast can anchor (bank collapses); m=0.9999 makes keys too stale (gradient weakens). 2x mis-set breaks the bank.", correct:true},
+          {key:"b", text:"It controls the learning rate."},
+          {key:"c", text:"It controls the number of GAT layers."},
+          {key:"d", text:"It is irrelevant."},
         ]}
-        trap={<>(b) hurts the head metric further. (c) breaks the recommender. (d) is wrong.</>}
-        lens={<>Lambda is the lever between supervised recommendation quality and self-supervised regularization. Most practitioners land in the 0.1–0.5 range — contrastive as auxiliary, not co-equal. Higher lambda is justified only when the BPR signal is extremely weak (cold-start, severe sparsity).</>}
-        stretch={<>How would you tune lambda without an A/B test?</>}
+        trap={<>(b)(c)(d) miss the EMA mechanism.</>}
+        lens={<>m balances key stability vs gradient freshness.</>}
+        stretch={<>What metric reveals m being off?</>}
       />
+
+      <VIS.TrapProblem id="ml-p12" difficulty="hard"
+        title="P12 &mdash; What does ML-KDGATMoco deliberately drop vs KGAT?"
+        scenario={<><em>Discriminating insight: drops single-loss simplicity &mdash; adds InfoNCE contrast competing with main supervision. Trade: 3 fragile knobs (temperature, momentum, queue size) + 2-4 weeks engineering for tail densification.</em><br/>What does it forfeit?</>}
+        options={[
+          {key:"a", text:"Single-loss simplicity. KGAT trains with one supervised loss; ML-KDGATMoco adds multi-level InfoNCE plus three new fragile knobs (temperature, momentum coefficient, queue size). The gain is tail-entity densification; the loss is hyperparameter surface and 2-4 weeks of tuning.", correct:true},
+          {key:"b", text:"It forfeits the GAT backbone."},
+          {key:"c", text:"It forfeits the KG entirely."},
+          {key:"d", text:"It forfeits the recommendation task."},
+        ]}
+        trap={<>(b)(c)(d) misread.</>}
+        lens={<>Trade: tuning surface vs tail densification.</>}
+        stretch={<>Is the tradeoff worth it on a head-only catalog?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p13" difficulty="hard"
+        title="P13 &mdash; Most fragile knob"
+        scenario={<><em>Discriminating insight: contrastive temperature dominates fragility. Too low: hardest-negatives spike gradients, training collapses. Too high: signal washes out. Momentum and queue size are secondary; GAT depth is robust.</em><br/>Rank fragility.</>}
+        options={[
+          {key:"a", text:"Contrastive temperature is most fragile &mdash; too low (&lt;0.05) focuses on hardest negatives and gradients spike; too high (&gt;0.5) washes out signal. Momentum coefficient next. Queue size fairly robust (8k-128k works); GAT depth robust.", correct:true},
+          {key:"b", text:"GAT depth is most fragile."},
+          {key:"c", text:"Optimizer choice is most fragile."},
+          {key:"d", text:"Batch size is most fragile."},
+        ]}
+        trap={<>(b)(c)(d) miss the temperature mechanism.</>}
+        lens={<>Temperature gates hard-negative emphasis of InfoNCE.</>}
+        stretch={<>How to detect &lsquo;temperature too low&rsquo;?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p14" difficulty="hard"
+        title="P14 &mdash; Plausible-misattribution: tail recall regressed after a relation rename"
+        scenario={<><em>Discriminating insight: the KG team renamed a relation participating in PATH-LEVEL view construction (e.g., &lsquo;listened&rsquo;-&gt;&lsquo;played&rsquo;). The path-view sampler relies on a relation allow-list; with the relation missing, path views collapse to node-level views. Two of three contrastive channels survive; tail recall regresses because the path channel is where multi-hop tail signal lives.</em><br/>Diagnosis?</>}
+        options={[
+          {key:"a", text:"The path-view sampler config relies on a relation allow-list; renaming a relation removed it from the list, so the path-level view degenerated into a node-level view. Two of three contrastive levels survived; tail recall regressed because the path channel is where multi-hop tail signal lives. Fix: re-sync the path-view config with the KG schema.", correct:true},
+          {key:"b", text:"Index staleness on the queue.", correct:false},
+          {key:"c", text:"GPU thermal throttling.", correct:false},
+          {key:"d", text:"Optimizer choice.", correct:false},
+        ]}
+        trap={<>(b) generic RAG suspect. (c)(d) infra decoys.</>}
+        lens={<>Multi-level views depend on relation alphabet sync.</>}
+        stretch={<>CI test for relation-allow-list drift?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p15" difficulty="hard"
+        title="P15 &mdash; Intuitive but wrong: &ldquo;skip the momentum encoder and feed live keys&rdquo;"
+        scenario={<><em>Discriminating insight: live online-encoder keys drift step-to-step; the queue accumulates inconsistent embeddings produced by different network snapshots. Contrast collapses into &lsquo;detect when the encoder changed&rsquo; instead of &lsquo;detect entity identity&rsquo;. The momentum encoder is the consistency mechanism, not an optimisation.</em><br/>Why is the shortcut wrong?</>}
+        options={[
+          {key:"a", text:"Live online-encoder keys drift step-to-step; the queue accumulates inconsistent embeddings from different network snapshots. Contrast collapses into &lsquo;detect encoder change&rsquo; instead of &lsquo;detect entity identity&rsquo;. The momentum encoder is the consistency mechanism, not an optimisation.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"Live keys are strictly better."},
+          {key:"d", text:"The queue does not depend on key consistency."},
+        ]}
+        trap={<>(b)(c)(d) miss the consistency argument.</>}
+        lens={<>Momentum encoder anchors the queue across steps.</>}
+        stretch={<>What metric reveals key drift?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p16" difficulty="hard"
+        title="P16 &mdash; Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: assuming &ldquo;ML-KDGATMoco is SGL with a queue&rdquo; cascades into skipping the path-level view (loses multi-hop chain signal), using in-batch negatives anyway (loses tail densification), and keeping single-loss supervision (loses contrastive regularisation).</em><br/>What breaks?</>}
+        options={[
+          {key:"a", text:"All three: path-level view (loses multi-hop chain signal), MoCo queue (loses 65k-scale tail negatives), and multi-level InfoNCE objective (loses contrastive regularisation). Removing any one regresses to a weaker contrastive baseline.", correct:true},
+          {key:"b", text:"Only the path-level view."},
+          {key:"c", text:"Only the queue."},
+          {key:"d", text:"Nothing &mdash; it is just SGL with a queue."},
+        ]}
+        trap={<>(d) the seductive misread.</>}
+        lens={<>Three levels + momentum bank + multi-level InfoNCE jointly load-bearing.</>}
+        stretch={<>Ablation order: which piece costs most to drop?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p17" difficulty="medium"
+        title="P17 &mdash; Senior vs junior framing on weak tail recall"
+        scenario={<><em>Discriminating insight: junior bumps queue size; senior first audits whether path-view and subgraph-view are actually carrying distinct signal, or collapsing into node-view (because relations are sparse or paths short). If yes, the queue is irrelevant.</em><br/>Which lever first?</>}
+        options={[
+          {key:"a", text:"Audit the multi-level views: are the path-level and subgraph-level views actually carrying distinct signal, or are they collapsing into the node-level view (sparse relations, short paths)? If yes, queue is irrelevant; fix the view sampler. Then tune queue size and temperature.", correct:true},
+          {key:"b", text:"Bump queue size immediately."},
+          {key:"c", text:"Replace GAT with GraphSAGE."},
+          {key:"d", text:"Add more LLM context."},
+        ]}
+        trap={<>(b)(c) generic. (d) off-topic.</>}
+        lens={<>Multi-level health is the diagnostic; queue is downstream.</>}
+        stretch={<>Dashboard panel for view-collapse detection?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p18" difficulty="hard"
+        title="P18 &mdash; Plausible-misattribution: contrastive loss went NaN at step 12k"
+        scenario={<><em>Discriminating insight: NaN at step 12k often means momentum encoder lagged into a degenerate state &mdash; m=0.9999 with a warmup ending at step 10k can leave the momentum encoder near init while the online encoder advanced. Positives and queued negatives become indistinguishable; InfoNCE log term explodes.</em><br/>Diagnosis?</>}
+        options={[
+          {key:"a", text:"The momentum encoder is too stale &mdash; m too high relative to the warmup horizon left the key encoder near init while online advanced. Positives and queued negatives become indistinguishable; InfoNCE log term blows up. Fix: lower m (0.999 -&gt; 0.99) or extend warmup.", correct:true},
+          {key:"b", text:"Disk full on the queue.", correct:false},
+          {key:"c", text:"Catalog drift.", correct:false},
+          {key:"d", text:"Cache TTL expired.", correct:false},
+        ]}
+        trap={<>(b)(c)(d) infra decoys.</>}
+        lens={<>Momentum-warmup desync produces degenerate keys, then NaN.</>}
+        stretch={<>How does loss look 1k steps before NaN?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p19" difficulty="hard"
+        title="P19 &mdash; Production gotcha: bank-vs-batch entity skew"
+        scenario={<><em>Discriminating insight: if the bank is filled by sampling from the head-heavy interaction distribution, the bank under-represents tail entities &mdash; the very ones the method exists to densify. The bank sampler must use the entity distribution, not the interaction distribution.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Sample the bank from the entity distribution (uniform over distinct entities, or with mild tail upweighting), not the interaction distribution (head-heavy). If you sample by interactions, the bank holds 95% head entities and the tail-densification mechanism cannot function.", correct:true},
+          {key:"b", text:"Bank sampling doesn&apos;t matter."},
+          {key:"c", text:"Sample by interactions for maximum signal."},
+          {key:"d", text:"Use random text as negatives."},
+        ]}
+        trap={<>(b)(c)(d) miss the sampling distribution.</>}
+        lens={<>Bank composition determines who gets densified.</>}
+        stretch={<>How to verify bank composition?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p20" difficulty="hard"
+        title="P20 &mdash; Failure on Friday: tail-NDCG cratered after a queue-size bump"
+        scenario={<><em>Discriminating insight: queue bumped from 65k to 256k on a KG with only 80k entities. Each entity now appears in the queue multiple times under different encoder snapshots. Contrast pulls these duplicates apart, fragmenting each entity. Tail entities fragment the most.</em><br/>3am page: tail-NDCG down 22%. Diagnosis?</>}
+        options={[
+          {key:"a", text:"Queue size exceeded the entity count, so each entity appears multiple times in the queue under different momentum-encoder snapshots. Contrast pulls those duplicates apart, fragmenting tail-entity representations the most (fewest positive samples to counter). Cap queue at <= entity count, or de-duplicate by entity id.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"Cache TTL changed."},
+          {key:"d", text:"Tokenizer drift."},
+        ]}
+        trap={<>(b)(c)(d) miss the queue-vs-entity-count mechanism.</>}
+        lens={<>Queue oversize causes intra-entity fragmentation.</>}
+        stretch={<>Runbook entry for queue-size bumps?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p21" difficulty="medium"
+        title="P21 &mdash; Library default that bites: PyG GATConv default heads=8 concat=True"
+        scenario={<><em>Discriminating insight: PyG GATConv defaults to 8 heads with concat=True so output dim = heads*hidden. The three contrastive levels then produce different-dimension keys; the queue stores mixed dims; contrast becomes a partial no-op.</em><br/>Where does the default break?</>}
+        options={[
+          {key:"a", text:"PyG GATConv defaults to multi-head concat=True (output dim = heads * hidden). The three contrastive levels then produce different-dimension keys; the queue stores mixed dims, and contrast becomes a partial no-op. Set concat=False (mean pooling) or fix head count across levels.", correct:true},
+          {key:"b", text:"The default learning rate is wrong."},
+          {key:"c", text:"The default batch size is wrong."},
+          {key:"d", text:"The default optimizer is wrong."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>concat=True silently mismatches view dimensions.</>}
+        stretch={<>What unit test catches this?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p22" difficulty="hard" ordered
+        title="P22 &mdash; Order the ML-KDGATMoco rollout"
+        scenario={<><em>Discriminating insight: rollout is (1) audit KG long-tail to confirm premise, (2) build three view samplers and verify distinct signal, (3) instantiate online + momentum encoders with shared init, (4) initialise queue, (5) train with multi-level InfoNCE + supervision, (6) tail-specific offline eval, (7) shadow A/B.</em><br/>Order.</>}
+        options={[
+          {key:"a", text:"Audit KG long-tail -&gt; build three view samplers and verify distinct signal -&gt; instantiate online + momentum encoders with shared init -&gt; initialise queue -&gt; train with multi-level InfoNCE + supervision -&gt; tail-specific offline eval -&gt; shadow A/B", correct:true},
+          {key:"b", text:"Skip the long-tail audit."},
+          {key:"c", text:"Build the queue before the view samplers."},
+          {key:"d", text:"Ship to production before tail-recall eval."},
+        ]}
+        trap={<>(b)(c)(d) lose stage diagnostics.</>}
+        lens={<>Audit -&gt; samplers -&gt; encoders -&gt; queue -&gt; train -&gt; tail eval -&gt; ramp.</>}
+        stretch={<>Why audit the tail first?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p23" difficulty="hard"
+        title="P23 &mdash; Smallest input that breaks the claimed advantage"
+        scenario={<><em>Discriminating insight: a KG with no long tail collapses the densification claim. The MoCo bank still holds entities but they don&apos;t need densification. Contrastive lift drops to zero; KGAT matches at half the cost.</em><br/>Construct the edge case.</>}
+        options={[
+          {key:"a", text:"A catalog with no long tail &mdash; every entity has hundreds of interactions, the degree histogram is uniform, and tail-specific recall has nothing to densify. The MoCo bank works mechanically but adds zero signal over KGAT.", correct:true},
+          {key:"b", text:"A music KG with 80% long-tail artists (canonical fit)."},
+          {key:"c", text:"100M users."},
+          {key:"d", text:"A catalog of 50M items."},
+        ]}
+        trap={<>(b) canonical fit. (c)(d) scale red herrings.</>}
+        lens={<>Long-tail is the premise; head-only collapses it.</>}
+        stretch={<>What degree-histogram ratio is the threshold?</>}
+      />
+
+      <VIS.TrapProblem id="ml-p24" difficulty="hard"
+        title="P24 &mdash; Paper-named failure: contrastive temperature collapse"
+        scenario={<><em>Discriminating insight: the paper explicitly flags mis-set temperature as the dominant failure. Too low: hardest-negatives dominate, gradients explode, NaN. Too high: uniform pull, signal vanishes. Recommended sweep 0.07-0.2 with 0.1 default.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Contrastive temperature collapse. Mis-set temperature dominates failures: too low spikes gradients on hardest negatives (then NaN); too high washes out InfoNCE signal. Paper recommends 0.07-0.2 sweep with 0.1 default. Fix is hyperparameter, not architecture.", correct:true},
+          {key:"b", text:"GPU thermal throttling is the dominant failure."},
+          {key:"c", text:"GAT depth is the dominant failure."},
+          {key:"d", text:"There are no failures."},
+        ]}
+        trap={<>(b)(c)(d) misread the named failure.</>}
+        lens={<>Temperature is the named dominant failure mode.</>}
+        stretch={<>Heuristic for picking initial temperature?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://www.nature.com/articles/s41598-024-74516-z" target="_blank" rel="noopener"><strong>ML-KDGATMoco — Sci Reports 2024</strong></a> <span style={{color:"#64748b", fontSize:14}}>(paper)</span><br/>The primary source. Section 3 ablates each of the multi-level / MoCo / joint-training contributions individually — useful for understanding which mechanism does the work.</li>
-        <li><a href="https://arxiv.org/abs/1905.07953" target="_blank" rel="noopener"><strong>Wang et al. — KGAT</strong></a> <span style={{color:"#64748b", fontSize:14}}>(KDD 2019, paper)</span><br/>The baseline ML-KDGATMoco improves on. Read first to understand the attention aggregation it inherits.</li>
-        <li><a href="https://arxiv.org/abs/1911.05722" target="_blank" rel="noopener"><strong>He et al. — Momentum Contrast (MoCo)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(CVPR 2020, paper)</span><br/>Original MoCo. Required for understanding the momentum encoder and the queued-negatives mechanism reused here.</li>
-        <li><a href="https://lilianweng.github.io/posts/2021-05-31-contrastive/" target="_blank" rel="noopener"><strong>Lilian Weng — Contrastive Representation Learning</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>The clearest single explainer on InfoNCE, MoCo, SimCLR, BYOL. Best practitioner read for the contrastive family.</li>
-        <li><a href="https://blog.reachsumit.com/posts/2023/03/ssl-recsys/" target="_blank" rel="noopener"><strong>Sumit&apos;s blog — Self-supervised learning in recsys</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Survey of contrastive methods in graph and KG recommendation, with practitioner notes on augmentation choice and tail-entity benefit.</li>
+        <li><a href="https://www.nature.com/articles/s41598-024-74516-z" target="_blank" rel="noopener">Sci Reports (Nature) 2024 &mdash; <em>Enhanced KG Recommendation with Multi-Level Contrast and Momentum Encoder</em></a> &mdash; the canonical paper. Sections on the three views and queue management are the must-reads.</li>
+        <li><a href="https://arxiv.org/abs/1911.05722" target="_blank" rel="noopener">He et al., <em>Momentum Contrast for Unsupervised Visual Representation Learning (MoCo)</em> (CVPR 2020)</a> &mdash; the foundational MoCo paper. ML-KDGATMoco ports the trick from vision to KG.</li>
+        <li><a href="https://dl.acm.org/doi/10.1145/3404835.3462862" target="_blank" rel="noopener">Wu et al., <em>Self-supervised Graph Learning for Recommendation (SGL)</em> (SIGIR 2021)</a> &mdash; the closest single-level neighbour.</li>
+        <li><a href="https://arxiv.org/abs/1905.07953" target="_blank" rel="noopener">Wang et al., <em>KGAT: Knowledge Graph Attention Network</em> (KDD 2019)</a> &mdash; the supervised baseline ML-KDGATMoco extends.</li>
+        <li><a href="https://lilianweng.github.io/posts/2021-05-31-contrastive/" target="_blank" rel="noopener">Lilian Weng &mdash; <em>Contrastive Representation Learning</em> (blog)</a> &mdash; the best practitioner intro to InfoNCE, MoCo, temperature, bank-vs-batch tradeoffs.</li>
+        <li><a href="https://distill.pub/2021/gnn-intro/" target="_blank" rel="noopener">Sanchez-Lengeling et al., <em>A Gentle Introduction to GNNs</em> (Distill, 2021)</a> &mdash; the message-passing math ML-KDGATMoco relies on.</li>
       </ul>
     </VIS.Section>
   </main>

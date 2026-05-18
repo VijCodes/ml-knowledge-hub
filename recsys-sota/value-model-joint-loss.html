@@ -1414,261 +1414,399 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// REDO v2 — RecSys-SOTA batch 17
+// Value Model (Joint Loss) — Pinterest 2026
+//
+// Anchor (survives §2a redaction):
+//   Single network with TWO heads — a VALUE head (learned scalar score
+//   that combines objectives) and a RANKING head (pairwise/listwise loss).
+//   Shared backbone; trained JOINTLY with a SUM of per-objective supervised
+//   losses + a ranking loss on the value-head output. Replaces late linear
+//   fusion (w1*click + w2*save + w3*share) and its hand-tuned weights.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Multi-objective fusion"
-      title="Value Model (Joint Loss)"
-      subtitle="One model predicts a learned scalar 'value' per item that fuses multiple objectives end-to-end, replacing brittle late linear fusion of separate task heads."
+      pill="RecSys SOTA &middot; Multi-objective fusion"
+      title="Value Model (Joint Loss) &mdash; learned multi-objective fusion"
+      subtitle="Replace late linear fusion (w1*click + w2*save + w3*share) with a single network: shared backbone feeding a VALUE head (learned scalar) and a RANKING head (pairwise/listwise loss). Train the heads jointly with per-objective supervised losses + a ranking loss on the value head. Calibration across objectives is consistent because the value is learned, not hand-tuned."
       byline={[
-        {label: "Source", value: "Pinterest engineering blog (2026)"},
-        {label: "Domain", value: "Multi-objective ranking in feed surfaces"},
+        {label: "Source", value: "Pinterest Engineering, 'Evolution of Multi-Objective Optimization at Pinterest Home Feed' (2026)"},
+        {label: "Surface", value: "Mature multi-objective recsys stacks where late-fusion weights are retuned by hand, exhibit drift, and are gameable by adversarial creators"},
+        {label: "Anchor that survives redaction", value: "Single backbone with value + ranking heads, trained jointly with sum of per-objective + ranking losses"},
       ]}/>
 
     <VIS.TLDR>
-      Classic multi-objective ranking trains separate heads for click, save, share, etc., then combines them via a hand-tuned linear formula at serve time. <strong>Value model</strong> learns ONE scalar utility score per item directly, so calibration and tradeoffs are consistent — but you lose the dial-by-dial knobs PMs love.
+      In a mature recsys stack with multiple objectives (click, save, share, dwell, hide), the conventional pattern is late linear fusion: per-objective models, scores combined via w1*click + w2*save + ..., weights retuned weekly. This is brittle (weights drift), gameable (creators learn to optimise the heaviest term), and inconsistent (per-objective models have different calibration). The Value Model replaces fusion with a single network having two heads &mdash; VALUE head learns the scalar combination, RANKING head enforces ordering &mdash; trained jointly with a sum of per-objective supervised losses + a ranking loss on the value output. Senior trap: NOT MMoE/PLE (multi-task with late fusion still), NOT PMORS (Pareto + forgetting curve weighting), NOT a generic multi-task model. The defining feature is a learned scalar value head with joint training.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        Instead of fusing per-objective scores late, a value model is trained on a single composite objective whose target is a learned function of multiple business signals.
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  L["Logs: clicks, saves, shares, hides"] --> T["Compose target value (e.g., weighted survival)"]
-  T --> M["Value model (single head)"]
-  M --> S["Scalar value v(u,i)"]
-  S --> R["Ranker uses v directly"]
-      `} />
+    <VIS.Section id="sec-what" title="What it is &mdash; one backbone, two heads, joint loss">
+      <VIS.Mermaid chart={`flowchart TB
+  X["Features (user, item, context)"]
+  BB["Shared backbone"]
+  VH["Value head (scalar v)"]
+  PH["Per-objective heads (click, save, share, dwell)"]
+  RL["Ranking loss on v vs ground-truth order"]
+  PL["Per-objective supervised losses"]
+  L["Joint loss = sum of PL + RL"]
+  RANK["Final ranker: sort by v"]
+  X --> BB
+  BB --> VH
+  BB --> PH
+  VH --> RL
+  PH --> PL
+  PL --> L
+  RL --> L
+  VH --> RANK`} />
       <ul>
-        <li><strong>Composed target</strong> — instead of separate labels per task, define one "value" target offline (e.g., a weighted survival-style function of long-term engagement signals).</li>
-        <li><strong>Single head</strong> — one model output, one loss; no late-stage linear fusion at serving.</li>
-        <li><strong>End-to-end calibration</strong> — the model learns the joint distribution rather than calibrating heads independently and combining miscalibrated probabilities.</li>
-        <li><strong>Serving simplicity</strong> — rankers sort by a single scalar. No PM-tunable weights at runtime.</li>
+        <li><strong>Shared backbone.</strong> A standard tower (DLRM, transformer) consumes user + item + context features and produces a representation.</li>
+        <li><strong>Value head.</strong> Outputs ONE scalar v &mdash; the learned multi-objective value. v is what the ranker sorts by at serve time.</li>
+        <li><strong>Per-objective heads.</strong> Auxiliary heads (click, save, share, dwell) inject per-objective supervised gradient into the backbone. NOT used at serve.</li>
+        <li><strong>Joint loss.</strong> Sum of per-objective BCE (or regression) losses PLUS a ranking loss (pairwise hinge, listwise softmax) on the value head against labeled ordering.</li>
+        <li><strong>Why this beats late fusion.</strong> The value head learns the OPTIMAL combination from joint training &mdash; not the combination an analyst guessed. Drift requires retraining, not retuning. Calibration is consistent because all objectives share gradient through one head.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from late linear fusion and multi-task heads">
+    <VIS.Section id="sec-diff" title="How the Value Model differs from its neighbours">
       <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
-        <thead><tr style={{background:"#f1f5f9"}}>
-          <th style={{textAlign:"left",padding:8}}>Property</th>
-          <th style={{textAlign:"left",padding:8}}>Late linear fusion</th>
-          <th style={{textAlign:"left",padding:8}}>Multi-task model + late fusion</th>
-          <th style={{textAlign:"left",padding:8}}>Value model</th>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Fusion stage</th>
+          <th style={{textAlign:"left", padding:8}}>Weight source</th>
+          <th style={{textAlign:"left", padding:8}}>Cross-objective calibration</th>
         </tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Number of heads at serve</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>K (one per task)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>K (one per task)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>One</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Calibration consistency</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Per-head, brittle</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Per-head, brittle</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>End-to-end, consistent</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>PM knob to adjust weights</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes (linear weights)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes (linear weights)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Hidden (in the target)</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Business override (e.g., promo)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Easy (post-multiply)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Easy</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Harder (model-level)</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Gameability</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High (tune one weight, surface flips)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Lower</td></tr>
+          <tr><td style={{padding:8}}>Late linear fusion</td><td style={{padding:8}}>Post-model</td><td style={{padding:8}}>Hand-tuned</td><td style={{padding:8}}>None (each model independent)</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>MMoE / PLE</td><td style={{padding:8}}>Post-model</td><td style={{padding:8}}>Hand-tuned</td><td style={{padding:8}}>None (per-task heads)</td></tr>
+          <tr><td style={{padding:8}}>PMORS</td><td style={{padding:8}}>Post-model</td><td style={{padding:8}}>Pareto + forgetting decay</td><td style={{padding:8}}>None</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>DeepPRL</td><td style={{padding:8}}>Post-model</td><td style={{padding:8}}>Pareto front via RL</td><td style={{padding:8}}>None</td></tr>
+          <tr><td style={{padding:8}}><strong>Value Model</strong></td><td style={{padding:8}}><strong>In-model (value head)</strong></td><td style={{padding:8}}><strong>Learned end-to-end</strong></td><td style={{padding:8}}><strong>Consistent (shared backbone + ranking loss)</strong></td></tr>
         </tbody>
       </table>
-      <p style={{marginTop:12}}>
-        The value model trades runtime steerability for calibration consistency and stability. Late fusion is easy to tune one knob at a time — but every tune is a band-aid.
-      </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li><strong>Mature stack</strong> where the late-fusion weights are constantly being hand-retuned and the team is tired of it.</li>
-        <li>Surfaces with many objectives (4+) where the linear combination space is too large to tune sanely.</li>
-        <li>Strong offline-target definition — you have an agreed scalar (e.g., long-term engagement, retention proxy) you trust.</li>
-        <li>Organizations where ranking quality is bottlenecked by miscalibrated head combinations rather than by feature engineering.</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill &mdash; 22 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the axis. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <ul>
-        <li><strong>Interpretability loss</strong> — "why did this item get a high value?" is harder to answer than "high click prediction times 0.6 plus high save prediction times 0.4".</li>
-        <li><strong>Business overrides are harder</strong> — PMs can no longer say "boost shares by 20 percent this week"; overrides need a separate post-multiply layer.</li>
-        <li><strong>Target definition is now the policy</strong> — whoever defines the composite target is implicitly setting the product strategy.</li>
-        <li><strong>Counterfactual evaluation is harder</strong> — late fusion lets you simulate weight changes offline; value models require retraining or a separate offline simulator.</li>
-        <li><strong>Strong drift on target definition changes</strong> — if the composite target changes, the whole model needs to be retrained, not a config push.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
-      <p style={{color:"#475569"}}>Pick the right move(s); reveal trap and lens after committing.</p>
-
-      <VIS.TrapProblem
-        id="value-p1" difficulty="hard" multiSelect
-        title="P1 — Why do PMs typically resist a learned value model despite the offline lift?"
-        scenario={<>The value model shows a clear offline win and the ML team is eager to ship. PMs push back. Pick the REAL reasons (not strawmen).</>}
+      <VIS.TrapProblem id="vm-p1" difficulty="hard"
+        title="P1 &mdash; Value Model vs late linear fusion: load-bearing difference?"
+        scenario={<><em>Discriminating insight: late linear fusion combines scores AFTER independent per-objective models with hand-tuned weights. Value Model learns the combination INSIDE one network end-to-end via a joint loss with the value head trained against a ranking objective. Weights are learned from data; calibration is consistent because all heads share the backbone.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"They lose the steering wheel — they cannot push 'more saves this quarter' by nudging a weight; the change requires a model retrain plus an experiment.", correct:true},
-          {key:"b", text:"Business overrides for promos, events, or seasonal pushes are harder to inject as multiplicative tweaks on a single scalar.", correct:true},
-          {key:"c", text:"Interpretability for stakeholders drops — 'value' is harder to defend in a review than 'click times click-weight plus save times save-weight'.", correct:true},
-          {key:"d", text:"The value model cannot be A/B tested."},
-          {key:"e", text:"Value models always degrade clicks."},
+          {key:"a", text:"Late fusion combines independent per-objective model scores via hand-tuned linear weights (brittle, gameable, drift-prone). The Value Model learns the combination end-to-end inside one network with a shared backbone, per-objective heads for supervision, and a value head trained with a ranking loss. The combination is data-driven; calibration is consistent across objectives.", correct:true},
+          {key:"b", text:"They are equivalent &mdash; one just learns the weights."},
+          {key:"c", text:"Late fusion is strictly better."},
+          {key:"d", text:"Value Model drops per-objective signals."},
         ]}
-        trap={<>(d) is false — value models can be A/B tested like any other ranker. (e) is empirically wrong; the original blog post reports neutral-to-positive on each component.</>}
-        lens={<>The resistance is operational and political, not technical. PMs lose the per-objective dial they have used for years. The ML team has to invest in (i) a clean policy doc on what defines value, (ii) a post-multiply override layer for business needs, and (iii) interpretability dashboards. Without those three, the win does not stick.</>}
-        stretch={<>How would you design the post-multiply override layer without re-introducing the brittleness of late fusion?</>}
+        trap={<>(b) collapses the calibration argument. (c)(d) wrong.</>}
+        lens={<>Post-model linear fusion vs in-model learned value head.</>}
+        stretch={<>How does calibration improvement show up in offline metrics?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p2" difficulty="hard"
-        title="P2 — Composite target definition is the policy"
-        scenario={<>You are defining the composite "value" target. Pick the most defensible approach.</>}
+      <VIS.TrapProblem id="vm-p2" difficulty="hard"
+        title="P2 &mdash; Value Model vs PMORS (sibling-batch caution)"
+        scenario={<><em>Discriminating insight: PMORS keeps late multi-objective fusion but reshapes weights via Pareto search + Ebbinghaus-style forgetting decay. Value Model removes late fusion entirely and learns a single scalar v end-to-end. Different stage, different machinery.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Anchor the target to a long-term outcome (e.g., user retention or session-survival probability) using observed counterfactuals, with explicit per-action weights documented as a policy doc owned jointly by ML and product.", correct:true},
-          {key:"b", text:"Use raw clicks only — simplest possible signal."},
-          {key:"c", text:"Let the ML team pick the weights and not tell the product team."},
-          {key:"d", text:"Train against the historical late-fusion score so the new model imitates the old one."},
+          {key:"a", text:"PMORS keeps late multi-objective fusion but reshapes the weights via Pareto + forgetting-curve decay on stale objectives. The Value Model removes late fusion entirely &mdash; the value is learned end-to-end through a value head and ranking loss. Different stage (post-model vs in-model), different machinery.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"PMORS is a special case of Value Model."},
+          {key:"d", text:"Both use forgetting curves."},
         ]}
-        trap={<>(b) collapses multi-objective into a single objective with no diversity. (c) is a process failure waiting to happen. (d) is "value-model in name only" — you bake in the old miscalibration.</>}
-        lens={<>The composite target is the product policy. It should be (i) anchored to a long-term outcome, (ii) documented and owned jointly, (iii) versioned (target v1, v2, ...). Pretending the target choice is a purely technical decision is the failure mode that gets value models pulled six months in.</>}
-        stretch={<>What governance process for changing the target would you propose?</>}
+        trap={<>(b)(c)(d) blur the stage and machinery.</>}
+        lens={<>Post-model Pareto + decay (PMORS) vs in-model learned value head.</>}
+        stretch={<>Can they compose?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p3" difficulty="medium" multiSelect
-        title="P3 — Designing a business override layer"
-        scenario={<>You need a way for PMs to inject short-term boosts (e.g., promote shares during a campaign) without breaking the value model. Pick reasonable designs.</>}
+      <VIS.TrapProblem id="vm-p3" difficulty="hard"
+        title="P3 &mdash; Value Model vs MMoE / PLE"
+        scenario={<><em>Discriminating insight: MMoE/PLE share experts across tasks but each task still emits its OWN prediction; downstream you still need late fusion. Value Model collapses fusion into a single value head trained with a ranking loss.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"A post-ranker scaling layer that multiplies value by a campaign-time-bounded factor for items matching an audience or content rule.", correct:true},
-          {key:"b", text:"A per-action auxiliary boost score added on top of the value, capped to a small relative magnitude and time-bounded.", correct:true},
-          {key:"c", text:"A separate constraint solver that ensures a minimum share-fraction in the slate.", correct:true},
-          {key:"d", text:"Let PMs edit the value-model weights directly during a campaign."},
-          {key:"e", text:"Refuse overrides entirely."},
+          {key:"a", text:"MMoE/PLE are multi-task architectures that share experts across tasks but emit one prediction per task &mdash; you still need late fusion to combine them at serve time. The Value Model emits a SINGLE value at serve time, trained against per-objective heads (gradient only) + a ranking loss. Multi-task is upstream of fusion; Value Model removes the fusion step.", correct:true},
+          {key:"b", text:"Value Model is a variant of MMoE."},
+          {key:"c", text:"MMoE has no late fusion."},
+          {key:"d", text:"PLE outputs one value head."},
         ]}
-        trap={<>(d) destabilizes the model and defeats joint training. (e) is operationally untenable — campaigns happen.</>}
-        lens={<>Three legitimate override patterns: time-bounded multiplicative scaling, capped additive boosts, slate-level constraint solvers. All three keep the value model intact and put overrides into a layer designed to be unstable.</>}
-        stretch={<>How would you design the audit trail so overrides are visible?</>}
+        trap={<>(b)(c)(d) miss the architectural distinction.</>}
+        lens={<>MMoE/PLE: share experts then late fuse. Value Model: share backbone then learn the value.</>}
+        stretch={<>Can MMoE feed a Value Model on top?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p4" difficulty="hard"
-        title="P4 — Counterfactual evaluation under a value model"
-        scenario={<>Under late fusion, you can ask "what if save weight had been 0.5 instead of 0.4?" offline by re-ranking with a different formula. The value model breaks this workflow. Pick the strongest replacement.</>}
+      <VIS.TrapProblem id="vm-p4" difficulty="medium"
+        title="P4 &mdash; Without the Value Model, what is the realistic fallback?"
+        scenario={<><em>Discriminating insight: fallbacks are late linear fusion (brittle, gameable), per-objective sequential gates (cliffs), Pareto search (offline, slow to adapt), or RL with hand-crafted reward (variance).</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Train an auxiliary set of per-task heads alongside the value head and use them in an offline simulator to estimate the impact of target re-weighting, then validate the most promising configs in an A/B test.", correct:true},
-          {key:"b", text:"Give up on counterfactuals — value models are end-to-end."},
-          {key:"c", text:"Always A/B test every change without offline analysis."},
-          {key:"d", text:"Use a single proxy metric and ignore tradeoffs."},
+          {key:"a", text:"Late linear fusion (brittle, drift-prone, gameable), per-objective sequential gates (cliff effects at thresholds), Pareto search via DeepPRL (offline, slow to adapt), or RL with hand-crafted reward (high variance, off-policy gap). The Value Model occupies the learned-in-model corner.", correct:true},
+          {key:"b", text:"There is no fallback."},
+          {key:"c", text:"Random ranking at parity."},
+          {key:"d", text:"Skip multi-objective entirely."},
         ]}
-        trap={<>(b) and (c) are operational dead ends. (d) ignores the multi-objective nature.</>}
-        lens={<>The trick is to keep auxiliary task heads for evaluation even if ranking uses only the value head. You get counterfactual analysis on objective tradeoffs and protect serving simplicity. This is the standard Pinterest/Meta pattern.</>}
-        stretch={<>How does this approach affect training cost and complexity?</>}
+        trap={<>(b)(c)(d) absurd.</>}
+        lens={<>Each fallback drops calibration, adaptivity, or stability.</>}
+        stretch={<>When is late linear fusion still right?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p5" difficulty="hard" multiSelect
-        title="P5 — Detecting value-model degradation in production"
-        scenario={<>Pick signals that suggest the value model has drifted or become miscalibrated.</>}
+      <VIS.TrapProblem id="vm-p5" difficulty="hard"
+        title="P5 &mdash; When does the Value Model stop helping?"
+        scenario={<><em>Discriminating insight: needs (i) multiple interacting objectives, (ii) enough data, (iii) tolerance for a single learned ranker. With only one objective, or with a rare objective that needs guaranteed weight (safety floor), late fusion + business rules win.</em><br/>Where is the boundary?</>}
         options={[
-          {key:"a", text:"Per-action engagement rates (clicks, saves, shares) all drift together in one direction — the composite target is now miscalibrated against the true objective mix.", correct:true},
-          {key:"b", text:"User-segment-level rates diverge — value model is fine on heavy users but degrading on light users.", correct:true},
-          {key:"c", text:"Slate diversity collapses — the model converged onto one type of content.", correct:true},
-          {key:"d", text:"Auxiliary heads (if maintained) show calibration drift against logged outcomes.", correct:true},
-          {key:"e", text:"Click-through rate goes up."},
+          {key:"a", text:"Single-objective surfaces (no fusion to do), surfaces with a rare-but-critical objective that needs a guaranteed business weight (e.g., safety floors that cannot be learned away), data-sparse surfaces where the joint head cannot learn the combination, or settings where interpretable per-objective overrides are a regulatory requirement.", correct:true},
+          {key:"b", text:"It always wins."},
+          {key:"c", text:"It only works at Pinterest."},
+          {key:"d", text:"It only works on click-heavy surfaces."},
         ]}
-        trap={<>(e) is ambiguous — CTR up is sometimes a degradation signal (clickbait) and sometimes a win. Without context it is not a degradation signal in itself.</>}
-        lens={<>Four diagnostic signals. The value model can silently optimize the wrong thing for months if you only watch CTR or a single proxy. Per-action drift, segment drift, diversity collapse, and auxiliary-head calibration form the standard four-signal dashboard.</>}
-        stretch={<>How would you alert on segment-level divergence automatically?</>}
+        trap={<>(b)(c)(d) miss the premises.</>}
+        lens={<>Multi-objective + data + no rule-override requirement.</>}
+        stretch={<>How to expose business overrides on top of a Value Model?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p6" difficulty="medium"
-        title="P6 — When NOT to use a value model"
-        scenario={<>Pick the strongest case against a value model for a given surface.</>}
+      <VIS.TrapProblem id="vm-p6" difficulty="hard"
+        title="P6 &mdash; Pick the architecture for a 5-objective home feed with weekly weight retunes"
+        scenario={<><em>Discriminating insight: 5-objective home feed with weekly weight retunes is the canonical Value Model surface. Late fusion is gameable and drift-prone; PMORS still late-fuses; MMoE still late-fuses. Value Model removes the retune loop by learning v end-to-end.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"A small surface with two objectives whose tradeoff is well-understood, and where the team needs frequent, fine-grained PM steering for marketing campaigns — late fusion is operationally simpler.", correct:true},
-          {key:"b", text:"A mature feed surface with six objectives and constant late-fusion retuning."},
-          {key:"c", text:"A surface where calibration consistency matters."},
-          {key:"d", text:"A team with strong target-definition culture."},
+          {key:"a", text:"Value Model &mdash; 5-objective fusion with weekly retunes is the canonical pain point. Shared backbone + 5 per-objective heads + value head + joint loss (sum of per-objective BCE + ranking loss on the value head). Removes the weekly weight-tuning loop; calibration becomes data-driven.", correct:true},
+          {key:"b", text:"Late linear fusion &mdash; keep tuning weekly."},
+          {key:"c", text:"Skip multi-objective."},
+          {key:"d", text:"Train 5 independent rankers and average."},
         ]}
-        trap={<>(b), (c), (d) are the value-model sweet spots, not the anti-cases.</>}
-        lens={<>Value models pay off when objective counts are large and the late-fusion overhead is real. Small surfaces with two objectives and high marketing cadence get more value from the steerability of late fusion than from joint calibration.</>}
-        stretch={<>What is the cutoff in number of objectives where value models start to pay off?</>}
+        trap={<>(b)(c)(d) miss the joint-learning fit.</>}
+        lens={<>Frequent weight retunes triggers the joint head.</>}
+        stretch={<>How does Pinterest measure &lsquo;weekly retune cost&rsquo;?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p7" difficulty="hard" mode="ordered"
-        title="P7 — Order your debugging when value model regresses on shares"
-        scenario={<>Post-launch, share rate is down five percent while clicks are flat. PMs want it rolled back. Order your diagnostics. Wrong moves do not get a number.</>}
+      <VIS.TrapProblem id="vm-p7" difficulty="hard"
+        title="P7 &mdash; Sounds reasonable: &ldquo;just train one model on a hand-weighted combined label&rdquo;"
+        scenario={<><em>Discriminating insight: pre-fusing the label (0.5*click + 0.3*save + 0.2*share) bakes the hand-tuned weights into the data and removes the model&apos;s ability to recover the optimal combination from per-objective signal.</em><br/>Why is the shortcut wrong?</>}
         options={[
-          {key:"a", text:"Inspect the per-action auxiliary head (if kept) for share-rate calibration vs logged outcomes.", order:1},
-          {key:"b", text:"Examine the composite target weights and per-action contribution to value.", order:2},
-          {key:"c", text:"Slice by user segment to see if regression is uniform or concentrated.", order:3},
-          {key:"d", text:"Adjust the override layer to boost shares as a hotfix.", order:4},
-          {key:"e", text:"Roll back to late fusion immediately without diagnosis."},
+          {key:"a", text:"Pre-fusing the label bakes the hand-tuned weights into the data &mdash; the model cannot learn the optimal combination because the supervision IS the pre-fused combination. The Value Model keeps per-objective heads (separate supervision signal per objective) so the value head can learn the combination end-to-end.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"Hand-weighted labels are strictly better."},
+          {key:"d", text:"Per-objective heads are decorative."},
         ]}
-        trap={<>(e) is destructive and discards the learning. (d) is the hotfix but should not be step one.</>}
-        lens={<>The ladder: diagnose calibration of the affected action, audit the target definition, slice for concentration, then apply a bounded hotfix while a proper fix is being trained. Rollback is the last resort, not the first.</>}
-        stretch={<>How would you decide whether to retrain with a re-weighted target vs persist the override?</>}
+        trap={<>(b)(c)(d) miss the signal-baking argument.</>}
+        lens={<>Per-objective heads keep separate supervision; pre-fusing destroys it.</>}
+        stretch={<>What does the gradient look like when you pre-fuse the label?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p8" difficulty="medium" multiSelect
-        title="P8 — Production launch checklist"
-        scenario={<>You are about to launch a value model as a replacement for late fusion. Which items belong on the pre-launch checklist?</>}
+      <VIS.TrapProblem id="vm-p8" difficulty="hard"
+        title="P8 &mdash; Pitch the Value Model&apos;s anchor"
+        scenario={<><em>Discriminating insight: anchor = &ldquo;single backbone, value head + per-objective heads, joint loss = sum of per-objective + ranking loss on the value head, serve the value head&rdquo;.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Composite target definition is documented as a versioned policy with joint ML and product ownership.", correct:true},
-          {key:"b", text:"Override layer exists and has been tested for sane behaviour under campaign loads.", correct:true},
-          {key:"c", text:"Auxiliary per-action heads are trained alongside for diagnostics and counterfactual analysis.", correct:true},
-          {key:"d", text:"Segment-level metric dashboards cover heavy and light users separately.", correct:true},
-          {key:"e", text:"The composite target equals the old late-fusion formula exactly."},
+          {key:"a", text:"Single shared backbone consumes features; value head outputs a learned scalar v; per-objective auxiliary heads inject per-objective supervised gradient; joint loss sums per-objective BCE + a ranking loss against the labeled order on v; at serve time the ranker uses v only. The combination is learned, not hand-tuned.", correct:true},
+          {key:"b", text:"Value Model uses Pareto search + forgetting curve."},
+          {key:"c", text:"Value Model is MMoE."},
+          {key:"d", text:"Value Model fine-tunes an LLM on KG triples."},
         ]}
-        trap={<>(e) defeats the point — the win comes from learning the JOINT calibration, not imitating the old formula. If you target the old formula you have re-implemented late fusion in a more expensive way.</>}
-        lens={<>Four enabling pieces: policy, override, auxiliary heads, segment dashboards. Without them, the value model is a black box that PMs will distrust and the ML team cannot defend when something regresses.</>}
-        stretch={<>Which of these items would you build first if resources are tight?</>}
+        trap={<>(b) PMORS. (c) MMoE. (d) wrong stack.</>}
+        lens={<>Backbone &middot; value head &middot; per-objective heads &middot; joint loss &middot; serve v.</>}
+        stretch={<>Which piece is the Pinterest blog most underspecific about?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p9" difficulty="hard"
-        title="P9 — Target gaming"
-        scenario={<>Three months after launch, content creators have figured out how to optimize for the value signal. Engagement looks great but user-reported quality has dropped. Pick the most likely mechanism.</>}
+      <VIS.TrapProblem id="vm-p9" difficulty="hard" multiSelect
+        title="P9 &mdash; When NOT to use the Value Model. Select all that apply."
+        scenario={<><em>Discriminating insight: needs multi-objective + data + no hard per-objective rule overrides + opacity tolerance. Wrong for single-objective, regulated audit-trail, very low-data, interpretability-critical surfaces.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"The composite target collapsed quality into a small number of measurable signals (clicks, saves, shares) — creators optimized those signals via clickbait or shareability tricks, hitting the metric without serving real user value.", correct:true},
-          {key:"b", text:"The value model learned to hate quality content."},
-          {key:"c", text:"Random drift."},
-          {key:"d", text:"Auxiliary heads broke."},
+          {key:"a", text:"Single-objective surface (no fusion to learn).", correct:true},
+          {key:"b", text:"Regulated surface with mandatory per-objective audit trail (e.g., ads with hard policy floors).", correct:true},
+          {key:"c", text:"Interpretability-critical surface where stakeholders need to see &lsquo;why click-weight is X&rsquo;.", correct:true},
+          {key:"d", text:"Mature 5-objective home feed with weekly weight retunes."},
+          {key:"e", text:"Search-result ranking with multiple engagement signals and enough training data."},
         ]}
-        trap={<>(b), (c), (d) are off-mechanism. The real failure is Goodhart on the target.</>}
-        lens={<>Any single-scalar target invites Goodhart. The fix is target evolution: monitor leading indicators of quality (dwell, return visits, explicit feedback), add them to the composite, and version the target. The value model itself is not at fault; the policy did not evolve.</>}
-        stretch={<>How would you design a quality-canary in production?</>}
+        trap={<>(d)(e) are canonical fits.</>}
+        lens={<>Multi-objective + data + no hard overrides + opacity tolerance.</>}
+        stretch={<>How to layer business rules on top?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p10" difficulty="hard"
-        title="P10 — Slate diversity under value scoring"
-        scenario={<>The value model ranks items globally and the top-K is dominated by one content type. Diversity is poor. Pick the strongest fix.</>}
+      <VIS.TrapProblem id="vm-p10" difficulty="hard"
+        title="P10 &mdash; Why a RANKING loss on the value head, not just regression?"
+        scenario={<><em>Discriminating insight: regression to a target combined score requires defining the target, which reintroduces hand-tuned weights. Ranking loss only requires labeled ORDER between items (which user engaged more) &mdash; no target weights needed.</em><br/>Why ranking?</>}
         options={[
-          {key:"a", text:"Add a slate-level constraint or post-rerank diversity step (e.g., MMR-style or constrained slate optimization) that runs on top of value scores rather than baking diversity into the value head itself.", correct:true},
-          {key:"b", text:"Retrain the value model with a diversity bonus inside the target."},
-          {key:"c", text:"Disable the value model."},
-          {key:"d", text:"Pretend diversity is not a problem."},
+          {key:"a", text:"A regression target reintroduces the hand-tuned weight problem &mdash; you have to define what scalar to regress to. Ranking loss requires only the labeled ORDER between items (pairwise or listwise), which observed user engagement directly provides. No hand-tuned target needed; the value head learns the combination from the order signal.", correct:true},
+          {key:"b", text:"Regression is strictly better."},
+          {key:"c", text:"They are equivalent."},
+          {key:"d", text:"Ranking loss is decorative."},
         ]}
-        trap={<>(b) couples value and diversity inside the head — every time diversity policy changes, you retrain. (c) is destructive. (d) is wrong on its face.</>}
-        lens={<>Keep the value model pointwise and clean. Diversity is a slate-level concern; solve it at the slate-construction layer where it can be tuned without retraining. This separation is the standard pattern in mature feed systems.</>}
-        stretch={<>How does this interact with the override layer?</>}
+        trap={<>(b)(c)(d) miss the target-definition argument.</>}
+        lens={<>Ranking loss avoids defining a regression target.</>}
+        stretch={<>Pairwise vs listwise &mdash; which fits?</>}
       />
 
-      <VIS.TrapProblem
-        id="value-p11" difficulty="medium"
-        title="P11 — Migration plan from late fusion to value model"
-        scenario={<>You are migrating a live surface. Pick the safest rollout plan.</>}
+      <VIS.TrapProblem id="vm-p11" difficulty="hard"
+        title="P11 &mdash; Calibration: what does the Value Model fix?"
+        scenario={<><em>Discriminating insight: late linear fusion has independent calibration per objective model &mdash; a 0.5 click and 0.5 save can represent different odds. Value Model trains all heads through a shared backbone with joint loss; gradients flow through one network so calibration is consistent.</em><br/>Pick.</>}
         options={[
-          {key:"a", text:"Run value-model and late-fusion side by side, with a small percentage of traffic on value-model and the rest on late-fusion. Compare per-segment metrics. Increase traffic only if no segment regresses.", correct:true},
-          {key:"b", text:"Switch one hundred percent of traffic on day one."},
-          {key:"c", text:"Deploy the value model offline only and never run it in production."},
-          {key:"d", text:"Migrate without measurement."},
+          {key:"a", text:"Per-objective models in late fusion have independent calibration; a 0.5 click and 0.5 save can represent different odds. The Value Model trains all heads through one backbone with joint loss; gradients flow through one network so calibration is consistent across objectives. The value head combines comparable probabilities, not heterogeneous calibrations.", correct:true},
+          {key:"b", text:"Calibration is irrelevant."},
+          {key:"c", text:"Late fusion has consistent calibration."},
+          {key:"d", text:"Calibration matters only for ads."},
         ]}
-        trap={<>(b) is reckless on a live surface. (c) is not a migration. (d) is malpractice.</>}
-        lens={<>The standard staged-rollout with segment-level guardrails. Value models often hurt SOME segments while helping overall — segment-level monitoring is required, not optional.</>}
-        stretch={<>What is your stopping rule for a regression on a small segment?</>}
+        trap={<>(b)(c)(d) miss the calibration mechanism.</>}
+        lens={<>Shared backbone forces consistent per-objective calibration.</>}
+        stretch={<>How to verify cross-objective calibration consistency offline?</>}
       />
+
+      <VIS.TrapProblem id="vm-p12" difficulty="hard"
+        title="P12 &mdash; What does the Value Model deliberately drop vs late fusion?"
+        scenario={<><em>Discriminating insight: late fusion exposes interpretable per-objective weights (&ldquo;click is 50%, save is 30%&rdquo;) that PMs and policy teams can reason about. Value Model bakes the combination into network parameters; weights are implicit and not directly readable.</em><br/>What does it forfeit?</>}
+        options={[
+          {key:"a", text:"Per-objective weight interpretability. Late fusion exposes weights as numbers PMs can reason about and override; the Value Model bakes the combination into network parameters that are not directly readable. The gain is data-driven calibration; the loss is the explicit &lsquo;click weight is X&rsquo; lever for policy + business.", correct:true},
+          {key:"b", text:"It forfeits the recommendation task."},
+          {key:"c", text:"It forfeits the per-objective heads."},
+          {key:"d", text:"It forfeits the use of any model."},
+        ]}
+        trap={<>(b)(c)(d) misread.</>}
+        lens={<>Interpretability for calibration + adaptivity.</>}
+        stretch={<>How to expose business overrides without late fusion?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p13" difficulty="hard"
+        title="P13 &mdash; Most fragile knob"
+        scenario={<><em>Discriminating insight: ranking-loss weight vs per-objective losses dominates fragility. Too low: value head ignores ordering, model degenerates to multi-task. Too high: per-objective gradients vanish, calibration degrades.</em><br/>Rank fragility.</>}
+        options={[
+          {key:"a", text:"Ranking-loss weight relative to per-objective losses is most fragile &mdash; too low and the value head learns nothing (degenerates to multi-task); too high and per-objective gradients vanish and calibration degrades. Per-objective head weights are next. Learning rate is robust.", correct:true},
+          {key:"b", text:"Optimizer choice is most fragile."},
+          {key:"c", text:"Batch size is most fragile."},
+          {key:"d", text:"Embedding dimensionality is most fragile."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Ranking-vs-per-objective loss balance is the load-bearing knob.</>}
+        stretch={<>What metric reveals the ranking-loss weight being off?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p14" difficulty="hard"
+        title="P14 &mdash; Plausible-misattribution: home-feed dwell-time regressed after Value Model launch"
+        scenario={<><em>Discriminating insight: dwell-time labels are sparser than click; in joint training, dwell-time per-objective loss contributes less gradient; the backbone underweights dwell representations and the value head undervalues dwell. Engineers blamed the value head; real cause is label-density-driven gradient imbalance.</em><br/>Diagnosis?</>}
+        options={[
+          {key:"a", text:"Per-objective heads have label-density-dependent gradient magnitude. Dwell-time labels are sparser than click; its per-objective loss contributes less gradient; the backbone underweights dwell representations and the value head learns to undervalue dwell. Fix: rebalance per-objective loss weights to compensate for label sparsity (not business priority).", correct:true},
+          {key:"b", text:"GPU thermal throttling.", correct:false},
+          {key:"c", text:"Catalog drift on dwell items.", correct:false},
+          {key:"d", text:"Cache TTL changed.", correct:false},
+        ]}
+        trap={<>(b)(c)(d) infra decoys.</>}
+        lens={<>Label-density imbalance leaks into per-objective gradient.</>}
+        stretch={<>How to neutralise label-density bias?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p15" difficulty="hard"
+        title="P15 &mdash; Intuitive but wrong: &ldquo;the value head is just a fancy weighted sum&rdquo;"
+        scenario={<><em>Discriminating insight: weighted-sum is linear in objective scores. The value head is non-linear in the BACKBONE representation, which itself is non-linear in features. Two items with identical per-objective scores can get different v because backbones differ.</em><br/>Why is the naive view wrong?</>}
+        options={[
+          {key:"a", text:"The value head is non-linear in the backbone representation, which itself is non-linear in the features. Two items with identical per-objective scores can get different values because the backbones differ. Late linear fusion treats objectives as independent scalars and cannot capture this interaction.", correct:true},
+          {key:"b", text:"They are equivalent."},
+          {key:"c", text:"The value head is exactly linear."},
+          {key:"d", text:"Per-objective scores fully determine v."},
+        ]}
+        trap={<>(b)(c)(d) miss the non-linearity argument.</>}
+        lens={<>v depends on the backbone, not on per-objective scalars.</>}
+        stretch={<>What interactions does v capture that linear fusion cannot?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p16" difficulty="hard"
+        title="P16 &mdash; Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: assuming &ldquo;Value Model is MMoE with one extra head&rdquo; cascades into skipping the joint ranking loss (no ordering signal), late-fusing v with per-objective heads (defeats the point), ignoring shared-backbone calibration.</em><br/>What breaks?</>}
+        options={[
+          {key:"a", text:"All three: skipping the joint ranking loss (value head learns no ordering signal), late-fusing v with per-objective heads (reintroduces the problem the method solves), and ignoring shared-backbone calibration (heads decouple). Each is load-bearing.", correct:true},
+          {key:"b", text:"Only the ranking loss."},
+          {key:"c", text:"Only the calibration."},
+          {key:"d", text:"Nothing &mdash; it is just MMoE with an extra head."},
+        ]}
+        trap={<>(d) the seductive misread.</>}
+        lens={<>Value head + ranking loss + serve-v jointly load-bearing.</>}
+        stretch={<>Which piece does the Pinterest blog underspecify?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p17" difficulty="medium"
+        title="P17 &mdash; Senior vs junior framing on weak Value Model lift"
+        scenario={<><em>Discriminating insight: junior adds more per-objective heads; senior first audits whether v is actually being served (deploy bug), then ranking-loss weight, then label balance.</em><br/>Which lever first?</>}
+        options={[
+          {key:"a", text:"Audit serving: is the ranker actually sorting by v, or by a per-objective head? Then audit the ranking-loss weight (is the value head receiving meaningful ordering gradient?). Then audit per-objective label balance. Only then touch architecture.", correct:true},
+          {key:"b", text:"Add more per-objective heads immediately."},
+          {key:"c", text:"Switch backbones."},
+          {key:"d", text:"Add LLM features."},
+        ]}
+        trap={<>(b)(c) generic. (d) off-topic.</>}
+        lens={<>Serve audit -&gt; loss weights -&gt; labels -&gt; architecture.</>}
+        stretch={<>Dashboard panel for &lsquo;ranker sorting by wrong head&rsquo;?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p18" difficulty="hard"
+        title="P18 &mdash; Plausible-misattribution: model exhibits a single dominant objective"
+        scenario={<><em>Discriminating insight: post-launch, v correlates 0.98 with click head. PMs call it a &ldquo;click-only model in disguise&rdquo;. Real cause: click had 10x label density; click gradient dominates joint loss; value head learns click first.</em><br/>Diagnosis?</>}
+        options={[
+          {key:"a", text:"Click&apos;s label density is much higher than other objectives; click gradient dominates the joint loss; the value head learns the click signal first and stays correlated with the click head. Fix: scale per-objective loss weights inversely with label density during training (not by business priority &mdash; that&apos;s a separate layer).", correct:true},
+          {key:"b", text:"GPU thermal throttling.", correct:false},
+          {key:"c", text:"LLM context truncation.", correct:false},
+          {key:"d", text:"Cache TTL changed.", correct:false},
+        ]}
+        trap={<>(b)(c)(d) infra decoys.</>}
+        lens={<>Label-density imbalance manifests as objective dominance.</>}
+        stretch={<>How to measure objective dominance in v?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p19" difficulty="hard"
+        title="P19 &mdash; Production gotcha: business override layer"
+        scenario={<><em>Discriminating insight: PMs need hard floors (&ldquo;safety items above rank N&rdquo;) and boosts (&ldquo;new-creator +X&rdquo;). Value Model bakes combination into weights where rules cannot live. The discipline is a POST-VALUE override layer.</em><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Wrap the Value Model in a POST-VALUE override layer that applies business rules (safety floors, new-creator boosts, policy caps) to v before final sort. The Value Model handles fusion of engagement signals; the override layer handles business + policy. Injecting these into joint training silently distorts v.", correct:true},
+          {key:"b", text:"Business overrides should be baked into the joint loss."},
+          {key:"c", text:"No overrides are needed."},
+          {key:"d", text:"Overrides should replace the value head."},
+        ]}
+        trap={<>(b)(c)(d) misjudge the layering.</>}
+        lens={<>Engagement fusion in v; business rules in a post-value layer.</>}
+        stretch={<>What does the override layer look like?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p20" difficulty="hard"
+        title="P20 &mdash; Failure on Friday: v collapsed to a constant after a label-pipeline bug"
+        scenario={<><em>Discriminating insight: label pipeline silently lost order signal &mdash; pairwise comparisons all tied. Ranking loss provided no gradient; value head settled at constant. Per-objective heads stayed healthy so total loss looked normal.</em><br/>3am page: recall down 40%. Diagnosis?</>}
+        options={[
+          {key:"a", text:"The label pipeline lost order signal (all pairwise comparisons tied). The ranking loss provided no gradient; the value head converged to a constant. Per-objective heads stayed healthy so total loss looked normal. v no longer orders items, so recall craters. Monitor variance of v at serve time and alert if it collapses.", correct:true},
+          {key:"b", text:"GPU thermal throttling."},
+          {key:"c", text:"Cache TTL changed."},
+          {key:"d", text:"Index disk full."},
+        ]}
+        trap={<>(b)(c)(d) miss the label-signal-vs-loss disconnect.</>}
+        lens={<>Healthy total loss can mask collapsed ranking signal.</>}
+        stretch={<>What dashboard panel catches this?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p21" difficulty="medium"
+        title="P21 &mdash; Library default that bites: PyTorch BCEWithLogitsLoss default reduction='mean'"
+        scenario={<><em>Discriminating insight: BCEWithLogitsLoss defaults to reduction=&apos;mean&apos;. When per-objective label densities differ wildly, mean-reduction makes the sparse-label objective contribute the same per-example loss as the dense one but gradient is dominated by the dense objective (more positives per batch).</em><br/>Where does the default bite?</>}
+        options={[
+          {key:"a", text:"BCEWithLogitsLoss with reduction=&apos;mean&apos; silently lets the dense-label objective dominate the gradient even when per-objective losses look balanced. Use reduction=&apos;sum&apos; with explicit per-objective scaling (inverse label density). The default fails silently &mdash; loss curves look fine but v is dominated by the dense objective.", correct:true},
+          {key:"b", text:"Default learning rate is wrong."},
+          {key:"c", text:"Default optimizer is wrong."},
+          {key:"d", text:"Default batch size is wrong."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Mean reduction hides label-density-driven gradient imbalance.</>}
+        stretch={<>What unit test catches this?</>}
+      />
+
+      <VIS.TrapProblem id="vm-p22" difficulty="hard" ordered
+        title="P22 &mdash; Order the Value Model rollout"
+        scenario={<><em>Discriminating insight: rollout = (1) per-objective label-density audit, (2) multi-task baseline, (3) add value head + ranking loss at low weight, (4) ramp ranking-loss weight, (5) shadow v-serve vs late-fusion-serve, (6) launch v-serve, (7) business-override layer on top.</em><br/>Order.</>}
+        options={[
+          {key:"a", text:"Per-objective label-density audit -&gt; multi-task baseline (per-objective heads only) -&gt; add value head + ranking loss at low weight -&gt; ramp ranking-loss weight to target -&gt; shadow v-serve vs late-fusion-serve -&gt; launch v-serve -&gt; business-override layer on top", correct:true},
+          {key:"b", text:"Skip the label-density audit."},
+          {key:"c", text:"Launch v-serve without shadow."},
+          {key:"d", text:"Bake business rules into the joint loss."},
+        ]}
+        trap={<>(b)(c)(d) lose stage diagnostics or layering.</>}
+        lens={<>Density audit -&gt; multi-task baseline -&gt; joint -&gt; shadow -&gt; launch -&gt; overrides.</>}
+        stretch={<>Why ramp ranking-loss weight rather than enable at target?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://medium.com/pinterest-engineering/evolution-of-multi-objective-optimization-at-pinterest-home-feed-06657e33cd10" target="_blank" rel="noopener"><strong>Pinterest — Evolution of Multi-Objective Optimization at Home Feed</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>The primary source. Walks through their migration from late linear fusion to joint-loss value models, with the operational gotchas the paper rarely captures.</li>
-        <li><a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener"><strong>Eugene Yan — System Design for Discovery</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>The clearest walkthrough of ranking stack design tradeoffs, including where fusion lives. Best practitioner read for context.</li>
-        <li><a href="https://arxiv.org/abs/2008.13535" target="_blank" rel="noopener"><strong>Tang et al. — PLE</strong></a> <span style={{color:"#64748b", fontSize:14}}>(RecSys 2020, paper)</span><br/>The multi-task ranking baseline value models typically sit on top of. Helpful for understanding what is being fused.</li>
-        <li><a href="https://blog.reachsumit.com/posts/2024/06/multi-task-video-recsys-p2/" target="_blank" rel="noopener"><strong>Sumit&apos;s blog — Multi-task video recsys part 2</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Discusses joint-loss value modelling in YouTube/Pinterest/Kuaishou-style stacks with concrete formulas.</li>
-        <li><a href="https://eugeneyan.com/writing/multitask/" target="_blank" rel="noopener"><strong>Eugene Yan — Multi-Task and Multi-Modal Learning</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Survey of multi-task patterns in production recsys. Useful for placing the value-model approach in the broader landscape.</li>
+        <li><a href="https://medium.com/pinterest-engineering/evolution-of-multi-objective-optimization-at-pinterest-home-feed-06657e33cd10" target="_blank" rel="noopener">Pinterest Engineering &mdash; <em>Evolution of Multi-Objective Optimization at Pinterest Home Feed</em> (2026)</a> &mdash; the canonical blog post. Sections on the value head and the trade-off versus late fusion are the must-reads.</li>
+        <li><a href="https://www.tensorflow.org/recommenders/examples/multitask" target="_blank" rel="noopener">TF Recommenders &mdash; <em>Multi-task learning tutorial</em> (TFRS)</a> &mdash; the working-example baseline for multi-task heads.</li>
+        <li><a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener">Eugene Yan &mdash; <em>System Design for Discovery</em> (blog)</a> &mdash; the best practitioner framing of multi-objective ranking, calibration drift, and post-ranker layers.</li>
+        <li><a href="https://research.google/pubs/modeling-task-relationships-in-multi-task-learning-with-multi-gate-mixture-of-experts/" target="_blank" rel="noopener">Ma et al. &mdash; <em>MMoE</em> (KDD 2018)</a> &mdash; the multi-task baseline the Value Model contrasts with.</li>
+        <li><a href="https://github.com/easezyc/Multitask-Recommendation-Library" target="_blank" rel="noopener">Multitask-Recommendation-Library (GitHub)</a> &mdash; reference implementations of MMoE, PLE, AESM you can hand off to the Value Model on top.</li>
+        <li><a href="https://www.youtube.com/watch?v=cyTtdrEjjpQ" target="_blank" rel="noopener">RecSys 2022 industry talk &mdash; <em>Multi-objective optimization in production</em> (video)</a> &mdash; a 30-minute walkthrough of late-fusion failure modes.</li>
       </ul>
     </VIS.Section>
   </main>
