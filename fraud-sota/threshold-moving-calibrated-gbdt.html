@@ -1414,328 +1414,446 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Threshold moving + calibrated GBDT — Fraud SOTA · Cost-sensitive learning
-// Calibrate probabilities, then choose threshold per segment by expected dollar savings.
+// Threshold moving + calibrated GBDT — Fraud SOTA · Cost-sensitive learning.
+// CONCEPT ANCHOR (B3): POST-HOC decision-threshold choice on top of CALIBRATED probabilities.
+// No loss change at training. Train GBDT with default loss; then (1) calibrate via
+// Platt/isotonic on holdout, (2) move threshold to optimize precision-recall trade.
+// Different from asymmetric BCE (per-class scalar IN loss), focal (per-sample modulation
+// IN loss), LDAM (logit margin IN training). Strip "post-hoc threshold on calibrated probs"
+// and the answer must collapse.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Cost-sensitive learning"
-      title="Threshold moving + calibrated GBDT"
-      subtitle="Train a plain-loss model, calibrate its probabilities, then pick a threshold per segment by expected dollar savings."
+      title="Threshold Moving + Calibrated GBDT"
+      subtitle="Train GBDT with default loss. Calibrate the probabilities (Platt / isotonic). Move the decision threshold to hit your operating point. Two post-hoc steps, no training change."
       byline={[
-        {label: "Source", value: "Sift, Stripe Radar engineering blogs (2024–2025)"},
-        {label: "Year", value: "2025"},
-        {label: "L3", value: "Calibration + threshold policy"},
+        {label: "Source", value: "Sift, Stripe blogs 2024-2025; classical practice"},
+        {label: "L3", value: "Probability calibration + decision-threshold tuning"},
+        {label: "Anchor", value: "Train default -> Calibrate -> Move threshold. Loss UNCHANGED."},
       ]}/>
 
     <VIS.TLDR>
-      Plain{" "}
-      <VIS.Term def="Gradient-Boosted Decision Trees — an ensemble of small trees built sequentially, each correcting the previous tree's errors. The dominant tabular ML algorithm; XGBoost, LightGBM, and CatBoost are popular implementations.">GBDT</VIS.Term>{" "}
-      with vanilla log-loss outputs probabilities that are{" "}
-      <VIS.Term def="A model is calibrated if its predicted probabilities match observed frequencies — among samples predicted with p=0.7, roughly 70 percent are truly positive.">well calibrated</VIS.Term>{" "}
-      with isotonic or Platt scaling. The threshold is then a separate, interpretable lever you can move per merchant, per segment, or per business cycle without retraining. Stripe Radar and Sift both run this pattern in production. The decoupling is the win.
+      The default GBDT (XGBoost / LightGBM / CatBoost) with default loss often produces probabilities that are{" "}
+      <VIS.Term def="A model is calibrated if predicted probability = empirical frequency. E.g., among samples with predicted p=0.7, about 70% are actually positive.">miscalibrated</VIS.Term>{" "}
+      under heavy imbalance — but the RANKING (relative ordering of scores) is usually excellent. Two post-hoc steps fix the gap: (1) fit a calibrator (Platt / isotonic) on a held-out set to map raw GBDT score to honest probability; (2) move the decision threshold from 0.5 to the value that maximizes expected $ savings (or hits a target FPR / recall). The whole pipeline keeps the training loss untouched — the lever is entirely post-hoc. This is different from asymmetric BCE (modifies LOSS), focal (modifies LOSS per sample), and LDAM (modifies LOGITS in training). The post-hoc lever is more transparent and easier to re-tune per merchant / per segment without re-training.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — train, calibrate, threshold; no loss surgery">
       <p>
-        Imagine your fraud model assigns each transaction a probability between zero and one. The Risk PM asks: "Decline anything above what number?" If your model is calibrated, that number IS the policy — 0.85 means "decline transactions with at-least 85 percent estimated fraud probability." If your model is miscalibrated, the threshold is a meaningless magic number.
+        Three-stage pipeline. Stage 1: train a GBDT with default binary-log-loss; no class weights, no focal, no logit adjustment. GBDTs already rank well under imbalance because trees can carve out rare-class regions of feature space. Stage 2: hold out 5-10% of the data and fit a calibrator that maps raw GBDT probability to honest probability. Two standard choices: Platt scaling (one sigmoid: a*sigmoid(b*score + c) -> calibrated_prob) and isotonic regression (non-parametric monotone map from raw to calibrated). Stage 3: pick the decision threshold tau on the calibrated probability that hits your operating point — usually 'max expected $ savings = recall_at(tau) * $_per_fraud - fpr_at(tau) * $_per_FP * N_legit'.
       </p>
-      <p>
-        Three steps:
-      </p>
-      <ol>
-        <li><strong>Train with plain log-loss</strong> — let GBDT minimize binary cross-entropy on the original imbalanced data.</li>
-        <li><strong>Calibrate</strong> — fit isotonic regression or Platt scaling on a held-out set so predicted probabilities match observed frequencies.</li>
-        <li><strong>Choose threshold per segment</strong> — for each (merchant, country, channel) bucket, sweep thresholds on a holdout and pick the one maximizing expected dollar savings.</li>
-      </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  T["Train: GBDT with log-loss"]
-  T --> C["Calibrate: isotonic on holdout"]
-  C --> P["Calibrated probabilities"]
-  P --> S1["Segment 1: threshold tuning"]
-  P --> S2["Segment 2: threshold tuning"]
-  P --> S3["Segment 3: threshold tuning"]
-  S1 --> POL["Threshold policy table"]
-  S2 --> POL
-  S3 --> POL
-  style C fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style POL fill:#dcfce7,stroke:#16a34a,stroke-width:2px
-      `} />
-
-      <VIS.Equation display tex={`\\tau_s^* = \\arg\\max_\\tau \\sum_{i \\in s} \\Big[ \\mathbb{1}[p_i > \\tau] \\cdot \\text{savings}(y_i, d_i) - \\mathbb{1}[p_i > \\tau] \\cdot (1-y_i) \\cdot c_{\\text{FP}} \\Big]`} />
-      <p>For each segment s, the optimal threshold tau-star maximizes expected savings: fraud caught (savings equal d-i for the true positives) minus friction cost on false positives. Each segment can have its own threshold because they have different fraud rates and dollar distributions.</p>
+  T["Train GBDT (default log loss)"]
+  T --> C["Calibrate on holdout (Platt / isotonic)"]
+  C --> M["Move threshold to optimize $ savings / target FPR"]
+  M --> P["Production scorer"]
+  style C fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style M fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+      `}/>
+      <p>Blue = calibration (probability layer). Red = threshold (decision layer). The training loss is UNCHANGED. The post-hoc layers are independently auditable and re-tunable per segment.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from cost-sensitive loss">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-why" title="Why post-hoc beats loss-level interventions for production fraud">
+      <ol>
+        <li><strong>Auditability:</strong> a Risk PM can grep for 'threshold = 0.42' and trace it to a $ optimization on a holdout. Loss-level interventions (focal gamma, LDAM margin, asymmetric weights) are harder to audit because they hide inside training.</li>
+        <li><strong>Segmentation:</strong> different merchants / segments have different cost matrices. Post-hoc threshold can be tuned PER segment without re-training. A loss-level intervention would require N model retrains.</li>
+        <li><strong>Drift response:</strong> when class prior shifts, only the threshold needs re-tuning (cheap, daily). A loss-level intervention may require full re-training.</li>
+        <li><strong>Probability integrity:</strong> calibrated probabilities are usable downstream (pricing, expected-loss policy). Focal-trained probabilities are not (Brier drops by 30%+).</li>
+        <li><strong>GBDT-friendly:</strong> tree models already rank well under imbalance; loss surgery offers small marginal gains while post-hoc calibration + threshold often delivers most of the benefit.</li>
+      </ol>
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="Threshold moving vs loss-level interventions">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Cost-sensitive loss</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Calibrated + threshold</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Threshold moving</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Asymmetric BCE</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Focal</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>LDAM</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Decision surface</td>
-            <td style={{padding:"8px 10px"}}>Baked into model weights</td>
-            <td style={{padding:"8px 10px"}}>External policy table</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Cost-matrix change</td>
-            <td style={{padding:"8px 10px"}}>Full retrain</td>
-            <td style={{padding:"8px 10px"}}>Re-run threshold sweep (minutes)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Per-segment policy</td>
-            <td style={{padding:"8px 10px"}}>Requires segment-specific weights or models</td>
-            <td style={{padding:"8px 10px"}}>One threshold per segment</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Calibration</td>
-            <td style={{padding:"8px 10px"}}>Distorted by weights</td>
-            <td style={{padding:"8px 10px"}}>Preserved (post-hoc calibrated)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Risk PM readability</td>
-            <td style={{padding:"8px 10px"}}>Black box</td>
-            <td style={{padding:"8px 10px"}}>Reads like SQL</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>When applied</td><td style={{padding:"6px 10px"}}>POST-hoc (after training)</td><td style={{padding:"6px 10px"}}>During training (loss)</td><td style={{padding:"6px 10px"}}>During training (loss)</td><td style={{padding:"6px 10px"}}>During training (logit)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Model retraining required to change?</td><td style={{padding:"6px 10px"}}>No</td><td style={{padding:"6px 10px"}}>Yes</td><td style={{padding:"6px 10px"}}>Yes</td><td style={{padding:"6px 10px"}}>Yes</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Calibrated probabilities?</td><td style={{padding:"6px 10px"}}>Yes (calibration step)</td><td style={{padding:"6px 10px"}}>Shifted (recoverable)</td><td style={{padding:"6px 10px"}}>Distorted</td><td style={{padding:"6px 10px"}}>Tilted</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Per-segment / per-merchant tunable?</td><td style={{padding:"6px 10px"}}>Yes — N thresholds, 1 model</td><td style={{padding:"6px 10px"}}>N retrains</td><td style={{padding:"6px 10px"}}>N retrains</td><td style={{padding:"6px 10px"}}>N retrains</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Auditability</td><td style={{padding:"6px 10px"}}>High — two numbers (calibrator + tau)</td><td style={{padding:"6px 10px"}}>Medium</td><td style={{padding:"6px 10px"}}>Low (gamma hidden)</td><td style={{padding:"6px 10px"}}>Low (margin hidden)</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Production environment with Risk PMs</strong> who need to read and own the threshold policy.</li>
-        <li><strong>Cost matrix shifts often</strong> — monthly business reviews, seasonal pricing, regulatory updates.</li>
-        <li><strong>Per-segment policy</strong> — different merchants, geographies, or channels deserve different thresholds.</li>
-        <li><strong>Downstream consumers need calibrated probabilities</strong> for expected-loss accounting or risk capital.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Threshold drift across segments">
-        Segment-level thresholds need frequent recalibration. As fraud distributions shift (new payment methods, new attack vectors), segments that had threshold 0.7 in January may need 0.55 by June. Automate the threshold sweep as a weekly or monthly job.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Isotonic regression needs enough holdout samples">
-        Calibration with isotonic regression is non-parametric and hungry for data. Tiny segments (under 1000 holdout samples) over-fit the calibration map. Fall back to Platt scaling (logistic) for small segments.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Beware Simpson's paradox in segmented thresholds">
-        Per-segment thresholds can each look great in isolation but produce a worse global outcome if segment definitions interact (e.g., a merchant straddles two segment definitions). Validate the threshold table on global holdout dollars, not just segment-level.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — 22 trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on calibration, threshold moving, and when cost-sensitive loss is the better choice.
+        Every problem hinges on the post-hoc nature: calibrate, then move threshold, training loss unchanged. Sister concepts (loss-level interventions) explicitly contrasted.
       </p>
 
       <VIS.TrapProblem
-        id="thr-p1"
+        id="thm-p1"
         difficulty="hard"
-        title="P1 — Why decouple training loss from threshold?"
-        scenario={<>An interviewer asks: "Why not just bake the cost into the loss with weighted BCE?" Give the senior-MLE answer.</>}
+        title="P1 — Risk PM asks: 'Why threshold moving over focal for our fraud pipeline?'"
+        scenario={<><em>Discriminating insight: post-hoc lever is auditable, segment-tunable, drift-resilient, and preserves calibration. Loss-level (focal) hides the lever inside training. Risk PMs prefer auditable.</em><br/><br/>Pitch threshold moving.</>}
         options={[
-          {key:"a", text:"Decoupling lets the model produce calibrated probabilities once, while threshold policies adapt independently per segment, per business cycle, and per cost-matrix change — no retraining needed. The model is a probability estimator; the threshold is the business policy. Mixing them couples ML velocity to business cycle velocity, which slows both.", correct:true},
-          {key:"b", text:"Weighted BCE is mathematically wrong."},
-          {key:"c", text:"Threshold tuning is always better."},
-          {key:"d", text:"Decoupling doubles compute cost."},
+          {key:"a", text:"Threshold moving is newer."},
+          {key:"b", text:"Train a GBDT with default loss (clean, well-understood). Then fit a calibrator on holdout (Platt or isotonic — one parameter or a monotone curve, fully auditable). Then move the decision threshold to optimize expected $ savings per merchant segment. Two post-hoc numbers, both independently auditable, both re-tunable PER SEGMENT without retraining (focal requires a model retrain to change gamma; threshold moving lets you re-tune the threshold daily per merchant from a single trained model). Calibrated probabilities are preserved (focal distorts them). Drift response is cheap (re-tune threshold; focal needs retrain). For production fraud where Risk PMs need transparency and you have many segments, post-hoc threshold moving usually wins.", correct:true},
+          {key:"c", text:"Focal is wrong."},
+          {key:"d", text:"They're equivalent."},
         ]}
-        trap={<>(b) is wrong — weighted BCE is mathematically valid. (c) is too strong. (d) is false; threshold tuning is essentially free at inference.</>}
-        lens={<>(a) — the win is separation of concerns. ML produces calibrated probabilities; business produces threshold policy. Each can move at its own clock speed. This is why Stripe Radar, Sift, and most large-scale fraud stacks ship this way.</>}
-        stretch={<>When does coupling them (weighted BCE) actually win?</>}
+        trap={<>(a)(c)(d) miss the post-hoc + segment-tunable advantages.</>}
+        lens={<>B3 redact-test: strip "post-hoc + calibrated + segment-tunable" and only (b) collapses.</>}
+        stretch={<>When does focal outperform threshold moving even on a GBDT-friendly fraud problem?</>}
       />
 
       <VIS.TrapProblem
-        id="thr-p2"
+        id="thm-p2"
         difficulty="hard"
-        multiSelect
-        title="P2 — Isotonic vs Platt calibration"
-        scenario={<>Which statements are true about choosing between isotonic and Platt scaling? Select all that apply.</>}
+        title="P2 — Probability-calibrated GBDT: decision threshold = 0.5?"
+        scenario={<><em>Discriminating insight: NO. Calibrated means P_predicted is honest, but at 1:1000 imbalance the OPTIMAL threshold (for any reasonable cost matrix) is far from 0.5. Calibration and threshold are independent.</em><br/><br/>Threshold misconception.</>}
         options={[
-          {key:"a", text:"Isotonic is non-parametric and flexible but needs more holdout samples (rough rule: 1000+).", correct:true},
-          {key:"b", text:"Platt is a logistic fit; works with small holdout sets but assumes a sigmoid shape that may not match the miscalibration curve.", correct:true},
-          {key:"c", text:"Isotonic preserves the ranking of predictions; calibrated probabilities are monotone in raw scores.", correct:true},
-          {key:"d", text:"Platt is uniformly better than isotonic.", correct:false},
-          {key:"e", text:"Calibration via monotone maps preserves AUC since AUC depends only on ranking.", correct:true},
+          {key:"a", text:"Yes, 0.5."},
+          {key:"b", text:"NO. Calibration means P_predicted matches empirical frequency — if the model says p=0.7, then about 70% of those samples are positive. At 1:1000 imbalance, MOST samples have calibrated p well below 0.5 — the BASE RATE is 0.001, so even a positive class's average predicted p might be 0.05-0.15. The optimal threshold depends on the cost matrix: tau = cost(FP) / (cost(FP) + cost(FN)), per Bayes. At fraud rate 1:1000 with cost(miss) = $200 and cost(FP) = $1 (review cost), optimal tau is about 1/201 ≈ 0.005. Calibration is independent of threshold. Confusing the two is the most common rookie error in cost-sensitive fraud ML.", correct:true},
+          {key:"c", text:"Yes, 0.5 always."},
+          {key:"d", text:"Threshold = 1 - calibration."},
         ]}
-        trap={<>(d) is the seductively wrong "Platt is simpler so it must be better" answer. Candidates who think calibration changes AUC miss (e).</>}
-        lens={<>(a)-(c) are the standard isotonic/Platt distinctions. (e) is a true fact: calibration is monotone, so AUC is preserved. The actual trap is candidates who think calibration changes AUC.</>}
-        stretch={<>Why does isotonic with too little data overfit while Platt does not?</>}
+        trap={<>(a)(c)(d) confuse calibration with threshold.</>}
+        lens={<>Calibration and threshold are independent. Even with calibrated probs, optimal tau is not 0.5 for imbalanced cost.</>}
+        stretch={<>Derive the Bayes-optimal tau given cost(FN) and cost(FP).</>}
       />
 
       <VIS.TrapProblem
-        id="thr-p3"
+        id="thm-p3"
+        difficulty="hard"
+        title="P3 — Platt vs Isotonic: which calibrator?"
+        scenario={<><em>Discriminating insight: Platt fits a sigmoid (one shape, parametric, low variance, biased if true shape is non-sigmoidal). Isotonic fits ANY monotone shape (flexible but needs more calibration data ~1000+ positives). GBDT often needs isotonic because raw GBDT probs are S-curved or step-shaped.</em><br/><br/>Pick the calibrator.</>}
+        options={[
+          {key:"a", text:"Always Platt."},
+          {key:"b", text:"Choose by calibration-curve shape and calibration-set size. PLATT scaling fits a one-sigmoid map a * sigmoid(b * score + c); it's parametric, low-variance, biased if the true calibration shape is non-sigmoidal. ISOTONIC regression fits any monotone-increasing step function; flexible, captures non-sigmoidal shapes (S-curves with kinks, plateaus), but high-variance — needs >1000 positives in calibration set or it overfits. For GBDT under imbalance, raw probabilities often have non-sigmoidal calibration curves (sharp jumps at decision regions), so ISOTONIC usually wins if data permits. Sweep both on a holdout and pick by validation log-loss or Brier.", correct:true},
+          {key:"c", text:"Always isotonic."},
+          {key:"d", text:"Doesn't matter."},
+        ]}
+        trap={<>(a)(c) absolutist; (d) misses the empirical reality.</>}
+        lens={<>Platt = sigmoid-shape, low data. Isotonic = any monotone shape, more data. Sweep both.</>}
+        stretch={<>Why does GBDT often have a step-shaped raw calibration curve?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p4"
+        difficulty="hard"
+        title="P4 — Threshold moving vs asymmetric BCE: redundant?"
+        scenario={<><em>Discriminating insight: asymptotically equivalent (loss-weighting = threshold shift in log-odds) BUT practical implementations differ in calibration, optimization, and segment-flexibility. Threshold moving wins on engineering merits.</em><br/><br/>Compare.</>}
+        options={[
+          {key:"a", text:"Identical."},
+          {key:"b", text:"Asymptotically equivalent, practically distinct. In theory: weighting positives by w_pos shifts the Bayes-optimal threshold by log(w_pos/w_neg) — so per-class loss weighting is equivalent to threshold shifting on calibrated outputs. In practice: (1) threshold moving doesn't disturb training, so calibration is naturally preserved; (2) threshold moving is segment-flexible — change tau per merchant without retraining; (3) under prior drift, only tau needs re-tuning; (4) audit trail is two numbers, not loss-level surgery. Asymmetric BCE biases the optimization trajectory and the produced model is slightly different (under-parameterization, BatchNorm, regularization interactions). For PRODUCTION fraud with many segments and drift, threshold moving usually wins on engineering merits even though they're theoretically equivalent.", correct:true},
+          {key:"c", text:"Completely different."},
+          {key:"d", text:"Asymmetric BCE strictly better."},
+        ]}
+        trap={<>(a)(d) absolutist.</>}
+        lens={<>Asymptotic equivalence; practical engineering advantage favors threshold moving in production.</>}
+        stretch={<>What's the test that determines whether they actually diverge in practice?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p5"
         difficulty="medium"
-        title="P3 — Picking the threshold"
-        scenario={<>Sweep thresholds on a holdout. The optimal point maximizes which quantity?</>}
+        title="P5 — Calibrator fit on training data: ok or not?"
+        scenario={<><em>Discriminating insight: NEVER fit calibrator on training data — the model is over-confident on its own training set, so calibrator absorbs noise. Use a separate held-out set the model didn't train on.</em><br/><br/>Where to fit.</>}
         options={[
-          {key:"a", text:"Expected dollar savings: sum over holdout of [TP_savings(d_i) - FP_friction_cost]. Pick tau that maximizes this sum. Compute the curve at fine granularity (0.01 steps) because the optimum can be sharp.", correct:true},
-          {key:"b", text:"F1 score on the holdout."},
-          {key:"c", text:"Accuracy on the holdout."},
-          {key:"d", text:"AUC on the holdout."},
+          {key:"a", text:"Yes, training data is fine."},
+          {key:"b", text:"NO. The model has been optimized to minimize loss on the training set; raw probabilities on training samples are typically over-confident (model has overfit to training peculiarities). Fitting a calibrator on training data absorbs that overfitting noise as 'calibration' and produces a calibrator that doesn't generalize. Always hold out a separate calibration set (5-10% of data, never seen during training or model selection). Fit the calibrator on that holdout. Evaluate Brier/ECE on yet another test set. Cross-validation alternative: use out-of-fold predictions for calibration data (more data-efficient but more code).", correct:true},
+          {key:"c", text:"Training is best."},
+          {key:"d", text:"Doesn't matter."},
         ]}
-        trap={<>(b)-(d) are ML metrics, not business metrics. The threshold should optimize the business objective.</>}
-        lens={<>(a) — threshold moving is a business optimization. Optimize the dollar metric. F1 is for ML reviewers; dollars are for Risk PMs.</>}
-        stretch={<>How does the threshold change if you weight false positives by long-run churn cost?</>}
+        trap={<>(a)(c)(d) leak.</>}
+        lens={<>Calibrate on HELD-OUT data the model never saw. Otherwise calibration is just memorization.</>}
+        stretch={<>How to do this with cross-validation when data is limited?</>}
       />
 
       <VIS.TrapProblem
-        id="thr-p4"
+        id="thm-p6"
         difficulty="hard"
-        title="P4 — Threshold drift detection"
-        scenario={<>You set thresholds in January. By June, your dollar savings are dropping. How do you detect threshold drift?</>}
+        title="P6 — Threshold drifts across merchants. How to manage?"
+        scenario={<><em>Discriminating insight: different merchants have different priors and cost matrices, so thresholds should be tuned per merchant. Production pattern: single trained model + N per-merchant thresholds in a config table, refreshed weekly.</em><br/><br/>Per-segment tuning.</>}
         options={[
-          {key:"a", text:"Monitor segment-level realized FN cost / FP cost ratio. If actual ratio drifts away from the cost matrix assumed when picking tau, the threshold is mis-tuned. Trigger automated re-sweep weekly.", correct:true},
-          {key:"b", text:"Wait for a customer complaint."},
-          {key:"c", text:"Retrain the model from scratch."},
-          {key:"d", text:"Lower all thresholds by 0.1."},
+          {key:"a", text:"Single threshold for all."},
+          {key:"b", text:"Per-merchant thresholds in a config table. Single trained model produces calibrated probabilities; per-merchant cost matrices and base rates produce per-merchant optimal thresholds. Production pattern: weekly job recomputes tau_merchant on a sliding-window holdout; results stored in a small Redis / config table keyed by merchant_id. Inference reads tau_merchant. If merchant is new or low-volume, fall back to a global default tau. Critical advantage over loss-level intervention: ZERO model retrains required to refresh thresholds. Pair with monitoring on per-merchant precision/recall to catch threshold staleness.", correct:true},
+          {key:"c", text:"Retrain per merchant."},
+          {key:"d", text:"Never tune per merchant."},
         ]}
-        trap={<>(b) is reactive. (c) treats threshold drift as a model problem. (d) is voodoo.</>}
-        lens={<>(a) — threshold drift is detected by monitoring the cost-ratio invariant. When realized FP cost per FN cost diverges from the matrix assumed when picking tau, automated re-sweep. Set this up as a SLO with paging if drift exceeds X percent.</>}
-        stretch={<>What invariant would you monitor for calibration drift, separately from threshold drift?</>}
+        trap={<>(a)(c)(d) miss the per-segment + weekly-refresh pattern.</>}
+        lens={<>Single model + N thresholds in config. Refresh weekly. Loss-level can't compete on this.</>}
+        stretch={<>How to detect threshold staleness automatically?</>}
       />
 
       <VIS.TrapProblem
-        id="thr-p5"
+        id="thm-p7"
         difficulty="medium"
-        multiSelect
-        title="P5 — Where calibration fails"
-        scenario={<>Which of these will make your calibration map wrong? Select all that apply.</>}
+        title="P7 — Optimization objective for tau: maximize $-savings, or hit FPR target?"
+        scenario={<><em>Discriminating insight: depends on whether you have a clean $ cost matrix or a hard FPR constraint (e.g., compliance). Most fraud teams set a hard FPR target (say 1%) and pick tau to maximize recall at that target.</em><br/><br/>Tau objective.</>}
         options={[
-          {key:"a", text:"Calibrating on a non-representative holdout (e.g., a temporally separated sample with different fraud mix).", correct:true},
-          {key:"b", text:"Tiny holdout (under 1000 samples) used for isotonic regression.", correct:true},
-          {key:"c", text:"Training distribution drift since the calibration set was assembled.", correct:true},
-          {key:"d", text:"Using the same data for training and calibration (data leakage).", correct:true},
-          {key:"e", text:"Storing probabilities as float32 instead of float64.", correct:false},
+          {key:"a", text:"Always max accuracy."},
+          {key:"b", text:"Two common patterns. (1) Cost-based: pick tau maximizing E[$savings] = recall(tau) * $/fraud * N_fraud - fpr(tau) * $/FP * N_legit. Requires clean $ estimates. (2) Constraint-based: tau such that FPR <= 1% (or whatever operational/compliance constraint), maximize recall at that constraint. Most fraud teams use (2) because $/FP is hard to estimate (includes intangible customer-friction cost) while FPR is operationally bounded by review-team capacity. (3) Multi-objective: Pareto frontier of (recall, fpr) and pick a tau by business preference. Always validate the chosen tau on a separate test set — overfitting tau to the calibration set is a real risk.", correct:true},
+          {key:"c", text:"Always 0.5."},
+          {key:"d", text:"Maximize AUC."},
         ]}
-        trap={<>(e) is a red-herring "looks technical" distractor. The first four are the real failure modes.</>}
-        lens={<>(a)-(d) are the canonical calibration failure modes. (a) is the most common — practitioners assemble a calibration set that doesn't match production traffic. Set up automated checks for calibration freshness.</>}
-        stretch={<>How would you build a representative calibration holdout for a seasonal business?</>}
+        trap={<>(a)(c)(d) miss the business-objective dependency.</>}
+        lens={<>$ savings or constrained-recall@FPR. Validate on held-out test.</>}
+        stretch={<>How to express 'customer friction' in $ for the cost-based objective?</>}
       />
 
       <VIS.TrapProblem
-        id="thr-p6"
+        id="thm-p8"
         difficulty="hard"
-        title="P6 — Segment definition trap (Simpson's paradox)"
-        scenario={<>You define segments by merchant. Per-merchant thresholds each look great. Global dollar savings DROP. What's happening?</>}
+        title="P8 — Class prior shifts week-over-week (1:1000 to 1:500). How does threshold moving cope vs loss-level?"
+        scenario={<><em>Discriminating insight: threshold moving handles drift naturally — re-tune tau weekly on fresh holdout, takes minutes. Loss-level needs full retrain. Threshold's drift-resilience is a major production advantage.</em><br/><br/>Drift handling.</>}
         options={[
-          {key:"a", text:"Likely Simpson's paradox: merchants share customers, so a threshold tuned per merchant in isolation creates inconsistent decisions for the same customer across merchants. Or your segment definitions aren't disjoint (one txn lands in two segments). Validate threshold table on global holdout, not just segment-level.", correct:true},
-          {key:"b", text:"Your model is broken; retrain."},
-          {key:"c", text:"GBDT can't handle segments."},
-          {key:"d", text:"You're using the wrong calibration method."},
+          {key:"a", text:"Loss-level wins."},
+          {key:"b", text:"Threshold moving wins under drift. When the prior shifts from 1:1000 to 1:500 (twice as much fraud), the Bayes-optimal tau also shifts. With threshold moving: pull a fresh week of labeled data, re-fit the calibrator (or apply a prior-shift correction in closed form: shift logit by log(new_prior / train_prior)), re-compute optimal tau — takes minutes, no retrain. With loss-level (asymmetric BCE, focal, LDAM): the per-class weight/margin was set under the OLD prior and is now misspecified; correction requires re-tuning the loss and re-training the model — hours to days. Threshold moving's drift resilience is one of the most valuable production advantages it has over loss-level interventions.", correct:true},
+          {key:"c", text:"Both equivalent."},
+          {key:"d", text:"Drift doesn't matter."},
         ]}
-        trap={<>(b)-(d) misattribute. The issue is segment composition, not the model.</>}
-        lens={<>(a) — segmented thresholds are powerful but the global outcome depends on segment composition. Always validate the threshold table on a global holdout dollar metric. If global drops while per-segment improves, redefine segments to be disjoint.</>}
-        stretch={<>How would you design a segmented threshold that is invariant to overlap?</>}
+        trap={<>(a)(c)(d) miss drift advantage.</>}
+        lens={<>Drift = threshold's playground. Loss-level needs retrain.</>}
+        stretch={<>What's the closed-form prior-shift correction on the logit?</>}
       />
 
       <VIS.TrapProblem
-        id="thr-p7"
+        id="thm-p9"
         difficulty="hard"
-        title="P7 — When cost-sensitive loss wins over threshold tuning"
-        scenario={<>Sometimes weighted BCE wins. When?</>}
+        title="P9 — Calibration on a sliding window holdout: how big?"
+        scenario={<><em>Discriminating insight: needs >= 1000 positives for stable isotonic, >= 100 for Platt. At 1:1000 imbalance that means 1M+ samples for isotonic. Use stratified sampling to boost positives.</em><br/><br/>Calibration set size.</>}
         options={[
-          {key:"a", text:"When cost matrix is genuinely stationary AND dollar variance is huge (1000x) AND you want the model itself to allocate its capacity to high-dollar regions. Threshold tuning can't change which features the model attends to; weighted BCE can.", correct:true},
-          {key:"b", text:"Always — weighted BCE is mathematically better."},
-          {key:"c", text:"Never — threshold tuning is universally better."},
-          {key:"d", text:"When you have small data."},
+          {key:"a", text:"100 samples is enough."},
+          {key:"b", text:"By positives, not total. ISOTONIC needs >= 1000 positives for stable monotone fit (otherwise overfits with step artifacts). PLATT needs >= 100 positives for stable sigmoid fit. At 1:1000 imbalance, isotonic needs 1M+ samples in the calibration set, Platt needs 100K+. Mitigations: (1) sliding-window keeps the freshest 30-90 days; (2) stratified sampling — keep ALL positives and sample negatives at 1:10 or 1:50 (then correct the sample weights when fitting the calibrator); (3) cross-validation with out-of-fold predictions on positives only. Validate the fitted calibrator on a true held-out set and watch for over-fit step artifacts in isotonic.", correct:true},
+          {key:"c", text:"1B samples needed."},
+          {key:"d", text:"Doesn't matter."},
         ]}
-        trap={<>(b) and (c) are absolute statements. (d) is wrong direction — small data hurts weighted BCE more.</>}
-        lens={<>(a) — the precise edge case where weighted BCE wins: stable costs plus extreme heterogeneity. The model's representational capacity is finite; if you don't tell it which samples matter most via the loss, it spreads capacity uniformly. Weighted loss is then a legitimate edge over post-hoc threshold tuning.</>}
-        stretch={<>How would you test in production whether weighted BCE is winning the edge case?</>}
+        trap={<>(a)(c)(d) miss the positive-count requirement.</>}
+        lens={<>Isotonic: 1000+ positives. Platt: 100+ positives. Total samples follows from imbalance.</>}
+        stretch={<>How does sample stratification interact with calibration validity?</>}
       />
 
       <VIS.TrapProblem
-        id="thr-p8"
+        id="thm-p10"
         difficulty="medium"
-        title="P8 — Calibration plot reading"
-        scenario={<>Your reliability diagram shows predicted probabilities consistently UNDER-estimating actual fraud frequency by about 30 percent (the curve lies below the diagonal). What's the fix?</>}
+        title="P10 — GBDT with class weights = no calibration needed?"
+        scenario={<><em>Discriminating insight: NO. Class weighting in GBDT (XGBoost scale_pos_weight) shifts probability outputs — calibration still needed (perhaps more so). Calibration is independent of training loss settings.</em><br/><br/>Calibration requirement.</>}
         options={[
-          {key:"a", text:"Fit isotonic or Platt calibration on a representative holdout. The under-prediction will be corrected by the monotone map. Then re-do threshold sweeps on calibrated probabilities.", correct:true},
-          {key:"b", text:"Retrain the model with weighted BCE."},
-          {key:"c", text:"Lower all thresholds by 30 percent."},
-          {key:"d", text:"Ignore — AUC is fine."},
+          {key:"a", text:"Class weights = calibrated."},
+          {key:"b", text:"NO. Setting scale_pos_weight = N_neg / N_pos in XGBoost shifts the probability outputs toward positives — they become MORE miscalibrated, not less, relative to the empirical fraud rate. The model now outputs probabilities consistent with a balanced posterior, not the true imbalanced posterior. To recover true probabilities you can: (a) invert the known shift analytically (P_true = w_neg P_tilted / (w_neg P_tilted + w_pos (1-P_tilted))), or (b) fit a post-hoc calibrator on holdout (Platt or isotonic). Either way, calibration is REQUIRED, just from a tilted starting point. The notion that 'class weights = calibrated' is a common rookie misconception.", correct:true},
+          {key:"c", text:"Always calibrated."},
+          {key:"d", text:"Never calibrated."},
         ]}
-        trap={<>(b) is overkill. (c) is a heuristic that doesn't respect the shape of miscalibration. (d) ignores the problem.</>}
-        lens={<>(a) — calibration is a one-line fix for systematic under-prediction. The reliability diagram is your friend; fit and apply a calibration map; re-tune thresholds.</>}
-        stretch={<>Why might a model systematically under-predict fraud probability?</>}
+        trap={<>(a)(c)(d) miss the post-weight shift.</>}
+        lens={<>Class weights shift probs; calibration still needed.</>}
+        stretch={<>Why does shifted prob still rank correctly even though it's miscalibrated?</>}
       />
 
       <VIS.TrapProblem
-        id="thr-p9"
+        id="thm-p11"
         difficulty="hard"
-        title="P9 — Calibrated GBDT vs deep network"
-        scenario={<>Is the calibrate-plus-threshold pattern specific to GBDT, or does it work for deep networks?</>}
+        title="P11 — Move threshold OR tune class weights? Both compose; which to start with?"
+        scenario={<><em>Discriminating insight: start with threshold moving on a default-trained model. It's cheaper, more flexible, more auditable. Only reach for loss-level (weights / focal / LDAM) if the model's RANKING is insufficient — diagnosed by low AUPRC.</em><br/><br/>Starting point.</>}
         options={[
-          {key:"a", text:"It works for any probabilistic classifier. GBDT happens to be more naturally calibrated out of the box than ReLU deep networks (which are notoriously over-confident), but the post-hoc calibration step closes that gap. The pattern is architecture-agnostic.", correct:true},
-          {key:"b", text:"Only GBDT supports calibration."},
-          {key:"c", text:"Deep networks can't be calibrated."},
-          {key:"d", text:"Calibration only works for binary classifiers."},
+          {key:"a", text:"Always weights."},
+          {key:"b", text:"Start with threshold moving on a default-trained model with no class weights. Why: (1) cheaper to iterate (no retrain), (2) more auditable, (3) more flexible (per-segment retunable), (4) preserves probability calibration via the separate calibrator step. Diagnose model quality first: if AUPRC is high but the operating point at default threshold is wrong, threshold moving is the right lever. If AUPRC itself is low, the model's RANKING is poor and threshold can't fix that — reach for loss-level (focal for hard-mining, or asymmetric BCE for explicit class weighting) to improve ranking. The ordering: ranking via training, calibration via post-hoc, operating point via threshold.", correct:true},
+          {key:"c", text:"Always focal."},
+          {key:"d", text:"Pick randomly."},
         ]}
-        trap={<>(b)-(d) are wrong. (c) is the most seductive misconception because deep nets are notoriously over-confident, but calibration techniques (temperature scaling, isotonic) work on them too.</>}
-        lens={<>(a) — calibration is architecture-agnostic. Deep nets need temperature scaling or isotonic on a holdout; GBDT often comes pre-calibrated. The thresholding policy is the same either way.</>}
-        stretch={<>What is temperature scaling and why is it the deep-net analogue of Platt?</>}
+        trap={<>(a)(c)(d) miss the diagnostic order.</>}
+        lens={<>Order: ranking (train) -> calibration (post-hoc) -> threshold (operating point).</>}
+        stretch={<>How to tell if poor performance is ranking-limited or threshold-limited?</>}
       />
 
       <VIS.TrapProblem
-        id="thr-p10"
+        id="thm-p12"
         difficulty="hard"
-        title="P10 — Senior framing of the whole stack"
-        scenario={<>Frame the full calibrate-plus-threshold-moving stack for a Director of Risk who has never seen it.</>}
+        title="P12 — Why is GBDT specifically well-suited to threshold moving (vs neural net)?"
+        scenario={<><em>Discriminating insight: GBDT's tree structure can carve rare-class regions without loss surgery; ranking is usually strong. Neural nets often need loss-level help to learn rare class at all. Threshold moving works best when the model RANKS well.</em><br/><br/>Why GBDT.</>}
         options={[
-          {key:"a", text:"Three loosely-coupled components: a GBDT that learns from data, a calibration step that maps its scores to honest probabilities, and a per-segment threshold policy that translates probabilities to decline decisions. Each component changes on its own schedule — model retrains monthly, calibration weekly, threshold sweeps weekly per segment. Risk PMs own the threshold table. ML owns the model. Calibration is automated. This is what Stripe Radar and Sift run in production.", correct:true},
-          {key:"b", text:"It's a GBDT plus some heuristics."},
-          {key:"c", text:"It's the same as weighted BCE."},
-          {key:"d", text:"It's old-school and we should use deep learning."},
+          {key:"a", text:"GBDT is newer."},
+          {key:"b", text:"Tree models can carve out rare-class regions of feature space by splitting on rare-class-discriminative features; trees don't suffer from the 'easy negatives drown signal' problem as severely as neural nets, because trees split greedily on the most discriminative feature at each node. Result: default-loss GBDT (e.g., binary log-loss, no class weights) typically achieves high AUPRC on imbalanced fraud — the RANKING is strong. The only issue is probability calibration (raw probs are over-confident) and decision threshold (default 0.5 is wrong). Both fixable post-hoc. Neural networks under default loss often fail to learn rare classes at all (gradient is drowned by easy negatives), so they NEED loss-level intervention to even produce a usable ranking. Threshold moving works best when ranking is already strong.", correct:true},
+          {key:"c", text:"Neural nets are better."},
+          {key:"d", text:"Same."},
         ]}
-        trap={<>(b)-(d) miss the structural point: separation of concerns.</>}
-        lens={<>(a) — the senior framing emphasizes that the stack has three components with three ownership boundaries and three update cadences. Risk PMs read the threshold; ML owns the model; the calibration step is the bridge. This is what Directors want to hear.</>}
-        stretch={<>How would you onboard a new segment with no labelled data?</>}
+        trap={<>(a)(c)(d) miss the tree-vs-NN architectural difference.</>}
+        lens={<>Trees rank well by default; NNs need loss help. Threshold moving leverages strong rankers.</>}
+        stretch={<>What signal indicates a GBDT does NEED loss-level help?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p13"
+        difficulty="medium"
+        title="P13 — Threshold moving with isotonic: monotone violation in calibration curve. Diagnose."
+        scenario={<><em>Discriminating insight: isotonic forces monotonicity; a 'violation' usually means too few samples in a bin causing the pool-adjacent-violators algorithm to merge bins. Solution: more calibration data, or smooth the calibration curve.</em><br/><br/>Isotonic artifacts.</>}
+        options={[
+          {key:"a", text:"Bug in code."},
+          {key:"b", text:"Symptom of small or unevenly distributed calibration set. Isotonic uses the pool-adjacent-violators (PAV) algorithm to enforce monotonicity. When some probability bins have few samples, PAV merges them into wide flat steps — visually 'monotonicity violations' in the input data become large plateaus in the calibrator output. Result: the calibrator returns the same probability for a wide range of raw scores, which is rarely what you want. Fixes: (1) increase calibration set size or stratify by raw score, (2) post-smooth the isotonic curve with a small monotone-respecting smoother, (3) switch to Platt if calibration set is small.", correct:true},
+          {key:"c", text:"Isotonic is broken."},
+          {key:"d", text:"Use Platt."},
+        ]}
+        trap={<>(a)(c)(d) wrong diagnosis.</>}
+        lens={<>Isotonic plateaus = PAV merging sparse bins. Add data or smooth.</>}
+        stretch={<>What's the minimum bin size for stable PAV?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p14"
+        difficulty="hard"
+        title="P14 — Two thresholds: 'review queue' (low tau) and 'auto-block' (high tau). How to optimize jointly?"
+        scenario={<><em>Discriminating insight: multi-threshold policy = tau_review for human review, tau_block for auto-block. Solve as a discrete policy optimization: pick (tau_review, tau_block) maximizing E[$savings] under a review-capacity constraint.</em><br/><br/>Multi-threshold policy.</>}
+        options={[
+          {key:"a", text:"Use one tau."},
+          {key:"b", text:"Three-tier policy: score < tau_review -> approve, tau_review <= score < tau_block -> route to human review, score >= tau_block -> auto-block. Optimize: pick (tau_review, tau_block) jointly to maximize E[$savings] = (recall@tau_block * $/fraud) + (recall@tau_review * $/fraud * P(human catches)) - costs. Constraints: review queue volume = N_legit * (FPR@tau_review - FPR@tau_block) <= review_capacity_per_day. Solve as a discrete 2D search over (tau_review, tau_block) on a calibration-set grid. Easy to extend to more tiers. The flexibility of post-hoc threshold moving makes this multi-tier policy possible without ANY model change.", correct:true},
+          {key:"c", text:"Train two models."},
+          {key:"d", text:"Doesn't matter."},
+        ]}
+        trap={<>(a)(c)(d) miss the multi-tier policy.</>}
+        lens={<>Multi-threshold policy is a search over tau-tuple, constrained by review capacity.</>}
+        stretch={<>How to express the human-review catch rate in the optimization?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p15"
+        difficulty="hard"
+        title="P15 — Calibration vs threshold-moving: which to do first?"
+        scenario={<><em>Discriminating insight: ALWAYS calibrate first. Threshold without calibration uses raw scores that are not probabilities; tau interpretation isn't meaningful. Calibrate -> threshold.</em><br/><br/>Order.</>}
+        options={[
+          {key:"a", text:"Threshold first."},
+          {key:"b", text:"Calibrate FIRST, then threshold. Reason: threshold is meaningful as a probability cutoff only if probabilities are calibrated. Picking tau = 0.42 on a raw GBDT score doesn't have a clean Bayesian interpretation, and the tau may not transfer when the model is retrained. After calibration, tau is the literal probability above which you classify as positive — and the optimal tau is computable from the cost matrix via Bayes. Order: train -> calibrate on holdout -> compute optimal tau on calibrated scores -> deploy. The two post-hoc steps compose cleanly only in this order.", correct:true},
+          {key:"c", text:"Doesn't matter."},
+          {key:"d", text:"Both simultaneously."},
+        ]}
+        trap={<>(a)(c)(d) miss the order.</>}
+        lens={<>Calibrate -> threshold. Order matters for tau interpretation.</>}
+        stretch={<>What goes wrong if you threshold raw scores?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p16"
+        difficulty="medium"
+        title="P16 — GBDT trained with scale_pos_weight=1000, then calibrate. Issue?"
+        scenario={<><em>Discriminating insight: when GBDT is trained with class weights, raw probs are TILTED away from the true posterior. The calibrator absorbs the tilt — works fine. Subtle issue: re-using the calibrator after re-training with different scale_pos_weight requires re-fitting.</em><br/><br/>Compose weights + calibration.</>}
+        options={[
+          {key:"a", text:"Calibration doesn't work."},
+          {key:"b", text:"Works fine but couples tightly to training config. With scale_pos_weight = 1000, raw probabilities are tilted toward the positive class — they're not the true posterior. Fit calibrator on holdout: it absorbs the tilt and produces honest probs. Subtle issue: if you change scale_pos_weight in a future retrain (e.g., to 500), the tilt changes, and the OLD calibrator is now wrong — you must re-fit. Cleaner: train GBDT with default loss (scale_pos_weight = 1), calibrate normally, threshold-move. This decouples the calibrator from training hyperparameters and is more robust.", correct:true},
+          {key:"c", text:"Better than no weights."},
+          {key:"d", text:"Calibrator is wrong."},
+        ]}
+        trap={<>(a)(c)(d) miss the coupling.</>}
+        lens={<>Class weights + calibrator work but couple to training. Default loss + calibrate decouples.</>}
+        stretch={<>When does class weighting still help even with post-hoc calibration?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p17"
+        difficulty="hard"
+        title="P17 — Junior says 'threshold moving = same as Bayes-optimal decision rule with prior'. Diagnose."
+        scenario={<><em>Discriminating insight: TRUE — at calibrated probabilities, threshold moving IS the Bayes-optimal decision rule with a cost matrix. The decision tau = cost(FP) / (cost(FP) + cost(FN)). This is the canonical statement.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Wrong."},
+          {key:"b", text:"Correct, with one important caveat. Given a calibrated probability p (where p = P(y=1|x)), the Bayes-optimal decision rule under a 0-1 cost matrix is 'predict positive if p > 0.5'. Under a cost matrix with cost(FN) and cost(FP), the optimal rule is 'predict positive if p > cost(FP) / (cost(FP) + cost(FN))'. So threshold moving on calibrated probabilities IS the implementation of the Bayes-optimal cost-sensitive decision rule. Caveat: this requires the probabilities to be ACTUALLY calibrated; if they're miscalibrated, tau computed from cost matrix won't deliver optimal cost. Reinforces 'calibrate first, threshold second'.", correct:true},
+          {key:"c", text:"Threshold = average."},
+          {key:"d", text:"Coincidence."},
+        ]}
+        trap={<>(a)(c)(d) miss the theoretical grounding.</>}
+        lens={<>Threshold moving = Bayes-optimal cost-sensitive decision on calibrated probs.</>}
+        stretch={<>What changes if probabilities are only approximately calibrated?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p18"
+        difficulty="medium"
+        title="P18 — Multi-class fraud (5 fraud types + legit). Threshold moving still applies?"
+        scenario={<><em>Discriminating insight: yes — calibrate each class probability (one-vs-rest), then apply per-class threshold OR a multi-class cost-sensitive decision rule (pick class minimizing E[cost]). Multi-class generalization is clean.</em><br/><br/>Multi-class.</>}
+        options={[
+          {key:"a", text:"Binary only."},
+          {key:"b", text:"Cleanly generalized. Calibrate each class probability — either via one-vs-rest Platt/isotonic per class, or via a multi-class calibrator (Dirichlet calibration or vector Platt scaling). Then for decision: (a) if your policy is 'predict the most likely class', simple argmax on calibrated probs; (b) if you have a cost matrix C[true, pred], pick the class y_hat = argmin_y sum_t p_t * C[t, y]; (c) if you want a 'fraud-or-not' binary decision, sum over fraud-type probs and apply a single binary threshold. Multi-class threshold moving extends naturally — the post-hoc pipeline is independent of class count.", correct:true},
+          {key:"c", text:"Doesn't work."},
+          {key:"d", text:"Use focal."},
+        ]}
+        trap={<>(a)(c)(d) miss the multi-class extension.</>}
+        lens={<>Multi-class: calibrate then argmin expected cost. Same pipeline, multi-d generalization.</>}
+        stretch={<>Which multi-class calibrator handles correlated class probabilities best?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p19"
+        difficulty="hard"
+        title="P19 — Threshold moving fails: AUC excellent, $-savings poor at any threshold. Diagnose."
+        scenario={<><em>Discriminating insight: AUC averages over all thresholds; $ savings is a SINGLE point. Possible: AUC is high because mid-distribution ranking is good but extreme tails are wrong; the high-$ frauds at the very top of the score distribution are mis-ranked. Threshold moving cannot fix a model whose top-of-distribution is wrong.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Random variance."},
+          {key:"b", text:"AUC is a global metric averaging over all thresholds; $-savings depends on the TOP of the score distribution (highest-score predictions). If the model's mid-distribution ranking is excellent but the very top scores are dominated by high-confidence FALSE positives (e.g., legitimate big-ticket purchases that LOOK like fraud), no threshold choice avoids them. Threshold moving cannot fix poor ranking AT the operating point. Fix: (1) inspect top-K scored cases by hand; (2) add features that distinguish big-ticket-legit from big-ticket-fraud; (3) use a dollar-weighted training loss so the model attends specifically to high-$ examples; (4) ensemble with a model that uses different features.", correct:true},
+          {key:"c", text:"Wrong metric."},
+          {key:"d", text:"Threshold is broken."},
+        ]}
+        trap={<>(a)(c)(d) miss the operating-point dependency.</>}
+        lens={<>AUC global, $-savings at operating point. Threshold can't fix top-of-distribution mis-ranking.</>}
+        stretch={<>How to detect 'top mis-ranking' from production logs?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p20"
+        difficulty="medium"
+        title="P20 — When NOT to use threshold moving?"
+        scenario={<><em>Discriminating insight: when ranking is the problem (model can't learn rare class at all), threshold moving has nothing to move. When you need a single training-time end-to-end pipeline (e.g., for regulators that audit training loss), post-hoc steps may not satisfy.</em><br/><br/>Not threshold moving.</>}
+        options={[
+          {key:"a", text:"Never not use."},
+          {key:"b", text:"Skip threshold moving when: (1) the model's RANKING is poor (low AUPRC even after careful training) — threshold moving has nothing to operate on; reach for focal/LDAM to fix ranking first; (2) calibration data is unavailable or too small for a stable calibrator; (3) regulators require a SINGLE training-time pipeline that encodes the cost matrix as loss (rare but happens — auditability of training-time-only); (4) you can't deploy a separate calibrator + threshold table (legacy serving stack with fixed pipeline). In those regimes, loss-level interventions (asymmetric BCE) are forced.", correct:true},
+          {key:"c", text:"Always use."},
+          {key:"d", text:"Always avoid."},
+        ]}
+        trap={<>(a)(c)(d) absolutist.</>}
+        lens={<>Threshold moving needs good ranking + calibration set + flexible serving stack.</>}
+        stretch={<>What's the AUPRC floor below which threshold moving alone is insufficient?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p21"
+        difficulty="hard"
+        title="P21 — 'Threshold moving is just changing 0.5 to something else.' Diagnose."
+        scenario={<><em>Discriminating insight: false — that misses the calibration step. The full lever is 'calibrate AND threshold-move' as a paired post-hoc pipeline. Without calibration, the threshold has no Bayesian interpretation.</em><br/><br/>Diagnose claim.</>}
+        options={[
+          {key:"a", text:"Correct."},
+          {key:"b", text:"Misses half the lever. The full lever is 'CALIBRATE to honest probabilities, THEN move threshold to the Bayes-optimal point given the cost matrix'. Without calibration, the 'threshold' on raw scores has no Bayesian interpretation; it's an arbitrary scalar and doesn't translate to cost-sensitive decisions cleanly. The two-stage pipeline (calibrate + threshold) is what gives this approach its theoretical grounding (Bayes-optimal decision rule on a probability) and its practical advantages (auditable, segment-tunable, drift-resilient). Calling it 'just changing 0.5' trivializes the actual mechanism.", correct:true},
+          {key:"c", text:"Same."},
+          {key:"d", text:"Threshold doesn't matter."},
+        ]}
+        trap={<>(a)(c)(d) collapse.</>}
+        lens={<>Calibrate + threshold = two-stage post-hoc lever. Not 'just change 0.5'.</>}
+        stretch={<>What's the minimum-viable production threshold pipeline?</>}
+      />
+
+      <VIS.TrapProblem
+        id="thm-p22"
+        difficulty="hard"
+        title="P22 — In one sentence, what's THE unique mechanism of threshold moving + calibrated GBDT?"
+        scenario={<><em>Discriminating insight: TWO-STAGE POST-HOC pipeline — calibrate probabilities (Platt/isotonic on holdout), then move decision threshold (Bayes-optimal on cost matrix). Training loss UNCHANGED.</em><br/><br/>State.</>}
+        options={[
+          {key:"a", text:"Changes the loss."},
+          {key:"b", text:"TWO-STAGE POST-HOC pipeline applied to a default-trained GBDT: (1) fit a probability calibrator (Platt or isotonic) on a held-out set to convert raw GBDT scores into honest probabilities; (2) move the decision threshold to the Bayes-optimal value given the cost matrix (or to hit a target FPR / recall). The training loss is UNCHANGED. The lever is entirely post-hoc — auditable, per-segment tunable, drift-resilient — distinct from asymmetric BCE (per-class loss scalar), focal (per-sample loss modulation), and LDAM (logit margin in training).", correct:true},
+          {key:"c", text:"Just changes 0.5."},
+          {key:"d", text:"Same as focal."},
+        ]}
+        trap={<>(a) wrong direction; (c) trivializes; (d) confuses families.</>}
+        lens={<>Anchor: post-hoc, two-stage (calibrate + threshold), no loss change.</>}
+        stretch={<>Why is 'no loss change' the load-bearing phrase?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li>
-          <a href="https://stripe.com/blog/how-we-built-it-stripe-radar" target="_blank" rel="noopener">
-            <strong>Stripe — How We Built Radar (engineering blog)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(practitioner blog)</span>
-          <br/>The canonical writeup of calibrate-plus-threshold in real production. Read end-to-end before authoring your own stack.
-        </li>
-        <li>
-          <a href="https://scikit-learn.org/stable/modules/calibration.html" target="_blank" rel="noopener">
-            <strong>scikit-learn — Probability Calibration (docs)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(docs)</span>
-          <br/>The practical Platt vs isotonic reference. CalibratedClassifierCV is the code path you'll actually ship.
-        </li>
-        <li>
-          <a href="https://www.fharrell.com/post/classification/" target="_blank" rel="noopener">
-            <strong>Frank Harrell — Classification vs Prediction (blog)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The clearest essay on why calibrated probabilities plus thresholds beat classification accuracy. Harrell is the statistician most cited on this point.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1706.04599" target="_blank" rel="noopener">
-            <strong>Guo et al. — On Calibration of Modern Neural Networks (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2017)</span>
-          <br/>Origin of temperature scaling. Read if you're applying the same pattern to deep networks.
-        </li>
-        <li>
-          <a href="https://www.youtube.com/watch?v=7TX6E5wG-Co" target="_blank" rel="noopener">
-            <strong>Cassie Kozyrkov — Calibration in production ML (video)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(video, ~20 min)</span>
-          <br/>Plain-English explanation of why calibration is a production hygiene problem and how to monitor it.
-        </li>
+        <li><a href="https://scikit-learn.org/stable/modules/calibration.html" target="_blank" rel="noopener"><strong>sklearn — Probability calibration docs</strong></a><br/>Best starting point — covers Platt vs isotonic with worked examples, plus reliability diagrams. The diagrams alone are worth the visit.</li>
+        <li><a href="https://www.cs.cornell.edu/~caruana/niculescu.scldbst.crc.rev4.pdf" target="_blank" rel="noopener"><strong>Niculescu-Mizil & Caruana — Predicting good probabilities</strong></a> <span style={{color:"#64748b", fontSize:14}}>(ICML 2005, paper)</span><br/>The canonical paper showing GBDT and SVM probabilities are miscalibrated and how Platt/isotonic fix it. Read sections 2 and 4.</li>
+        <li><a href="https://machinelearningmastery.com/threshold-moving-for-imbalanced-classification/" target="_blank" rel="noopener"><strong>Jason Brownlee — Threshold-Moving for Imbalanced Classification</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Practitioner walkthrough with code for tau optimization under cost matrix. Quick read.</li>
+        <li><a href="https://stripe.com/blog/how-we-built-it-stripe-radar" target="_blank" rel="noopener"><strong>Stripe — How we built Stripe Radar</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog, 2024-2025)</span><br/>Production fraud at Stripe. The per-merchant threshold table pattern shows up explicitly.</li>
+        <li><a href="https://arxiv.org/abs/2107.07511" target="_blank" rel="noopener"><strong>Angelopoulos & Bates — Conformal Prediction Tutorial</strong></a> <span style={{color:"#64748b", fontSize:14}}>(2022, paper)</span><br/>If you want statistical-guarantee thresholds (Type I error bounded), conformal is the formal extension of threshold moving.</li>
+        <li><a href="https://www.youtube.com/watch?v=NgozZUS8YJ8" target="_blank" rel="noopener"><strong>StatQuest — ROC and AUC (~16 min, video)</strong></a><br/>Foundational; if 'threshold trades precision-recall' isn't already intuitive, watch this before reading the calibration docs.</li>
       </ul>
     </VIS.Section>
   </main>

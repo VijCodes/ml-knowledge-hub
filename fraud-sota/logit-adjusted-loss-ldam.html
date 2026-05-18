@@ -1414,327 +1414,447 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Logit-adjusted loss / LDAM — Fraud SOTA · Class imbalance / rare-event learning
-// Adjust logits by class-prior at train time so loss optimizes balanced error.
+// LDAM / Logit-Adjusted Loss — Fraud SOTA · Class imbalance / rare-event learning.
+// CONCEPT ANCHOR (B3): Class-dependent MARGIN added to the LOGIT before softmax/sigmoid.
+// Geometrically pushes the decision boundary AWAY from rare-class points. Different from
+// asymmetric BCE (per-class scalar on loss), focal (per-sample confidence modulation),
+// threshold moving (post-hoc, no training change). Strip "class-dependent logit margin"
+// and the answer must collapse.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Class imbalance / rare-event learning"
-      title="Logit-adjusted loss / LDAM"
-      subtitle="Subtract a class-prior term from each class's logit before softmax — moves the decision boundary, with formal balanced-error guarantees."
+      title="LDAM / Logit-Adjusted Loss"
+      subtitle="Subtract a class-dependent margin C / n_y^(1/4) from the logit of the TRUE class before softmax. Geometric, not loss-scaling."
       byline={[
-        {label: "Paper", value: "Menon et al. (ICLR 2021); Cao et al. LDAM (NeurIPS 2019)"},
-        {label: "Year", value: "2021"},
-        {label: "L3", value: "Prior-aware loss"},
+        {label: "Papers", value: "Cao et al. LDAM (NeurIPS 2019); Menon et al. Logit Adjustment (ICLR 2021)"},
+        {label: "L3", value: "Class-dependent logit margin"},
+        {label: "Anchor", value: "z_y - Delta_y before softmax, where Delta_y scales with 1/n_y^(1/4)"},
       ]}/>
 
     <VIS.TLDR>
-      Class weighting changes the loss SCALE; the decision boundary stays at p equal to 0.5. Logit adjustment changes the decision boundary itself by subtracting a class-log-prior term from each logit before softmax. The resulting classifier is provably{" "}
-      <VIS.Term def="A classification objective that weights each class equally regardless of its frequency. Equivalent to treating false-positives and false-negatives symmetrically across classes.">Bayes-optimal for balanced error</VIS.Term>{" "}
-      under standard assumptions — a formal guarantee focal loss does not offer. The cost is that you need to know the class prior accurately.
+      Plain cross-entropy under imbalance learns a decision boundary that crowds the rare class — there's little margin around rare-class points, so generalization on rare-class test points suffers. LDAM adds a CLASS-DEPENDENT MARGIN to the logit before softmax: z_y becomes z_y - Delta_y where Delta_y is larger for rare classes (Delta_y proportional to 1/n_y^(1/4)). Effect: at train time the model must produce a logit that EXCEEDS the negative class by MORE than a class-dependent gap to be considered correct — so the learned boundary sits farther from rare-class points. This is{" "}
+      <VIS.Term def="A theoretical bound on how training error generalizes to test error. For imbalanced classes, the bound depends on the per-class margin — larger margin around rare class gives tighter generalization.">theoretically grounded</VIS.Term>{" "}
+      via margin-based generalization bounds (Cao et al.). Different lever from asymmetric BCE (per-class scalar on loss), focal (per-sample (1-p_t)^gamma), threshold moving (post-hoc on a trained model).
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — class-dependent logit margin">
       <p>
-        Imagine your model produces a logit z for each class. Softmax converts logits to probabilities. With class imbalance (positive rate one in ten thousand), the model learns to bias its logits so it almost always predicts negative — that's correct on the training distribution but wrong on balanced error. Logit adjustment subtracts a fixed offset from each class logit so the model is forced to learn features that DISTINGUISH the rare class rather than just predicting its rate.
+        Imagine the model is about to compute softmax over logits z_0 (legit) and z_1 (fraud). Plain CE: softmax(z), cross-entropy with y. LDAM at train time: subtract a class-specific margin Delta_y from the TRUE-class logit before softmax, so the model only counts as 'correct' if z_y exceeds the other logits by more than Delta_y. Delta_y is set proportional to 1/n_y^(1/4) — so the rare class (small n_y) gets a LARGER margin. Geometrically: the rare class's decision region must be 'pushed outward' to satisfy the larger required gap. The result is a boundary that sits farther from rare-class training points, giving better generalization (proven via Cao's margin-bound).
       </p>
-      <p>
-        Two flavors:
-      </p>
-      <ol>
-        <li><strong>Menon-style logit adjustment</strong> — subtract tau times log(pi-y) from the logit of class y during training, where pi-y is the class prior. At test time, use raw logits (no adjustment). Provably consistent for balanced error.</li>
-        <li><strong>LDAM (Label-Distribution-Aware Margin)</strong> — Cao et al.'s related approach: enforce a margin proportional to 1 over the fourth root of the class count. Same intuition, different parametrization. Often combined with deferred re-weighting in the literature.</li>
-      </ol>
+      <VIS.Equation display tex={`\\mathcal{L}_{\\text{LDAM}} = -\\log \\frac{e^{z_y - \\Delta_y}}{e^{z_y - \\Delta_y} + \\sum_{j \\neq y} e^{z_j}}, \\quad \\Delta_y = \\frac{C}{n_y^{1/4}}`}/>
+      <p>The margin Delta_y depends only on n_y (class count), not on the sample. Hyperparameter C is tuned to control overall margin strength (often C is around 0.5 - 1.0 after re-normalization). At test time the model uses plain z (no Delta) for inference, so production scoring is unchanged.</p>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  X["Input x"]
-  X --> NET["Model produces logits z_y"]
-  NET --> ADJ["Subtract tau * log(pi_y) from z_y"]
-  ADJ --> SMX["Softmax"]
-  SMX --> LOSS["Cross-entropy with true label"]
-  LOSS --> GRAD["Gradient updates"]
-  style ADJ fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-      `} />
-
-      <VIS.Equation display tex={`\\mathcal{L}_{\\text{LA}} = -\\log \\frac{\\exp(z_y - \\tau \\log \\pi_y)}{\\sum_{y'} \\exp(z_{y'} - \\tau \\log \\pi_{y'})}` } />
-      <p>The shift is added during training only. Inference uses unshifted logits because the shift exactly cancels the prior at the Bayes-optimal balanced boundary. The Menon paper proves this is the unique linear adjustment giving balanced-error consistency.</p>
+  L["Logits z_0 ... z_K"]
+  Y["True class y"]
+  L --> A["Subtract Delta_y from z_y at train time"]
+  Y --> A
+  A --> S["Softmax + cross-entropy"]
+  S --> G["Gradient pushes boundary away from rare class"]
+  style A fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style G fill:#dcfce7,stroke:#16a34a,stroke-width:2px
+      `}/>
+      <p>Yellow box is THE mechanism: class-dependent margin subtracted from the TRUE-class logit, before softmax. Loss is plain cross-entropy after this surgery. Per-sample logic absent.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from class weighting and focal">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-why" title="Why margin shifting beats loss scaling for generalization on rare classes">
+      <p>
+        Cao et al. proved a generalization bound: for a model with class-dependent margins gamma_y, test error on class y is bounded by O(1/gamma_y * sqrt(1/n_y)). To balance test error across classes, you want gamma_y proportional to 1/n_y^(1/4). That is exactly the LDAM schedule. Loss scaling (asymmetric BCE) does not appear in the bound; you can scale loss any way and the per-class margin is unchanged. So under the margin-bound theory, LDAM is the principled lever for imbalance, and asymmetric BCE is heuristic.
+      </p>
+      <p>
+        Practical recipe (Cao 2019 'DRW' — Deferred Re-Weighting): train with LDAM alone for the first 80% of epochs to shape the boundary; then add class-balanced sampling or per-class weights in the final 20% to fine-tune the calibration. The two-phase schedule outperforms either alone.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="LDAM vs the rest">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Class weighting</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>LDAM</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Asymmetric BCE</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Focal</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Logit adjustment</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Threshold moving</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Mechanism</td>
-            <td style={{padding:"8px 10px"}}>Scale loss per class</td>
-            <td style={{padding:"8px 10px"}}>Down-weight easy samples</td>
-            <td style={{padding:"8px 10px"}}>Shift decision boundary</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Decision-boundary change</td>
-            <td style={{padding:"8px 10px"}}>No — stays at p=0.5</td>
-            <td style={{padding:"8px 10px"}}>Modest, indirect</td>
-            <td style={{padding:"8px 10px"}}>Yes — provably optimal</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Theoretical guarantee</td>
-            <td style={{padding:"8px 10px"}}>None</td>
-            <td style={{padding:"8px 10px"}}>None</td>
-            <td style={{padding:"8px 10px"}}>Consistent for balanced error</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Requires class prior</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Yes — must be accurate</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Calibration impact</td>
-            <td style={{padding:"8px 10px"}}>Modest</td>
-            <td style={{padding:"8px 10px"}}>Substantial</td>
-            <td style={{padding:"8px 10px"}}>Modest (corrected at inference)</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Surgical layer</td><td style={{padding:"6px 10px"}}>Logit (pre-softmax)</td><td style={{padding:"6px 10px"}}>Loss (post-softmax)</td><td style={{padding:"6px 10px"}}>Loss (post-softmax)</td><td style={{padding:"6px 10px"}}>Decision (post-training)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Class lever</td><td style={{padding:"6px 10px"}}>Margin Delta_y proportional to 1/n_y^(1/4)</td><td style={{padding:"6px 10px"}}>Scalar w_y</td><td style={{padding:"6px 10px"}}>(1-p_t)^gamma per sample</td><td style={{padding:"6px 10px"}}>Threshold tau</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Geometric effect</td><td style={{padding:"6px 10px"}}>Larger decision-boundary margin around rare class</td><td style={{padding:"6px 10px"}}>Boundary shifted but no margin enforced</td><td style={{padding:"6px 10px"}}>Boundary shaped by hard-mining</td><td style={{padding:"6px 10px"}}>Boundary translated</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Theory backing</td><td style={{padding:"6px 10px"}}>Margin generalization bound</td><td style={{padding:"6px 10px"}}>Bayes-optimal at infinite data only</td><td style={{padding:"6px 10px"}}>Heuristic</td><td style={{padding:"6px 10px"}}>Bayes-optimal under prior shift</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Inference change</td><td style={{padding:"6px 10px"}}>None (margin only at train)</td><td style={{padding:"6px 10px"}}>None</td><td style={{padding:"6px 10px"}}>None</td><td style={{padding:"6px 10px"}}>Different threshold</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>You need balanced AP or balanced recall</strong> with formal guarantees, not just an empirical bump.</li>
-        <li><strong>Class prior is known accurately</strong> — global fraud rate is measurable and stable.</li>
-        <li><strong>Multi-class long-tail problems</strong> — fraud typology classification with dozens of rare attack categories.</li>
-        <li><strong>You want a principled alternative to focal</strong> when the calibration distortion of focal is unacceptable.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Wrong prior, wrong boundary">
-        Logit adjustment subtracts log(pi-y). If your estimate of pi-y is off by 2x, the boundary is shifted by log(2) — a meaningful error. Estimate the prior from a representative holdout, not from a sub-sampled training set. Recompute when fraud rates shift.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Use shifted logits at training, raw at inference">
-        Most implementation bugs: leaving the shift on at inference time. The Menon paper proves consistency precisely under the regime of "shift at train, raw at test." Get this wrong and you have a worse classifier than plain BCE.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="tau is a hyperparameter">
-        tau equal to 1 is the theoretically motivated default; in practice tau in 0.5 to 2 often works better empirically because of finite-sample effects. Sweep on a validation set.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — 22 trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on logit adjustment, LDAM, and how the prior-aware family contrasts with focal.
+        Every problem hinges on LDAM's unique mechanism: CLASS-DEPENDENT MARGIN added to the TRUE-class LOGIT before softmax. Strip that and answers collapse. Sister concepts (asymmetric BCE, focal, threshold moving) are explicitly contrasted.
       </p>
 
       <VIS.TrapProblem
-        id="la-p1"
+        id="ldam-p1"
         difficulty="hard"
-        title="P1 — Focal vs logit adjustment for 1 in 10000 imbalance"
-        scenario={<>Compare focal loss vs logit-adjusted loss for fraud detection at 1-in-10000 imbalance. Which has better theoretical grounding?</>}
+        title="P1 — Risk PM asks: 'We want generalization guarantees on rare class. Why LDAM over weighted BCE?'"
+        scenario={<><em>Discriminating insight: LDAM is backed by a margin-based generalization bound. Asymmetric BCE has no such bound — its theoretical justification is Bayes-optimality at infinite data, which doesn't speak to finite-sample generalization on rare classes.</em><br/><br/>Pitch the theory.</>}
         options={[
-          {key:"a", text:"Logit adjustment is provably consistent for balanced error under standard assumptions; focal is a heuristic with no such guarantee. In practice, logit adjustment also gives cleaner calibration (the shift can be reverted at inference). However, logit adjustment requires an accurate class-prior estimate; focal doesn't. Picking depends on whether you have a trustworthy prior.", correct:true},
-          {key:"b", text:"Focal is theoretically better."},
-          {key:"c", text:"They're identical."},
-          {key:"d", text:"Neither has theoretical grounding."},
+          {key:"a", text:"LDAM is newer."},
+          {key:"b", text:"LDAM (Cao et al. 2019) is backed by a margin-based generalization bound: test error on class y is O(1/gamma_y * sqrt(1/n_y)) where gamma_y is the per-class margin. The bound is BALANCED across classes when gamma_y is proportional to 1/n_y^(1/4) — which is exactly LDAM's schedule. That bound says: enforcing a larger margin around rare-class training points (LDAM's mechanism) directly improves generalization on those rare classes. Asymmetric BCE adjusts the LOSS magnitude per class, but the per-class margin in the bound is unchanged — so loss reweighting does not improve the generalization bound. Use LDAM when finite-sample generalization on rare classes is the goal.", correct:true},
+          {key:"c", text:"LDAM trains faster."},
+          {key:"d", text:"Same theory."},
         ]}
-        trap={<>(b)-(d) miss the consistency theorem. (a) is the precise answer.</>}
-        lens={<>(a) — the senior answer cites the Menon consistency theorem AND the practical caveat about prior estimation. This is the kind of nuance that distinguishes senior from mid-level.</>}
-        stretch={<>What does "consistent for balanced error" mean operationally?</>}
+        trap={<>(a)(c) miss; (d) collapses.</>}
+        lens={<>B3 redact-test: strip "class-dependent margin" and only (b) collapses. The pitch IS the mechanism.</>}
+        stretch={<>What does the bound say about the 'right' margin schedule under known class priors?</>}
       />
 
       <VIS.TrapProblem
-        id="la-p2"
+        id="ldam-p2"
         difficulty="hard"
-        multiSelect
-        title="P2 — Where logit adjustment fails"
-        scenario={<>Which conditions make logit adjustment less effective? Select all that apply.</>}
+        title="P2 — LDAM vs asymmetric BCE: surgical-layer difference?"
+        scenario={<><em>Discriminating insight: LDAM acts at the LOGIT (pre-softmax). Asymmetric BCE acts at the LOSS (post-softmax). Same goal, different surgical layer with different theoretical and practical implications.</em><br/><br/>Diff the layer.</>}
         options={[
-          {key:"a", text:"Class prior estimate is wrong — the shift is wrong, the boundary is wrong.", correct:true},
-          {key:"b", text:"Class prior shifts during deployment (concept drift).", correct:true},
-          {key:"c", text:"Implementation leaves the shift on at inference time.", correct:true},
-          {key:"d", text:"Logit adjustment works only with deep networks.", correct:false},
-          {key:"e", text:"Logit adjustment requires GPUs.", correct:false},
+          {key:"a", text:"Same layer."},
+          {key:"b", text:"Different surgical layer. LDAM modifies the LOGIT z_y by subtracting a class-dependent margin Delta_y before softmax — this changes what 'correct' means at training time and enforces a geometric margin. Asymmetric BCE multiplies the LOSS by a class-scalar after softmax — this changes the gradient magnitude per class but not the margin. Concretely: at convergence, LDAM produces logit separation z_y - z_other > Delta_y across train points; asymmetric BCE produces the same plain CE-optimal separation, just with a probability shift. The first directly affects margin-based generalization; the second does not.", correct:true},
+          {key:"c", text:"Both at loss."},
+          {key:"d", text:"Both at logit."},
         ]}
-        trap={<>(d) and (e) are wrong. The real failure modes are all prior-related or implementation-related.</>}
-        lens={<>(a)-(c) are the failure modes. The prior is the central assumption; everything depends on getting it right and applying it correctly.</>}
-        stretch={<>How would you detect prior drift in production?</>}
+        trap={<>(a)(c)(d) collapse.</>}
+        lens={<>Logit-margining (LDAM) vs loss-scaling (asymmetric BCE). Different layers, different theory.</>}
+        stretch={<>Can you re-express LDAM as a loss reweighting? Why or why not?</>}
       />
 
       <VIS.TrapProblem
-        id="la-p3"
+        id="ldam-p3"
+        difficulty="hard"
+        title="P3 — LDAM vs focal: where do the mechanisms diverge?"
+        scenario={<><em>Discriminating insight: focal modulates loss by per-sample CONFIDENCE; LDAM modifies logits by per-CLASS MARGIN. Sample-vs-class, confidence-vs-margin — different on both axes.</em><br/><br/>Diff the levers.</>}
+        options={[
+          {key:"a", text:"Same lever."},
+          {key:"b", text:"Different on two axes. (1) Granularity: focal is PER SAMPLE — (1-p_t)^gamma depends on each sample's current p_t. LDAM is PER CLASS — Delta_y depends only on class count. (2) Quantity modified: focal scales the LOSS; LDAM shifts the LOGIT before softmax. Consequences: focal does hard-example mining (concentrates gradient on uncertain samples regardless of class); LDAM enforces a geometric margin around rare-class points regardless of sample difficulty. Focal helps when easy negatives drown out hard positives; LDAM helps when the rare class needs better generalization geometry. Different problems, different cures.", correct:true},
+          {key:"c", text:"Both per-sample."},
+          {key:"d", text:"Both per-class."},
+        ]}
+        trap={<>(a)(c)(d) collapse.</>}
+        lens={<>Focal: per-sample loss modulation. LDAM: per-class logit margin.</>}
+        stretch={<>Can focal + LDAM compose? When does the combination help?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p4"
+        difficulty="hard"
+        title="P4 — LDAM vs threshold moving: which solves what?"
+        scenario={<><em>Discriminating insight: LDAM changes WHAT the model learns (training-time margin); threshold moving changes HOW to use a trained model (inference-time decision point). Independent axes.</em><br/><br/>Different problems.</>}
+        options={[
+          {key:"a", text:"Same."},
+          {key:"b", text:"Different problems on different timelines. LDAM acts at training time on logits to enforce a class-dependent margin — it shapes the learned decision boundary geometry. Threshold moving acts at inference time on a trained model — it picks an operating point on the existing ROC curve without re-training. Use LDAM when the model itself needs better margin around rare classes (generalization); use threshold moving when the model's ranking is good but you need a different precision-recall tradeoff for deployment. They compose: train with LDAM, then threshold-move at inference.", correct:true},
+          {key:"c", text:"Threshold moving subsumes LDAM."},
+          {key:"d", text:"LDAM subsumes threshold moving."},
+        ]}
+        trap={<>(a)(c)(d) collapse the timeline distinction.</>}
+        lens={<>LDAM at train. Threshold at inference. Compose.</>}
+        stretch={<>If you have to pick one, which delivers more value at 1:100K imbalance?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p5"
         difficulty="medium"
-        title="P3 — LDAM's margin"
-        scenario={<>LDAM enforces a margin proportional to 1 over the fourth root of the class count. Why fourth root specifically?</>}
+        title="P5 — Why is Delta_y proportional to 1/n_y^(1/4) and not 1/n_y?"
+        scenario={<><em>Discriminating insight: the margin-bound derivation gives 1/n_y^(1/4) as the schedule that BALANCES test error across classes. Steeper schedules (1/n_y) over-penalize the rare class and hurt majority. Cao proved the 1/4 power.</em><br/><br/>Derive the exponent.</>}
         options={[
-          {key:"a", text:"The fourth-root scaling comes from generalization-bound analysis: the optimal class-specific margin that maximizes balanced-error generalization scales like 1 over n_y^(1/4). It's not arbitrary; it falls out of the Rademacher-complexity bound in the LDAM paper. In practice tau equal to 0.5 (the multiplier) is also tuned.", correct:true},
-          {key:"b", text:"Fourth root is empirically chosen with no theory."},
-          {key:"c", text:"Other roots work equally well."},
-          {key:"d", text:"It's the same as the Menon log."},
+          {key:"a", text:"Empirical sweep gave 1/4."},
+          {key:"b", text:"Cao et al. proved: the per-class test error bound is O((1/gamma_y) sqrt(1/n_y)) under standard concentration assumptions. To balance test error across classes (set the bound equal for all y), we need gamma_y proportional to (1/n_y)^(1/2). The actual LDAM Delta is itself related to gamma by a factor — the final published schedule is Delta_y proportional to 1/n_y^(1/4) (after re-derivation that accounts for the cross-entropy/softmax geometry). Different exponents have different effects: 1/n_y over-margins rare class and crashes majority; constant margin (no n_y) reverts to fixed-margin SVM which doesn't address imbalance. 1/4 is theory-derived, not empirical.", correct:true},
+          {key:"c", text:"Random choice."},
+          {key:"d", text:"1/n_y is correct."},
         ]}
-        trap={<>(b)-(d) miss the theoretical derivation.</>}
-        lens={<>(a) — LDAM's margin scaling has a generalization-bound derivation. Cao et al. show it minimizes a balanced-error upper bound. Read the paper's Theorem 2 if you want the details.</>}
-        stretch={<>How does this generalization bound compare to Menon's consistency theorem?</>}
+        trap={<>(a)(c)(d) miss the theoretical derivation.</>}
+        lens={<>1/n_y^(1/4) is theory-derived, not heuristic. Steeper schedules backfire.</>}
+        stretch={<>What changes if you derive the bound under a different concentration assumption?</>}
       />
 
       <VIS.TrapProblem
-        id="la-p4"
+        id="ldam-p6"
         difficulty="hard"
-        title="P4 — Estimating the prior"
-        scenario={<>Your training set is artificially balanced (you over-sampled positives 100x). What's the prior for logit adjustment?</>}
+        title="P6 — Walk through the gradient of LDAM w.r.t. the logit z_y for class y."
+        scenario={<><em>Discriminating insight: subtracting Delta_y from z_y is equivalent (gradient-wise) to a shift in the cross-entropy 'target probability' — gradient on the TRUE class is reduced by the softmax response at the shifted logit. Effectively the model is told 'you need more confidence than usual to be considered correct'.</em><br/><br/>Gradient derivation.</>}
         options={[
-          {key:"a", text:"Use the TRUE deployment prior, not the training-set prior. Logit adjustment fixes the gap between training-time imbalance and deployment-time balanced-error objective. If you over-sampled, you've already changed the training prior; using the over-sampled prior cancels the adjustment.", correct:true},
-          {key:"b", text:"Use the training-set prior (now balanced)."},
-          {key:"c", text:"Skip logit adjustment if data is over-sampled."},
-          {key:"d", text:"Use the over-sampled prior multiplied by 100."},
+          {key:"a", text:"Same as CE."},
+          {key:"b", text:"Define z'_y = z_y - Delta_y. The loss is plain cross-entropy on the shifted logits. d/dz_y L = (p'_y - 1) where p'_y = softmax over (z'_y, z_others)_y. Compared to plain CE where d/dz_y = (p_y - 1) and p_y is the softmax over original z. The effect: p'_y < p_y (because we subtracted Delta_y from z_y), so (p'_y - 1) is more negative — gradient is LARGER in magnitude for the true class. The model gets stronger pressure to increase z_y at training time, until z_y exceeds the others by more than Delta_y. At test, no Delta is applied; the model uses the original z. Net effect: trained model achieves z_y > z_others + Delta_y on training points, leaving margin Delta_y on the boundary.", correct:true},
+          {key:"c", text:"Gradient flips sign."},
+          {key:"d", text:"Gradient is zero."},
         ]}
-        trap={<>(b) is the most common confident-wrong answer because over-sampling makes the training set balanced. (c) and (d) are wrong.</>}
-        lens={<>(a) — the prior in logit adjustment refers to the DEPLOYMENT distribution, not the training distribution. Sampling tricks during training don't change deployment reality.</>}
-        stretch={<>What if you don't know the deployment prior accurately?</>}
+        trap={<>(a) ignores the shift; (c)(d) wrong.</>}
+        lens={<>Margin shift = harder training target = larger trained margin = better generalization.</>}
+        stretch={<>Why doesn't Delta appear at inference?</>}
       />
 
       <VIS.TrapProblem
-        id="la-p5"
+        id="ldam-p7"
         difficulty="medium"
-        multiSelect
-        title="P5 — Calibration after logit adjustment"
-        scenario={<>What is the calibration behavior of logit-adjusted models at inference time? Select all that apply.</>}
+        title="P7 — Class prior is wrong: n_y misspecified by 2x. What happens to LDAM?"
+        scenario={<><em>Discriminating insight: LDAM depends on n_y (class count). If your reported counts are off by 2x, the margins Delta_y are off by 2^(-1/4) ~ 0.84 — a small relative error in margin, modest impact on generalization. Not as fragile as logit-adjusted-loss-at-test (Menon).</em><br/><br/>Robustness to misspec.</>}
         options={[
-          {key:"a", text:"Raw logits at inference produce probabilities calibrated to balanced error, not to the deployment marginal.", correct:true},
-          {key:"b", text:"You can recover deployment-calibrated probabilities by adding the log-prior back to inference logits.", correct:true},
-          {key:"c", text:"Post-hoc isotonic on a representative holdout is the empirical fix.", correct:true},
-          {key:"d", text:"Logit-adjusted models cannot be calibrated.", correct:false},
-          {key:"e", text:"Adding logit-adjustment improves calibration on the unbalanced distribution.", correct:false},
+          {key:"a", text:"LDAM breaks."},
+          {key:"b", text:"Modest impact. Delta_y is proportional to 1/n_y^(1/4); a 2x error in n_y gives 2^(1/4) ~ 1.19 relative error in Delta_y, meaning the margin you enforce is about 19% larger or smaller than ideal. This shifts the boundary slightly but doesn't break training. Compare to logit-adjusted-loss-AT-TEST (Menon) which adds log(n_y) at inference — a 2x prior error there gives log(2) shift, a much larger relative impact on the decision rule. LDAM is relatively robust to prior misspecification. To minimize impact, use a held-out base-rate estimate to set n_y.", correct:true},
+          {key:"c", text:"LDAM is hyper-sensitive."},
+          {key:"d", text:"Doesn't matter."},
         ]}
-        trap={<>(d) is the most common wrong answer (calibration always works post-hoc). (e) is reversed.</>}
-        lens={<>(a)-(c) are the calibration mechanics. The shift turns balanced-error consistency on/off; you pick which calibration you want based on the downstream consumer.</>}
-        stretch={<>Why is balanced-error calibration the right target for some Risk PMs?</>}
+        trap={<>(a)(c) overstate; (d) understates.</>}
+        lens={<>1/n_y^(1/4) is robust to ~2x prior error. Logit-adjustment AT TEST is not.</>}
+        stretch={<>How would you measure prior accuracy needed in production?</>}
       />
 
       <VIS.TrapProblem
-        id="la-p6"
+        id="ldam-p8"
         difficulty="hard"
-        title="P6 — tau tuning"
-        scenario={<>The theory says tau equal to 1; empirically, tau in 0.5 to 2 often works better. Why?</>}
+        title="P8 — DRW (Deferred Re-Weighting): train with LDAM first 80%, then add weights. Why?"
+        scenario={<><em>Discriminating insight: LDAM alone shapes the boundary geometry but doesn't fully calibrate. Adding class-balanced sampling/weights in the final phase calibrates without disturbing the geometric margin already learned. Two-phase schedule is empirically optimal.</em><br/><br/>Why two phases.</>}
         options={[
-          {key:"a", text:"Finite-sample effects: the consistency theorem assumes infinite data. At finite scale, the optimal tau trades off bias and variance. Smaller tau pulls less aggressively toward balanced error (less variance, more bias); larger tau pulls more aggressively. Sweep on a held-out balanced-error metric to find the empirical optimum.", correct:true},
-          {key:"b", text:"The theory is wrong."},
-          {key:"c", text:"tau equal to 1 is always optimal."},
-          {key:"d", text:"tau is the learning rate."},
+          {key:"a", text:"DRW is a bug."},
+          {key:"b", text:"Two-phase composition. Phase 1 (first 80% of epochs): train with LDAM only — the class-dependent logit margin shapes the decision boundary geometry, enforcing larger margin around rare classes. Phase 2 (final 20%): add class-balanced sampling OR per-class weights to fine-tune the operating point and calibration without disturbing the margin already learned. The intuition: margin geometry should be set FIRST (when representation is forming); calibration is a finishing touch. Running weights from epoch 1 would distort the representation learning; running LDAM only never calibrates the operating point.", correct:true},
+          {key:"c", text:"Pick one phase."},
+          {key:"d", text:"Run weights first."},
         ]}
-        trap={<>(b)-(d) miss the finite-sample distinction. (a) is the precise answer.</>}
-        lens={<>(a) — theoretical optimum versus empirical optimum is a recurring senior MLE topic. The theorem holds at infinite data; you tune at finite data. The right move is to sweep tau on the metric you care about and report both.</>}
-        stretch={<>What balanced-error metric would you sweep against?</>}
+        trap={<>(a)(c)(d) miss the two-phase rationale.</>}
+        lens={<>Margin geometry first. Calibration finish. DRW is the canonical schedule.</>}
+        stretch={<>Why 80/20 specifically? Have papers explored other splits?</>}
       />
 
       <VIS.TrapProblem
-        id="la-p7"
-        difficulty="hard"
-        title="P7 — Logit adjustment plus focal"
-        scenario={<>Can you combine logit adjustment with focal loss?</>}
-        options={[
-          {key:"a", text:"Yes — apply logit adjustment FIRST (shift logits), then apply focal modulation on the resulting cross-entropy. The shift moves the decision boundary; focal additionally down-weights easy samples around the shifted boundary. The combination is studied in 2022-2023 long-tail papers (e.g., 'Balanced Group Softmax') and often beats either alone on extreme imbalance.", correct:true},
-          {key:"b", text:"They are mutually exclusive."},
-          {key:"c", text:"Logit adjustment subsumes focal."},
-          {key:"d", text:"Focal subsumes logit adjustment."},
-        ]}
-        trap={<>(b)-(d) are wrong. The two mechanisms operate on different parts of the loss function.</>}
-        lens={<>(a) — the combination is well-studied. Logit adjustment fixes the boundary; focal fixes the gradient distribution. Together they cover both failure modes of plain BCE on long-tail data.</>}
-        stretch={<>Which long-tail benchmark would best evaluate the combination?</>}
-      />
-
-      <VIS.TrapProblem
-        id="la-p8"
+        id="ldam-p9"
         difficulty="medium"
-        title="P8 — Multi-class fraud typology"
-        scenario={<>You're classifying fraud into 20 typologies, some with 1 percent prevalence, some with 0.001 percent. Which loss?</>}
+        title="P9 — Implementation: how do you subtract Delta_y from the true-class logit in PyTorch?"
+        scenario={<><em>Discriminating insight: build a Delta vector of length K (class count), use one_hot(y) to mask, subtract from logits before cross-entropy. Or use a scatter operation on z to subtract per-sample by its y index.</em><br/><br/>Implement.</>}
         options={[
-          {key:"a", text:"Logit adjustment / LDAM is the natural fit for multi-class long-tail problems. Each class gets its own shift by its log-prior. Focal generalizes to multi-class less cleanly. Class weighting blows up at 1000x imbalance ratios.", correct:true},
-          {key:"b", text:"Plain cross-entropy is fine."},
-          {key:"c", text:"Binary one-vs-rest with focal."},
-          {key:"d", text:"Random under-sampling."},
+          {key:"a", text:"Loop in Python."},
+          {key:"b", text:"Build Delta = C / (n_classes ** 0.25) — a vector of length K. At training step, given logits z [B, K] and targets y [B], compute z_adj = z.clone(); for the true-class slot, subtract Delta[y]: z_adj.scatter_add_(1, y.unsqueeze(1), -Delta[y].unsqueeze(1)). Or use a one-hot mask: z_adj = z - F.one_hot(y, K) * Delta.unsqueeze(0). Then loss = F.cross_entropy(z_adj, y). At inference, use original z. ~5 lines. Validate by training a tiny model and checking learned margin on a held-out set.", correct:true},
+          {key:"c", text:"Subtract from all logits."},
+          {key:"d", text:"Add to true class."},
         ]}
-        trap={<>(b) ignores the long tail. (c) is workable but doesn't share signal across classes. (d) destroys data.</>}
-        lens={<>(a) — the multi-class long-tail benchmarks (CIFAR-LT, ImageNet-LT, iNaturalist) are where logit adjustment / LDAM shine. Fraud typology classification is the same structural problem.</>}
-        stretch={<>How would you handle a brand-new fraud typology with 5 examples?</>}
+        trap={<>(a) slow; (c)(d) wrong direction.</>}
+        lens={<>One-hot mask times Delta vector. Then plain CE.</>}
+        stretch={<>Why subtract from the TRUE class, not add to other classes?</>}
       />
 
       <VIS.TrapProblem
-        id="la-p9"
+        id="ldam-p10"
         difficulty="hard"
-        title="P9 — Logit adjustment in GBDT"
-        scenario={<>Does logit adjustment translate to GBDT (XGBoost / LightGBM)?</>}
+        title="P10 — LDAM at test time: do you subtract Delta again?"
+        scenario={<><em>Discriminating insight: NO. Delta is applied only at TRAINING. At inference, use original z (or z minus log(n_y) per Menon's adjustment if you also want logit-adjustment-at-test). LDAM only shapes training geometry.</em><br/><br/>Inference behavior.</>}
         options={[
-          {key:"a", text:"Yes — implement as a custom objective that subtracts the log-prior from the predicted logit before computing gradient and hessian. The gradient takes a clean closed form. Less commonly deployed than focal in trees, but works.", correct:true},
-          {key:"b", text:"No — logit adjustment is for deep networks only."},
-          {key:"c", text:"Yes, but it always hurts performance."},
-          {key:"d", text:"Only XGBoost supports it."},
+          {key:"a", text:"Yes, always subtract."},
+          {key:"b", text:"No. LDAM applies Delta_y at TRAINING ONLY. Reason: the margin enforcement is a training surgery — the model learns to produce logits with the required margin. At inference, you want the model's natural confidence; subtracting Delta_y again would double-discount the true class. There is a separate technique — Menon et al.'s 'logit adjustment at test' — which subtracts log(pi_y) from each test-time logit to convert from balanced-error-trained outputs to standard outputs. That's a DIFFERENT method (post-hoc calibration shift), and can be combined with LDAM but is not LDAM itself.", correct:true},
+          {key:"c", text:"Use Delta at test, not train."},
+          {key:"d", text:"Add Delta everywhere."},
         ]}
-        trap={<>(b) is the most common wrong answer because the papers focus on deep nets. (c) and (d) are wrong.</>}
-        lens={<>(a) — logit adjustment is architecture-agnostic. The custom objective is slightly trickier than focal but no fundamental barrier. Practitioner blogs from 2022-2023 walk through it.</>}
-        stretch={<>Write the gradient for logit-adjusted log-loss in XGBoost custom-objective form.</>}
+        trap={<>(a)(c)(d) misapply Delta.</>}
+        lens={<>LDAM = train-time only. Inference uses original z.</>}
+        stretch={<>How does Menon's logit-adjustment-at-test compose with LDAM?</>}
       />
 
       <VIS.TrapProblem
-        id="la-p10"
+        id="ldam-p11"
         difficulty="hard"
-        title="P10 — Senior framing of the imbalance-loss landscape"
-        scenario={<>Frame logit adjustment in the imbalance-loss landscape for a senior interviewer.</>}
+        title="P11 — Binary fraud (2 classes). Does LDAM still apply?"
+        scenario={<><em>Discriminating insight: yes — formulate as 2-class softmax with logits z_0 (legit), z_1 (fraud), apply Delta_1 to the fraud-class logit at train time. Equivalent to a bias-shifted BCE with margin.</em><br/><br/>Binary case.</>}
         options={[
-          {key:"a", text:"Three layers: data-level (sampling), loss-level (class weight, focal, logit-adjusted), decision-level (calibrate plus threshold). Within loss-level, logit adjustment is the only intervention with a formal consistency guarantee for balanced error — it shifts the decision boundary by log-prior. Focal is a heuristic targeting gradient dominance; class weighting is a scale fix. Pick logit adjustment when you have a trustworthy class prior AND you need balanced-error guarantees. Otherwise the calibrate-plus-threshold pattern is usually the workhorse.", correct:true},
-          {key:"b", text:"Use logit adjustment everywhere."},
-          {key:"c", text:"Use focal everywhere."},
-          {key:"d", text:"Don't bother — they all work the same."},
+          {key:"a", text:"Only multi-class."},
+          {key:"b", text:"Applies cleanly. Express binary classification as 2-class softmax with logits z_0 and z_1 (or equivalently as BCE with a single logit z = z_1 - z_0). At training, subtract Delta_1 (the rare class's margin) from z_1 before softmax. The effective binary form: shift the decision logit z by -Delta_1 at training time, so the model must produce z > Delta_1 (instead of z > 0) to predict fraud. The trained model then has a geometric margin of Delta_1 around fraud points. Inference uses original z. Many practical fraud implementations use this exact form because BCE is the standard primitive.", correct:true},
+          {key:"c", text:"Doesn't apply to binary."},
+          {key:"d", text:"Use focal."},
         ]}
-        trap={<>(b)-(d) lack the structural view.</>}
-        lens={<>(a) — the senior framing names the three intervention layers, distinguishes loss-level interventions, and gives a clean picking rule. This is the meta-answer interviewers love.</>}
-        stretch={<>What experiment would compare all three loss-level interventions head-to-head?</>}
+        trap={<>(a)(c)(d) miss the 2-class equivalence.</>}
+        lens={<>Binary LDAM = bias-shifted BCE with class-dependent margin on rare class.</>}
+        stretch={<>What's the relation to the SVM hinge loss margin?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p12"
+        difficulty="hard"
+        title="P12 — LDAM doesn't help on your fraud dataset. Diagnose."
+        scenario={<><em>Discriminating insight: LDAM's value comes from margin-based generalization. If your model is already over-parameterized and memorizes positives, margin enforcement makes little difference. Or if positives are so rare (1:1M) that any margin is achievable, LDAM saturates. Or if features are non-separable, margin is moot.</em><br/><br/>Diagnose 'LDAM doesn't help'.</>}
+        options={[
+          {key:"a", text:"LDAM is wrong."},
+          {key:"b", text:"Several possible causes. (1) Over-parameterization: a model with enough capacity already achieves any required training margin via memorization; LDAM's margin enforcement is redundant. Try a smaller model or stronger regularization, then LDAM. (2) Non-separable features: if the legit/fraud distributions overlap heavily in feature space, no margin is achievable and LDAM only restates an impossible target. Improve features first. (3) Already-effective alternative: if you're using strong augmentation, mixup, or focal-DRW, the boundary may already be well-margined; LDAM's added value is small. (4) Wrong n_y estimate: if class counts are 10x off, Delta_y is in the wrong regime. (5) Calibration goal: LDAM optimizes generalization not calibration; if your metric is Brier, expect modest LDAM gains.", correct:true},
+          {key:"c", text:"Always works."},
+          {key:"d", text:"Doesn't work."},
+        ]}
+        trap={<>(a)(c)(d) miss the dependency on regime.</>}
+        lens={<>LDAM helps in: under-parameterized + separable + accurate n_y + generalization metric. Diagnose along these axes.</>}
+        stretch={<>How to diagnose 'over-parameterization' vs 'non-separable features'?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p13"
+        difficulty="medium"
+        title="P13 — LDAM with class weights (DRW): same as adding margin in BCE?"
+        scenario={<><em>Discriminating insight: DRW combines LDAM (margin) + class-balanced sampling/weights (loss). The two work at different layers and stack non-redundantly. Single-layer combos (e.g., just margin in BCE) don't capture both.</em><br/><br/>DRW vs single-layer.</>}
+        options={[
+          {key:"a", text:"Same."},
+          {key:"b", text:"Different. DRW = Phase1: LDAM (logit margin) + Phase2: LDAM + class-balanced weights (loss reweighting). The two operate at different surgical layers (logit vs loss) and at different training phases (early vs late). A 'single-layer' approach like 'BCE with margin added' would either (a) be LDAM alone (no calibration phase) or (b) be ad-hoc loss+margin that double-counts. The DRW schedule's empirical edge is that early-phase margin shaping is done WITHOUT loss reweighting (to keep representation learning clean), and late-phase calibration is done WITH weights (to set operating point). Stacking everything from epoch 1 underperforms.", correct:true},
+          {key:"c", text:"Pick one."},
+          {key:"d", text:"Stack always."},
+        ]}
+        trap={<>(a)(c)(d) miss the temporal split.</>}
+        lens={<>DRW = LDAM early, LDAM + weights late. Temporal composition, not just stacking.</>}
+        stretch={<>What goes wrong with weights-from-epoch-1?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p14"
+        difficulty="hard"
+        title="P14 — Margin geometry: what does 'larger margin around rare class' mean exactly?"
+        scenario={<><em>Discriminating insight: the trained logits satisfy z_y - z_other > Delta_y on training points. Geometrically, the decision hyperplane is at z_y = z_other + Delta_y; the rare-class training points are required to live ABOVE this raised hyperplane. So the boundary is 'pushed away' from rare-class points by Delta_y in logit space.</em><br/><br/>Geometric statement.</>}
+        options={[
+          {key:"a", text:"Bigger rare-class region."},
+          {key:"b", text:"At training optimum (assuming separability), the model's logits satisfy z_y - z_{other} > Delta_y for every rare-class training point. Equivalently, the decision boundary {z_y - z_{other} = 0} sits at logit-distance Delta_y from every rare-class training point. So in logit space, rare-class training points are confined to a region that's at least Delta_y AWAY from the boundary. Compared to plain CE (where the only requirement is z_y > z_{other}, margin = 0+), the rare class enjoys a guaranteed buffer. This buffer is what powers the generalization bound.", correct:true},
+          {key:"c", text:"Bigger label."},
+          {key:"d", text:"Smaller logit."},
+        ]}
+        trap={<>(a) imprecise; (c)(d) wrong.</>}
+        lens={<>Margin = logit-distance buffer from boundary for rare-class training points.</>}
+        stretch={<>Does the margin in input space (not logit space) also scale with 1/n_y^(1/4)?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p15"
+        difficulty="medium"
+        title="P15 — Tune C in Delta_y = C / n_y^(1/4). Range?"
+        scenario={<><em>Discriminating insight: C is the overall margin strength. Typical range 0.5 to 1.0 after re-normalization to the max-class margin. C too small: LDAM degenerates to plain CE. C too large: training fails (impossible margin).</em><br/><br/>Tune C.</>}
+        options={[
+          {key:"a", text:"C = 100."},
+          {key:"b", text:"Cao recommends C such that the MAXIMUM margin (rarest class) is around 0.5 after re-normalization — concretely, Delta_max ~ 0.5 logit units. Setting C too small (Delta_max ~ 0.01) makes LDAM essentially plain CE — the margin enforcement is trivial. C too large (Delta_max ~ 5) makes training fail because the required logit gap exceeds what the model can produce on noisy or overlapping classes — loss never decreases. Sweep C in {0.1, 0.3, 0.5, 1.0} on validation. Validate by measuring achieved margin on training data.", correct:true},
+          {key:"c", text:"C is irrelevant."},
+          {key:"d", text:"Fixed at 1."},
+        ]}
+        trap={<>(a)(c)(d) miss the empirical sweet spot.</>}
+        lens={<>Delta_max ~ 0.5 logit. Sweep C around that.</>}
+        stretch={<>What signal tells you C is too large?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p16"
+        difficulty="hard"
+        title="P16 — LDAM + label noise: better or worse than asymmetric BCE?"
+        scenario={<><em>Discriminating insight: under label noise, LDAM is more robust than focal but less so than asymmetric BCE. Reason: margin enforcement on a NOISY positive forces the model to OVER-confidently predict the wrong class — distorts geometry. Mitigations: clip outliers, label smoothing.</em><br/><br/>Noise interaction.</>}
+        options={[
+          {key:"a", text:"LDAM is noise-immune."},
+          {key:"b", text:"Middle of the pack. Under label noise, asymmetric BCE applies a uniform per-class weight — noisy positives are amplified the same as good positives (no selective amplification). Focal applies per-sample modulation that selectively amplifies hard-looking (noisy) positives — noise-amplifying. LDAM enforces a class-dependent margin geometrically — a noisy positive forces the model to push the boundary toward the legit cluster (since the noisy point is treated as a rare-class training point), distorting geometry but not amplifying gradient as much as focal. Empirically: asymmetric BCE > LDAM > focal on label-noise robustness. Mitigations for LDAM: gradient clipping, label smoothing, or a noise-cleaning pre-pass.", correct:true},
+          {key:"c", text:"Always best."},
+          {key:"d", text:"Always worst."},
+        ]}
+        trap={<>(a)(c)(d) miss the relative comparison.</>}
+        lens={<>Noise robustness order: asymmetric BCE > LDAM > focal.</>}
+        stretch={<>How to detect noise-distortion of LDAM geometry?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p17"
+        difficulty="hard"
+        title="P17 — When is LDAM strictly WORSE than asymmetric BCE?"
+        scenario={<><em>Discriminating insight: when the model is over-parameterized (memorizes positives anyway), under heavy label noise, or when calibrated probabilities are the deliverable. In those regimes the simpler lever wins.</em><br/><br/>LDAM worse.</>}
+        options={[
+          {key:"a", text:"Never worse."},
+          {key:"b", text:"Specific regimes. (1) Over-parameterized model that memorizes positives: LDAM's margin is achieved trivially via memorization, providing no actual generalization gain over CE. (2) Heavy label noise (>10%): margin enforcement on noisy positives distorts geometry; asymmetric BCE's uniform weighting is less harmful. (3) Calibration-critical deliverable (pricing, expected-loss): LDAM optimizes ranking/generalization not calibration; you need post-hoc calibration. (4) Mild imbalance (1:10): margin gain is small; the simpler asymmetric BCE or BCE + threshold is preferable. (5) Tiny dataset (<1K positives): n_y estimate is noisy, schedule is unreliable.", correct:true},
+          {key:"c", text:"Always better."},
+          {key:"d", text:"Never matters."},
+        ]}
+        trap={<>(a)(c)(d) miss regime dependency.</>}
+        lens={<>LDAM shines: under-parameterized + clean labels + separable + generalization metric.</>}
+        stretch={<>How would you detect 'over-parameterization is hiding LDAM's effect'?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p18"
+        difficulty="medium"
+        title="P18 — Logit-adjusted loss (Menon 2021) vs LDAM: same?"
+        scenario={<><em>Discriminating insight: similar family but different. Menon's logit-adjusted loss adds log(pi_y) to logits — and this can be applied EITHER at train time OR at test time. LDAM (Cao 2019) subtracts a non-log class-dependent margin only at train. Different scheduling, different theoretical framing.</em><br/><br/>Same family, different recipe.</>}
+        options={[
+          {key:"a", text:"Identical."},
+          {key:"b", text:"Same family, different recipe. Menon et al.'s 'logit adjustment' uses Delta_y = tau * log(pi_y) (where pi_y is class prior); LDAM (Cao) uses Delta_y = C / n_y^(1/4). Menon's analysis frames this as Bayes-optimal under prior shift (you can apply log(pi_y) at TEST time to convert from balanced-error to standard outputs); Cao's analysis frames it as a generalization margin (applied at TRAIN time only). Practically: Menon at-train + Menon at-test ≈ balanced-error optimal; LDAM at-train + DRW = strong rare-class generalization. Both work; pick by what theory you need.", correct:true},
+          {key:"c", text:"Same exact recipe."},
+          {key:"d", text:"Unrelated."},
+        ]}
+        trap={<>(a)(c)(d) collapse or distance them too far.</>}
+        lens={<>Both are 'class-dependent logit shift'. Different magnitude schedule + different timing (train vs test).</>}
+        stretch={<>When does Menon's tau * log(pi_y) outperform LDAM's 1/n_y^(1/4)?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p19"
+        difficulty="hard"
+        title="P19 — LDAM with extreme imbalance (1:1M). Schedule edge case?"
+        scenario={<><em>Discriminating insight: at 1:1M, Delta_rare can grow large under 1/n_y^(1/4) — but the model may not be able to achieve it, leading to training failure. Cap Delta_max, or use smaller C, or use Menon's log(pi_y) which scales gentler in log-space.</em><br/><br/>Extreme regime.</>}
+        options={[
+          {key:"a", text:"LDAM breaks."},
+          {key:"b", text:"Schedule edge case requires care. At 1:1M, n_rare = 1, n_majority = 1M. Delta_rare proportional to 1 (constant); Delta_majority proportional to 1/1M^(1/4) ~ 0.03 — relative Delta_rare/Delta_majority ~ 32x. Whether this is achievable depends on feature separability — if the rare class is well-separated, fine; if overlapping, the model can't satisfy the margin and training stalls. Mitigations: (1) cap Delta_max at some practical value (e.g., 0.5 logit), (2) use smaller C overall, (3) switch to Menon's log(pi_y) schedule which scales gentler — at 1:1M, log(1/1M) = -13.8, but you scale by tau (typically 1-2) so the effective shift is manageable. Sweep both LDAM and Menon at extreme imbalance.", correct:true},
+          {key:"c", text:"Use bigger Delta."},
+          {key:"d", text:"Same as 1:1000."},
+        ]}
+        trap={<>(a)(c)(d) miss the schedule edge case.</>}
+        lens={<>1/n_y^(1/4) at 1:1M gives 32x margin ratio. Cap or switch schedule.</>}
+        stretch={<>Compare Delta_max under LDAM vs Menon at 1:1M, 1:100K, 1:1K.</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p20"
+        difficulty="medium"
+        title="P20 — Does LDAM help with calibration?"
+        scenario={<><em>Discriminating insight: not directly. LDAM optimizes margin generalization, not calibration. Probabilities from an LDAM-trained model are usable but typically biased toward the rare class. Pair with post-hoc calibration if you need probabilities.</em><br/><br/>Calibration.</>}
+        options={[
+          {key:"a", text:"Perfectly calibrated."},
+          {key:"b", text:"No. LDAM optimizes a margin-based objective, not a likelihood. The trained model is biased toward predicting the rare class (because training pushes the rare-class logit upward beyond what plain CE would). Probabilities are not the true posterior; they are tilted. Pair with post-hoc calibration (Platt or isotonic on a holdout) to recover usable probabilities. Alternatively, use Menon's logit-adjustment-at-test, which analytically inverts the tilt and recovers Bayes-optimal probabilities under prior shift — this is calibration-friendly by design.", correct:true},
+          {key:"c", text:"Worse than CE."},
+          {key:"d", text:"Same as CE."},
+        ]}
+        trap={<>(a)(c)(d) miss.</>}
+        lens={<>LDAM = generalization. Add post-hoc calibration for probability deliverable.</>}
+        stretch={<>Why does Menon's log(pi_y) at test recover calibration but Cao's LDAM doesn't?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p21"
+        difficulty="hard"
+        title="P21 — 'LDAM is just a fancy class weight.' Diagnose."
+        scenario={<><em>Discriminating insight: false. LDAM adds a margin at the LOGIT layer; class weights scale the LOSS layer. Different surgical layers, different theoretical implications. The redact-test: strip "logit margin" and answer collapses.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Correct."},
+          {key:"b", text:"Wrong. Class weights scale the per-sample loss by a class-dependent scalar — same gradient direction, different magnitude. LDAM modifies the LOGIT before softmax by a class-dependent margin — changes what 'correct prediction' means at training. Practical evidence: (a) class-weighted CE with weights matching class prior has the SAME Bayes-optimal decision rule as plain CE at infinite data; (b) LDAM has a DIFFERENT optimum because the geometric margin requirement is part of the objective. The redact-test: if you strip 'logit margin' from LDAM's description, the remaining 'class-aware loss' is exactly asymmetric BCE — which is a different concept.", correct:true},
+          {key:"c", text:"Same."},
+          {key:"d", text:"Class weight is logit shift."},
+        ]}
+        trap={<>(a)(c)(d) collapse.</>}
+        lens={<>Logit shift (LDAM) vs loss scaling (asymmetric BCE). Different layers, different optima.</>}
+        stretch={<>Can you construct a class-weighted CE that reproduces LDAM's optimum?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ldam-p22"
+        difficulty="hard"
+        title="P22 — In one sentence, what is THE unique mechanism of LDAM / logit-adjusted loss?"
+        scenario={<><em>Discriminating insight: CLASS-DEPENDENT MARGIN added to the LOGIT of the true class BEFORE softmax — geometric, not loss-scaling. Strip "class-dependent margin on logit" and it becomes either asymmetric BCE (loss scaling) or threshold moving (post-hoc).</em><br/><br/>State.</>}
+        options={[
+          {key:"a", text:"Uses cross-entropy."},
+          {key:"b", text:"At training time, subtract a class-dependent MARGIN Delta_y (proportional to 1/n_y^(1/4) for LDAM, or tau * log(pi_y) for Menon) from the TRUE-class LOGIT before softmax. The cross-entropy loss is otherwise unchanged, and at inference the original logits are used. The mechanism is GEOMETRIC — enforcing a class-dependent decision-boundary margin around rare-class points — distinct from asymmetric BCE (per-class scalar on loss), focal (per-sample confidence modulation), and threshold moving (post-hoc decision-point shift).", correct:true},
+          {key:"c", text:"Uses focal."},
+          {key:"d", text:"Moves the threshold."},
+        ]}
+        trap={<>(a) trivial; (c)(d) describe sister concepts.</>}
+        lens={<>Anchor: class-dependent margin on the true-class logit, pre-softmax, train-time only.</>}
+        stretch={<>Why is 'on the logit, before softmax' the load-bearing phrase?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li>
-          <a href="https://arxiv.org/abs/2007.07314" target="_blank" rel="noopener">
-            <strong>Menon et al. — Long-tail Learning via Logit Adjustment (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2021)</span>
-          <br/>The canonical paper. Section 3 has the consistency proof; Section 5 has empirical comparisons against focal and class-balanced cross-entropy.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1906.07413" target="_blank" rel="noopener">
-            <strong>Cao et al. — LDAM (Label-Distribution-Aware Margin) (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2019)</span>
-          <br/>The companion paper. Theorem 2 derives the fourth-root margin scaling. Read together with Menon for the full long-tail loss story.
-        </li>
-        <li>
-          <a href="https://lilianweng.github.io/posts/2018-11-30-meta-learning/" target="_blank" rel="noopener">
-            <strong>Lilian Weng — Long-tail and Imbalanced Classification (blog)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Excellent practitioner survey covering sampling, loss design, two-stage training, and decoupled representation learning. Best single starting point.
-        </li>
-        <li>
-          <a href="https://github.com/google-research/google-research/tree/master/logit_adjustment" target="_blank" rel="noopener">
-            <strong>Google Research — Logit Adjustment reference code</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(code)</span>
-          <br/>Official TensorFlow implementation. Useful for the exact form of the shift and the test-time un-shift.
-        </li>
-        <li>
-          <a href="https://www.youtube.com/watch?v=k4QFv0wckqM" target="_blank" rel="noopener">
-            <strong>Aditya Menon — talk on logit adjustment and long-tail learning (video)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(video, ~35 min)</span>
-          <br/>The first author explains the intuition and consistency theorem in plain language. Useful complement to the paper's notation.
-        </li>
+        <li><a href="https://arxiv.org/abs/1906.07413" target="_blank" rel="noopener"><strong>Cao et al. — Learning Imbalanced Datasets with Label-Distribution-Aware Margin Loss</strong></a> <span style={{color:"#64748b", fontSize:14}}>(NeurIPS 2019, paper)</span><br/>The LDAM paper. Read Section 3 (margin generalization bound) + Section 4 (DRW schedule). The math is light and the diagrams are clear.</li>
+        <li><a href="https://arxiv.org/abs/2007.07314" target="_blank" rel="noopener"><strong>Menon et al. — Long-tail Learning via Logit Adjustment</strong></a> <span style={{color:"#64748b", fontSize:14}}>(ICLR 2021, paper)</span><br/>The sibling paper. Logit shift by log(pi_y), applied at train OR test. Read alongside Cao for the full family picture.</li>
+        <li><a href="https://liaopeiyuan.com/long-tail-classification/" target="_blank" rel="noopener"><strong>Peiyuan Liao — Long-Tail Classification (blog)</strong></a><br/>Practitioner walkthrough comparing focal, LDAM, logit adjustment side-by-side with code. Best single resource for cross-method intuition.</li>
+        <li><a href="https://github.com/kaidic/LDAM-DRW" target="_blank" rel="noopener"><strong>LDAM-DRW reference implementation</strong></a> <span style={{color:"#64748b", fontSize:14}}>(repo)</span><br/>Cao's official PyTorch code. The LDAMLoss class is ~30 lines; read end-to-end before implementing.</li>
+        <li><a href="https://www.youtube.com/watch?v=DGSAv0z1aQc" target="_blank" rel="noopener"><strong>Long-tail learning tutorial (video)</strong></a><br/>If you prefer video, this covers Cao/Menon side-by-side with worked examples.</li>
       </ul>
     </VIS.Section>
   </main>

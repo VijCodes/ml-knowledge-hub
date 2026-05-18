@@ -1414,321 +1414,451 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Asymmetric / Weighted BCE — Fraud SOTA · Cost-sensitive learning
-// Per-sample dollar-value-weighted binary cross-entropy.
+// Asymmetric / Weighted BCE — Fraud SOTA · Cost-sensitive learning.
+// CONCEPT ANCHOR (B3): PER-CLASS SCALAR weights on BCE — multiplies positive vs negative
+// class contribution by fixed scalars. Different from focal (per-sample confidence
+// modulation (1-p)^gamma), LDAM (margin on logits), threshold moving (post-hoc).
+// Strip "per-class scalar weight" and the answer must collapse.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Cost-sensitive learning"
       title="Asymmetric / Weighted BCE"
-      subtitle="Make the loss function care about dollars by weighting each sample by its at-risk dollar value."
+      subtitle="Multiply each class's BCE term by a fixed scalar (w_pos, w_neg). The simplest cost-sensitive loss — the weight choice IS the lever."
       byline={[
-        {label: "Source", value: "KDD 2024 ADS — Cost-Sensitive Loss Design for Fraud"},
-        {label: "Year", value: "2024"},
-        {label: "L3", value: "Cost-sensitive loss"},
+        {label: "Source", value: "Standard practice; revisited in 'Cost-Sensitive Loss Design for Fraud' (KDD 2024 ADS)"},
+        {label: "L3", value: "Per-class scalar loss weighting"},
+        {label: "Anchor", value: "L = - [w_pos * y log p + w_neg * (1-y) log(1-p)]"},
       ]}/>
 
     <VIS.TLDR>
-      Uniform{" "}
-      <VIS.Term def="The standard loss function for binary classification. Penalizes the model with -log p when the true label is 1, and -log(1-p) when the true label is 0. Treats every sample equally.">binary cross-entropy</VIS.Term>{" "}
-      optimizes AUC — every transaction counts the same. But fraud loss is dollars, not transactions. A 10-dollar fraud and a 10,000-dollar fraud carry equal weight in BCE; a model can win AUC while leaving real money on the table. Weighted BCE attaches each sample's at-risk dollar amount as a loss weight, so SGD literally optimizes expected dollar loss.
+      Plain{" "}
+      <VIS.Term def="Binary cross-entropy: -[y log p + (1-y) log(1-p)]. The standard loss for binary classification.">BCE</VIS.Term>{" "}
+      treats every sample's contribution equally. Asymmetric BCE multiplies the positive-class term by a scalar w_pos and the negative-class term by w_neg. That's it. The mechanism is one number per class — fixed across all samples of that class and across training. This is its strength (simple, transparent, well-calibrated) and its limit (cannot adapt to which samples are easy/hard the way{" "}
+      <VIS.Term def="Focal loss multiplies BCE by (1-p_t)^gamma — a per-sample factor that depends on current prediction confidence.">focal loss</VIS.Term>{" "}
+      does, and cannot shift the decision boundary the way{" "}
+      <VIS.Term def="LDAM adds a class-dependent margin to the logit before softmax — geometrically pushes the decision boundary away from rare-class points.">LDAM</VIS.Term>{" "}
+      does). The weight choice — class-frequency-inverse, $-value, regulator cost matrix — is where the engineering lives.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — per-class scalar weighting, nothing more">
       <p>
-        Imagine two transactions: a 5-dollar coffee and a 50,000-dollar wire transfer. Both are fraud. Plain BCE rewards your model equally for catching either. But the business cares 10,000x more about the wire transfer. Weighted BCE fixes this by multiplying each sample's loss by a cost coefficient.
+        Imagine training 1000 transactions: 999 legit, 1 fraud. Plain BCE: positives contribute 1 log-term, negatives contribute 999 log-terms. The negative class dominates the loss and the gradient — even when the model is right. Asymmetric BCE rescales: pick w_pos = 999, w_neg = 1, and now both classes contribute equally to the loss SUM by class. Or pick w_pos = average $ value of fraud, w_neg = average $ cost of a false positive (operational review cost), and now the loss directly optimizes expected dollar loss instead of count-accuracy. The scalar lever is the only knob — but the choice is the engineering.
       </p>
-      <p>
-        Three flavors in practice:
-      </p>
-      <ol>
-        <li><strong>Class weights</strong> — coarse: multiply all positives by w-plus, all negatives by w-minus. Captures the rare-positive imbalance but not per-sample dollar variance.</li>
-        <li><strong>Per-sample dollar weights</strong> — fine: weight each sample by its transaction amount or expected loss. Captures the heavy tail.</li>
-        <li><strong>Asymmetric weights</strong> — let false-positive cost differ from false-negative cost via separate coefficients in the two BCE branches.</li>
-      </ol>
+      <VIS.Equation display tex={`\\text{wBCE} = -[w_{+} \\, y \\, \\log p + w_{-} \\, (1-y) \\, \\log(1-p)]`}/>
+      <p>w_pos and w_neg are scalars chosen BEFORE training. They are uniform across all samples of their class (the asymmetry is between classes, not within). The ratio w_pos / w_neg controls how strongly the model is pushed toward classifying positives correctly at the expense of false positives.</p>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  S["Sample i with label y and amount d"]
-  S --> W["Cost weight w_i from cost matrix"]
-  W --> L["Weighted BCE: w_i times BCE"]
-  L --> SUM["Mini-batch sum"]
-  SUM --> O["Gradient step optimizes dollar loss"]
-  style W fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style O fill:#dcfce7,stroke:#16a34a,stroke-width:2px
-      `} />
-
-      <VIS.Equation display tex={`\\mathcal{L} = -\\sum_{i} w_i \\Big[ y_i \\log p_i + (1-y_i) \\log (1-p_i) \\Big], \\quad w_i = \\text{cost}(y_i, \\hat{y}_i, d_i)`} />
-      <p>The per-sample weight w-i depends on the true label, predicted label, and dollar amount. A natural choice for the asymmetric case is: w-i equals the dollar amount d-i when y-i equals 1 (false negative loses that money), and w-i equals a fixed friction cost when y-i equals 0 (false positive costs a customer support ticket).</p>
+  S["Sample (x, y)"]
+  S --> Y{"y == 1?"}
+  Y -- "yes" --> P["L = - w_pos * log p"]
+  Y -- "no" --> N["L = - w_neg * log(1-p)"]
+  P --> G["Sum, backprop"]
+  N --> G
+  style P fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+  style N fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+      `}/>
+      <p>Per-class scalar is THE mechanism. No per-sample logic. No logit modification. No post-hoc step. Just two numbers chosen ahead of training.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from threshold tuning">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-weights" title="How to choose the weights">
+      <ol>
+        <li><strong>Class-frequency-inverse:</strong> w_pos = N_neg / N_pos, w_neg = 1. Brings the per-class summed loss to parity. Simple, common default.</li>
+        <li><strong>Effective number:</strong> Cui et al. — w_c = (1 - beta) / (1 - beta^n_c). Smoother than raw inverse, avoids over-weighting at extreme imbalance.</li>
+        <li><strong>Dollar-cost matrix:</strong> w_pos = avg $ value of a true fraud, w_neg = avg $ cost of a false positive (review + customer friction). Loss directly optimizes expected dollar.</li>
+        <li><strong>Regulator-set:</strong> sometimes regulators specify miss-vs-FP tradeoff. Use those numbers directly.</li>
+      </ol>
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="How asymmetric BCE differs from the rest of the imbalance toolbox">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Plain BCE plus threshold</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Weighted BCE</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Asymmetric BCE</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Focal loss</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>LDAM</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Threshold moving</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>What it optimizes</td>
-            <td style={{padding:"8px 10px"}}>AUC / Brier; threshold optimizes dollars</td>
-            <td style={{padding:"8px 10px"}}>Expected dollar loss directly</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Calibration</td>
-            <td style={{padding:"8px 10px"}}>Preserved</td>
-            <td style={{padding:"8px 10px"}}>Distorted — p is no longer P(fraud)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Interpretability</td>
-            <td style={{padding:"8px 10px"}}>Probability + threshold</td>
-            <td style={{padding:"8px 10px"}}>Loss-weight black box</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Cost-matrix change</td>
-            <td style={{padding:"8px 10px"}}>Retune threshold only</td>
-            <td style={{padding:"8px 10px"}}>Retrain model</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Variance vs noise in costs</td>
-            <td style={{padding:"8px 10px"}}>Robust (threshold smooths)</td>
-            <td style={{padding:"8px 10px"}}>Fragile — heavy-tailed weights destabilize SGD</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Lever</td><td style={{padding:"6px 10px"}}>Scalar per class (fixed)</td><td style={{padding:"6px 10px"}}>(1-p_t)^gamma per sample</td><td style={{padding:"6px 10px"}}>Margin added to logit</td><td style={{padding:"6px 10px"}}>Decision threshold (post-hoc)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Adapts during training?</td><td style={{padding:"6px 10px"}}>No</td><td style={{padding:"6px 10px"}}>Yes</td><td style={{padding:"6px 10px"}}>No (fixed by class prior)</td><td style={{padding:"6px 10px"}}>N/A — post-hoc</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Calibration</td><td style={{padding:"6px 10px"}}>Modest shift, easy to recover</td><td style={{padding:"6px 10px"}}>Substantial — over-confident</td><td style={{padding:"6px 10px"}}>Boundary shifts; calibration mostly ok</td><td style={{padding:"6px 10px"}}>Preserved (calibrate first)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Easiest to combine with</td><td style={{padding:"6px 10px"}}>Threshold moving</td><td style={{padding:"6px 10px"}}>Calibration (post-hoc)</td><td style={{padding:"6px 10px"}}>DRW schedule</td><td style={{padding:"6px 10px"}}>Calibrator</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Fraud dollar amounts span 1000x</strong> — heavy-tailed at-risk values where uniform-cost optimization wastes capacity on small transactions.</li>
-        <li><strong>Cost matrix is stable</strong> — known false-positive cost (e.g., friction dollars per declined customer) and known false-negative cost (e.g., dollars per missed fraud).</li>
-        <li><strong>You want one model</strong>, not one model plus a threshold-tuning service.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Calibration is destroyed">
-        Weighted BCE warps the learned probability surface. Your model output is no longer P(fraud); it is a score correlated with dollar-weighted fraud likelihood. Calibration metrics (Brier, ECE) get worse. If downstream consumers need calibrated probabilities (e.g., for expected-loss accounting), use plain BCE plus threshold instead.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Heavy-tailed weights blow up SGD">
-        A single 1-million-dollar fraud weighted 1M makes its gradient dominate the batch. Result: training oscillation or divergence. Standard fixes: log-transform weights, clip weights at a percentile (e.g., 99th), or sqrt-transform.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Cost matrix instability">
-        Business-side cost estimates drift (friction cost per decline depends on segment, time, competition). A model trained on last year's cost matrix may be miscalibrated to this year's. Recalibrate the cost matrix quarterly and retrain.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — 22 trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on weighted BCE, when it beats threshold tuning, and the failure modes that bite in production.
+        Every problem hinges on the unique mechanism: PER-CLASS SCALAR weight on BCE. Strip "per-class scalar" and the answer must collapse. Sister concepts (focal, LDAM, threshold moving) are explicitly contrasted to prevent collision.
       </p>
 
       <VIS.TrapProblem
-        id="wbce-p1"
+        id="awbce-p1"
         difficulty="hard"
-        title="P1 — Translate a cost matrix to a weight"
-        scenario={<>Cost matrix: false-negative loses the dollar amount d; false-positive costs a fixed 5-dollar friction. Express per-sample weight in code.</>}
+        title="P1 — Risk PM asks: 'We have a $ cost matrix from regulators. What's the simplest loss?'"
+        scenario={<><em>Discriminating insight: per-class scalar weights translate directly from a cost matrix — w_pos = cost(miss), w_neg = cost(FP). No per-sample logic, no calibration distortion, fully interpretable to the PM. Sister levers (focal/LDAM/threshold) don't ingest a $ matrix as cleanly.</em><br/><br/>Translate $ matrix to loss.</>}
         options={[
-          {key:"a", text:"w_i = d_i if y_i == 1 else 5.0; loss = sum(w_i * BCE(y_i, p_i)). Optionally clip d_i at the 99th percentile to bound batch-level variance.", correct:true},
-          {key:"b", text:"w_i = 1 for all samples; threshold-tune afterward."},
-          {key:"c", text:"w_i = p_i; use predicted probability as the weight."},
-          {key:"d", text:"w_i = -d_i for negatives, +d_i for positives."},
+          {key:"a", text:"Use focal loss."},
+          {key:"b", text:"Asymmetric/weighted BCE. The cost matrix gives two numbers — cost of a missed fraud (FN cost) and cost of a false positive (FP cost). Set w_pos = cost(miss) and w_neg = cost(FP). The training loss now directly minimizes expected $ cost. The PM can audit the implementation in one line of config and trace the weight back to the cost matrix. Focal multiplies by (1-p_t)^gamma, which distorts probabilities and doesn't ingest a cost matrix cleanly. LDAM uses class PRIOR, not cost. Threshold moving is post-hoc and doesn't shape training. For a regulator-supplied cost matrix, weighted BCE is the right tool because the mechanism IS scalar-per-class.", correct:true},
+          {key:"c", text:"Use LDAM with cost-margin."},
+          {key:"d", text:"Use threshold moving with cost-FP ratio."},
         ]}
-        trap={<>(b) ignores the question. (c) creates a feedback loop (weight depends on the model). (d) introduces negative weights — gradient ascent on negatives.</>}
-        lens={<>(a) — the cost matrix maps directly to per-sample weights. Clipping is essential because real fraud dollar distributions are heavy-tailed.</>}
-        stretch={<>How would you handle a non-stationary cost matrix?</>}
+        trap={<>(a) distorts probability, harder to audit. (c) confuses prior with cost. (d) post-hoc, can't shape training to minimize $.</>}
+        lens={<>B3 redact-test: strip "per-class scalar weight" and only (b) collapses. The pitch IS the mechanism.</>}
+        stretch={<>How would you handle a per-sample $ value rather than a single scalar?</>}
       />
 
       <VIS.TrapProblem
-        id="wbce-p2"
+        id="awbce-p2"
         difficulty="hard"
-        multiSelect
-        title="P2 — Why does weighted BCE hurt calibration?"
-        scenario={<>You train weighted BCE and observe Brier loss go up. Which statements are true?</>}
+        title="P2 — Asymmetric BCE vs focal: where do they actually differ in mechanism?"
+        scenario={<><em>Discriminating insight: asymmetric BCE applies a FIXED scalar per class; focal applies a (1-p_t)^gamma factor PER SAMPLE that depends on current model prediction. The former is a uniform rebalance; the latter is hard-example mining. Don't blur them.</em><br/><br/>Pin the mechanism diff.</>}
         options={[
-          {key:"a", text:"Weighted BCE optimizes a different objective than maximum likelihood; the resulting p is no longer the conditional probability.", correct:true},
-          {key:"b", text:"Predicted scores are shifted toward the high-weight class because the loss rewards confidence there.", correct:true},
-          {key:"c", text:"You can recover calibration by post-hoc Platt scaling or isotonic regression on a held-out set.", correct:true},
-          {key:"d", text:"Brier loss should always improve when you add weights.", correct:false},
-          {key:"e", text:"Weighted BCE has the same optimum as plain BCE regardless of weights.", correct:false},
+          {key:"a", text:"They're equivalent."},
+          {key:"b", text:"Different lever. Asymmetric BCE: L = -[w_pos y log p + w_neg (1-y) log(1-p)]. w_pos and w_neg are scalars chosen before training and uniform across all samples of their class. Focal: L = -(1-p_t)^gamma log p_t (optionally times alpha). The (1-p_t)^gamma factor is PER SAMPLE and depends on current p_t. Consequences: (i) asymmetric BCE keeps full weight on easy-correct samples; focal drops them to near-zero. (ii) asymmetric BCE preserves calibration up to a known offset; focal distorts probabilities. (iii) asymmetric BCE is auditable from one config line; focal's effective per-sample weighting changes every step. Compose: alpha in focal is exactly asymmetric BCE's role added on top of focal's gamma modulation.", correct:true},
+          {key:"c", text:"Both modulate per-sample."},
+          {key:"d", text:"Focal is asymmetric BCE with different defaults."},
         ]}
-        trap={<>(d) and (e) are wrong; (a), (b), (c) are the calibration story.</>}
-        lens={<>Weighted BCE distorts probabilities by design. If you need calibrated probabilities downstream, recalibrate with Platt/isotonic on a held-out validation set after training. Or use plain BCE plus threshold tuning, which preserves calibration.</>}
-        stretch={<>Why does isotonic regression recover calibration but Platt sometimes does not?</>}
+        trap={<>(a)(c) collapse the distinction; (d) inverts the relationship.</>}
+        lens={<>Fixed-scalar (asymmetric) vs dynamic-modulation (focal). Different surgical levers.</>}
+        stretch={<>If you set focal alpha equal to w_pos / (w_pos + w_neg) and gamma equal to 0, do you recover asymmetric BCE?</>}
       />
 
       <VIS.TrapProblem
-        id="wbce-p3"
-        difficulty="medium"
-        title="P3 — Heavy-tailed weights destabilize training"
-        scenario={<>Your fraud dollar amounts span 5 dollars to 5 million dollars. Training loss oscillates wildly batch-to-batch. Why?</>}
-        options={[
-          {key:"a", text:"One million-dollar sample dominates the batch gradient by a factor of 200000-to-1 over a 5-dollar sample. Standard fix: log-transform the dollar weight (w = log(1+d)) or clip weights at the 99th percentile.", correct:true},
-          {key:"b", text:"Adam optimizer is unsuitable for weighted BCE."},
-          {key:"c", text:"The learning rate is wrong."},
-          {key:"d", text:"Use a smaller batch size."},
-        ]}
-        trap={<>(b)-(d) are misattributions. The root cause is the weight distribution, not the optimizer.</>}
-        lens={<>(a) — the gradient norm scales with the weight. Heavy-tailed weights produce heavy-tailed gradients. Log or clip the weights before applying them. Some papers also recommend sqrt-transform as a middle ground.</>}
-        stretch={<>What other loss functions suffer from the same heavy-tailed-weight problem?</>}
-      />
-
-      <VIS.TrapProblem
-        id="wbce-p4"
+        id="awbce-p3"
         difficulty="hard"
-        title="P4 — When threshold tuning beats weighted BCE"
-        scenario={<>Your cost matrix changes monthly as business strategy shifts. Which approach is more flexible?</>}
+        title="P3 — Asymmetric BCE vs LDAM: both 'class-aware'. What's the surgical difference?"
+        scenario={<><em>Discriminating insight: asymmetric BCE scales the LOSS per class — gradient magnitude shifts but the decision boundary geometry is the same as plain BCE at the same operating point. LDAM modifies the LOGIT by class-dependent margin — geometrically pushes the boundary away from rare class. Loss vs geometry.</em><br/><br/>Diff the surgical layer.</>}
         options={[
-          {key:"a", text:"Plain BCE plus per-segment threshold tuning. Calibrated probabilities are stable; only the threshold needs retuning when costs change. Weighted BCE requires full model retrain per cost change.", correct:true},
-          {key:"b", text:"Weighted BCE — costs are baked into the model."},
-          {key:"c", text:"Both equally flexible."},
-          {key:"d", text:"Neither works; need a new architecture."},
+          {key:"a", text:"Same thing."},
+          {key:"b", text:"Different surgical layer. Asymmetric BCE acts at the loss layer: each sample's loss is scaled by w_pos or w_neg, gradient magnitude shifts class-asymmetrically, but the decision boundary that minimizes expected loss is the same Bayes-optimal threshold (just at a different operating point on the ROC). LDAM acts at the logit layer: z_y is replaced by z_y - C / n_y^(1/4) for the true class y, BEFORE softmax. Effect: the model's training objective enforces a class-dependent MARGIN around rare-class points — geometrically, the rare class gets more 'breathing room' near the decision boundary. LDAM has theoretical generalization-bound backing for imbalanced data; asymmetric BCE does not. Both work, but the surgical levers are loss vs geometry.", correct:true},
+          {key:"c", text:"LDAM is asymmetric BCE."},
+          {key:"d", text:"Asymmetric BCE shifts the boundary."},
         ]}
-        trap={<>(b) is the seductively wrong answer — it sounds efficient but isn't. (c) and (d) are wrong.</>}
-        lens={<>(a) — threshold tuning decouples model training from cost policy. The model produces probabilities; the threshold encodes the cost. Change costs, change the threshold, done in minutes. Weighted BCE bakes costs in and requires retraining when they shift.</>}
-        stretch={<>When would you accept the retrain overhead of weighted BCE anyway?</>}
+        trap={<>(a)(c) collapse; (d) confuses — boundary moves when threshold moves; asymmetric BCE indirectly via prob shift but doesn't enforce a margin.</>}
+        lens={<>Loss scaling vs logit margining. Different surgical layers.</>}
+        stretch={<>For what regime is the LDAM advantage largest over asymmetric BCE?</>}
       />
 
       <VIS.TrapProblem
-        id="wbce-p5"
+        id="awbce-p4"
+        difficulty="hard"
+        title="P4 — Asymmetric BCE vs threshold moving on plain BCE: are they equivalent?"
+        scenario={<><em>Discriminating insight: in theory, scaling per-class loss is equivalent to scaling the prior P(y=1) / P(y=0) — which IS what threshold moving does. So at convergence with infinite data, they give the same decision boundary. In practice they differ because (a) asymmetric BCE biases the OPTIMIZATION trajectory, (b) finite-data gradient effects differ, (c) calibration is different.</em><br/><br/>Equivalence in theory vs practice.</>}
+        options={[
+          {key:"a", text:"Completely different."},
+          {key:"b", text:"Asymptotically equivalent (proven: per-class loss weight ratio is the prior odds ratio shift), but practically different. Equivalent: at infinite data and exact optimization, scaling positive-class loss by w_pos and negative by w_neg has the same Bayes-optimal decision rule as plain BCE with threshold moved by log(w_pos/w_neg). Different in practice: (1) asymmetric BCE biases the SGD trajectory — gradient on positives is amplified, so the model spends representation capacity differently; (2) under-parameterized models converge to different solutions; (3) calibration of raw probabilities differs (asymmetric BCE shifts probs by a known offset, threshold moving leaves probs alone); (4) interactions with regularization, early stopping, and BatchNorm differ. Threshold moving is usually preferred when calibration is the goal; weighted BCE when you want training to focus capacity on positives.", correct:true},
+          {key:"c", text:"Exactly equivalent in all cases."},
+          {key:"d", text:"Weighted BCE always strictly better."},
+        ]}
+        trap={<>(a)(d) absolutist; (c) ignores finite-data effects.</>}
+        lens={<>Asymptotic equivalence, practical divergence. Pick by what you want from the model.</>}
+        stretch={<>Why does calibration differ in practice if they're theoretically equivalent?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p5"
         difficulty="medium"
         multiSelect
-        title="P5 — Practical weight-engineering tricks"
-        scenario={<>Which of these are sound practice for weighted BCE? Select all that apply.</>}
+        title="P5 — Choosing w_pos: select all valid recipes"
+        scenario={<><em>Discriminating insight: weight choices are NOT all equivalent. Inverse-frequency, effective-number (Cui), dollar-cost — each has tradeoffs.</em><br/><br/>Pick valid weight recipes.</>}
         options={[
-          {key:"a", text:"Normalize weights so the per-batch sum is constant; preserves effective learning rate.", correct:true},
-          {key:"b", text:"Clip weights at a percentile (e.g., 99th) to bound gradient variance.", correct:true},
-          {key:"c", text:"Log-transform weights when the cost distribution is heavy-tailed.", correct:true},
-          {key:"d", text:"Multiply weights by p_i to amplify confident predictions.", correct:false},
-          {key:"e", text:"Use negative weights to penalize false positives more aggressively.", correct:false},
+          {key:"a", text:"w_pos = N_neg / N_pos (inverse frequency)", correct:true},
+          {key:"b", text:"w_pos = (1 - beta) / (1 - beta^n_pos) for beta near 1 (Cui et al. effective number)", correct:true},
+          {key:"c", text:"w_pos = average $ value of a fraud (dollar-cost)", correct:true},
+          {key:"d", text:"w_pos = random"},
+          {key:"e", text:"w_pos = N_pos / N_neg (UNDER-weight positives)"},
         ]}
-        trap={<>(d) creates a feedback loop. (e) flips gradient signs and causes divergence.</>}
-        lens={<>(a)-(c) are standard production hygiene. (d) and (e) are footguns. The KDD 2024 paper specifically warns against (d) and (e).</>}
-        stretch={<>How do these tricks interact with mixed precision training?</>}
+        trap={<>(d) defeats the purpose. (e) makes imbalance worse, common copy-paste bug.</>}
+        lens={<>Three principled recipes: inverse-freq, effective-number, dollar. Pick by deliverable.</>}
+        stretch={<>When does effective-number beat raw inverse-frequency?</>}
       />
 
       <VIS.TrapProblem
-        id="wbce-p6"
-        difficulty="hard"
-        title="P6 — Asymmetric weighted BCE"
-        scenario={<>You want to weight false-negative loss differently from false-positive loss. Write the asymmetric form.</>}
-        options={[
-          {key:"a", text:"loss = -sum( alpha * y * log(p) + beta * (1-y) * log(1-p) ); alpha is FN cost, beta is FP cost. Setting alpha greater than beta pushes the model toward higher recall.", correct:true},
-          {key:"b", text:"Just multiply BCE by alpha for everyone."},
-          {key:"c", text:"Asymmetric BCE is mathematically the same as plain BCE."},
-          {key:"d", text:"Subtract the smaller loss from the larger."},
-        ]}
-        trap={<>(b) is class weighting, not asymmetric. (c) is false. (d) is gibberish.</>}
-        lens={<>(a) — asymmetric weights act on the two BCE branches separately. This is the precise form recommended by the cost-sensitive loss literature. Alpha controls FN aversion, beta controls FP aversion.</>}
-        stretch={<>How do alpha and beta relate to the optimal decision threshold?</>}
-      />
-
-      <VIS.TrapProblem
-        id="wbce-p7"
-        difficulty="hard"
-        title="P7 — Weighted BCE plus focal loss"
-        scenario={<>Can you combine weighted BCE with focal loss (which down-weights easy negatives)? When would you?</>}
-        options={[
-          {key:"a", text:"Yes: multiply per-sample dollar weight by focal modulation (1-p)^gamma. Use when imbalance is extreme (under 1 in 10000) AND dollar variance is huge. Tune gamma carefully because it interacts with the dollar-weight distribution.", correct:true},
-          {key:"b", text:"No — they are mutually exclusive."},
-          {key:"c", text:"Yes, but they cancel out."},
-          {key:"d", text:"Yes, but only for image data."},
-        ]}
-        trap={<>(b)-(d) are wrong. The composition is well-known in the long-tail literature.</>}
-        lens={<>(a) — the two mechanisms attack different parts of the problem. Dollar weights address heterogeneous cost; focal modulation addresses extreme class imbalance. The product is a single loss function. The KDD 2024 paper has an ablation showing the composition helps when both pathologies are present.</>}
-        stretch={<>Why does this composition often need lower gamma than vanilla focal?</>}
-      />
-
-      <VIS.TrapProblem
-        id="wbce-p8"
+        id="awbce-p6"
         difficulty="medium"
-        title="P8 — Eval metric for weighted BCE"
-        scenario={<>You train weighted BCE. What eval metric should you track on the validation set?</>}
+        title="P6 — Implement weighted BCE numerically stable. Which is correct?"
+        scenario={<><em>Discriminating insight: in PyTorch, BCEWithLogitsLoss supports pos_weight directly — accepts a tensor, multiplies positive class loss. Avoid sigmoid+log composition.</em><br/><br/>Pick the implementation.</>}
         options={[
-          {key:"a", text:"Expected dollar loss on the validation set: sum over predictions of cost(y, y_hat, d). This is what weighted BCE actually optimizes. Add AUC as a secondary metric for sanity. Track Brier separately if you also need calibration.", correct:true},
-          {key:"b", text:"AUC only — it's the standard."},
-          {key:"c", text:"Accuracy — it's interpretable."},
-          {key:"d", text:"F1 — it balances precision and recall."},
+          {key:"a", text:"loss = -(w_pos * y * log(sigmoid(z)) + w_neg * (1-y) * log(1-sigmoid(z)))"},
+          {key:"b", text:"In PyTorch: F.binary_cross_entropy_with_logits(z, y, pos_weight=torch.tensor([w_pos / w_neg])). pos_weight is a vector for multi-label; in binary it's a scalar that multiplies the positive-class loss. The function uses the logsumexp trick internally for numerical stability. For per-sample weights (e.g., $ per case), pass weight=per_sample_tensor and reduce yourself.", correct:true},
+          {key:"c", text:"loss = w_pos * y - w_neg * (1-y)"},
+          {key:"d", text:"loss = (p - y) * w_pos"},
         ]}
-        trap={<>(b)-(d) ignore the dollar-weighted nature of the loss. They are sanity checks, not the primary metric.</>}
-        lens={<>(a) — track the metric your loss actually optimizes. Expected dollar loss on validation. Reporting AUC alone hides regressions in dollar-cost terms.</>}
-        stretch={<>Why is expected dollar loss not the same as dollar-weighted AUC?</>}
+        trap={<>(a) is unstable at large negative z; (c)(d) are not BCE.</>}
+        lens={<>Use the framework's stable primitive with pos_weight. Don't compose sigmoid+log.</>}
+        stretch={<>Why does pos_weight scale only the positive term and not the negative?</>}
       />
 
       <VIS.TrapProblem
-        id="wbce-p9"
+        id="awbce-p7"
         difficulty="hard"
-        title="P9 — Cost matrix from finance"
-        scenario={<>Finance gives you cost matrix: FN cost = transaction amount, FP cost = 8 dollars per declined customer per month (CAC). 30 percent of declined customers churn. How do you encode this in BCE weights?</>}
+        title="P7 — Probabilities from asymmetric BCE: calibrated?"
+        scenario={<><em>Discriminating insight: weighted BCE shifts the optimal probability output by a known offset — sigmoid(z) no longer equals P(y=1|x); it equals a tilted posterior. Recover true posterior by a known transform OR use post-hoc calibration.</em><br/><br/>Calibration analysis.</>}
         options={[
-          {key:"a", text:"w_i = d_i for positives; w_i = 8 plus expected_churn_value * 0.3 for negatives. The FP cost is amplified by the long-run revenue loss from churn, not just the immediate friction. This often raises the FP weight from 8 to 40-100 dollars depending on customer LTV.", correct:true},
-          {key:"b", text:"Just use 8 for negatives."},
-          {key:"c", text:"Just use 1 for positives and negatives."},
-          {key:"d", text:"Use transaction amount for both classes."},
+          {key:"a", text:"Fully calibrated."},
+          {key:"b", text:"Predictably miscalibrated — easy to fix. Weighting the positive class by w_pos shifts the model's optimum from P(y=1|x) to a tilted posterior P_tilted = w_pos * P(y=1|x) / [w_pos * P(y=1|x) + w_neg * P(y=0|x)]. The model outputs probabilities consistent with the tilted distribution. To recover true posterior: invert the transform — P(y=1|x) = (w_neg / w_pos) * p_tilted / [(w_neg / w_pos) * p_tilted + (1 - p_tilted)]. Or fit a one-parameter Platt scaler on a holdout (which absorbs the shift). Far easier to calibrate than focal loss, which distorts non-linearly.", correct:true},
+          {key:"c", text:"Hopelessly miscalibrated."},
+          {key:"d", text:"Same calibration as BCE."},
         ]}
-        trap={<>(b) ignores churn. (c) ignores the cost matrix entirely. (d) is incoherent for negatives.</>}
-        lens={<>(a) — translate the business cost faithfully. FP cost is dominated by long-run churn for high-LTV customers. Treating FP as a flat 8 dollars badly under-weights it. This is the kind of detail Risk PMs notice.</>}
-        stretch={<>How would you decompose churn cost into segments?</>}
+        trap={<>(a)(d) ignore the shift; (c) overstates — fix is analytical.</>}
+        lens={<>Known shift; analytical inversion or one-param calibrator. Compare to focal's non-linear distortion.</>}
+        stretch={<>Why is asymmetric BCE's miscalibration analytical while focal's isn't?</>}
       />
 
       <VIS.TrapProblem
-        id="wbce-p10"
+        id="awbce-p8"
         difficulty="hard"
-        title="P10 — Senior framing for the cost-sensitive choice"
-        scenario={<>You're presenting to the Director of Risk. Pick weighted BCE vs threshold tuning. Frame the recommendation.</>}
+        title="P8 — Junior sets w_pos = 1000 (matches imbalance), training loss EXPLODES at first epoch. Diagnose."
+        scenario={<><em>Discriminating insight: very high w_pos means the few positives in early batches produce huge gradient. Without LR warmup, the optimizer overshoots, blows up logits, and loss becomes inf/nan.</em><br/><br/>Diagnose explosion.</>}
         options={[
-          {key:"a", text:"Both optimize expected dollar loss, but they expose different control surfaces. Plain BCE plus threshold tuning preserves calibrated probabilities, allows fast per-segment retuning when business costs shift, and is preferred when Risk PMs want to read the policy. Weighted BCE bakes costs in and gives slightly tighter optima when the cost matrix is truly stationary. We should ship calibrated plus threshold by default, and consider weighted BCE only for segments with stable costs and extreme dollar variance.", correct:true},
-          {key:"b", text:"Weighted BCE is more advanced; we should adopt it."},
-          {key:"c", text:"Threshold tuning is simpler; ignore weighted BCE."},
-          {key:"d", text:"Use both at the same time."},
+          {key:"a", text:"Bug in PyTorch."},
+          {key:"b", text:"Gradient explosion from high w_pos with no LR warmup. At 1:1000 imbalance and w_pos=1000, the few positives in early batches produce gradient magnitude ~1000x larger than at w_pos=1. With default LR (e.g., 1e-3), the first positive-containing update can push logits by enough to produce extreme sigmoid outputs (1.0 or 0.0), at which point log(p) is inf/nan and loss explodes. Mitigations: (1) LR warmup over the first 500-1000 steps, (2) gradient clipping (clipnorm=1), (3) start with smaller w_pos and ramp up, (4) initialize the model's final bias to log(p_pos / p_neg) so the model starts predicting the prior.", correct:true},
+          {key:"c", text:"PyTorch can't handle it."},
+          {key:"d", text:"Use focal instead."},
         ]}
-        trap={<>(b) and (c) lack judgment. (d) is operationally messy.</>}
-        lens={<>(a) — the senior framing names both options, explains the tradeoff, recommends a default, and reserves an escape hatch. This is what Directors want to hear.</>}
-        stretch={<>What experiment design would you propose to validate the recommendation?</>}
+        trap={<>(a)(c) blame framework; (d) skips the fix.</>}
+        lens={<>High class weight = large gradient. Pair with warmup + clipping + bias init.</>}
+        stretch={<>What's the right initial bias for the final layer at 1:1000 imbalance?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p9"
+        difficulty="medium"
+        title="P9 — Setting w_pos = sqrt(N_neg/N_pos) instead of N_neg/N_pos. Rationale?"
+        scenario={<><em>Discriminating insight: full inverse-frequency can over-correct and hurt overall accuracy. Sqrt is a softer correction widely used in practice — Cui's effective-number gives a similar smoothing.</em><br/><br/>Why sqrt vs full.</>}
+        options={[
+          {key:"a", text:"Sqrt is faster."},
+          {key:"b", text:"Sqrt smooths the correction. Full inverse-frequency (N_neg/N_pos = 1000 at 1:1000) over-corrects: the model becomes too sensitive to noise in the positive class, calibration shifts dramatically, and overall accuracy can drop. Sqrt (sqrt(1000) is about 31) is a softer rebalance — the model still focuses on positives but doesn't over-tune. Cui et al.'s 'effective number' is the principled smoothing: w_c = (1 - beta) / (1 - beta^n_c), with beta near 0.999, which interpolates between 1 (no weighting) and inverse-frequency (full). All three (raw, sqrt, effective) are practitioner-tested smoothings of the same idea.", correct:true},
+          {key:"c", text:"Sqrt has no rationale."},
+          {key:"d", text:"Sqrt is wrong."},
+        ]}
+        trap={<>(a)(c)(d) miss the smoothing rationale.</>}
+        lens={<>Inverse-freq is a corner case. Smoothed corrections often work better at extreme imbalance.</>}
+        stretch={<>Derive the effective-number formula at beta=0 and beta=1 — what does each limit say?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p10"
+        difficulty="hard"
+        title="P10 — Per-sample $ weight: still 'asymmetric BCE' or something else?"
+        scenario={<><em>Discriminating insight: per-sample weights are NOT the canonical asymmetric BCE anymore — they introduce per-sample variation that is technically a different loss family ('cost-sensitive sample weighting'). Still simple, still calibratable, but mechanism-wise it's no longer 'per-class scalar'.</em><br/><br/>Per-sample weight: same thing?</>}
+        options={[
+          {key:"a", text:"Same — just different scalars."},
+          {key:"b", text:"Subtle but real distinction. Canonical asymmetric BCE has one weight per CLASS — w_pos and w_neg, fixed across samples. Per-sample weights w_i (e.g., $ value of case i) generalize this and are sometimes called 'cost-sensitive sample weighting' or just 'sample-weighted BCE'. Mechanism implications: (1) gradient variance per batch increases because per-sample weights vary; (2) calibration becomes per-sample dependent; (3) the simple inverse-prob-shift calibrator no longer recovers the true posterior — need a more elaborate calibrator or per-sample normalization. Still useful (sometimes critical for $-cost optimization), but the simple 'two-scalar' theory no longer fully applies. In interview, name the distinction explicitly.", correct:true},
+          {key:"c", text:"Completely different concept."},
+          {key:"d", text:"Identical."},
+        ]}
+        trap={<>(a)(d) collapse; (c) overstates.</>}
+        lens={<>Per-class scalar is canonical asymmetric BCE. Per-sample $ is a generalization with extra concerns.</>}
+        stretch={<>How to normalize per-sample $ weights so they don't blow up gradient variance?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p11"
+        difficulty="hard"
+        title="P11 — Different fraud TYPES have different cost. One scalar pair w_pos/w_neg or per-type weights?"
+        scenario={<><em>Discriminating insight: with multiple fraud types of differing cost, treat each as a multi-class softmax problem with per-class scalars, OR add a per-sample $ weight conditioned on fraud type. A single w_pos collapses all types.</em><br/><br/>Multi-type cost.</>}
+        options={[
+          {key:"a", text:"One w_pos for all."},
+          {key:"b", text:"Per-type weights via either path. Path 1: multi-class softmax with K classes (one per fraud type + legit); per-class weight vector w of length K. Loss equals minus sum over k of w_k * y_k * log p_k. The mechanism remains per-class scalar — just generalized from K=2 to K=many. Path 2: stay binary but add a per-sample weight conditioned on fraud type — w_i equals w_pos times type_cost_multiplier(case_i) if y=1 else w_neg. This becomes per-sample weighting (see P10). Path 1 is preferred when types have distinct signature; Path 2 is preferred when types are roughly homogeneous in feature space but cost-different.", correct:true},
+          {key:"c", text:"Train K separate models."},
+          {key:"d", text:"Ignore type."},
+        ]}
+        trap={<>(a) collapses; (c) loses cross-type signal; (d) ignores requirement.</>}
+        lens={<>Per-class scalar generalizes to per-type — softmax with weight vector.</>}
+        stretch={<>Why might Path 1 outperform K separate models even with the same data?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p12"
+        difficulty="medium"
+        title="P12 — At 1:10 imbalance, do you even need asymmetric BCE?"
+        scenario={<><em>Discriminating insight: at mild imbalance, plain BCE often suffices and class weighting can hurt by over-shifting. The threshold of when weighting helps is empirical — sweep.</em><br/><br/>Need weighting?</>}
+        options={[
+          {key:"a", text:"Always weight."},
+          {key:"b", text:"Often no. At 1:10, plain BCE with threshold tuning is usually enough — the positive class is rare but not catastrophically so, and the model can learn it with enough data. Class weighting at this regime can over-shift: w_pos=10 may cause the model to over-classify positives, hurting precision substantially while only marginally improving recall. Sweep w_pos in {1, 2, 5, 10} on validation and compare to BCE + threshold moving. The intuition that 'imbalance always needs weighting' is wrong; the threshold for weighting to help is around 1:50 or worse.", correct:true},
+          {key:"c", text:"Never weight."},
+          {key:"d", text:"Always use focal."},
+        ]}
+        trap={<>(a)(c)(d) absolutist.</>}
+        lens={<>Imbalance threshold for weighting to help: ~1:50. Below that, BCE + threshold often wins.</>}
+        stretch={<>How to detect that weighting is over-shifting in production?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p13"
+        difficulty="hard"
+        title="P13 — Asymmetric BCE + focal: redundant or composable?"
+        scenario={<><em>Discriminating insight: composable but not redundant. Focal's alpha IS the asymmetric BCE component; combining adds gamma's per-sample modulation on top. Just don't double-count by adding both alpha (inside focal) AND a separate w_pos.</em><br/><br/>Compose or not.</>}
+        options={[
+          {key:"a", text:"Redundant."},
+          {key:"b", text:"Composable — in fact, the alpha in focal IS exactly asymmetric BCE's role. The standard formulation FL = -alpha (1-p_t)^gamma log(p_t) decomposes into 'asymmetric BCE (alpha) + gamma modulation'. Setting alpha=0.25 with gamma=2 (paper recipe) is asymmetric BCE PLUS hard-example mining. The risk is double-counting: don't multiply the loss separately by another w_pos in addition to alpha inside focal. Pick one of: (a) plain focal with alpha and gamma, (b) focal with gamma only and external class weights, (c) asymmetric BCE alone.", correct:true},
+          {key:"c", text:"Pure focal."},
+          {key:"d", text:"Pure asymmetric."},
+        ]}
+        trap={<>(a)(c)(d) miss the alpha-within-focal connection.</>}
+        lens={<>Focal alpha = asymmetric BCE component. Don't double-count externally.</>}
+        stretch={<>If you observe focal underperforming plain BCE, would you try alpha=1 (no class weight) or alpha=0.5?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p14"
+        difficulty="medium"
+        title="P14 — Asymmetric BCE + threshold moving: do they compose?"
+        scenario={<><em>Discriminating insight: yes, both are well-behaved. Asymmetric BCE shifts the probability output by a known offset; threshold moving picks the operating point. Standard pipeline.</em><br/><br/>Compose.</>}
+        options={[
+          {key:"a", text:"Conflict."},
+          {key:"b", text:"Cleanly composable. Asymmetric BCE shifts the training objective's optimal posterior by a known w_pos/w_neg offset; the model outputs tilted probabilities. Threshold moving then picks a decision threshold on those tilted probabilities (or on calibrated probabilities) to hit the desired operating point. Pipeline: (1) train with asymmetric BCE for capacity allocation, (2) calibrate on holdout (one-param Platt or invert the known shift), (3) move threshold to operating point. All three steps are independently auditable and tunable.", correct:true},
+          {key:"c", text:"Same thing."},
+          {key:"d", text:"Threshold moving is invalid post weighting."},
+        ]}
+        trap={<>(a)(c)(d) miss the clean compose.</>}
+        lens={<>Three orthogonal levers: loss weight, calibration, threshold. Compose, don't conflate.</>}
+        stretch={<>Why fit calibration AFTER weighted training and not before?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p15"
+        difficulty="hard"
+        title="P15 — Gradient of asymmetric BCE w.r.t. logit z?"
+        scenario={<><em>Discriminating insight: per-class scalar scales the gradient by w_y for each sample. Same direction as BCE gradient; magnitude scaled by class.</em><br/><br/>Gradient derivation.</>}
+        options={[
+          {key:"a", text:"Zero."},
+          {key:"b", text:"d/dz of -[w_pos y log p + w_neg (1-y) log(1-p)] equals w_y times (sigmoid(z) - y), where w_y equals w_pos if y=1 else w_neg. Direction is identical to BCE; magnitude is scaled by the class scalar. Implication: at high w_pos, positive samples produce w_pos-times larger gradient; the optimizer 'sees' positives w_pos-times more strongly per gradient step. This explains both the desired behavior (positives focused) and the failure mode (gradient explosion if w_pos is huge and LR is large).", correct:true},
+          {key:"c", text:"BCE gradient unchanged."},
+          {key:"d", text:"Gradient flips sign."},
+        ]}
+        trap={<>(a)(c)(d) wrong.</>}
+        lens={<>Per-class scalar scales gradient magnitude per sample by its class weight.</>}
+        stretch={<>Why does this gradient form make LR-warmup essential at high w_pos?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p16"
+        difficulty="hard"
+        title="P16 — 5% of labels are wrong. Asymmetric BCE safer than focal here?"
+        scenario={<><em>Discriminating insight: yes. Asymmetric BCE applies uniform weight per class — noisy positives are amplified the same as good positives. Focal selectively amplifies the noisy positives (they look like 'hard'). Under label noise, weighted BCE typically suffers less.</em><br/><br/>Noise interaction.</>}
+        options={[
+          {key:"a", text:"Same risk."},
+          {key:"b", text:"Asymmetric BCE is safer under label noise. The class scalar weights all positives uniformly — including the 5% noisy ones — but does NOT selectively amplify them. Focal, with the (1-p_t)^gamma modulation, treats noisy positives as 'hard positives' (the model correctly predicts p_legit high so p_t is low and modulation is high), and amplifies their gradient. Empirically, asymmetric BCE degrades roughly linearly with noise rate while focal can degrade super-linearly. Under noisy labels, asymmetric BCE + label smoothing + threshold moving often beats focal.", correct:true},
+          {key:"c", text:"Focal is always safer."},
+          {key:"d", text:"Noise doesn't matter."},
+        ]}
+        trap={<>(a)(c)(d) miss the hard-mining amplification.</>}
+        lens={<>Uniform per-class weighting is noise-robust. Hard-mining is noise-amplifying.</>}
+        stretch={<>What noise threshold flips the preference from focal to asymmetric BCE?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p17"
+        difficulty="medium"
+        title="P17 — Risk PM wants to see the cost matrix encoded in code. Which loss makes this easy?"
+        scenario={<><em>Discriminating insight: asymmetric BCE has ONE line that maps cost matrix to loss config. Focal's gamma is not auditable to a cost matrix. Threshold moving operates post-hoc. Asymmetric BCE wins on auditability.</em><br/><br/>Auditability.</>}
+        options={[
+          {key:"a", text:"Focal — gamma is auditable."},
+          {key:"b", text:"Asymmetric BCE. The cost matrix has two numbers — cost(FN) and cost(FP). The weighted BCE config has two numbers — w_pos and w_neg. One line of code: pos_weight = cost(FN) / cost(FP). The PM can grep for pos_weight, follow it back to the cost matrix YAML, and audit in 30 seconds. Focal has gamma and alpha; gamma cannot be derived from a cost matrix and isn't interpretable to a risk PM. Threshold moving is post-training and depends on calibration, harder to audit end-to-end. For regulated environments, asymmetric BCE is often preferred PRECISELY because it's auditable.", correct:true},
+          {key:"c", text:"LDAM."},
+          {key:"d", text:"Threshold moving."},
+        ]}
+        trap={<>(a)(c)(d) less directly auditable to a cost matrix.</>}
+        lens={<>Audit trail: cost matrix to pos_weight config to training. Two numbers, one line.</>}
+        stretch={<>What docs would you write to support the audit?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p18"
+        difficulty="medium"
+        title="P18 — Class prior shifts week-over-week (1:1000 to 1:500). Re-train weights?"
+        scenario={<><em>Discriminating insight: yes — class weight is a function of prior, and prior is shifting. Either re-train weights weekly OR use a prior-shift-robust formulation (e.g., asymmetric BCE with weights based on cost, not prior). Threshold moving is more resilient to prior shift because it only retunes the decision point.</em><br/><br/>Prior shift.</>}
+        options={[
+          {key:"a", text:"Doesn't matter."},
+          {key:"b", text:"Yes — if your weights are based on class prior (e.g., w_pos = N_neg/N_pos), the weights become stale when the prior shifts. Options: (1) refresh weights weekly with current class frequencies; (2) use cost-based weights (w_pos = $ value), which don't depend on prior; (3) use prior-shift-robust techniques — adjust the logit offset by log(p_new/p_train) at inference (classic prior-shift correction); (4) switch to threshold moving on a calibrated model, which is naturally prior-shift-resilient because you can re-tune the threshold without re-training. In dynamic regimes, threshold moving often beats weighted BCE for this reason alone.", correct:true},
+          {key:"c", text:"Never re-train."},
+          {key:"d", text:"Increase w_pos."},
+        ]}
+        trap={<>(a)(c)(d) miss the prior-shift dependency.</>}
+        lens={<>Prior-based weights need refresh. Cost-based or threshold-based don't.</>}
+        stretch={<>Why is threshold moving more resilient than weighted BCE under drift?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p19"
+        difficulty="medium"
+        title="P19 — Asymmetric BCE + sampler with 50:50 positive ratio. Double dipping?"
+        scenario={<><em>Discriminating insight: yes — sampler already balanced the batch, so asymmetric BCE on top double-counts. Either drop the sampler (use original distribution + weights) OR drop weights (use balanced sampling + plain BCE). Pick one.</em><br/><br/>Stack sampler + weights?</>}
+        options={[
+          {key:"a", text:"Yes, double-up for safety."},
+          {key:"b", text:"Stop one or the other. Balanced sampling already presents the model with 50:50 positives:negatives per batch — gradient is already 'rebalanced' at the data level. Adding w_pos=1000 on top means each positive contributes 1000x as much gradient on a batch where positives are already 50% — gradient on positives blows up by ~1000x compared to plain BCE on a 50:50 batch. Pick one rebalancing strategy: (a) plain BCE + balanced sampling, OR (b) asymmetric BCE on the original imbalanced distribution. Don't stack.", correct:true},
+          {key:"c", text:"Always stack."},
+          {key:"d", text:"Doesn't matter."},
+        ]}
+        trap={<>(a)(c)(d) double-count.</>}
+        lens={<>One rebalancing lever at a time. Don't stack.</>}
+        stretch={<>If forced to stack, what weights would you use to avoid double-counting?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p20"
+        difficulty="medium"
+        title="P20 — When NOT to use asymmetric BCE?"
+        scenario={<><em>Discriminating insight: when calibration is the deliverable and you can't post-calibrate; when imbalance is severe (1:1M+) where per-sample levers help; when noise is low and AUC is the goal (focal often wins).</em><br/><br/>When not.</>}
+        options={[
+          {key:"a", text:"Never."},
+          {key:"b", text:"Skip asymmetric BCE when: (1) calibration is critical and you can't afford a post-hoc calibration step (asymmetric BCE shifts probs, requires calibration to recover true posterior); (2) imbalance is extreme (1:1M+) and per-sample mining helps — focal or LDAM may win; (3) labels are clean and AUC is the only metric — focal often slightly better in pure ranking; (4) you need theoretical guarantees on balanced error — LDAM has them, asymmetric BCE does not.", correct:true},
+          {key:"c", text:"Always avoid."},
+          {key:"d", text:"Always use."},
+        ]}
+        trap={<>(a)(c)(d) absolutist.</>}
+        lens={<>Asymmetric BCE: simple, auditable, calibration-friendly. Not always the best.</>}
+        stretch={<>For a fraud team with strict regulatory audit + clean labels, would you start with weighted BCE or focal?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p21"
+        difficulty="hard"
+        title="P21 — 'Asymmetric BCE is just per-sample loss reweighting.' Diagnose."
+        scenario={<><em>Discriminating insight: false. Canonical asymmetric BCE is per-CLASS scalar, not per-sample. Mixing the two confuses the family. The mechanism is uniform within class.</em><br/><br/>Diagnose claim.</>}
+        options={[
+          {key:"a", text:"Correct."},
+          {key:"b", text:"Wrong. Canonical asymmetric BCE has one weight per CLASS (w_pos, w_neg), uniform across all samples of that class — the asymmetry is BETWEEN classes, not WITHIN. Per-sample loss reweighting is a generalization (sample-weighted BCE or cost-sensitive sample weighting), and while it includes asymmetric BCE as a special case, calling them 'just' the same conflates the canonical from the general. The canonical mechanism — per-class scalar — is what makes asymmetric BCE auditable, calibratable, and the simplest cost-sensitive loss.", correct:true},
+          {key:"c", text:"Both are the same."},
+          {key:"d", text:"Per-sample is asymmetric BCE."},
+        ]}
+        trap={<>(a)(c)(d) collapse the distinction.</>}
+        lens={<>Per-class is canonical. Per-sample is generalization. Don't conflate.</>}
+        stretch={<>How to handle a regulator who asks 'why this exact weight'?</>}
+      />
+
+      <VIS.TrapProblem
+        id="awbce-p22"
+        difficulty="hard"
+        title="P22 — In one sentence, what's THE unique mechanism of asymmetric BCE?"
+        scenario={<><em>Discriminating insight: per-class SCALAR weight on BCE — fixed, uniform across all samples of that class. Strip "per-class scalar" and it becomes either plain BCE (no weighting) or some other family (per-sample, focal, LDAM, threshold).</em><br/><br/>State.</>}
+        options={[
+          {key:"a", text:"Uses cross-entropy."},
+          {key:"b", text:"PER-CLASS SCALAR weighting of the BCE loss: multiply the positive-class term by w_pos and the negative-class term by w_neg, with w_pos and w_neg fixed across samples and across training. This is the simplest cost-sensitive loss and the most directly auditable to a regulator-supplied cost matrix; it's distinct from focal (per-sample modulation), LDAM (logit margin), and threshold moving (post-hoc).", correct:true},
+          {key:"c", text:"Uses focal."},
+          {key:"d", text:"Moves the threshold."},
+        ]}
+        trap={<>(a) trivial; (c)(d) describe sister concepts.</>}
+        lens={<>Anchor: per-class scalar weight on BCE. Two numbers. One line of config.</>}
+        stretch={<>Why is 'fixed across training' the load-bearing word in the anchor?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li>
-          <a href="https://dl.acm.org/doi/10.1145/3637528.3671634" target="_blank" rel="noopener">
-            <strong>KDD 2024 ADS — Cost-Sensitive Loss Design for Fraud Detection</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, KDD 2024)</span>
-          <br/>The current SOTA treatment with industrial-strength experiments. Section 5 (ablations) shows what actually helps.
-        </li>
-        <li>
-          <a href="https://machinelearningmastery.com/cost-sensitive-learning-for-imbalanced-classification/" target="_blank" rel="noopener">
-            <strong>Jason Brownlee — Cost-Sensitive Learning for Imbalanced Classification (blog)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Practitioner introduction with scikit-learn examples. Best starting point if you've never built a cost-sensitive model.
-        </li>
-        <li>
-          <a href="https://stripe.com/blog/how-we-built-it-stripe-radar" target="_blank" rel="noopener">
-            <strong>Stripe — How We Built Radar (engineering blog)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(practitioner blog)</span>
-          <br/>Real production fraud system. Discusses why they ship calibrated probabilities plus per-merchant thresholds rather than baking cost into the loss.
-        </li>
-        <li>
-          <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.brier_score_loss.html" target="_blank" rel="noopener">
-            <strong>scikit-learn — Brier score loss and calibration (docs)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(docs)</span>
-          <br/>If weighted BCE destroys calibration, you need to recalibrate. This doc plus the CalibratedClassifierCV reference is the practical fix.
-        </li>
-        <li>
-          <a href="https://www.youtube.com/watch?v=NhAYBVi6XaY" target="_blank" rel="noopener">
-            <strong>Cassie Kozyrkov — Decision Intelligence and Cost-Sensitive ML (video)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(video, ~25 min)</span>
-          <br/>Excellent intuition on why "accuracy" is the wrong metric and how to think about costs in production ML.
-        </li>
+        <li><a href="https://arxiv.org/abs/1901.05555" target="_blank" rel="noopener"><strong>Cui et al. — Class-Balanced Loss Based on Effective Number of Samples</strong></a> <span style={{color:"#64748b", fontSize:14}}>(CVPR 2019, paper)</span><br/>The effective-number formula and the empirical case for it. Read sections 3-4.</li>
+        <li><a href="https://machinelearningmastery.com/cost-sensitive-learning-for-imbalanced-classification/" target="_blank" rel="noopener"><strong>Jason Brownlee — Cost-Sensitive Learning for Imbalanced Classification</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Practitioner walkthrough with sklearn code. Best starting point for the cost-matrix recipe.</li>
+        <li><a href="https://pytorch.org/docs/stable/generated/torch.nn.BCEWithLogitsLoss.html" target="_blank" rel="noopener"><strong>PyTorch BCEWithLogitsLoss docs</strong></a><br/>The pos_weight argument is the canonical implementation. Read the math expression in the docstring.</li>
+        <li><a href="https://dl.acm.org/doi/10.1145/3637528.3671634" target="_blank" rel="noopener"><strong>Cost-Sensitive Loss Design for Fraud</strong></a> <span style={{color:"#64748b", fontSize:14}}>(KDD 2024 ADS, paper)</span><br/>Modern revisit in fraud context — when weights, focal, and threshold moving each win.</li>
+        <li><a href="https://imbalanced-learn.org/stable/" target="_blank" rel="noopener"><strong>imbalanced-learn docs</strong></a><br/>Beyond weights: oversampling, undersampling, and where each fits relative to loss weighting.</li>
       </ul>
     </VIS.Section>
   </main>

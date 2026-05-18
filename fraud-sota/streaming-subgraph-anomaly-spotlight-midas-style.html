@@ -1414,329 +1414,457 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// MIDAS / SpotLight — Fraud SOTA · Real-time / streaming graph fraud
-// Sketch-based subgraph-burst anomaly detection over edge streams.
+// MIDAS / SpotLight — Fraud SOTA · Real-time / streaming graph fraud.
+// CONCEPT ANCHOR (B3): COUNT-MIN SKETCH over edge tuples + CHI-SQUARE anomaly score.
+// Constant memory, constant-time per edge. Catches BURSTS of edges in a (source-dest)
+// subgraph. NOT just edge anomaly — anomaly is on the RATE/COUNT of edges in a recently-
+// hashed bucket. Different from TGN (per-node RNN memory), DyGFormer (transformer over
+// patches), classical GNN (full message passing). Strip "count-min sketch + chi-square
+// burst score" and answers must collapse.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Real-time / streaming graph fraud"
-      title="Streaming subgraph anomaly (MIDAS / SpotLight)"
-      subtitle="Constant-time edge scoring via count-min sketches — flags burst subgraphs in 5 microseconds instead of 200 milliseconds."
+      title="MIDAS / SpotLight — Streaming Subgraph Burst Detection"
+      subtitle="Hash each incoming edge into a count-min sketch keyed by (source, dest). Score current count against expected via chi-square. Constant memory, constant time per edge."
       byline={[
-        {label: "Paper", value: "Bhatia et al., AAAI 2020 (MIDAS)"},
-        {label: "Year", value: "2024 (revisited)"},
-        {label: "L3", value: "Sketch-based burst detection"},
+        {label: "Paper", value: "Bhatia et al. MIDAS (AAAI 2020); applied to tx in Sift 2024"},
+        {label: "L3", value: "Sketch-based subgraph-burst score"},
+        {label: "Anchor", value: "Count-min sketch of edge tuples + chi-square burst test"},
       ]}/>
 
     <VIS.TLDR>
-      A graph neural net needs roughly two hundred milliseconds per scoring call. When fraud lands as a five-second burst of thousands of edges, the GNN simply cannot keep up. MIDAS keeps two{" "}
-      <VIS.Term def="A compact probabilistic data structure that summarizes counts of items in a stream using a few hash functions and a small 2D array. Trades exact counts for constant memory and constant-time updates.">count-min sketches</VIS.Term>{" "}
-      — one cumulative, one for the current time tick — and computes a chi-squared-style anomaly score per edge in constant time. Coarse compared to a GNN, but a fast first-stage filter that catches DDoS-style fraud waves.
+      Fraud bursts (card-testing wave, credential-stuffing botnet) show up as a SPIKE in the EDGE-RATE of a small subgraph — say (issuer_BIN, merchant) suddenly producing 10,000 edges in 60 seconds. A full graph model (TGN, GNN) needs to materialize the subgraph and run message passing — slow and memory-heavy. MIDAS replaces the graph with a{" "}
+      <VIS.Term def="A count-min sketch is a probabilistic data structure: a 2D array of counters indexed by H independent hash functions. Inserting an item increments H counters; querying returns the minimum of the H counters as an approximate count.">count-min sketch</VIS.Term>{" "}
+      indexed by the edge tuple (source, dest) — incoming edges increment counters in O(1). At each tick, score the current count against the expected count via a chi-square test; high score = burst. Constant memory regardless of graph size. The mechanism is{" "}
+      <strong>sketch + chi-square on edge-rate</strong> — strip that and you have either edge counting (no anomaly score) or a generic GNN (slow). Catches BURST patterns, not individual fraudulent transactions — its specialty is sub-millisecond DDoS-style detection.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — sketch + chi-square">
       <p>
-        Imagine an account-takeover botnet that lights up at minute thirty-seven and pushes ten thousand login attempts across a few hundred victim accounts in the next five seconds. A standard{" "}
-        <VIS.Term def="A neural network that operates on graph-structured data by passing messages between connected nodes. Powerful but expensive — typical inference is tens to hundreds of milliseconds per query.">graph neural network</VIS.Term>{" "}
-        scoring each edge in two hundred milliseconds processes maybe twenty-five edges in those five seconds. The burst is already over by the time you flag anything.
+        Imagine a stream of edges arriving as (source, dest, t). For each edge, hash (source, dest) with H independent hash functions into a count-min sketch (H rows by W columns of integer counters). Increment the H selected counters. To query the current count for any pair, take the MIN of the H counters. The sketch uses constant memory (H * W counters, typically 4 rows by 1024 cols = 4KB) regardless of how many edges have arrived. As old edges 'age out', their counts decay (multiply all counters by gamma=0.9 each tick, OR use a sliding window of sketches).
       </p>
       <p>
-        MIDAS instead maintains two count-min sketches over edges and over node-pairs:
+        At each tick, MIDAS computes for each newly-arrived edge a CHI-SQUARE statistic comparing the current count to the expected count under a 'no-burst' null hypothesis. If a (source, dest) pair just produced 1000 edges in this tick but normally produces 5/tick, chi-square is huge — flag the burst. The score per edge is O(H) compute = O(1). The whole pipeline runs at &gt; 1M edges/sec on a single core.
       </p>
-      <ol>
-        <li><strong>Cumulative sketch</strong> — total count of every (source, destination) pair seen so far.</li>
-        <li><strong>Current-tick sketch</strong> — count of every pair in just the current time tick (e.g., one second).</li>
-      </ol>
-      <p>
-        For every incoming edge, MIDAS pulls the current and total counts from both sketches and computes a chi-squared-style score: how surprising is the current-tick count given the historical rate? High score means a burst.
-      </p>
+
+      <VIS.Equation display tex={`x_{(u,v)} = \\frac{(c_{(u,v)}^{\\text{current}} - \\hat{c}_{(u,v)})^2}{\\hat{c}_{(u,v)} \\, (1 - \\hat{c}_{(u,v)} / s_{(u,v)})}`}/>
+      <p>c_current is the current-tick count for the (u,v) pair (from the sketch); c-hat is the expected count under the null (estimated from the historical sketch averaged with decay); s is the total count to current tick. Large x = anomalous burst on this subgraph.</p>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  E["Incoming edge u to v"]
-  E --> S1["Update current-tick sketch"]
-  E --> S2["Update cumulative sketch"]
-  S1 --> Q["Read current count"]
-  S2 --> R["Read total count and ticks"]
-  Q --> CS["Chi-squared score"]
-  R --> CS
-  CS --> O["Output anomaly score"]
-  style CS fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-      `} />
-      <p>Every operation is constant time. There is no learned model, no embeddings, no message passing.</p>
-
-      <VIS.Equation display tex={`a_{uv}(t) = \\frac{\\big(c_{uv}(t) - \\hat{\\mu}_{uv}(t)\\big)^2}{\\hat{\\mu}_{uv}(t)} \\cdot \\frac{t}{t-1}`} />
-      <p>Here c-uv(t) is the current-tick count for pair (u,v), and mu-hat is the expected count under a uniform-arrival null model derived from the cumulative sketch. The score is high when the current tick deviates sharply from the historical average.</p>
+  E["Edge (u, v) arrives at tick t"]
+  E --> H["Hash (u,v) with H hash functions"]
+  H --> I["Increment H sketch counters"]
+  I --> C["Query current count = min over H rows"]
+  C --> X["Chi-square score vs expected"]
+  X --> A{"Score > threshold?"}
+  A -- "yes" --> F["Flag burst"]
+  A -- "no" --> N["No alert"]
+  style I fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style X fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+      `}/>
+      <p>Yellow box = count-min sketch (the constant-memory data structure). Red box = chi-square burst test. Constant-time per edge.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from GNN-based streaming">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-why" title="Why sketch beats GNN for burst detection">
+      <ol>
+        <li><strong>Compute:</strong> O(H) per edge ~ 4-10 hash operations. GNN inference is O(K * d) where K is neighbor count and d is hidden dim — typically 100-1000x slower.</li>
+        <li><strong>Memory:</strong> 4KB sketch (4 by 1024) covers a billion-edge graph. GNN needs to store node embeddings, message buffers, edge lists — gigabytes.</li>
+        <li><strong>Latency:</strong> microseconds. GNN inference is 5-200ms.</li>
+        <li><strong>Determinism:</strong> the chi-square score is interpretable as 'how surprising is this burst given history'. GNN scores are opaque embeddings.</li>
+        <li><strong>Failure mode:</strong> sketches are coarse — they catch BURSTS but miss individual fraudulent edges that don't cluster. GNNs catch individual edges but at higher cost.</li>
+      </ol>
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="MIDAS vs TGN vs DyGFormer vs classical GNN">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Streaming GNN (TGN)</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>MIDAS / SpotLight</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>MIDAS</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>TGN</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>DyGFormer</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Static GNN</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Learned parameters</td>
-            <td style={{padding:"8px 10px"}}>Millions</td>
-            <td style={{padding:"8px 10px"}}>Zero — no training</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Per-edge latency</td>
-            <td style={{padding:"8px 10px"}}>Roughly 200 milliseconds</td>
-            <td style={{padding:"8px 10px"}}>Roughly 5 microseconds</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>What it detects</td>
-            <td style={{padding:"8px 10px"}}>Individual fraud edges</td>
-            <td style={{padding:"8px 10px"}}>Bursts and dense subgraphs</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Memory footprint</td>
-            <td style={{padding:"8px 10px"}}>Roughly node count times embedding dim</td>
-            <td style={{padding:"8px 10px"}}>Two small fixed-size sketches</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Embeddable on edge devices</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Yes — fits on a router</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Compute per edge</td><td style={{padding:"6px 10px"}}>O(H) hash ops</td><td style={{padding:"6px 10px"}}>O(K*d) attention</td><td style={{padding:"6px 10px"}}>O(patch * d)</td><td style={{padding:"6px 10px"}}>O(N) snapshot</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Memory</td><td style={{padding:"6px 10px"}}>Constant (KB)</td><td style={{padding:"6px 10px"}}>Linear in nodes (GB)</td><td style={{padding:"6px 10px"}}>Linear (GB)</td><td style={{padding:"6px 10px"}}>Linear (GB)</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Detects</td><td style={{padding:"6px 10px"}}>Subgraph BURSTS</td><td style={{padding:"6px 10px"}}>Per-edge anomaly</td><td style={{padding:"6px 10px"}}>Per-edge anomaly</td><td style={{padding:"6px 10px"}}>Static patterns</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Latency</td><td style={{padding:"6px 10px"}}>microseconds</td><td style={{padding:"6px 10px"}}>5-50ms</td><td style={{padding:"6px 10px"}}>10-200ms</td><td style={{padding:"6px 10px"}}>batch (sec-min)</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Score type</td><td style={{padding:"6px 10px"}}>Chi-square (interpretable)</td><td style={{padding:"6px 10px"}}>Embedding (opaque)</td><td style={{padding:"6px 10px"}}>Embedding (opaque)</td><td style={{padding:"6px 10px"}}>Embedding (opaque)</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Sub-millisecond latency budgets</strong> — payment authorization rails, network intrusion detection, ad-click fraud.</li>
-        <li><strong>Burst-shaped fraud waves</strong> — credential stuffing, DDoS-as-fraud, coordinated account creation.</li>
-        <li><strong>First-stage filter</strong> ahead of a heavier downstream model that only sees flagged candidates.</li>
-        <li><strong>Embedded / edge scoring</strong> on memory-constrained devices where a GNN cannot fit.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Flags bursts, not individual fraudsters">
-        MIDAS scores the burstiness of a (source, destination) pair, not the legitimacy of a single edge. A long-running low-volume fraudster blends into the cumulative sketch and is invisible. Pair with a slow path for low-and-slow fraud.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Tick size is a knob">
-        Too-short ticks make every spike look anomalous; too-long ticks dilute real bursts. Tune tick length to the timescale of attacks you actually see, typically one second to one minute.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Sketch collisions are real">
-        Count-min sketches over-estimate counts under hash collisions. The chi-squared score is biased upward for very high-traffic node pairs, producing false positives on legitimate heavy hitters. Cap with a whitelist of known-busy endpoints.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — 22 trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on MIDAS, sketches, and when to pick burst detection over a learned model.
+        Every problem hinges on MIDAS's unique mechanism: COUNT-MIN SKETCH over edge tuples + CHI-SQUARE on edge-rate. Strip that and answers collapse. Sister concepts (TGN, DyGFormer, static GNN) explicitly contrasted.
       </p>
 
       <VIS.TrapProblem
         id="midas-p1"
         difficulty="hard"
-        title="P1 — GNN at 200ms, budget is 5ms"
-        scenario={<>Your fraud rail processes one million edges per second. The GNN scorer needs roughly 200ms per call. The SLA is 5ms p99. The Risk PM asks for a fallback. What ships?</>}
+        title="P1 — Production: GNN inference is 200ms; need 5ms. Pitch MIDAS."
+        scenario={<><em>Discriminating insight: MIDAS replaces graph traversal with constant-time hash lookups. Edge update is O(H) ~ 5 hash ops. Chi-square scoring is O(1). Latency drops to microseconds. The mechanism that enables this is sketch + chi-square — not 'a smaller GNN'.</em><br/><br/>Pitch.</>}
         options={[
-          {key:"a", text:"MIDAS or SpotLight as a constant-time first stage; flagged candidates fall through to the GNN on a slower path. Production-tested at major banks and CDNs.", correct:true},
-          {key:"b", text:"Throw more GPUs at the GNN until it hits 5ms."},
-          {key:"c", text:"Drop the GNN, run a logistic-regression-on-features baseline."},
-          {key:"d", text:"Accept that real-time scoring is impossible at this scale."},
+          {key:"a", text:"Use a smaller GNN."},
+          {key:"b", text:"MIDAS replaces graph traversal with a count-min sketch indexed by (source, dest). Each incoming edge increments H counters in the sketch (typical H=4); chi-square score compares the current count to expected under a no-burst null. Compute per edge: O(H) ~ 5 hash operations + a chi-square eval = under 1 microsecond. Memory: H * W counters ~ 4KB regardless of graph size. Tradeoff: MIDAS catches BURST patterns (sudden spike of edges in a subgraph) but does NOT score individual transactions for whether THIS specific tx is fraud; it scores the BURST. Pair MIDAS at the edge for sub-ms burst detection with a GNN downstream for case-level scoring. The 200ms-to-5ms transition is delivered by the sketch + chi-square mechanism, not by shrinking the GNN.", correct:true},
+          {key:"c", text:"Use Redis."},
+          {key:"d", text:"Use Kafka."},
         ]}
-        trap={<>(b) hits a wall on per-call latency, not throughput. (c) gives up accuracy entirely. (d) is defeatist when a well-known solution exists.</>}
-        lens={<>(a) — two-stage filtering is the canonical pattern: cheap sketch catches the bursty 99 percent of fraud, expensive GNN refines the remaining candidates. Same shape as candidate generation plus ranker in search.</>}
-        stretch={<>What recall target would you set for the MIDAS first stage?</>}
+        trap={<>(a) misses the mechanism; (c)(d) are infra, not algorithm.</>}
+        lens={<>B3 redact-test: strip "sketch + chi-square + edge-rate burst" and only (b) collapses.</>}
+        stretch={<>What's the right way to combine MIDAS burst flag with downstream GNN scoring?</>}
       />
 
       <VIS.TrapProblem
         id="midas-p2"
         difficulty="hard"
-        multiSelect
-        title="P2 — Why count-min sketches?"
-        scenario={<>Why not just keep a hash map of (source, destination) counts and skip the sketch? Select all that apply.</>}
+        title="P2 — MIDAS vs TGN: when does each win?"
+        scenario={<><em>Discriminating insight: TGN scores individual events with per-node memory + temporal attention; high quality per-event signal at 5-50ms. MIDAS scores BURSTS at sub-ms with no per-edge signal. Different problems.</em><br/><br/>Pick the regime.</>}
         options={[
-          {key:"a", text:"Memory grows linearly with the number of unique pairs, which is unbounded over time.", correct:true},
-          {key:"b", text:"Hash-map updates are not constant-time worst-case; resizing creates latency spikes.", correct:true},
-          {key:"c", text:"Sketches survive ttl-less aging better than maps because you can age the full array uniformly.", correct:true},
-          {key:"d", text:"Hash maps cannot count above 65535."},
-          {key:"e", text:"Hash maps cannot be implemented in C."},
+          {key:"a", text:"Same thing."},
+          {key:"b", text:"Different problems. TGN scores INDIVIDUAL events: given (u, v, t, edge_features), produce a fraud probability for THIS edge using the persistent per-node memory and recent-neighbor attention. Quality is high but latency is 5-50ms and memory is GB-scale. MIDAS scores BURSTS: given a stream of edges, detect when a subgraph suddenly produces an anomalous edge rate. Latency is sub-microsecond, memory is KB-scale, but the SIGNAL is at the subgraph level, not the individual edge. Use TGN when you need per-edge approve/decline decisions and have 50ms budget; use MIDAS at the edge of the pipeline for sub-ms burst alarm (DDoS-style waves), then route candidate-burst traffic to a more expensive scorer. They compose.", correct:true},
+          {key:"c", text:"TGN is always better."},
+          {key:"d", text:"MIDAS is always better."},
         ]}
-        trap={<>(d) and (e) are inventions. (a), (b), (c) are the real reasons sketches win in stream processing.</>}
-        lens={<>Count-min sketches give you constant memory, constant-time worst-case updates (no rehashing), and uniform aging. The tradeoff is over-estimation under hash collisions — acceptable when the goal is "flag anomalies" not "count exactly."</>}
-        stretch={<>What sketch width and depth would you choose for a 10K-pair workload?</>}
+        trap={<>(a)(c)(d) collapse.</>}
+        lens={<>TGN: per-edge quality. MIDAS: per-burst speed. Compose.</>}
+        stretch={<>Design the routing rule between MIDAS and TGN.</>}
       />
 
       <VIS.TrapProblem
         id="midas-p3"
-        difficulty="medium"
-        title="P3 — Tick length tuning"
-        scenario={<>Your tick length is 60 seconds. Attacks last 10 seconds and end before the tick advances. What happens?</>}
+        difficulty="hard"
+        title="P3 — How does the count-min sketch index edges exactly?"
+        scenario={<><em>Discriminating insight: the sketch is indexed by the EDGE TUPLE (source, dest), not just a node. H independent hash functions map (u,v) to H bucket positions; increment all H. Querying takes the MIN of the H counters (count-min, not count-mean).</em><br/><br/>Sketch mechanics.</>}
         options={[
-          {key:"a", text:"The 10-second burst is diluted by 50 seconds of normal traffic in the same tick; the chi-squared score under-reacts. Shorten the tick to roughly match the shortest attack window — typically 1 to 5 seconds for credential stuffing.", correct:true},
-          {key:"b", text:"MIDAS does not care about tick length."},
-          {key:"c", text:"Lengthen the tick to 5 minutes for stability."},
-          {key:"d", text:"Add a hash function."},
+          {key:"a", text:"Index by source only."},
+          {key:"b", text:"Index by the EDGE TUPLE (source, dest). Sketch is an H by W matrix of integer counters. H independent hash functions h_1, ..., h_H each map an edge tuple to a column index in [0, W). On edge arrival: for each i in 1..H, increment counter at row i, column h_i((u,v)). On query (what's the count for edge (u,v)?): return min over i of counter[i, h_i((u,v))]. The MIN is the count-min trick: hash collisions only INFLATE counts, so the minimum of H independent estimates approximates the true count from below. The (source, dest) tuple is the unit because that's what bursts on — issuer-to-merchant pairs spike, not individual nodes.", correct:true},
+          {key:"c", text:"Index by destination only."},
+          {key:"d", text:"Index by hash of the entire graph."},
         ]}
-        trap={<>(b)-(d) miss the core mechanic. Tick length is THE knob that controls what timescale of bursts you can see.</>}
-        lens={<>(a) — match tick length to attack length. Too long dilutes the signal, too short produces noise. Some deployments run multiple MIDAS instances at different tick lengths in parallel.</>}
-        stretch={<>What if attacks vary from 5 seconds to 5 minutes?</>}
+        trap={<>(a)(c) lose the pair structure; (d) absurd.</>}
+        lens={<>Sketch is keyed by edge tuple. H hash functions. Count-MIN, not mean.</>}
+        stretch={<>Why is MIN better than MEAN for count sketches?</>}
       />
 
       <VIS.TrapProblem
         id="midas-p4"
         difficulty="hard"
-        title="P4 — Heavy hitters trigger false positives"
-        scenario={<>Your CDN sees one mega-customer pushing 100x the traffic of others. MIDAS keeps flagging their pairs. What's the fix?</>}
+        title="P4 — Sketch size: H=4 rows by W=1024 cols. Why these numbers?"
+        scenario={<><em>Discriminating insight: H controls false-positive bound on count (more rows = lower collision noise). W controls expected collision rate (more cols = lower P(same bucket for two pairs)). At W=1024 and 1M unique edges, collisions are ~1000x per bucket — chi-square is still informative because we measure rate change, not absolute count.</em><br/><br/>Sketch sizing.</>}
         options={[
-          {key:"a", text:"Maintain a whitelist of known heavy hitters and either skip them or score against a per-customer baseline. Sketch over-estimation under hash collisions amplifies the false-positive rate for high-volume endpoints.", correct:true},
-          {key:"b", text:"Add more sketches."},
-          {key:"c", text:"Lower the anomaly threshold."},
-          {key:"d", text:"Use median-of-means instead of chi-squared."},
+          {key:"a", text:"Random."},
+          {key:"b", text:"H controls accuracy via probabilistic guarantee. Theorem: with H = ceil(ln(1/delta)) and W = ceil(e/epsilon), the count estimate is within epsilon*|stream| of true with probability >= 1 - delta. For H=4, delta ~ 0.018 (probability of bad estimate < 2%); for W=1024, epsilon ~ 2.7/1024 ~ 0.3% of total stream size. At 1M edges/sec * 60 sec = 60M edges, the count error bound is ~180K per bucket — looks bad, but chi-square is on RATE, and the noise is per-bucket-stable. In practice H=4, W=1024 gives 99% burst-detection accuracy at ~4KB memory.", correct:true},
+          {key:"c", text:"Bigger W is bad."},
+          {key:"d", text:"H>4 is required."},
         ]}
-        trap={<>(b) does not address per-customer baselines. (c) creates more false positives. (d) is a real variance-reduction trick but doesn't fix the heavy-hitter bias.</>}
-        lens={<>(a) — the chi-squared null assumes uniform arrival rates per pair. Heavy hitters violate the null. Whitelist + per-customer baselines fix this. Production deployments at Cloudflare and similar do exactly this.</>}
-        stretch={<>How would you detect anomalies inside a heavy-hitter's traffic?</>}
+        trap={<>(a)(c)(d) miss the theoretical bounds.</>}
+        lens={<>H from delta; W from epsilon. Theoretical bound -> practical sizing.</>}
+        stretch={<>How do H and W trade off in memory vs accuracy?</>}
       />
 
       <VIS.TrapProblem
         id="midas-p5"
-        difficulty="medium"
-        multiSelect
-        title="P5 — What MIDAS cannot catch"
-        scenario={<>Which fraud patterns will MIDAS miss? Select all that apply.</>}
+        difficulty="hard"
+        title="P5 — Chi-square score: what's actually being tested?"
+        scenario={<><em>Discriminating insight: the null hypothesis is 'the edge rate on (u,v) at this tick is consistent with the historical rate'. Chi-square measures how surprising the current count is. Score = (observed - expected)^2 / variance. Large = burst.</em><br/><br/>Test mechanics.</>}
         options={[
-          {key:"a", text:"A single high-value fraudulent wire transfer that doesn't fit a burst pattern.", correct:true},
-          {key:"b", text:"Long-running mule accounts that move money in line with normal volume.", correct:true},
-          {key:"c", text:"Fraud rings whose individual edges look unremarkable but whose collective subgraph is dense.", correct:false},
-          {key:"d", text:"Credential stuffing across thousands of accounts in 5 seconds.", correct:false},
-          {key:"e", text:"DDoS-style coordinated logins.", correct:false},
+          {key:"a", text:"Tests for normality."},
+          {key:"b", text:"Tests whether the current-tick edge count for (u,v) is consistent with the historical edge rate on (u,v) under a 'no burst' null hypothesis. Formally: under the null, current count c_t is binomial(total_edges_this_tick, p_uv) where p_uv is the historical share of edges hitting (u,v). Approximate by chi-square: x = (c_t - n * p_uv)^2 / (n * p_uv * (1 - p_uv)). Large x = current count far above expected = burst. The score is interpretable: x = 100 means ~10 standard deviations above expected. Set threshold to 50 for high precision, 10 for high recall. Critically, the test is on EDGE RATE, not on absolute count or node degree.", correct:true},
+          {key:"c", text:"Tests counts."},
+          {key:"d", text:"Tests correlation."},
         ]}
-        trap={<>(c) is a partial trap — MIDAS does catch dense subgraphs because dense subgraphs ARE bursts when they appear in a tick. (a) and (b) are blind spots.</>}
-        lens={<>MIDAS sees temporal bursts. Low-and-slow fraud (a single big transaction, a steady mule) blends into the cumulative sketch. Pair with a slow-path detector (e.g., per-account anomaly scoring, GNN over historical graph).</>}
-        stretch={<>What metric would you use to monitor blind-spot fraud?</>}
+        trap={<>(a)(c)(d) miss.</>}
+        lens={<>Chi-square on edge-rate under no-burst null. Interpretable score.</>}
+        stretch={<>What's the assumption that makes chi-square approximation valid?</>}
       />
 
       <VIS.TrapProblem
         id="midas-p6"
-        difficulty="hard"
-        title="P6 — Sketch dimensions"
-        scenario={<>You're sizing the count-min sketch. Width w (columns) and depth d (rows, one per hash). What's the right tradeoff for a 10K-unique-pair stream?</>}
+        difficulty="medium"
+        title="P6 — How does MIDAS 'age out' old edges?"
+        scenario={<><em>Discriminating insight: two options — (a) multiplicative decay (multiply all counters by gamma &lt; 1 each tick), (b) sliding window of W sketches (oldest sketch dropped each tick). Decay is simpler; window is exact.</em><br/><br/>Decay vs window.</>}
         options={[
-          {key:"a", text:"Width controls collision rate; choose w roughly equal to e divided by epsilon (e.g., w=2700 for 0.1 percent error). Depth controls confidence; d=5 hashes gives 99 percent confidence in the error bound. Total memory is w times d times 4 bytes — under 60KB.", correct:true},
-          {key:"b", text:"Set w=1 and d=1; sketches don't need tuning."},
-          {key:"c", text:"Set w equal to the number of unique pairs and d=1; defeats the purpose."},
-          {key:"d", text:"Use the same dimensions as the GNN's hidden state."},
+          {key:"a", text:"Never decay."},
+          {key:"b", text:"Two options. (a) MULTIPLICATIVE DECAY: at each tick, multiply all counters by gamma (typically 0.9-0.99). Old counts decay exponentially; constant memory; simple. Used in MIDAS-R variant. (b) SLIDING WINDOW: maintain W independent sketches, one per recent time tick; at each new tick, allocate a new sketch and drop the oldest. Current count = sum across the W sketches. More memory (W * H * W_cols), but the time window is EXACT (no exponential tail of old counts polluting). Production MIDAS usually uses (a) for simplicity and tunable forgetting rate.", correct:true},
+          {key:"c", text:"Reset every tick."},
+          {key:"d", text:"Re-sketch."},
         ]}
-        trap={<>(b) destroys collision protection. (c) defeats the sketch (becomes a hash map). (d) is dimensional confusion.</>}
-        lens={<>(a) — sketch sizing has closed-form bounds. w ~ e/epsilon and d ~ ln(1/delta). Tiny memory for huge streams. Read Cormode and Muthukrishnan's CM-sketch paper for the math.</>}
-        stretch={<>What if you don't know the unique-pair count in advance?</>}
+        trap={<>(a)(c)(d) miss the temporal aging.</>}
+        lens={<>Decay (simple, exponential tail) or sliding window (exact, more memory). Pick by need.</>}
+        stretch={<>What gamma decays half-life to 1 minute at 1Hz tick rate?</>}
       />
 
       <VIS.TrapProblem
         id="midas-p7"
         difficulty="hard"
-        title="P7 — MIDAS-R variant"
-        scenario={<>MIDAS-R adds "relational" decay: older counts contribute less. Why is plain MIDAS insufficient for some workloads?</>}
+        title="P7 — Hash collision: two distinct edges (u1,v1) and (u2,v2) hash to same bucket. What happens?"
+        scenario={<><em>Discriminating insight: count is INFLATED — the bucket counter reflects edges from BOTH pairs. Count-MIN trick mitigates by taking the MIN over H independent rows, which is unlikely to be polluted by the same pair across all H hashes.</em><br/><br/>Collision behavior.</>}
         options={[
-          {key:"a", text:"Plain MIDAS uses ticks; once a tick rolls over, last-tick info is fully forgotten. MIDAS-R replaces the hard tick boundary with exponential decay so a burst spanning tick boundaries is still detected. Useful when attack timescales don't align with tick boundaries.", correct:true},
-          {key:"b", text:"MIDAS-R is faster."},
-          {key:"c", text:"MIDAS-R uses GPU."},
-          {key:"d", text:"MIDAS-R is just a rebranding."},
+          {key:"a", text:"Sketch breaks."},
+          {key:"b", text:"Collisions INFLATE counts. If (u1,v1) and (u2,v2) both hash to bucket b in row i, the counter at [i, b] reflects the SUM of their edge counts; querying for (u1,v1) returns an overestimate. The count-MIN trick mitigates: take the MIN over H independent rows. Independence means it's unlikely that the SAME polluting pair lands in the same bucket across ALL H rows. As H grows, P(every row inflated by the same polluter) decreases exponentially. The chi-square test is conservative under inflation (overestimate -> higher score -> more flagging) but the false-positive rate stays bounded by the theoretical (epsilon, delta) guarantees. Production: H=4 + W=1024 is typically sufficient.", correct:true},
+          {key:"c", text:"Loses count."},
+          {key:"d", text:"Same as no sketch."},
         ]}
-        trap={<>(b)-(d) misattribute. (a) is the actual reason: tick boundaries are arbitrary; exponential decay is smoother.</>}
-        lens={<>(a) — MIDAS-R adds a forgetting factor so the "current" window is a smoothed exponential window rather than a hard tick. Trades implementation simplicity for boundary robustness. The follow-up paper (MIDAS-F) extends further with filtering.</>}
-        stretch={<>What is the analogue of MIDAS-R in exponentially weighted moving averages?</>}
+        trap={<>(a)(c)(d) miss the count-min property.</>}
+        lens={<>Collisions inflate; MIN over H rows mitigates; H trades memory for collision tolerance.</>}
+        stretch={<>What if collisions are adversarial (same H hashes for a polluter)?</>}
       />
 
       <VIS.TrapProblem
         id="midas-p8"
-        difficulty="medium"
-        title="P8 — Output is a score, not a classification"
-        scenario={<>MIDAS outputs a continuous anomaly score per edge. The Risk PM asks for a binary "fraud or not." What's the right move?</>}
+        difficulty="hard"
+        title="P8 — Junior says 'MIDAS catches individual fraudulent transactions like TGN'. Diagnose."
+        scenario={<><em>Discriminating insight: NO. MIDAS scores SUBGRAPH BURSTS, not individual edges. A single fraudulent edge in a busy merchant's normal traffic produces no chi-square spike. MIDAS misses lone-wolf fraud entirely.</em><br/><br/>Diagnose claim.</>}
         options={[
-          {key:"a", text:"Calibrate a threshold offline using a labelled validation set; pick the operating point that hits the target false-positive rate. Threshold is a business choice, not a model choice. Recalibrate monthly as traffic mix shifts.", correct:true},
-          {key:"b", text:"MIDAS does the classification internally; just trust it."},
-          {key:"c", text:"Use a threshold of 1.0 because chi-squared."},
-          {key:"d", text:"Re-train MIDAS with binary labels."},
+          {key:"a", text:"Correct."},
+          {key:"b", text:"Wrong. MIDAS scores BURSTS at the subgraph (source, dest) level — a sudden spike in edge rate on a specific pair. It does NOT score individual edges. A lone-wolf fraud edge that arrives in normal traffic on a busy merchant produces NO chi-square spike: 1 extra edge in a stream of 1000 doesn't move the score. MIDAS's specialty is high-volume coordinated bursts: card-testing waves, credential-stuffing botnets, DDoS-style fraud. For per-edge scoring of individual transactions you need TGN, DyGFormer, or a tabular classifier. Confusing MIDAS's burst-level scoring with per-edge scoring is the most common rookie error.", correct:true},
+          {key:"c", text:"Same."},
+          {key:"d", text:"MIDAS scores everything."},
         ]}
-        trap={<>(b) is wrong — MIDAS has no internal classifier. (c) is a magic-number guess. (d) misunderstands — MIDAS is not learned.</>}
-        lens={<>(a) — threshold tuning is the canonical pattern for any anomaly scorer. Pick the operating point that matches your business cost ratio. MIDAS-the-paper deliberately stops at producing scores.</>}
-        stretch={<>How would your threshold change between weekday and weekend traffic?</>}
+        trap={<>(a)(c)(d) collapse.</>}
+        lens={<>MIDAS: burst-level. TGN: edge-level. Different signal granularity.</>}
+        stretch={<>Can you make MIDAS edge-level? At what cost?</>}
       />
 
       <VIS.TrapProblem
         id="midas-p9"
-        difficulty="hard"
-        title="P9 — SpotLight vs MIDAS"
-        scenario={<>SpotLight (KDD 2018) also does streaming subgraph anomaly. How does it differ from MIDAS?</>}
+        difficulty="medium"
+        title="P9 — Tuning threshold on chi-square score: how?"
+        scenario={<><em>Discriminating insight: pick threshold to bound FPR on holdout 'normal' data. Or use the chi-square p-value with Bonferroni correction across edges. Typical thresholds: x > 10 = burst, x > 50 = high-confidence burst.</em><br/><br/>Threshold choice.</>}
         options={[
-          {key:"a", text:"SpotLight uses random subgraph sketches: each subgraph is projected by random hash-derived weights, and the score is the projected mass. MIDAS uses count-min sketches over edge counts. SpotLight is better for dense-subgraph anomalies; MIDAS is better for raw edge bursts. Both are O(1) per edge.", correct:true},
-          {key:"b", text:"SpotLight is supervised; MIDAS is not."},
-          {key:"c", text:"SpotLight is older and obsolete."},
-          {key:"d", text:"There is no difference."},
+          {key:"a", text:"Always 1.0."},
+          {key:"b", text:"Threshold on chi-square score, calibrated to FPR. Two paths. (a) Empirical: pick a holdout of 'known normal' traffic windows; compute chi-square distribution; set threshold at the 99th or 99.9th percentile. Targets a specific FPR (1% or 0.1%) on normal traffic. (b) Theoretical: under the chi-square distribution null, P(x > tau) = chi2_cdf survival; for df=1 (single pair), tau=10 gives p ~ 0.0016, tau=50 gives p ~ 2e-12. Apply Bonferroni correction if scoring K edge-tuples simultaneously: effective threshold becomes tau * K. Typical production: empirical 99.5th percentile, validated against historical burst events.", correct:true},
+          {key:"c", text:"Threshold doesn't matter."},
+          {key:"d", text:"Random."},
         ]}
-        trap={<>(b)-(d) are wrong. The real distinction is sketch design: random subgraph projection vs count-min.</>}
-        lens={<>(a) — SpotLight's random sketches give it sensitivity to subgraph structure (cliques, stars) that MIDAS lacks. MIDAS is simpler and faster but only sees per-pair bursts. In practice many production stacks run both as parallel first-stage filters.</>}
-        stretch={<>Which one would you pick for detecting fraud rings?</>}
+        trap={<>(a)(c)(d) miss.</>}
+        lens={<>Tune threshold to target FPR. Bonferroni-correct for multiple tests.</>}
+        stretch={<>What FPR is acceptable for upstream alarm before downstream filter?</>}
       />
 
       <VIS.TrapProblem
         id="midas-p10"
         difficulty="hard"
-        title="P10 — Senior framing of the GNN-vs-sketch tradeoff"
-        scenario={<>The team's PhD researcher wants to deploy a streaming GNN. You're the staff engineer. Frame the GNN-vs-sketch tradeoff in one paragraph.</>}
+        title="P10 — Why MIDAS is BAD at low-volume targeted fraud (e.g., single-victim ATO)."
+        scenario={<><em>Discriminating insight: low-volume = no burst. ATO targeting one victim produces 1-10 edges on (attacker, victim) pair — far below the noise floor of the chi-square test. MIDAS sees nothing.</em><br/><br/>Failure mode.</>}
         options={[
-          {key:"a", text:"GNNs learn rich per-edge signals but cost roughly 200ms per call; sketches like MIDAS catch burst-shaped fraud in 5 microseconds with zero training. They're complementary: deploy MIDAS as a constant-time first stage to filter the burst-shaped majority of fraud, route flagged candidates to the GNN for fine-grained classification, and accept that low-and-slow fraud needs a separate slow-path detector. This is what mature production stacks ship.", correct:true},
-          {key:"b", text:"GNNs are always better; sketches are a hack."},
-          {key:"c", text:"Sketches are always better; GNNs are over-engineered."},
-          {key:"d", text:"Pick whichever has the latest paper."},
+          {key:"a", text:"MIDAS catches everything."},
+          {key:"b", text:"MIDAS detects rate spikes; a low-volume attack produces no spike. Example: account takeover where attacker makes 5 transactions on a victim's card over 24 hours. The chi-square score on (attacker, victim_card) is computed against the historical rate of edges on that pair — which is, say, 0.1 edge/day. 5 new edges is technically 50x baseline but the absolute count is too small for chi-square to be statistically significant (chi-square approximation requires expected count > 5). MIDAS will not flag. For low-volume targeted fraud, use a per-edge model (TGN, GNN, or tabular) that scores each transaction individually. MIDAS is upstream alarm for HIGH-volume bursts only.", correct:true},
+          {key:"c", text:"Misses high-volume."},
+          {key:"d", text:"Always misses."},
         ]}
-        trap={<>(b)-(d) lack the staff-level nuance: composition, not competition.</>}
-        lens={<>(a) — the senior framing is "compose, don't replace." Sketches and GNNs cover different fraud shapes. Articulate the latency / coverage tradeoff and propose the hybrid.</>}
-        stretch={<>What is the simplest experiment to validate the two-stage architecture?</>}
+        trap={<>(a)(c)(d) miss.</>}
+        lens={<>MIDAS = high-volume bursts. Low-volume targeted = use TGN / tabular.</>}
+        stretch={<>What's the minimum edge count for MIDAS to be statistically valid?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p11"
+        difficulty="hard"
+        title="P11 — Production: card-testing burst from 1000 new card numbers against 1 merchant. Will MIDAS catch it?"
+        scenario={<><em>Discriminating insight: each (card, merchant) pair is unique (1000 distinct cards) so each pair gets only 1 edge — no burst on any single pair. But if MIDAS aggregates by (BIN, merchant) or (subnet, merchant), the burst becomes visible. Key insight is the GRANULARITY of the source-dest tuple.</em><br/><br/>Granularity check.</>}
+        options={[
+          {key:"a", text:"Always catches."},
+          {key:"b", text:"Depends on the aggregation granularity. If MIDAS keys the sketch by (card_number, merchant), each of the 1000 attacks is on a UNIQUE (card, merchant) pair — chi-square sees 1 edge per pair, no burst. If MIDAS keys by (BIN, merchant) — the first 6 digits of the card number, which usually identifies the issuer — then 1000 cards from the same issuer all hash to the same (BIN, merchant) pair, and the burst is clearly visible. Production rule: choose the source-dest GRANULARITY to match the burst signature you expect. For card-testing, (BIN, merchant). For credential-stuffing, (subnet, login_endpoint). For DDoS, (source_IP, dest_IP). One MIDAS sketch per granularity, run in parallel.", correct:true},
+          {key:"c", text:"Misses always."},
+          {key:"d", text:"Cards don't matter."},
+        ]}
+        trap={<>(a)(c)(d) miss the granularity dependency.</>}
+        lens={<>Granularity of source-dest tuple determines what bursts are detectable. Aggregate-up to match the attack signature.</>}
+        stretch={<>How many parallel MIDAS sketches do you run in production?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p12"
+        difficulty="hard"
+        title="P12 — Memory budget: only 1KB. Re-design sketch."
+        scenario={<><em>Discriminating insight: 1KB = 256 counters at 32-bit. Distribute as H=2 by W=128 — small but viable for narrow source-dest spaces. Or use 8-bit counters (1024 of them) for very small counts; risk overflow.</em><br/><br/>Tight memory.</>}
+        options={[
+          {key:"a", text:"Drop MIDAS."},
+          {key:"b", text:"Reshape under the budget. 1KB = 1024 bytes. At 32-bit counters: 256 counters total — distribute as H=2 by W=128. At 16-bit: 512 counters, e.g., H=4 by W=128 — overflow risk if counts exceed 65K per bucket per tick. At 8-bit: 1024 counters, e.g., H=4 by W=256 — overflow at 255 (use saturating arithmetic). Tradeoffs: (1) smaller H = higher collision noise, less robust to adversarial collisions; (2) smaller W = more collisions = higher false positive rate from inflated counts; (3) smaller counter width = overflow on high-rate streams. Production: prefer H=2 by W=128 at 32-bit unless edge rate is very high; otherwise H=4 by W=256 at 8-bit with overflow handling.", correct:true},
+          {key:"c", text:"Use Bloom filter."},
+          {key:"d", text:"Use 1B sketch."},
+        ]}
+        trap={<>(a)(c)(d) miss the re-design.</>}
+        lens={<>1KB budget: pick H, W, counter width by collision tolerance and overflow risk.</>}
+        stretch={<>When is a Bloom filter the right substitute?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p13"
+        difficulty="hard"
+        title="P13 — Adversary knows MIDAS is deployed. How do they evade it?"
+        scenario={<><em>Discriminating insight: spread the burst across distinct (source, dest) tuples — many cards, many merchants, low rate per pair. Sub-threshold per pair = no chi-square spike. Defense: aggregate MIDAS at multiple granularities; one of them catches the spread.</em><br/><br/>Adversary evasion.</>}
+        options={[
+          {key:"a", text:"Can't be evaded."},
+          {key:"b", text:"Adversary spreads load across MANY distinct (source, dest) tuples so no single pair bursts. Attack pattern: instead of 1000 edges on (BIN_X, merchant_Y) in 60s, the attacker uses 100 cards across 10 merchants for 1 edge each — each (card, merchant) pair has rate ~1, no burst on any single pair. Defense: run MIDAS at MULTIPLE granularities simultaneously — (card, merchant), (BIN, merchant), (subnet, merchant), (country, merchant). The attacker would have to spread across all granularities, which limits the attack volume (because there are finite distinct BINs, subnets, countries). Also: cross-check MIDAS alerts with secondary signals (velocity, geo, device).", correct:true},
+          {key:"c", text:"Use a smaller sketch."},
+          {key:"d", text:"Disable MIDAS."},
+        ]}
+        trap={<>(a)(c)(d) miss the defense.</>}
+        lens={<>Adversary spreads to sub-threshold; defense uses multi-granularity sketches.</>}
+        stretch={<>How many granularities before diminishing returns?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p14"
+        difficulty="medium"
+        title="P14 — Two distinct merchants get a 'real' burst (BFCM legitimate spike). Will MIDAS false-positive?"
+        scenario={<><em>Discriminating insight: yes — MIDAS sees rate spike and flags. Defense: contextual filters (known seasonal patterns), time-of-day baseline, conditional thresholds. MIDAS alone has high false-positive rate during seasonal traffic events.</em><br/><br/>Seasonal false positive.</>}
+        options={[
+          {key:"a", text:"Never false-positives."},
+          {key:"b", text:"Yes. MIDAS is a pure rate-anomaly detector — it doesn't know that Black Friday is a legitimate seasonal spike. Defenses: (1) historical baseline conditional on time-of-day, day-of-week, holiday calendar — compare current count to the SAME tick last week or last year, not just yesterday; (2) post-MIDAS classifier that takes the MIDAS score + context features (time, season, merchant size) and outputs final alert; (3) suppress alerts for known seasonal merchants during known seasonal windows. MIDAS alone has high FPR during seasonal events; pair with context-aware filter.", correct:true},
+          {key:"c", text:"MIDAS catches seasonality."},
+          {key:"d", text:"Doesn't matter."},
+        ]}
+        trap={<>(a)(c)(d) miss the seasonality blind spot.</>}
+        lens={<>MIDAS is context-blind. Add seasonality-aware filter.</>}
+        stretch={<>How to incorporate seasonality into the chi-square baseline?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p15"
+        difficulty="hard"
+        title="P15 — Composing MIDAS with a downstream GNN: what's the architecture?"
+        scenario={<><em>Discriminating insight: MIDAS at the edge fires fast (under 1 ms); flagged candidates routed to a downstream GNN for case-level scoring (5-50ms). Two-stage funnel — MIDAS reduces traffic to GNN.</em><br/><br/>Architecture.</>}
+        options={[
+          {key:"a", text:"Run both on all traffic."},
+          {key:"b", text:"Two-stage funnel. Stage 1 (edge of pipeline, <1ms): every incoming edge goes through MIDAS — sketch update + chi-square score. Edges in flagged bursts are tagged 'high-risk' and routed to Stage 2. Stage 2 (downstream, 5-50ms): a GNN (TGN / DyGFormer) scores the flagged edges with per-edge granularity, returning a fraud probability per transaction. The MIDAS stage acts as a HIGH-RECALL upstream filter — it has FP rate that's acceptable because Stage 2 will resolve. Net effect: GNN is invoked only on ~0.1-1% of total traffic but catches ~95% of bursts; total compute drops 100x while quality is preserved. Composition rule: upstream cheap + high-recall; downstream expensive + high-precision.", correct:true},
+          {key:"c", text:"Skip MIDAS."},
+          {key:"d", text:"Skip GNN."},
+        ]}
+        trap={<>(a) wastes compute; (c)(d) lose one stage.</>}
+        lens={<>Two-stage funnel: MIDAS for upstream alarm, GNN for downstream scoring.</>}
+        stretch={<>What's the right MIDAS threshold for the funnel's first stage?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p16"
+        difficulty="medium"
+        title="P16 — Multi-relation graph (transactions + logins + reviews). One MIDAS sketch or many?"
+        scenario={<><em>Discriminating insight: one MIDAS sketch per relation type. Burst patterns differ by relation; combining sketches loses signal. Production runs multiple parallel sketches.</em><br/><br/>Multi-relation.</>}
+        options={[
+          {key:"a", text:"One sketch for all."},
+          {key:"b", text:"Multiple sketches, one per relation. Each relation has distinct burst signatures: transactions burst at minute-scale during card-testing; logins burst at second-scale during credential-stuffing; reviews burst over hours during astroturfing. A SINGLE sketch combining all relations would mix these signals and dilute the chi-square score for each. Production pattern: instantiate one MIDAS sketch per relation type (3-5 sketches typically), update each on its respective stream, and alarm on any. Cross-correlate alerts in a downstream rule (e.g., 'tx burst + login burst on same BIN' is stronger signal than either alone).", correct:true},
+          {key:"c", text:"Skip relations."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(a)(c)(d) miss the relation-specific scaling.</>}
+        lens={<>One sketch per relation. Cross-correlate alerts downstream.</>}
+        stretch={<>How to model cross-relation burst (tx + login simultaneously)?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p17"
+        difficulty="hard"
+        title="P17 — Edge has features (amount, currency, device). Can MIDAS use them?"
+        scenario={<><em>Discriminating insight: not directly — MIDAS scores only edge RATE, not edge features. To incorporate features, EITHER hash them into the source-dest tuple (e.g., key by (BIN, merchant, amount_bucket)) OR use a downstream feature-aware model after MIDAS flagging.</em><br/><br/>Feature incorporation.</>}
+        options={[
+          {key:"a", text:"Yes, add features to chi-square."},
+          {key:"b", text:"Not directly — MIDAS scores only edge RATE based on the hashed (source, dest) tuple. Two paths to incorporate features. (a) Hash features INTO the tuple: e.g., key by (BIN, merchant, amount_bucket) where amount_bucket discretizes amount into a few categories. Now the sketch tracks rate per (issuer, merchant, amount-band) — a burst of high-amount transactions on (BIN_X, merchant_Y) is distinguishable from a burst of low-amount ones. Tradeoff: increasing key dimensionality increases collision rate at fixed sketch size. (b) Use MIDAS as upstream filter and a downstream feature-aware model for final scoring. The 'features in the tuple' trick is a common way to extend MIDAS without adding complexity.", correct:true},
+          {key:"c", text:"Features are useless."},
+          {key:"d", text:"Use only features."},
+        ]}
+        trap={<>(a)(c)(d) miss the two paths.</>}
+        lens={<>Tuple = key for sketch. Hash features in OR use downstream feature-aware model.</>}
+        stretch={<>How does adding features change the sketch sizing?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p18"
+        difficulty="hard"
+        title="P18 — Detecting BOTH bursts AND drops in edge rate?"
+        scenario={<><em>Discriminating insight: chi-square is symmetric on positive/negative deviation but the standard MIDAS test only flags above-expected counts. Modify to flag below-expected ('quiet drop' = service outage or fraud-related rate change). Score on |x| or two-sided test.</em><br/><br/>Two-sided.</>}
+        options={[
+          {key:"a", text:"Can't detect drops."},
+          {key:"b", text:"Two-sided chi-square. Standard MIDAS scores |observed - expected|^2 / variance and tests for HIGH observed (burst). To detect drops, run the same test but flag both directions: above expected = burst, below expected = drop. Implementation: compute signed deviation (observed - expected); if positive and chi-square > tau, burst alarm; if negative and chi-square > tau, drop alarm. Drops are useful for: detecting fraud-suppression measures (a coordinated attacker stops to evade detection), service-outage that affects fraud signal, or unexpected merchant offboarding. Two-sided MIDAS is a small modification with valuable upstream signal.", correct:true},
+          {key:"c", text:"Only bursts."},
+          {key:"d", text:"Use TGN."},
+        ]}
+        trap={<>(a)(c) miss the two-sided extension; (d) overkill.</>}
+        lens={<>Chi-square is symmetric; flag both directions with signed test.</>}
+        stretch={<>When does a 'drop' alarm matter for fraud teams?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p19"
+        difficulty="medium"
+        title="P19 — Sketches on a multi-core machine: parallelization strategy?"
+        scenario={<><em>Discriminating insight: independent hash rows can be updated in parallel (H separate cores). For ultra-high throughput, partition the stream by source-hash modulo num_cores and maintain per-shard sketches; aggregate at query time.</em><br/><br/>Parallel sketch.</>}
+        options={[
+          {key:"a", text:"Single core only."},
+          {key:"b", text:"Two parallelization patterns. (a) ROW-PARALLEL: assign each of the H hash rows to its own core. Each incoming edge fires H increments, dispatched to H cores. Simple, low communication. Scales to H cores. (b) STREAM-SHARDED: partition the edge stream by hash(source) modulo num_shards. Each shard maintains its own sketch independently. To query, aggregate across shards. Scales to arbitrary cores but adds latency at query-aggregation. For 100K-1M edges/sec on a single core, single-threaded MIDAS is fine. For 10M+ edges/sec, switch to row-parallel; for 100M+ edges/sec, stream-sharded. The atomic update primitive at each counter is fetch-and-add (no locking).", correct:true},
+          {key:"c", text:"Can't parallelize."},
+          {key:"d", text:"Use one global lock."},
+        ]}
+        trap={<>(a)(c)(d) miss the parallel patterns.</>}
+        lens={<>Row-parallel for moderate throughput; stream-sharded for extreme.</>}
+        stretch={<>What's the throughput ceiling on a single core?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p20"
+        difficulty="medium"
+        title="P20 — When NOT to use MIDAS?"
+        scenario={<><em>Discriminating insight: when bursts are not the relevant fraud pattern (low-volume targeted), when context (seasonality) dominates (high FPR), when memory budget is so tight that even 1KB is too much, when graph structure beyond edge rate matters.</em><br/><br/>Not MIDAS.</>}
+        options={[
+          {key:"a", text:"Never."},
+          {key:"b", text:"Skip MIDAS when: (1) fraud signal is LOW-VOLUME targeted (lone-wolf ATO, single-victim social engineering) — no burst means no MIDAS signal; (2) graph STRUCTURE matters beyond rate (e.g., money-laundering ring detection requires GNN-level relational reasoning); (3) feature signal dominates rate signal (low-volume + feature-anomalous transactions); (4) seasonal traffic patterns make chi-square FPR untenable; (5) you can afford a full GNN at the latency budget. MIDAS is the right tool for EXTREME low-latency burst detection with constant memory — outside that regime, alternatives are better.", correct:true},
+          {key:"c", text:"Always avoid."},
+          {key:"d", text:"Always use."},
+        ]}
+        trap={<>(a)(c)(d) absolutist.</>}
+        lens={<>MIDAS = burst + low-latency + tight memory. Outside that, prefer alternatives.</>}
+        stretch={<>What's the latency budget below which MIDAS becomes mandatory?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p21"
+        difficulty="hard"
+        title="P21 — 'MIDAS is just edge counting with a hash table.' Diagnose."
+        scenario={<><em>Discriminating insight: false. Edge counting alone gives counts; MIDAS gives an ANOMALY SCORE (chi-square against expected rate) at CONSTANT memory via count-min sketch (vs hash table that grows with unique edges). The score + bounded memory together is the lever.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Correct."},
+          {key:"b", text:"Wrong on two axes. (1) MIDAS has an ANOMALY SCORE, not just counts — chi-square against expected rate gives a statistical anomaly signal that a hash table doesn't. (2) MIDAS has CONSTANT memory (sketch size fixed regardless of stream length or unique-edge count); a hash table grows linearly with unique edges, becoming impractical at billion-edge graphs. Together: constant-memory + chi-square = practical, theoretically grounded streaming anomaly detector. A hash table 'just edge counter' is neither.", correct:true},
+          {key:"c", text:"Same."},
+          {key:"d", text:"Hash table is better."},
+        ]}
+        trap={<>(a)(c)(d) collapse.</>}
+        lens={<>MIDAS = sketch (constant mem) + chi-square (anomaly score). Both load-bearing.</>}
+        stretch={<>What does a hash-table-based counter cost on a billion-edge graph?</>}
+      />
+
+      <VIS.TrapProblem
+        id="midas-p22"
+        difficulty="hard"
+        title="P22 — In one sentence, what's THE unique mechanism of MIDAS / SpotLight?"
+        scenario={<><em>Discriminating insight: COUNT-MIN SKETCH over edge tuples (source, dest) + CHI-SQUARE on the current count vs expected rate. Constant memory, constant time per edge, statistically grounded burst score.</em><br/><br/>State.</>}
+        options={[
+          {key:"a", text:"Hashes edges."},
+          {key:"b", text:"COUNT-MIN SKETCH over edge tuples (source, dest) PLUS CHI-SQUARE test on the current count vs the historical expected rate, producing a per-edge anomaly score in constant time and constant memory. The combination — sketch for constant-memory rate-tracking, chi-square for statistically interpretable burst detection — is the lever. Strip either piece (just sketch = counts only; just chi-square = no constant-memory) and the system loses its uniqueness. Distinct from per-edge models (TGN, DyGFormer) that score individual edges and from snapshot GNNs that run message passing on the full graph.", correct:true},
+          {key:"c", text:"Counts edges."},
+          {key:"d", text:"Hashes nodes."},
+        ]}
+        trap={<>(a)(c)(d) miss one or both pieces.</>}
+        lens={<>Anchor: count-min sketch over edge tuples + chi-square burst score. Constant time, constant memory.</>}
+        stretch={<>Why is 'on edge tuples' load-bearing — what would 'on nodes' do?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li>
-          <a href="https://arxiv.org/abs/1911.04464" target="_blank" rel="noopener">
-            <strong>Bhatia et al. — MIDAS: Microcluster-Based Detector of Anomalies in Edge Streams</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, AAAI 2020)</span>
-          <br/>The original paper. Section 3 has the chi-squared score derivation; Section 4 has the algorithmic pseudocode in 20 lines.
-        </li>
-        <li>
-          <a href="https://github.com/Stream-AD/MIDAS" target="_blank" rel="noopener">
-            <strong>MIDAS reference implementation (C++ and Python)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(code)</span>
-          <br/>Official repo with both flavors. Reading the 200-line C++ implementation is the fastest way to internalize how trivial the algorithm actually is.
-        </li>
-        <li>
-          <a href="http://dimacs.rutgers.edu/~graham/pubs/papers/cmsoft.pdf" target="_blank" rel="noopener">
-            <strong>Cormode and Muthukrishnan — An Improved Data Stream Summary: The Count-Min Sketch (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, 2005)</span>
-          <br/>The original count-min sketch paper. Section 3 (analysis) is the math you need to size sketches correctly.
-        </li>
-        <li>
-          <a href="https://sift.com/blog" target="_blank" rel="noopener">
-            <strong>Sift — Streaming Fraud Detection at Scale (blog)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(practitioner blog)</span>
-          <br/>Sift's engineering blog has real-world deployment notes on streaming anomaly detection. Useful counterpoint to the academic paper.
-        </li>
-        <li>
-          <a href="https://www.youtube.com/watch?v=eIeXz9ZS-Ts" target="_blank" rel="noopener">
-            <strong>Bryan Hooi — Anomaly Detection in Streams and Graphs (talk video)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(video, ~30 min)</span>
-          <br/>One of the MIDAS authors walks through the algorithm and follow-ups. Best concise overview of the whole MIDAS family.
-        </li>
+        <li><a href="https://arxiv.org/abs/1911.04464" target="_blank" rel="noopener"><strong>Bhatia et al. — MIDAS: Microcluster-Based Detector of Anomalies in Edge Streams</strong></a> <span style={{color:"#64748b", fontSize:14}}>(AAAI 2020, paper)</span><br/>The MIDAS paper. Read sections 3 (sketch construction) and 4 (chi-square score derivation). The diagrams are clear.</li>
+        <li><a href="https://github.com/Stream-AD/MIDAS" target="_blank" rel="noopener"><strong>MIDAS reference implementation</strong></a> <span style={{color:"#64748b", fontSize:14}}>(repo)</span><br/>C++ + Python bindings. The MIDAS-R variant in <code>midas.py</code> is the practical one (with multiplicative decay). Read end-to-end before implementing.</li>
+        <li><a href="https://florian.github.io/count-min-sketch/" target="_blank" rel="noopener"><strong>Florian's Count-Min Sketch primer (blog)</strong></a><br/>Best plain-English walkthrough of the count-min sketch data structure with worked examples and bounds.</li>
+        <li><a href="https://www.cs.cmu.edu/~christos/PUBLICATIONS/spotlight-kdd18.pdf" target="_blank" rel="noopener"><strong>Eswaran et al. — SpotLight</strong></a> <span style={{color:"#64748b", fontSize:14}}>(KDD 2018, paper)</span><br/>The sibling subgraph-anomaly streaming paper. Different sketch construction; same family.</li>
+        <li><a href="https://sift.com/blog" target="_blank" rel="noopener"><strong>Sift Engineering blog — MIDAS for transaction streams</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog, 2024)</span><br/>Production application of MIDAS at Sift. Discusses granularity choices and multi-relation composition.</li>
+        <li><a href="https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch" target="_blank" rel="noopener"><strong>Wikipedia — Count-min sketch</strong></a><br/>Theoretical bounds (epsilon, delta) and the proof sketch. Useful reference once you understand the basics.</li>
       </ul>
     </VIS.Section>
   </main>

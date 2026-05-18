@@ -1414,325 +1414,467 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Focal Loss — Fraud SOTA · Class imbalance / rare-event learning
-// Down-weights easy negatives with a (1-p)^gamma modulation.
+// Focal Loss — Fraud SOTA · Class imbalance / rare-event learning.
+// CONCEPT ANCHOR (B3): per-sample CONFIDENCE-MODULATED weighting via (1-p_t)^gamma.
+// Differs from asymmetric BCE (per-class scalar weight), LDAM (margin on logits),
+// threshold moving (post-hoc, no loss change). Strip "(1-p)^gamma confidence modulation"
+// and answers must collapse.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="Fraud SOTA · Class imbalance / rare-event learning"
       title="Focal Loss"
-      subtitle="Multiply BCE by (1 minus p)^gamma so easy negatives stop dominating the gradient — and the rare hard positives finally get learning signal."
+      subtitle="Multiply BCE by (1 - p_t)^gamma so confident-correct samples stop dominating the gradient. Per-SAMPLE, confidence-modulated — not per-class scalar."
       byline={[
-        {label: "Paper", value: "Lin et al., ICCV 2017"},
-        {label: "Year", value: "2024 (fraud applications)"},
-        {label: "L3", value: "Imbalance-aware loss"},
+        {label: "Paper", value: "Lin et al., 'Focal Loss for Dense Object Detection' (ICCV 2017)"},
+        {label: "L3", value: "Per-sample confidence modulation"},
+        {label: "Anchor", value: "(1-p_t)^gamma factor on BCE — modulation depends on current prediction"},
       ]}/>
 
     <VIS.TLDR>
       At a 1-in-1000 fraud rate, plain{" "}
       <VIS.Term def="Binary cross-entropy: -[y log p + (1-y) log(1-p)]. The standard loss for binary classification.">BCE</VIS.Term>{" "}
-      is dominated by easy negatives — millions of obviously-legitimate transactions each contribute small but additive gradient that drowns out the rare positives. Focal loss multiplies BCE by (1-p)^gamma so confident-correct predictions contribute almost nothing to the gradient, leaving capacity for the hard examples. Tunes well at gamma equal to 2 in most cases. Trades AUC for{" "}
+      is dominated by easy negatives — millions of obviously-legitimate transactions each contribute small but additive gradient that drowns out the rare positives. Focal multiplies BCE by (1-p_t)^gamma — the modulating factor goes to zero for confident-correct samples and stays near one for hard ones. The defining word is <strong>confidence-modulated</strong>: the weight on each sample depends on the model's CURRENT prediction for that sample, not on its class label. That is what distinguishes focal from asymmetric BCE (per-class scalar weight, fixed) and from LDAM (margin shift on logits) and from threshold moving (post-hoc, loss unchanged). Trades AUC for{" "}
       <VIS.Term def="Brier score: the mean squared error between predicted probability and the true 0/1 label. Lower is better. Measures calibration plus refinement.">Brier loss</VIS.Term>{" "}
       and probability calibration — by design.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — confidence-modulated per-sample weighting">
       <p>
-        Imagine training data with 999 legitimate transactions and 1 fraud. Plain BCE: each legit transaction with predicted p equal to 0.001 contributes loss of approximately 0.001. Sum over 999: total negative-class loss is roughly 1.0. The single fraud, with predicted p equal to 0.4, contributes loss of approximately 0.92. Now the negative gradient dominates by 1 to 0.92 even after the model is already correct on the negatives. Focal fixes this by scaling each sample's loss by (1 minus p-correct)^gamma.
-      </p>
-      <p>
-        Three ideas:
+        Imagine training data with 999 legitimate transactions and 1 fraud. Plain BCE: each legit transaction with predicted p_legit equal to 0.999 contributes loss of approximately 0.001. Sum over 999: total negative-class loss is roughly 1.0. The single fraud, with predicted p_fraud equal to 0.4, contributes loss of approximately 0.92. Now the negative gradient dominates by 1 to 0.92 even though the model is already correct on the negatives. Focal multiplies each sample's loss by (1-p_t)^gamma where p_t is the predicted probability of the TRUE class for THAT sample. A legit sample with p_t equal to 0.999 gets modulation (0.001)^2 = 1e-6 — essentially zero contribution. The fraud with p_t equal to 0.4 gets modulation (0.6)^2 = 0.36 — most of its gradient preserved.
       </p>
       <ol>
-        <li><strong>Modulating factor</strong> — (1-p)^gamma where p is the predicted probability of the TRUE class. Confident-correct samples (p near 1) get modulation near 0; uncertain samples get modulation near 1.</li>
-        <li><strong>gamma</strong> — focusing strength. gamma equal to 0 is plain BCE; larger gamma down-weights easy samples more aggressively.</li>
-        <li><strong>alpha</strong> — optional class weighting on top of focal modulation. Useful when you also want to amplify positive-class loss in addition to focusing on hard examples.</li>
+        <li><strong>Modulating factor</strong> — (1-p_t)^gamma where p_t is the predicted probability of the TRUE class for that specific sample. Per-SAMPLE, not per-class.</li>
+        <li><strong>gamma</strong> — focusing strength. gamma = 0 reduces to plain BCE; larger gamma down-weights easy samples more aggressively.</li>
+        <li><strong>alpha</strong> — optional class scalar on top, useful when you also want to amplify positive-class loss. This is the part that looks like asymmetric BCE; the core focal mechanism is the (1-p_t)^gamma factor.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  S["Sample with predicted p_correct"]
-  S --> M["Modulating factor: (1-p)^gamma"]
-  S --> B["BCE loss"]
-  M --> P["Product: focal loss"]
+  S["Sample with predicted p_t for its true class"]
+  S --> M["Modulating factor (1 - p_t)^gamma"]
+  S --> B["BCE: - log p_t"]
+  M --> P["Focal loss = (1 - p_t)^gamma times BCE"]
   B --> P
-  P --> O["Gradient: easy down-weighted, hard up-weighted"]
+  P --> O["Gradient: easy down-weighted, hard preserved"]
   style M fill:#fee2e2,stroke:#dc2626,stroke-width:2px
   style O fill:#dcfce7,stroke:#16a34a,stroke-width:2px
       `} />
 
-      <VIS.Equation display tex={`\\text{FL}(p_t) = -\\alpha_t \\, (1-p_t)^{\\gamma} \\, \\log(p_t)` } />
-      <p>p-t is the predicted probability of the true class. The exponent gamma controls how aggressively we down-weight confident-correct samples. At gamma equal to 2 (the paper's recommendation), a sample with p-t equal to 0.9 contributes 0.01 times the BCE loss; a sample with p-t equal to 0.5 contributes 0.25 times. The rare hard positive (p-t equal to 0.3) keeps almost full weight.</p>
+      <VIS.Equation display tex={`\\text{FL}(p_t) = -\\alpha_t \\, (1-p_t)^{\\gamma} \\, \\log(p_t)`} />
+      <p>p_t is the predicted probability of the true class FOR THAT SAMPLE. The exponent gamma controls how aggressively we down-weight confident-correct samples. At gamma = 2 (paper recommendation), a sample with p_t = 0.9 contributes (0.1)^2 = 0.01 times the BCE loss; a sample with p_t = 0.5 contributes 0.25 times; a hard sample with p_t = 0.3 contributes 0.49 times — almost full weight.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from class weighting">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-diff" title="How focal differs from the rest of the imbalance toolbox">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Class weighting (BCE with alpha)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Asymmetric BCE (per-class)</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Focal loss</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>LDAM (margin)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Threshold moving</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>What it down-weights</td>
-            <td style={{padding:"8px 10px"}}>Majority class uniformly</td>
-            <td style={{padding:"8px 10px"}}>Confident-correct samples (any class)</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Adapts during training</td>
-            <td style={{padding:"8px 10px"}}>No — weight is fixed</td>
-            <td style={{padding:"8px 10px"}}>Yes — modulation tracks current predictions</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Effect on calibration</td>
-            <td style={{padding:"8px 10px"}}>Modest distortion</td>
-            <td style={{padding:"8px 10px"}}>Substantial distortion</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Hyperparameters</td>
-            <td style={{padding:"8px 10px"}}>One (class weight)</td>
-            <td style={{padding:"8px 10px"}}>Two (gamma, optional alpha)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Hard-example mining built in</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Yes — implicit</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Lever</td><td style={{padding:"6px 10px"}}>Scalar weight per class</td><td style={{padding:"6px 10px"}}>(1-p_t)^gamma per sample</td><td style={{padding:"6px 10px"}}>Margin added to logit per class</td><td style={{padding:"6px 10px"}}>Decision threshold (post-hoc)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Depends on current pred?</td><td style={{padding:"6px 10px"}}>No — fixed</td><td style={{padding:"6px 10px"}}>Yes — modulation tracks p_t</td><td style={{padding:"6px 10px"}}>No — depends on class prior</td><td style={{padding:"6px 10px"}}>N/A — applied to fixed model</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Calibration effect</td><td style={{padding:"6px 10px"}}>Modest</td><td style={{padding:"6px 10px"}}>Substantial — over-confident</td><td style={{padding:"6px 10px"}}>Shifts boundary, calibration ok</td><td style={{padding:"6px 10px"}}>Preserved (calibrate first)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Hard-example mining</td><td style={{padding:"6px 10px"}}>No</td><td style={{padding:"6px 10px"}}>Implicit</td><td style={{padding:"6px 10px"}}>No — geometric</td><td style={{padding:"6px 10px"}}>No</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Extreme imbalance</strong> — positive rate under 1 percent, sometimes under 0.1 percent. Class weighting alone is insufficient.</li>
-        <li><strong>Loss is dominated by trivial negatives</strong> — observed via gradient analysis: most of the negative-class gradient comes from samples already predicted correctly.</li>
-        <li><strong>You care about AUC / recall</strong> over probability calibration. Focal helps the former; hurts the latter.</li>
-        <li><strong>Dense detection-style problems</strong> — credit-card fraud, click fraud, ad CTR, where the original paper's intuition transfers directly.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Focal loss hurts Brier / calibration by design">
-        Because focal squashes the loss for confident predictions, the model becomes systematically over-confident — predicted p of 0.9 corresponds to actual frequency of maybe 0.7. AUC improves, Brier loss gets worse. If you need calibrated probabilities, fit isotonic / temperature scaling on a holdout AFTER focal training, OR use plain BCE plus threshold tuning instead.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="gamma is sensitive">
-        gamma equal to 2 is a good default but the optimum varies by dataset. Sweep gamma in {`{0.5, 1, 2, 5}`}. Too-large gamma causes training instability (very few samples contribute gradient).
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Don't stack with random under-sampling">
-        Focal is designed for original imbalanced data. If you also under-sample negatives by 10x, the modulating factor has less to do and the loss is closer to plain BCE on the sub-sampled data. Pick one rebalancing strategy.
-      </VIS.Callout>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — 22 trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on focal loss, the gamma knob, and why focal can hurt calibration.
+        Every problem hinges on the (1-p_t)^gamma confidence modulation — the unique mechanism of focal. Strip that and the answer must collapse. Cross-checks against asymmetric BCE (per-class scalar), LDAM (margin), and threshold moving (post-hoc) are deliberate.
       </p>
 
+      {/* B3 anchor */}
       <VIS.TrapProblem
         id="focal-p1"
         difficulty="hard"
-        title="P1 — Focal hurts Brier, helps AUC. Why?"
-        scenario={<>You ship focal loss. AUC improves by 2 points; Brier loss WORSENS by 30 percent. Risk PMs are concerned. Explain.</>}
+        title="P1 — Risk PM asks: 'We already class-weight 1000:1. Why focal too?'"
+        scenario={<><em>Discriminating insight: per-class scalar weight is uniform across ALL samples of that class — including the millions of easy negatives. Focal's (1-p_t)^gamma down-weights samples by current PREDICTION confidence, so already-handled negatives stop contributing while hard negatives remain.</em><br/><br/>Pitch the lever that class weighting cannot provide.</>}
         options={[
-          {key:"a", text:"Focal squashes loss for confident-correct predictions, which removes the maximum-likelihood objective's pressure to match true probabilities. The model becomes systematically over-confident. AUC (ranking) is preserved; Brier (calibration) is destroyed. Standard fix: apply post-hoc calibration (isotonic / temperature scaling) on a holdout to recover honest probabilities.", correct:true},
-          {key:"b", text:"AUC is wrong; only Brier matters."},
-          {key:"c", text:"Brier is wrong; only AUC matters."},
-          {key:"d", text:"Focal loss is broken."},
+          {key:"a", text:"Focal is newer."},
+          {key:"b", text:"Class weighting multiplies every negative by a fixed scalar (say 1/1000). At a fraud rate of 1 in 1000, ~99% of negatives are predicted with p_legit > 0.99 — these are already 'solved' but each still contributes a small constant gradient that, summed over millions, dominates the positives. Focal multiplies by (1-p_t)^gamma so solved samples (p_t near 1) contribute essentially zero gradient while uncertain/hard samples retain almost full weight. The lever is per-SAMPLE confidence modulation, not per-class scalar — they compose, not replace.", correct:true},
+          {key:"c", text:"Focal does the same thing as class weights."},
+          {key:"d", text:"Focal replaces BCE; class weights are obsolete."},
         ]}
-        trap={<>(b)-(d) are wrong. The Risk PM concern is legitimate; (a) is the engineering answer.</>}
-        lens={<>(a) — focal trades calibration for ranking by design. Combine focal with post-hoc calibration if you need both. Or skip focal and use plain BCE plus threshold tuning if calibration is the binding constraint.</>}
-        stretch={<>Why does temperature scaling specifically help focal-trained models?</>}
+        trap={<>(a) is recency. (c) collapses the distinction. (d) wrong — focal MULTIPLIES BCE, doesn't replace it.</>}
+        lens={<>B3 redact-test: strip "per-sample confidence modulation (1-p_t)^gamma" and only (b) collapses. The pitch IS the mechanism.</>}
+        stretch={<>What happens if you set alpha (class weight inside focal) equal to your class ratio AND keep gamma = 2 — does it double-count?</>}
       />
 
+      {/* Calibration */}
       <VIS.TrapProblem
         id="focal-p2"
         difficulty="hard"
-        multiSelect
-        title="P2 — Choosing gamma"
-        scenario={<>How do you pick gamma? Select all that apply.</>}
+        title="P2 — Focal hurts Brier, helps AUC. Why?"
+        scenario={<><em>Discriminating insight: the modulating factor removes loss for confident predictions, eliminating the MLE pressure to match true probabilities. AUC (ranking) survives; Brier (calibration) does not. Fix is post-hoc isotonic/temperature on holdout — the model is mis-calibrated by design.</em><br/><br/>Explain why focal trades calibration for ranking.</>}
         options={[
-          {key:"a", text:"Sweep gamma in {0.5, 1, 2, 5} on a validation set; pick the value that maximizes the metric you actually care about (AUC, recall at fixed FPR, expected dollar savings).", correct:true},
-          {key:"b", text:"At extreme imbalance (under 1 in 10000), larger gamma (3-5) often helps; at moderate imbalance (1 in 100), smaller gamma (1-2) is usually enough.", correct:true},
-          {key:"c", text:"gamma equal to 0 reduces focal to plain BCE — useful baseline.", correct:true},
-          {key:"d", text:"gamma equal to 10 is always best.", correct:false},
-          {key:"e", text:"gamma can be negative.", correct:false},
+          {key:"a", text:"AUC is wrong; only Brier matters."},
+          {key:"b", text:"Focal squashes loss for confident-correct predictions via the (1-p_t)^gamma factor — meaning the model is no longer penalized for predicting p = 0.99 vs p = 0.7 on an easy sample. The MLE pressure to match P(Y=1|X) at a calibrated level is removed for high-confidence samples. Result: ranking is preserved (so AUC improves because the gradient is now concentrated on hard samples that move the ROC curve), but probabilities are systematically over-confident — Brier worsens. Standard fix: fit isotonic regression or temperature scaling on a held-out set AFTER focal training to recover honest probabilities.", correct:true},
+          {key:"c", text:"Focal is broken."},
+          {key:"d", text:"Use threshold moving instead."},
         ]}
-        trap={<>(d) and (e) are wrong. (d) destabilizes training; (e) inverts the loss.</>}
-        lens={<>(a)-(c) are the practical procedure. Imbalance severity informs the prior on gamma but you should sweep anyway. The original paper recommends gamma equal to 2 as a starting point.</>}
-        stretch={<>What happens at gamma equal to 5 with very small batches?</>}
+        trap={<>(a) is one-sided; (c) misses that this is by design; (d) is valid alternative but not the explanation.</>}
+        lens={<>Confidence modulation removes calibration pressure. By design.</>}
+        stretch={<>Why does temperature scaling specifically help focal-trained models?</>}
       />
 
+      {/* vs LDAM */}
       <VIS.TrapProblem
         id="focal-p3"
-        difficulty="medium"
-        title="P3 — Focal vs class weights"
-        scenario={<>An interviewer asks why focal is better than just multiplying positive samples by 100 in BCE. Answer.</>}
+        difficulty="hard"
+        title="P3 — Focal vs LDAM: both target class imbalance. Where does the mechanism differ?"
+        scenario={<><em>Discriminating insight: focal reweights the LOSS by per-sample confidence (1-p_t)^gamma. LDAM adds a class-dependent MARGIN to the logit before softmax — it geometrically pushes the decision boundary away from rare-class points. Different surgical layer.</em><br/><br/>Trace the mechanism diff.</>}
         options={[
-          {key:"a", text:"Class weighting is static — it amplifies positives uniformly regardless of whether the model already gets them right. Focal is dynamic — it amplifies HARD examples (uncertain predictions) and de-amplifies easy ones, regardless of class. As training progresses and easy examples become correctly classified, focal naturally redirects the gradient to remaining hard cases. Class weighting cannot do this.", correct:true},
-          {key:"b", text:"They're equivalent."},
-          {key:"c", text:"Class weighting is mathematically wrong."},
-          {key:"d", text:"Focal is just class weighting with extra steps."},
+          {key:"a", text:"They're equivalent."},
+          {key:"b", text:"Different surgical layer. Focal acts on the loss: FL = (1-p_t)^gamma * BCE. The model's logits are unchanged; only the gradient SCALE per sample is modulated by current confidence. LDAM acts on the logits: z_y is replaced by z_y - C / n_y^(1/4) for the true class y, where n_y is the class count. The training loss is plain cross-entropy on the margin-adjusted logits. Geometrically, LDAM enforces a larger decision boundary margin around rare-class points; theoretically grounded by generalization bounds. Focal is heuristic but extremely simple to implement; LDAM is principled but requires accurate class-prior estimate.", correct:true},
+          {key:"c", text:"Focal uses class weights, LDAM doesn't."},
+          {key:"d", text:"LDAM uses class weights, focal doesn't."},
         ]}
-        trap={<>(b)-(d) miss the dynamic nature of focal.</>}
-        lens={<>(a) — focal is "implicit hard-example mining." The modulating factor adapts each step based on current predictions. Class weighting is a static intervention. The dynamic adaptation is the actual mechanism that makes focal work.</>}
-        stretch={<>Can you combine focal and class weighting?</>}
+        trap={<>(a) collapses; (c)(d) confuse class-prior with class-weight.</>}
+        lens={<>Focal: loss reweighting by sample confidence. LDAM: margin shift on logits by class.</>}
+        stretch={<>Can you combine focal + LDAM (DRW-LDAM schedule)? What's the rationale?</>}
       />
 
+      {/* gamma multi-select */}
       <VIS.TrapProblem
         id="focal-p4"
         difficulty="hard"
-        title="P4 — Gradient analysis"
-        scenario={<>You suspect easy negatives still dominate even after adding focal. How do you diagnose?</>}
+        multiSelect
+        title="P4 — Choosing gamma: select all that apply"
+        scenario={<><em>Discriminating insight: gamma is the focusing strength on the (1-p_t)^gamma factor. gamma=0 is BCE; larger gamma down-weights confident samples more aggressively. Sweep, don't guess.</em><br/><br/>Select valid practices for picking gamma.</>}
         options={[
-          {key:"a", text:"Bucket the per-sample loss by predicted probability. If the negative-class loss is concentrated in the p under 0.1 bucket (i.e., confident-correct negatives still contribute meaningful gradient), either gamma is too small OR the modulation isn't being applied. Plot gradient norm per class per bucket.", correct:true},
-          {key:"b", text:"Run AUC."},
-          {key:"c", text:"Try a deeper network."},
-          {key:"d", text:"Add more data."},
+          {key:"a", text:"Sweep gamma in {0.5, 1, 2, 5} on validation; pick the value maximizing the metric you actually care about (AUC, recall at fixed FPR, expected $ savings).", correct:true},
+          {key:"b", text:"At extreme imbalance (1:10000+), larger gamma (3-5) often helps; at moderate (1:100), smaller gamma (1-2) usually suffices.", correct:true},
+          {key:"c", text:"gamma = 0 reduces focal to plain BCE — useful baseline.", correct:true},
+          {key:"d", text:"gamma = 10 is always best."},
+          {key:"e", text:"gamma can be negative to up-weight confident samples."},
         ]}
-        trap={<>(b)-(d) are reactions, not diagnoses. (a) is the engineering diagnostic.</>}
-        lens={<>(a) — the right diagnostic is per-bucket loss / gradient analysis. If easy negatives still dominate, gamma is undersized for your imbalance. Production teams maintain a "gradient diagnostic" tooling exactly for this.</>}
-        stretch={<>What's the gradient norm formula for focal loss, and how does it differ from BCE?</>}
+        trap={<>(d) destabilizes training; (e) inverts the loss and breaks training.</>}
+        lens={<>Sweep on validation; imbalance severity informs the prior on gamma. The paper recommends gamma=2 as default.</>}
+        stretch={<>What happens at gamma=5 with very small batches?</>}
       />
 
+      {/* p_t definition */}
       <VIS.TrapProblem
         id="focal-p5"
         difficulty="medium"
-        multiSelect
-        title="P5 — When focal fails"
-        scenario={<>Which conditions make focal loss UNHELPFUL or harmful? Select all that apply.</>}
+        title="P5 — What is p_t in the focal formula exactly?"
+        scenario={<><em>Discriminating insight: p_t is the predicted probability of the TRUE class for THAT sample. For a positive: p_t = p_predicted. For a negative: p_t = 1 - p_predicted. This is what makes the modulation operate symmetrically on confident-correct samples of EITHER class.</em><br/><br/>Pin the definition.</>}
         options={[
-          {key:"a", text:"When imbalance is mild (under 1 in 50) — plain BCE with class weights handles it fine.", correct:true},
-          {key:"b", text:"When you need calibrated probabilities downstream — focal destroys calibration.", correct:true},
-          {key:"c", text:"When label noise is high (under 25 percent labels wrong) — focal up-weights uncertain examples, which often ARE the mislabeled ones.", correct:true},
-          {key:"d", text:"When using deep neural networks — focal only works for trees.", correct:false},
-          {key:"e", text:"When you have GPU.", correct:false},
+          {key:"a", text:"The probability the model outputs for class 1."},
+          {key:"b", text:"p_t is the predicted probability of the GROUND-TRUTH class for that sample. If y=1 and the model outputs p (probability of class 1), then p_t = p. If y=0, then p_t = 1 - p. Consequence: when the model is correct AND confident, p_t is near 1 regardless of class, modulation (1-p_t)^gamma is near 0, and gradient vanishes. This 'correct-confident-vanishes' behavior applies symmetrically to easy negatives AND any easy positives, which is the source of focal's hard-example mining effect.", correct:true},
+          {key:"c", text:"Always p_predicted regardless of label."},
+          {key:"d", text:"The label y itself."},
         ]}
-        trap={<>(d) is reversed (focal was invented for deep nets). (e) is nonsense.</>}
-        lens={<>(a)-(c) are the real failure modes. The label-noise interaction in (c) is the subtle one: focal makes you train HARDER on noisy labels, which is exactly the wrong move when labels are unreliable.</>}
-        stretch={<>What's a label-noise-robust alternative to focal?</>}
+        trap={<>(a)(c) ignore the label asymmetry; (d) is a label not a probability.</>}
+        lens={<>p_t encodes 'how confident is the model on the right answer for this sample'.</>}
+        stretch={<>Why does this definition extend cleanly to multi-class softmax cross-entropy?</>}
       />
 
+      {/* gradient analysis */}
       <VIS.TrapProblem
         id="focal-p6"
         difficulty="hard"
-        title="P6 — Focal plus calibration"
-        scenario={<>You like focal's ranking improvement but need calibrated probabilities. Pipeline?</>}
+        title="P6 — Walk through the gradient of focal loss w.r.t. logit z at gamma=2."
+        scenario={<><em>Discriminating insight: gradient is BCE-gradient times (1-p_t)^gamma plus a correction term from differentiating the modulation factor itself. The dominant intuition: gradient magnitude scales roughly as (1-p_t)^(gamma+1), so easy samples contribute ~ (1-p_t)^3 — nearly zero.</em><br/><br/>Mechanics check.</>}
         options={[
-          {key:"a", text:"Train focal on imbalanced data. Hold out a calibration set. Fit isotonic regression (or temperature scaling for deep nets) on that set to map focal scores to calibrated probabilities. Threshold-tune on calibrated probabilities. Three components, each independently re-runnable.", correct:true},
-          {key:"b", text:"Focal cannot produce calibrated probabilities."},
-          {key:"c", text:"Use weighted BCE instead."},
-          {key:"d", text:"Train two models in parallel."},
+          {key:"a", text:"Identical to BCE gradient."},
+          {key:"b", text:"d/dz [-(1-p_t)^gamma log p_t] involves two terms: (i) the BCE-style gradient (p_t - 1) scaled by the modulation (1-p_t)^gamma and (ii) a correction from differentiating (1-p_t)^gamma w.r.t. p_t, which produces a -gamma (1-p_t)^(gamma-1) factor times the BCE log. Combined, the gradient magnitude scales roughly as (1-p_t)^(gamma+1) for the dominant regime. At gamma=2 and p_t=0.99 (easy correct), gradient is ~ (0.01)^3 = 1e-6 — effectively zero. At p_t=0.5 (uncertain), gradient is ~ 0.125 — meaningful. At p_t=0.05 (very wrong), gradient is ~ 0.86 — large.", correct:true},
+          {key:"c", text:"Zero everywhere."},
+          {key:"d", text:"Equals (1-p_t)^gamma alone."},
         ]}
-        trap={<>(b) is the seductively wrong answer — calibration is post-hoc and almost always works. (c) and (d) are different approaches, not corrections.</>}
-        lens={<>(a) — calibration is a separate step after training. Focal + isotonic recovers calibrated probabilities while preserving the focal ranking improvement. This is what production deployments at major fraud teams ship.</>}
-        stretch={<>Why might temperature scaling underperform isotonic specifically for focal-trained deep nets?</>}
+        trap={<>(a) ignores the modulation; (c) absurd; (d) ignores the BCE log term.</>}
+        lens={<>The (1-p_t)^(gamma+1) scaling explains both 'easy vanishes' and 'hard preserved' in one expression.</>}
+        stretch={<>At what p_t is focal gradient MAXIMAL? Why is that worth knowing?</>}
       />
 
+      {/* asymmetric BCE collision */}
       <VIS.TrapProblem
         id="focal-p7"
         difficulty="hard"
-        title="P7 — Focal in trees vs deep nets"
-        scenario={<>Does focal loss work in GBDT (XGBoost / LightGBM)?</>}
+        title="P7 — Teammate says 'focal is just asymmetric BCE with bigger weight on positives'. Diagnose."
+        scenario={<><em>Discriminating insight: asymmetric BCE multiplies positive class samples by a FIXED scalar (e.g. 1000). Focal multiplies EVERY sample by (1-p_t)^gamma — a quantity that depends on current model output. The two are not equivalent: asymmetric BCE down-weights NEITHER easy-correct nor uncertain negatives; focal down-weights confident-correct of either class.</em><br/><br/>Diagnose the equivalence claim.</>}
         options={[
-          {key:"a", text:"Yes — XGBoost and LightGBM accept custom loss functions via the gradient and hessian. Implement focal as a custom objective; pass it in. The benefit depends on how dominated your loss is by easy negatives — for fraud with 1 in 1000 imbalance, focal in GBDT often gives a modest AUC bump.", correct:true},
-          {key:"b", text:"No — focal is only for deep networks."},
-          {key:"c", text:"Yes, but it always hurts GBDT performance."},
-          {key:"d", text:"Only LightGBM supports focal."},
+          {key:"a", text:"Correct — same thing."},
+          {key:"b", text:"Wrong. Asymmetric BCE applies a scalar w_pos to every positive and w_neg to every negative — fixed across samples and across training. Focal multiplies BCE by a per-sample factor (1-p_t)^gamma that DEPENDS on the model's current prediction for that sample. The qualitative difference: asymmetric BCE keeps applying full weight to easy-correct positives even after they're solved, while focal drops their contribution to near zero. Conversely, asymmetric BCE applies a tiny weight to ALL negatives uniformly (including hard ones near the boundary); focal preserves nearly-full weight on uncertain negatives. The two compose (focal's alpha) but they are not the same lever.", correct:true},
+          {key:"c", text:"They're approximately the same."},
+          {key:"d", text:"Focal can be rewritten as asymmetric BCE with a learned weight."},
         ]}
-        trap={<>(b) is the most common wrong answer because the paper was deep-net-flavored. (c) and (d) are wrong specifics.</>}
-        lens={<>(a) — focal is loss-function-flavored, not architecture-flavored. Implementing the gradient and hessian (which are slightly more complex than BCE's) gets you focal in XGBoost. Many practitioner blogs walk through it.</>}
-        stretch={<>Write the focal-loss gradient and hessian for use in XGBoost.</>}
+        trap={<>(a)(c) collapse the distinction; (d) misses that the modulation depends on p_t per sample, not a learned parameter.</>}
+        lens={<>Class-scalar (fixed) vs sample-modulation (dynamic) — different surgical levers.</>}
+        stretch={<>Where does asymmetric BCE beat focal? (When hard-mining hurts, e.g., label noise.)</>}
       />
 
+      {/* label noise */}
       <VIS.TrapProblem
         id="focal-p8"
-        difficulty="medium"
-        title="P8 — Alpha in focal loss"
-        scenario={<>The paper's focal loss has both gamma and alpha. What does alpha add over class weighting?</>}
+        difficulty="hard"
+        title="P8 — 5% of your fraud labels are wrong (chargeback was a customer-service mistake). Focal or asymmetric BCE?"
+        scenario={<><em>Discriminating insight: focal's hard-example mining amplifies gradient on mis-labeled examples — they look like hard positives. Under label noise, asymmetric BCE (no hard-mining) is often safer. Or use focal with label smoothing / clipping.</em><br/><br/>Pick the loss under label noise.</>}
         options={[
-          {key:"a", text:"alpha is a class-balance weight applied ON TOP of focal modulation. It addresses the residual class imbalance that focal alone can't fix. Typically alpha equal to 0.25 for the rare class (positive) in the ICCV paper. Tune jointly with gamma.", correct:true},
-          {key:"b", text:"alpha is redundant; gamma alone suffices."},
-          {key:"c", text:"alpha replaces gamma."},
-          {key:"d", text:"alpha is the learning rate."},
+          {key:"a", text:"Always focal."},
+          {key:"b", text:"Be careful with focal under label noise. A mis-labeled fraud (truly legit but labeled fraud) appears to the model as 'hard positive' — model predicts p_legit high, p_t for the labeled class is low, modulation is near 1, gradient is large. Focal amplifies the bad signal. Asymmetric BCE applies a UNIFORM weight to all positives — noisy ones included, but not selectively amplified. Options: (1) use asymmetric BCE for noisy regimes, (2) use focal + label smoothing on positives, (3) use focal with gradient clipping per sample, (4) clean the labels with a separately-trained calibrated model. Don't reach for focal reflexively when noise is significant.", correct:true},
+          {key:"c", text:"Doesn't matter."},
+          {key:"d", text:"Always asymmetric BCE."},
         ]}
-        trap={<>(b) is the most common confident-wrong answer. (c) and (d) are wrong.</>}
-        lens={<>(a) — alpha and gamma address different aspects: alpha is the static class-balance lever, gamma is the dynamic focus lever. The combination outperforms either alone in the original paper's ablation. Modern uses sometimes drop alpha if gamma is large enough.</>}
-        stretch={<>Empirically, when does alpha matter and when can you drop it?</>}
+        trap={<>(a) ignores noise interaction; (c) wrong; (d) over-rotates.</>}
+        lens={<>Hard-mining loss + noisy labels = amplified noise. Mitigate or switch loss.</>}
+        stretch={<>How to detect noise-amplification at train time?</>}
       />
 
+      {/* gamma 0 sanity */}
       <VIS.TrapProblem
         id="focal-p9"
-        difficulty="hard"
-        title="P9 — Focal vs hard-example mining"
-        scenario={<>Hard-example mining (OHEM) explicitly samples confused examples. Is focal a substitute?</>}
+        difficulty="medium"
+        title="P9 — You set gamma=0 in a focal-loss config. What's the loss now?"
+        scenario={<><em>Discriminating insight: at gamma=0, (1-p_t)^0 = 1, so focal reduces to alpha-weighted BCE. A useful sanity baseline.</em><br/><br/>Reduce focal at gamma=0.</>}
         options={[
-          {key:"a", text:"Focal is implicit OHEM: the modulating factor automatically up-weights hard examples each step without an explicit mining loop. The benefit is simplicity (no separate mining stage) and continuous gradient (no hard cut between mined and ignored samples). OHEM still wins when you want explicit control over which examples enter the batch.", correct:true},
-          {key:"b", text:"Focal and OHEM are unrelated."},
-          {key:"c", text:"OHEM is universally better."},
-          {key:"d", text:"Focal is universally better."},
+          {key:"a", text:"Identity loss (zero)."},
+          {key:"b", text:"Plain BCE multiplied by alpha. (1-p_t)^0 = 1 for every sample, so focal collapses to alpha-weighted BCE — i.e., asymmetric BCE with the alpha class scalar. This is a useful baseline when sweeping gamma: gamma=0 vs gamma=2 vs gamma=5 isolates the modulation effect from the class-weight effect.", correct:true},
+          {key:"c", text:"BCE with random weights."},
+          {key:"d", text:"Undefined."},
         ]}
-        trap={<>(b)-(d) are wrong. (a) is the precise relationship.</>}
-        lens={<>(a) — they're cousins. Focal is the continuous, in-loss version of OHEM. OHEM is the discrete, sampling-stage version. In production, focal is usually preferred for simplicity; OHEM survives when you have explicit confusion budgets.</>}
-        stretch={<>When would you combine focal with OHEM?</>}
+        trap={<>(a)(c)(d) absurd.</>}
+        lens={<>gamma=0 is the asymmetric-BCE corner of the focal hyperparameter space.</>}
+        stretch={<>If alpha=1 and gamma=0, what is the loss exactly?</>}
       />
 
+      {/* alpha-gamma interaction */}
       <VIS.TrapProblem
         id="focal-p10"
         difficulty="hard"
-        title="P10 — Senior framing of imbalance interventions"
-        scenario={<>Frame focal loss in the broader imbalance-intervention landscape for a senior interview.</>}
+        title="P10 — Some practitioners set alpha=0.25 (DOWN-weight positives) with gamma=2. Why not alpha=4 (UP-weight)?"
+        scenario={<><em>Discriminating insight: gamma already up-weights hard samples relative to easy ones, and at extreme imbalance most hard samples ARE positives. Adding strong alpha on top double-counts and destabilizes. The paper's recipe alpha=0.25, gamma=2 reflects this empirical interaction.</em><br/><br/>Explain the alpha-gamma interaction.</>}
         options={[
-          {key:"a", text:"Imbalance interventions come in three flavors: data-level (under-sample, over-sample, SMOTE), loss-level (class weights, focal, logit-adjusted), and decision-level (calibrate plus threshold). Focal is a loss-level intervention; it shines at extreme imbalance where easy negatives dominate gradient. It trades calibration for ranking. In a senior design, you'd combine focal training with post-hoc calibration and per-segment thresholds, picking the loss-level intervention that matches your imbalance regime.", correct:true},
-          {key:"b", text:"Focal is the only solution."},
-          {key:"c", text:"Just use random oversampling."},
-          {key:"d", text:"Imbalance is a solved problem."},
+          {key:"a", text:"Just pick alpha equal to class ratio."},
+          {key:"b", text:"At extreme imbalance, the (1-p_t)^gamma factor already does most of the imbalance work: easy negatives are near p_t=1 and contribute near-zero gradient, while uncertain (often positive) samples are near p_t=0.5 and contribute heavily. Stacking a large alpha on top of gamma double-counts the imbalance correction and can destabilize training (gradient explodes on the few positives). The paper's empirical finding: alpha=0.25 (slightly DOWN-weighting positives) with gamma=2 gives best AP on dense object detection — counter-intuitive because alpha and gamma push in opposite directions, but it works because gamma already amplifies positives implicitly. The lesson: alpha is fine-tuning on top of gamma, not the main lever.", correct:true},
+          {key:"c", text:"Higher alpha is always better."},
+          {key:"d", text:"alpha doesn't matter."},
         ]}
-        trap={<>(b)-(d) lack the broader landscape view.</>}
-        lens={<>(a) — the senior framing names three layers of intervention and explains which problem each addresses. Focal is one tool; the choice depends on whether your bottleneck is gradient dominance, calibration, or decision policy.</>}
-        stretch={<>Design an A/B test to compare focal vs logit-adjusted loss.</>}
+        trap={<>(a) ignores the interaction; (c) destabilizes; (d) misses the empirical finding.</>}
+        lens={<>gamma does the imbalance work. alpha is fine-tune, not lever.</>}
+        stretch={<>For fraud at 1:1M, would the alpha=0.25 default still apply?</>}
+      />
+
+      {/* threshold-moving overlap */}
+      <VIS.TrapProblem
+        id="focal-p11"
+        difficulty="hard"
+        title="P11 — Junior asks: 'Why use focal at all when threshold moving gives me the same recall at lower complexity?'"
+        scenario={<><em>Discriminating insight: threshold moving works on a FIXED model's outputs — it can't fix a model that never learned the rare class. Focal changes WHAT the model learns by reshaping gradient. Different surgical layers.</em><br/><br/>Defend or refute focal.</>}
+        options={[
+          {key:"a", text:"Junior is right — always use threshold moving."},
+          {key:"b", text:"They operate at different layers and one cannot replace the other. Threshold moving is post-hoc: given a fixed model with miscalibrated outputs, choose a decision threshold optimizing precision-recall trade. It only works if the model's RANKING is good. Focal changes the model's training so that gradient is concentrated on hard samples; this can produce a fundamentally better-RANKED model (higher AUC), which threshold moving then translates into the operating-point you want. If the underlying model (trained with plain BCE) is overwhelmed by easy negatives and never learns hard-positive structure, no threshold tuning recovers that. Use focal when training is signal-starved; use threshold moving when calibration/policy is the issue.", correct:true},
+          {key:"c", text:"Focal and threshold moving are the same."},
+          {key:"d", text:"Threshold moving is wrong for fraud."},
+        ]}
+        trap={<>(a) misses training-vs-inference distinction; (c) collapses; (d) over-rotates.</>}
+        lens={<>Focal = WHAT model learns. Threshold = HOW to use a learned model. They compose.</>}
+        stretch={<>Can you use focal AND threshold moving? When is that the right call?</>}
+      />
+
+      {/* batch effect */}
+      <VIS.TrapProblem
+        id="focal-p12"
+        difficulty="medium"
+        title="P12 — Tiny batch (32). Why is focal less stable than BCE here?"
+        scenario={<><em>Discriminating insight: focal concentrates gradient on a few hard samples per batch. If a batch happens to contain only easy negatives (likely at 1:1000), the total gradient is microscopic and SGD stalls/jitters. BCE has uniform contribution and averages out.</em><br/><br/>Why focal needs larger batches.</>}
+        options={[
+          {key:"a", text:"Focal needs GPU."},
+          {key:"b", text:"Focal concentrates gradient on the few hard samples per batch. At 1:1000 imbalance with batch size 32, most batches contain zero positives — the per-sample (1-p_t)^gamma factor is near zero for nearly every sample, so total batch gradient is microscopic, then occasional batches with a positive produce a large jolt. SGD updates jitter. BCE has uniform per-sample gradient even on easy negatives, so the batch average is stable. Mitigation: use larger batches (256+) or oversample positives within each batch to guarantee hard-sample presence.", correct:true},
+          {key:"c", text:"Batch size doesn't matter."},
+          {key:"d", text:"Focal needs more epochs."},
+        ]}
+        trap={<>(a)(c) miss; (d) doesn't address stability.</>}
+        lens={<>Concentration of gradient = sensitivity to batch composition. Use larger batches.</>}
+        stretch={<>What's the minimum batch size at gamma=2 and 1:1000 imbalance?</>}
+      />
+
+      {/* multi-class generalization */}
+      <VIS.TrapProblem
+        id="focal-p13"
+        difficulty="medium"
+        title="P13 — Generalize focal to multi-class (5 fraud typologies + legit)."
+        scenario={<><em>Discriminating insight: in softmax cross-entropy, p_t is the softmax probability of the true class. Apply (1-p_t)^gamma uniformly. The class-imbalance effect operates on the rarest typology first.</em><br/><br/>Generalize cleanly.</>}
+        options={[
+          {key:"a", text:"Can't be done."},
+          {key:"b", text:"For softmax cross-entropy, p_t is the softmax probability of the ground-truth class for each sample. Apply FL = -(1-p_t)^gamma log(p_t) directly. Implementation: compute softmax, gather p_t = softmax[range(N), y], multiply BCE-style log loss by (1-p_t)^gamma. Optional alpha can be a per-class scalar vector (length K). The modulation continues to operate per-sample, so rare typologies get more weight implicitly via their lower p_t at start of training.", correct:true},
+          {key:"c", text:"Use one-vs-rest."},
+          {key:"d", text:"Apply focal only on the rarest class."},
+        ]}
+        trap={<>(a) false; (c) loses the modulation benefit; (d) misses the per-sample nature.</>}
+        lens={<>Focal generalizes via softmax p_t. Same lever, more classes.</>}
+        stretch={<>Why might focal underperform on multi-class when imbalance is mild?</>}
+      />
+
+      {/* calibration recovery */}
+      <VIS.TrapProblem
+        id="focal-p14"
+        difficulty="hard"
+        title="P14 — How to recover calibration after focal training, step by step?"
+        scenario={<><em>Discriminating insight: temperature scaling on logits OR isotonic on probabilities, fit on a holdout the model never trained on. Don't fit on train.</em><br/><br/>Recipe.</>}
+        options={[
+          {key:"a", text:"Retrain with BCE."},
+          {key:"b", text:"(1) Train with focal to optimize ranking (AUC, recall). (2) Hold out a calibration set (5-10% of data, NOT used in training, NOT used in model selection). (3) Choose calibrator: temperature scaling (one scalar T, divide all logits by T before sigmoid) if you trust the ranking and want the simplest fix; isotonic regression (non-parametric monotonic map from raw prob to calibrated prob) if the miscalibration is non-uniform. (4) Fit calibrator on holdout (minimize NLL or Brier). (5) At inference: model -> raw logit -> calibrator -> calibrated prob -> threshold. Validate Brier and reliability diagram on a separate test set. Do NOT fit the calibrator on training data — focal already distorted those probabilities.", correct:true},
+          {key:"c", text:"Add label smoothing."},
+          {key:"d", text:"Increase gamma."},
+        ]}
+        trap={<>(a) discards the focal benefit; (c) helps mildly; (d) makes calibration worse.</>}
+        lens={<>Focal + post-hoc calibration = ranking + calibration. Both.</>}
+        stretch={<>Why use a separate calibration set instead of the validation set?</>}
+      />
+
+      {/* stacking */}
+      <VIS.TrapProblem
+        id="focal-p15"
+        difficulty="medium"
+        title="P15 — Should focal be stacked with random under-sampling negatives 10x?"
+        scenario={<><em>Discriminating insight: under-sampling already removed the easy negatives that focal is designed to down-weight. Combining them is redundant and reduces effective data. Pick one.</em><br/><br/>Stack or not.</>}
+        options={[
+          {key:"a", text:"Always stack."},
+          {key:"b", text:"Generally no. Focal is designed for the original imbalanced distribution: the (1-p_t)^gamma factor automatically removes the easy-negative gradient contribution that under-sampling tries to remove by discarding data. If you under-sample 10x, you've already discarded ~90% of easy negatives by hand; the surviving negatives are a mix of easy and hard, and focal's modulation on this reduced set is weaker than on the full set. You've also lost data — informative-but-easy negatives that the model could have used to calibrate the boundary. Pick one rebalancing strategy: focal (loss-level) OR under-sampling (data-level), and tune accordingly. Stacking is rarely worth it.", correct:true},
+          {key:"c", text:"Yes, always 10x."},
+          {key:"d", text:"Use SMOTE plus focal plus weights."},
+        ]}
+        trap={<>(a)(c)(d) over-engineer.</>}
+        lens={<>One rebalancing lever at a time. Avoid stacking.</>}
+        stretch={<>When does stacking actually help? (Hint: extreme imbalance + training time budget.)</>}
+      />
+
+      {/* AUC vs recall@K */}
+      <VIS.TrapProblem
+        id="focal-p16"
+        difficulty="hard"
+        title="P16 — Focal helps AUC but not recall@1%FPR. Diagnose."
+        scenario={<><em>Discriminating insight: focal optimizes ranking GLOBALLY by concentrating gradient on hard samples in the middle of the score distribution. The top-of-distribution operating point (1% FPR) may not improve because the marginal hard samples focal helps with are mid-score, not at the extreme. Use targeted loss like rank loss at K or threshold-aware loss.</em><br/><br/>Why focal can miss the operating point.</>}
+        options={[
+          {key:"a", text:"AUC is the wrong metric."},
+          {key:"b", text:"Focal concentrates learning signal on hard samples — those with intermediate predicted probability around 0.3-0.7 where the modulation factor (1-p_t)^gamma is large. Global AUC improves because the middle of the score distribution is reshaped. But recall@1%FPR depends on the TOP of the score distribution — specifically, the worst-ranked positives among those scored above the 1%-FPR threshold. Focal does not directly target that regime. If your operating point is extreme, prefer (1) rank loss / pairwise AUPRC loss at K, (2) threshold-aware loss that penalizes mis-ranking near the operating point, (3) cost-sensitive loss with cost matrix matching business metric.", correct:true},
+          {key:"c", text:"Focal is wrong."},
+          {key:"d", text:"Use a bigger model."},
+        ]}
+        trap={<>(a) dismisses; (c)(d) miss the operating-point structure.</>}
+        lens={<>Global AUC vs operating-point recall — focal helps the former, not always the latter.</>}
+        stretch={<>What loss directly optimizes recall@K?</>}
+      />
+
+      {/* implementation */}
+      <VIS.TrapProblem
+        id="focal-p17"
+        difficulty="medium"
+        title="P17 — Implementing focal in PyTorch: which is correct?"
+        scenario={<><em>Discriminating insight: must use logit-space numerically stable formulation, NOT compute sigmoid then log. Standard pattern: BCEWithLogitsLoss(reduction='none') then multiply by ((1-p)**gamma) where p = sigmoid(logit).detach() OR formal logit-space derivation.</em><br/><br/>Pick the correct implementation.</>}
+        options={[
+          {key:"a", text:"loss = -((1-sigmoid(z))**gamma) * log(sigmoid(z))"},
+          {key:"b", text:"Numerically stable: compute logit-space BCE via F.binary_cross_entropy_with_logits(z, y, reduction='none') -> bce. Then p_t = where(y==1, sigmoid(z), 1-sigmoid(z)). focal = (1-p_t)**gamma * bce. Apply alpha as a per-sample tensor (alpha for y=1, 1-alpha for y=0) and multiply. Reduce by mean. Naive log(sigmoid(z)) underflows at large negative z; binary_cross_entropy_with_logits uses the logsumexp trick internally. Treat p_t.detach() if you want to stop gradient flow through the modulation (common variant).", correct:true},
+          {key:"c", text:"loss = (1 - p)**gamma"},
+          {key:"d", text:"loss = log(p)"},
+        ]}
+        trap={<>(a) is numerically unstable; (c)(d) drop pieces of the formula.</>}
+        lens={<>Numerically stable BCE in logit space + per-sample modulation.</>}
+        stretch={<>Why detach the modulation factor in some variants?</>}
+      />
+
+      {/* extreme imbalance */}
+      <VIS.TrapProblem
+        id="focal-p18"
+        difficulty="hard"
+        title="P18 — At 1:1,000,000 imbalance, does focal still work?"
+        scenario={<><em>Discriminating insight: at extreme imbalance the issue shifts from 'easy negatives drown signal' to 'positives are too few to learn'. Focal helps the former but not the latter. Pair with oversampling/augmentation or LDAM (theoretical guarantee at any imbalance).</em><br/><br/>Limit of focal.</>}
+        options={[
+          {key:"a", text:"Yes, focal scales perfectly."},
+          {key:"b", text:"Diminishing returns at extreme imbalance. Focal's mechanism is to suppress easy-negative gradient so positive gradient gets through; it doesn't INCREASE absolute positive signal. At 1:1M, you have so few positives that even fully-weighted, they may not span enough of the fraud distribution. Pair focal with (1) oversampling positives 10-100x within each batch, (2) data augmentation (SimFraud-style structural augments), (3) switch to LDAM which has theoretical guarantees on balanced error at any imbalance level, (4) two-stage training: first balanced-sample pretrain, then focal fine-tune on original distribution.", correct:true},
+          {key:"c", text:"Use BCE."},
+          {key:"d", text:"Use no loss."},
+        ]}
+        trap={<>(a) overstates; (c) reverts; (d) absurd.</>}
+        lens={<>Focal suppresses easy-neg noise. It cannot create more positive signal.</>}
+        stretch={<>What's the lower bound on positive count for focal to outperform BCE?</>}
+      />
+
+      {/* training dynamics */}
+      <VIS.TrapProblem
+        id="focal-p19"
+        difficulty="hard"
+        title="P19 — Mid-training, the focal loss curve oscillates while BCE was monotone. Why?"
+        scenario={<><em>Discriminating insight: as the model improves on easy samples (p_t goes from 0.7 to 0.99), their gradient contribution drops smoothly to zero — but mid-training a sample can flip from 'hard' to 'easy' suddenly, causing the effective sample set the model trains on to churn. Loss oscillates as the active set shifts.</em><br/><br/>Diagnose oscillation.</>}
+        options={[
+          {key:"a", text:"Random."},
+          {key:"b", text:"Focal effectively trains on a moving subset: the 'hard' samples that have non-trivial (1-p_t)^gamma weight at the current iteration. As training progresses, samples cross the 'easy' threshold (their p_t rises and modulation drops near zero), and new samples become relatively the hardest. The effective training set churns. Total focal loss (especially when averaged across the whole batch with many newly-easy samples now contributing near zero) reflects this churn and can oscillate while BCE — uniform weighting — was monotone. Mitigations: (1) use a learning rate schedule that decays in the second half of training, (2) average loss only over samples with modulation above a small floor, (3) use a smaller gamma to dampen the modulation.", correct:true},
+          {key:"c", text:"Bug in optimizer."},
+          {key:"d", text:"Focal is broken."},
+        ]}
+        trap={<>(a)(c)(d) miss the active-set churn.</>}
+        lens={<>Hard-mining loss = moving training subset. Curve can oscillate.</>}
+        stretch={<>Could you detect 'set churn' from the gradient norm history?</>}
+      />
+
+      {/* when not */}
+      <VIS.TrapProblem
+        id="focal-p20"
+        difficulty="medium"
+        title="P20 — When NOT to use focal."
+        scenario={<><em>Discriminating insight: when calibrated probabilities are the deliverable (pricing, expected-loss policy), or labels are noisy, or imbalance is mild, focal does more harm than good.</em><br/><br/>Pick the 'not focal' scenarios.</>}
+        options={[
+          {key:"a", text:"Always use focal."},
+          {key:"b", text:"Skip focal when: (1) calibrated probabilities are the deliverable (pricing model, expected-loss policy) — focal distorts probabilities even with post-hoc calibration; (2) labels are noisy (>2-3% label noise) — focal amplifies the wrong signal via hard-mining; (3) imbalance is mild (1:10 or better) — class weighting or threshold moving is simpler and equally effective; (4) the operating point is at extreme FPR (<0.1%) — focal helps mid-distribution ranking but may not help the extreme tail. In these regimes, prefer plain BCE + threshold tuning or asymmetric BCE.", correct:true},
+          {key:"c", text:"Never use focal."},
+          {key:"d", text:"Always use BCE."},
+        ]}
+        trap={<>(a)(c)(d) absolutist.</>}
+        lens={<>Focal is for extreme-imbalance, clean-label, ranking-metric regimes.</>}
+        stretch={<>How to A/B focal vs BCE in production safely?</>}
+      />
+
+      {/* misleading metric */}
+      <VIS.TrapProblem
+        id="focal-p21"
+        difficulty="hard"
+        title="P21 — Test AUC up 3 points with focal. Dollar savings down. Diagnose."
+        scenario={<><em>Discriminating insight: focal optimizes ranking globally. Dollar savings depend on top-of-score-distribution + per-case dollar value. Focal can improve mid-distribution ranking without helping the high-value cases at the top, especially if high-value cases were already correctly ranked.</em><br/><br/>AUC up, $ down. Why.</>}
+        options={[
+          {key:"a", text:"Random variance."},
+          {key:"b", text:"AUC is a global ranking metric weighting all positive-negative pairs equally. Dollar savings weighs only the top-of-score operating-point AND values each case by its $ amount. Focal can boost AUC by reshaping the middle of the distribution (many mid-confidence pairs) without improving high-value-case ranking at the top. If the original model already ranked the high-$ frauds correctly, focal's marginal gain is on low-$ cases, which moves AUC but not $ savings. Fix: switch to dollar-weighted loss (multiply each sample's loss by case-$ value) OR rank-loss at K targeted at the operating point.", correct:true},
+          {key:"c", text:"$ savings metric is wrong."},
+          {key:"d", text:"AUC metric is wrong."},
+        ]}
+        trap={<>(a) dismisses; (c)(d) dismiss valid metrics.</>}
+        lens={<>AUC and business metric can disagree. Optimize the business metric directly.</>}
+        stretch={<>Design a dollar-weighted focal variant.</>}
+      />
+
+      {/* anchor recap */}
+      <VIS.TrapProblem
+        id="focal-p22"
+        difficulty="hard"
+        title="P22 — In one sentence, what is THE unique mechanism of focal loss?"
+        scenario={<><em>Discriminating insight: per-sample confidence-modulated weighting via (1-p_t)^gamma. Strip "(1-p_t)^gamma" and you have either BCE or asymmetric BCE.</em><br/><br/>State the mechanism.</>}
+        options={[
+          {key:"a", text:"It uses cross-entropy."},
+          {key:"b", text:"Per-SAMPLE, CONFIDENCE-MODULATED weighting of BCE via a factor (1-p_t)^gamma, where p_t is the predicted probability of the true class for that sample. The weight automatically goes to zero for confident-correct samples (regardless of class) and stays near one for hard samples — implicit hard-example mining without manually selecting any subset. This is what distinguishes focal from per-class weighting (asymmetric BCE), per-class margin (LDAM), and post-hoc threshold moving.", correct:true},
+          {key:"c", text:"It re-weights classes."},
+          {key:"d", text:"It moves the threshold."},
+        ]}
+        trap={<>(a) trivial; (c) describes asymmetric BCE; (d) describes threshold moving.</>}
+        lens={<>The anchor sentence: per-sample confidence modulation via (1-p_t)^gamma.</>}
+        stretch={<>Of all imbalance levers, why is per-sample modulation the most adaptive?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li>
-          <a href="https://arxiv.org/abs/1708.02002" target="_blank" rel="noopener">
-            <strong>Lin et al. — Focal Loss for Dense Object Detection (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, ICCV 2017)</span>
-          <br/>The original paper. Section 3.3 has the math and intuition; the figures showing loss as a function of p-t are the clearest exposition you'll find.
-        </li>
-        <li>
-          <a href="https://amaarora.github.io/posts/2020-06-29-FocalLoss.html" target="_blank" rel="noopener">
-            <strong>Aman Arora — Understanding Focal Loss (blog with code)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Walks through the math, the modulating factor, and a PyTorch implementation. Best starting point if you want to implement focal yourself.
-        </li>
-        <li>
-          <a href="https://maxhalford.github.io/blog/lightgbm-focal-loss/" target="_blank" rel="noopener">
-            <strong>Max Halford — Focal Loss in LightGBM (blog)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(practitioner blog)</span>
-          <br/>Concrete derivation of the gradient and hessian for focal in LightGBM. The fraud-applicable adaptation of the original paper.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2007.07314" target="_blank" rel="noopener">
-            <strong>Menon et al. — Long-tail Learning via Logit Adjustment (paper)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2021)</span>
-          <br/>The principled alternative to focal. Read for the theoretical contrast — logit adjustment has stronger guarantees but assumes you know the class prior.
-        </li>
-        <li>
-          <a href="https://www.youtube.com/watch?v=44tlnmmt3h0" target="_blank" rel="noopener">
-            <strong>Andrej Karpathy — Imbalanced classification and loss design (video)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(video clip, ~12 min)</span>
-          <br/>Karpathy's discussion of when to reach for focal vs class weights vs sampling. The practitioner intuition compressed.
-        </li>
+        <li><a href="https://arxiv.org/abs/1708.02002" target="_blank" rel="noopener"><strong>Lin et al. — Focal Loss for Dense Object Detection</strong></a> <span style={{color:"#64748b", fontSize:14}}>(ICCV 2017, paper)</span><br/>The original paper. Sections 3 (the formula) and 4 (ablations on gamma, alpha) are sufficient — skip the RetinaNet detection details unless detection-specific.</li>
+        <li><a href="https://amaarora.github.io/posts/2020-06-29-FocalLoss.html" target="_blank" rel="noopener"><strong>Aman Arora — Focal Loss explained (blog)</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog, 2020)</span><br/>The clearest practitioner walkthrough on the internet — derives the gradient and shows the modulation effect with charts. Start here over the paper.</li>
+        <li><a href="https://leimao.github.io/blog/Focal-Loss-Explained/" target="_blank" rel="noopener"><strong>Lei Mao — Focal Loss Explained</strong></a> <span style={{color:"#64748b", fontSize:14}}>(blog)</span><br/>Tight derivation + the numerical-stability implementation in PyTorch. Good companion if you implement from scratch.</li>
+        <li><a href="https://github.com/AdeelH/pytorch-multi-class-focal-loss" target="_blank" rel="noopener"><strong>Reference PyTorch implementation</strong></a> <span style={{color:"#64748b", fontSize:14}}>(repo)</span><br/>Numerically stable binary + multi-class focal in &lt;100 lines. Read before rolling your own.</li>
+        <li><a href="https://arxiv.org/abs/2002.10857" target="_blank" rel="noopener"><strong>Mukhoti et al. — Calibrating Deep Neural Networks using Focal Loss</strong></a> <span style={{color:"#64748b", fontSize:14}}>(NeurIPS 2020, paper)</span><br/>The follow-up showing focal CAN be calibrated with the right schedule (gamma-decay). Counterpoint to the 'focal hurts calibration' folk wisdom.</li>
       </ul>
     </VIS.Section>
   </main>
