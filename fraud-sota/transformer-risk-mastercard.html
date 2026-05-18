@@ -1414,321 +1414,599 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Transformer-Risk (Mastercard) — sequence transformer over per-card transaction history
-// with learned merchant embeddings, sub-50ms inference for real-time authorization.
+// Transformer-Risk (Mastercard) — sequence transformer over authorization-event tape
+// for real-time fraud risk. Concept-specific anchors that must survive redaction:
+//   (1) tokens are (BIN, merchant_id, MCC, geo, time_delta_bucket, channel) tuples
+//       drawn from auth events, not from "any sequence"
+//   (2) Mastercard pretrains on the union of ALL issuer volumes, then fine-tunes
+//       per-issuer — small issuers gain cross-issuer behavioral priors they
+//       cannot reproduce alone
+//   (3) the label is delayed/biased: declines vs confirmed fraud are not the same
+//       objective, and the chargeback signal arrives 30-90 days late
+// Strip "Mastercard / cross-issuer / auth-tape" and the answers should NOT still work.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · Transaction sequences"
+      pill="Fraud SOTA · Auth-tape sequence transformer"
       title="Transformer-Risk (Mastercard)"
-      subtitle="Sequence transformer over per-card transaction history with learned merchant embeddings; sub-50ms inference for real-time authorization scoring."
+      subtitle="Sequence transformer over the authorization event tape with cross-issuer pretraining + per-issuer fine-tune. The network sees what no single issuer can."
       byline={[
-        {label: "Source", value: "Mastercard AI — Sequence Transformers for Real-time Authorization Scoring"},
-        {label: "Year", value: "2024"},
-        {label: "L3", value: "Transaction sequences"},
+        {label: "Source", value: "Mastercard AI — Sequence Transformers for Real-time Authorization Scoring (2024)"},
+        {label: "L3", value: "Auth-tape transformer + cross-issuer pretrain"},
+        {label: "Anchor", value: "Network-only signal: cross-issuer behavioral priors"},
       ]}/>
 
     <VIS.TLDR>
-      Classical card-fraud scoring used a{" "}
-      <VIS.Term def="Gradient Boosted Decision Trees — a tree-ensemble model (XGBoost, LightGBM, CatBoost). Industry default for tabular data because it ingests heterogeneous features and trains fast.">GBDT</VIS.Term>{" "}
-      on hand-engineered aggregate features (last-N-hour spend, merchant-category-distance from norm). It plateaued because the aggregates throw away sequence and velocity information. A transformer reads the actual transaction sequence and learns merchant embeddings end-to-end, capturing velocity, ordering, and substitution patterns directly. Sub-50ms inference makes it real-time-feasible on authorization paths.
+      Classical card-fraud scoring used per-issuer{" "}
+      <VIS.Term def="Gradient Boosted Decision Trees — tree-ensemble model (XGBoost, LightGBM, CatBoost). Industry default for tabular fraud because it ingests heterogeneous features and trains fast.">GBDT</VIS.Term>{" "}
+      on hand-engineered aggregates over <em>that issuer's own auth history</em>. It plateaus because (a) aggregates throw away order/velocity and (b) a small issuer's data is too sparse to learn the long tail of attack patterns.
+      Mastercard's Transformer-Risk reads the actual auth-event tape as a sequence of <code>(BIN, merchant_id, MCC, geo, time_delta_bucket, channel)</code> tokens, <strong>pretrains on the union of all issuer volumes</strong>, and fine-tunes per issuer. The advantage that no issuer can replicate: cross-issuer behavioral priors. A pattern like "card-present at gas station immediately followed by card-not-present at a luxury watch site" is ~80% lost-and-tested across the network, even if THIS issuer has never seen this cardholder do it.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — sequence transformer over the auth tape">
       <ol>
-        <li><strong>Input:</strong> the most recent N transactions on a card. Each transaction is tokenized as merchant-embedding + amount + time-delta + MCC + geography + channel.</li>
-        <li><strong>Backbone:</strong> a small transformer (4 to 8 layers, hidden dim 128 to 256). Causal masking — the model scores transaction T conditioned only on transactions less than T.</li>
-        <li><strong>Merchant embeddings:</strong> learned end-to-end, with a fallback embedding for long-tail merchants below a frequency threshold.</li>
-        <li><strong>Output:</strong> per-transaction risk score, served in under 50ms with quantization and batching at the GPU service.</li>
+        <li><strong>Token vocabulary:</strong> each authorization is tokenized as the tuple <code>(BIN, merchant_id, MCC, geo_h3, time_delta_bucket, channel)</code>. <code>merchant_id</code> is the high-cardinality lever; <code>MCC</code> + <code>BIN</code> are coarse fallbacks for cold/long-tail merchants.</li>
+        <li><strong>Positional encoding over irregular time:</strong> auth events are NOT evenly spaced. Use a learned embedding of the bucketed time-delta (e.g., &lt;1m, 1-5m, 5-30m, 30m-2h, ...) concatenated to the token, NOT a fixed-stride sinusoid that pretends the gap is uniform.</li>
+        <li><strong>Backbone:</strong> small causal transformer (4-8 layers, d=128-256). Causal mask is mandatory — score for transaction T can only attend to events &lt;T.</li>
+        <li><strong>Pretrain:</strong> next-event prediction + masked-token objectives on the <em>union</em> of all Mastercard-network authorizations. This is the network-only step — no single issuer can do it.</li>
+        <li><strong>Fine-tune:</strong> per-issuer head with that issuer's labeled fraud/chargeback signal. Small issuers inherit the cross-issuer behavioral priors via the frozen-ish trunk.</li>
+        <li><strong>Inference:</strong> sub-50ms on the auth path via batched GPU + INT8 quantization + cached embedding tables.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  S["Recent N transactions"]
-  S --> E["Token embeddings"]
-  E --> T["Transformer encoder"]
-  T --> H["Final hidden state"]
-  H --> R["Risk score"]
-  style T fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style R fill:#fef3c7,stroke:#d97706,stroke-width:2px
-      `} />
-      <p>
-        Blue is the transformer backbone. Yellow is the operational decision served on the authorization path within the network latency budget.
-      </p>
+  T["Auth event tape per card"]
+  T --> K["Token tuple per event"]
+  K --> P["Time delta positional embed"]
+  P --> X["Cross-issuer pretrain (network volume)"]
+  X --> F["Per-issuer fine-tune head"]
+  F --> R["Real-time risk score sub-50ms"]
+  style X fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style F fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style R fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+      `}/>
+      <p>Blue = the network-only pretrain that issuers cannot replicate. Yellow = the per-issuer head where calibration and policy live. Red = the latency-bound runtime decision.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-why" title="Why pretrain on the network and not just the issuer">
+      <p>
+        A mid-size issuer might see 5-50M authorizations/month. The network sees ~10B/month. Fraud-attack patterns (card-testing rings, geography-jump sequences, BIN-attack waves) are rare on any single issuer but dense across the network. A transformer pretrained on the union learns the priors directly; an issuer-only GBDT (or even an issuer-only transformer) cannot.
+      </p>
+      <p>
+        The redaction litmus for this whole visual: <em>if you can strip "Mastercard" / "cross-issuer" / "auth-tape" from a problem and the answer is unchanged, the problem is generic and belongs in a "sequence model for fraud" visual — not here.</em>
+      </p>
+
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>GBDT on aggregate features</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Transformer-Risk</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Issuer-only GBDT</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Mastercard Transformer-Risk</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Input shape</td>
-            <td style={{padding:"8px 10px"}}>Flat aggregates</td>
-            <td style={{padding:"8px 10px"}}>Sequence of recent transactions</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Captures velocity / ordering</td>
-            <td style={{padding:"8px 10px"}}>Partially via hand features</td>
-            <td style={{padding:"8px 10px"}}>End-to-end</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Long-tail merchants</td>
-            <td style={{padding:"8px 10px"}}>Handled by feature engineering</td>
-            <td style={{padding:"8px 10px"}}>Noisy unless fallback features used</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Inference latency</td>
-            <td style={{padding:"8px 10px"}}>Sub-10ms CPU</td>
-            <td style={{padding:"8px 10px"}}>Sub-50ms with batched GPU service</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Recall lift over baseline</td>
-            <td style={{padding:"8px 10px"}}>—</td>
-            <td style={{padding:"8px 10px"}}>5 to 15 percent at fixed precision</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Training data</td><td style={{padding:"6px 10px"}}>One issuer's auth + chargebacks</td><td style={{padding:"6px 10px"}}>Union of all network auths (pretrain) + issuer labels (fine-tune)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Input shape</td><td style={{padding:"6px 10px"}}>Flat aggregates (last-N-hr spend)</td><td style={{padding:"6px 10px"}}>Ordered auth-event tape</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Cross-issuer patterns</td><td style={{padding:"6px 10px"}}>Invisible</td><td style={{padding:"6px 10px"}}>Encoded in the pretrained trunk</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Long-tail merchants</td><td style={{padding:"6px 10px"}}>Handled by hand features</td><td style={{padding:"6px 10px"}}>Fallback to MCC + BIN when merchant_id has &lt;1k events network-wide</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Calibration</td><td style={{padding:"6px 10px"}}>Per-issuer trivially</td><td style={{padding:"6px 10px"}}>Per-issuer head; same logit ≠ same cutoff across issuers</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Card-present and card-not-present real-time authorization scoring</strong> where latency budget allows tens of milliseconds.</li>
-        <li><strong>You have a large card-transaction corpus</strong> — transformer training needs scale to beat well-tuned GBDT.</li>
-        <li><strong>Velocity and ordering patterns matter</strong> — testing-card patterns, geography-jump patterns, merchant-substitution patterns.</li>
-        <li><strong>GPU serving infrastructure exists</strong> — sub-50ms transformer inference requires GPU batching, not CPU.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Long-tail merchants get noisy embeddings">
-        Below a frequency threshold (say, fewer than 1,000 transactions in training), merchant embeddings are essentially random. The model lacks signal on these. Fallback features (MCC code, country, average ticket) carry the signal while the embedding warms up.
+    <VIS.Section id="sec-limits" title="Limits and gotchas — the auth-tape specific ones">
+      <VIS.Callout kind="gotcha" title="Decline-vs-fraud objective mismatch">
+        The cheap label is <em>"did the issuer decline?"</em>; the true label is <em>"was this confirmed fraud (chargeback)?"</em>. Issuer declines are a biased filter — they reflect THIS issuer's prior policy. Train on declines and you reproduce the policy. Train on confirmed fraud and you wait 30-90 days for the label. The fix is a two-headed loss + delayed-label correction.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Latency budget shapes architecture">
-        50ms end-to-end on an authorization path is brutal. Network round-trip eats 10 to 20ms; model inference, feature lookup, and decisioning fit in the rest. Architectural choices (depth, hidden dim, batching strategy, quantization) are dictated by the latency budget.
+      <VIS.Callout kind="warn" title="Token-vocabulary drift">
+        New merchants onboard daily. A merchant_id that appears mid-week dominates a customer cohort by Friday; its embedding is essentially random. Defense: hash-fallback to MCC + BIN until the merchant accumulates ~1k network-wide events.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Drift is constant in card-fraud">
-        Fraud patterns shift weekly. The transformer trained on this quarter underperforms next quarter unless you retrain. Champion-challenger continuous deployment with daily monitoring of recall at fixed precision is standard.
+      <VIS.Callout kind="warn" title="Per-issuer calibration drift">
+        The same logit means different cutoff per issuer because their fraud cost ratios differ (banking vs prepaid vs co-brand). Per-issuer Platt/isotonic on top of a shared trunk is mandatory.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Causal masking is mandatory">
-        Without it the model peeks at the current transaction when scoring. Train-time and inference-time both need the causal mask. Bugs here are silent: training metrics look great, production recall collapses.
+      <VIS.Callout kind="warn" title="Adversarial — rings learn the model's preferred patterns">
+        Card-testing rings probe sequences and quickly learn that the model down-weights, say, "small-amount then small-amount". Defense: randomized thresholds + ensembled second-stage GBDT on borderline scores.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Adversarial probing detects the threshold">
-        Fraudsters probe the system with low-value test transactions to learn where the threshold is. Mitigations: randomized thresholds, second-stage human-in-the-loop on borderline cases, ensembling with a different model class.
+      <VIS.Callout kind="gotcha" title="Causal-mask bug is silent">
+        Without causal masking the model peeks at the scored event. Train metrics look great; production recall collapses. Verify with synthetic sequences and attention-mass checks.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Trap problems on sequence transformers, GBDT vs sequence models, latency engineering, and authorization-path operations.
+        Every problem hinges on something only Mastercard's auth-tape transformer with cross-issuer pretraining does: token-vocabulary choice over BIN/merchant_id/MCC, irregular time-delta positional encoding, the cross-issuer pretrain → per-issuer fine-tune split, the decline-vs-fraud label problem, multi-channel attention (card-present / card-not-present / ATM / P2P as sub-vocabularies), per-issuer calibration drift, or adversarial ring behavior. Strip "Mastercard / cross-issuer / auth-tape" → the answer must no longer work.
       </p>
 
+      {/* B3 — STAKEHOLDER PITCH, must hinge on cross-issuer pretrain advantage */}
       <VIS.TrapProblem
         id="trk-p1"
         difficulty="hard"
-        title="P1 — Why does GBDT plateau when fraud depends on transaction order?"
-        scenario={<>Your team's well-tuned GBDT plateaus at recall 75 percent at fixed precision. You read that fraudsters use ordered patterns (test-small-then-big, geography jumps, merchant substitution). Why does GBDT struggle?</>}
+        title="P1 — A regional issuer's CRO asks: 'Why pay Mastercard for Transformer-Risk when we could train our own transformer on our own data?'"
+        scenario={<><em>Discriminating insight: the unfair advantage is pretraining on the union of all issuer volumes. A small issuer's own data is too sparse to learn cross-issuer attack patterns (e.g., card-present-at-gas-then-CNP-luxury-watch = 80% lost-and-tested). Strip "cross-issuer" and the pitch fails.</em><br/><br/>Your bank processes 30M auths/month. Mastercard offers Transformer-Risk; your team proposes a same-architecture transformer trained on your own data. Pick the pitch that ACTUALLY justifies paying the network.</>}
         options={[
-          {key:"a", text:"GBDT consumes flat aggregate features (last-hour spend, count of distinct merchants in window). These aggregates throw away sequence order, time deltas, and per-merchant transitions. A transformer reads the actual ordered sequence as tokens and learns velocity and substitution patterns from the data, no hand-engineered aggregate required. GBDT plateau is the aggregation losing information; transformer recovers it.", correct:true},
-          {key:"b", text:"GBDT cannot handle categorical merchant features."},
-          {key:"c", text:"GBDT requires too much memory."},
-          {key:"d", text:"GBDT is randomized."},
+          {key:"a", text:"Mastercard has more GPUs than us, so the model trains faster."},
+          {key:"b", text:"Our 30M/month is too sparse to learn rare cross-issuer attack patterns. Card-testing rings, BIN-attack waves, and lost-and-tested sequences (e.g., card-present gas-station → CNP luxury-watch within minutes) are dense across the ~10B/month network volume but rare on any one issuer. Mastercard pretrains on the union of all issuer auth tapes and we inherit those behavioral priors via the fine-tune; we literally cannot reproduce this signal in-house because we don't see other issuers' traffic. Per-issuer fine-tune lets us still own our policy / calibration on top.", correct:true},
+          {key:"c", text:"Transformers always beat GBDT, so the migration pays for itself."},
+          {key:"d", text:"Mastercard's model uses BERT, which is known to be better than other architectures."},
         ]}
-        trap={<>(b) is false — GBDT handles categoricals fine. (c) and (d) are wrong.</>}
-        lens={<>(a) is the conceptual answer. The issue is representation: aggregates lose order information. Sequence models recover what aggregation discards.</>}
-        stretch={<>Could you reach transformer-like performance by hand-engineering enough sequence aggregates for GBDT?</>}
+        trap={<>(a) is an infra claim, not a signal claim — we could rent GPUs. (c) is the generic transformer story that ignores cross-issuer data. (d) is cargo-cult and architecturally false.</>}
+        lens={<>The B3 pitch must redact-test: strip "Mastercard" / "cross-issuer" and the option no longer wins. Only (b) does — it names the network-only data source.</>}
+        stretch={<>If a regional issuer's traffic IS 5B/month (a top-5 US issuer), does the pretrain advantage shrink? By how much?</>}
       />
 
+      {/* C1 — token vocab choice */}
       <VIS.TrapProblem
         id="trk-p2"
         difficulty="hard"
-        title="P2 — Latency budget is 50ms end-to-end. How do you fit a transformer?"
-        scenario={<>Authorization path latency budget is 50ms total. Network round-trip is 15ms. Feature lookup is 10ms. Decisioning is 5ms. Transformer must fit in 20ms. How?</>}
+        title="P2 — Token granularity: BIN, merchant_id, or MCC as the primary token?"
+        scenario={<><em>Discriminating insight: merchant_id is high-cardinality and carries most signal but has a sparse long tail; MCC is coarse but stable; BIN identifies the card itself, not the merchant. The senior answer is merchant_id as primary with MCC+BIN as fallbacks gated by network frequency.</em><br/><br/>Pick the token design.</>}
         options={[
-          {key:"a", text:"Small model (4 to 8 layers, hidden 128 to 256), batched GPU inference with dynamic batching (group requests within a 5ms window), INT8 quantization, kernel fusion (FlashAttention or similar), and pre-warmed merchant-embedding tables. Avoid host-device transfer overhead per request by keeping the model on GPU continuously and using async transfer.", correct:true},
-          {key:"b", text:"Run the transformer on CPU."},
-          {key:"c", text:"Skip the transformer for latency-sensitive paths."},
-          {key:"d", text:"Use a 100-layer transformer with FP16."},
+          {key:"a", text:"Use BIN as the primary token — it identifies the card."},
+          {key:"b", text:"Use MCC as the primary token — it's stable and low-cardinality."},
+          {key:"c", text:"Use merchant_id as the primary token (high signal, distinguishes individual merchants — Best Buy vs Apple Store vs corner gas station). Add MCC + BIN as concatenated fallback features so the model has signal when merchant_id has &lt;1k network-wide events (long tail / new onboards). The fallback is a learned switch, not a hard rule.", correct:true},
+          {key:"d", text:"Use the raw transaction amount as the primary token."},
         ]}
-        trap={<>(b) is 10x too slow. (c) abandons the use case. (d) does not fit budget.</>}
-        lens={<>(a) is the production recipe. Latency budget shapes architecture; you co-design model and serving infrastructure.</>}
-        stretch={<>What is the cheapest latency win after architecture is fixed — batching, quantization, or kernel fusion?</>}
+        trap={<>(a) misreads BIN — it's the issuer's card-product identifier, NOT the merchant. (b) loses too much resolution (a single MCC bucket covers Walmart + corner store). (d) is not even a categorical.</>}
+        lens={<>Token vocabulary is THE concept-specific choice for this model. Primary = highest-cardinality stable id; fallback = lower-cardinality coarse codes gated by network frequency.</>}
+        stretch={<>What network-wide frequency threshold should switch merchant_id → MCC fallback? Why does the threshold depend on embedding dim?</>}
       />
 
+      {/* C1b — positional encoding over irregular time */}
       <VIS.TrapProblem
         id="trk-p3"
         difficulty="hard"
-        title="P3 — Long-tail merchants. Why is a fallback feature needed?"
-        scenario={<>Twenty percent of authorized transactions occur at merchants with fewer than 1,000 transactions in training. Recall on these is much lower than head merchants. Why and what is the fix?</>}
+        title="P3 — Auth events are irregularly spaced (4s, then 3 days, then 12s). What positional encoding?"
+        scenario={<><em>Discriminating insight: sinusoidal positional encoding assumes fixed-stride order; here the SAME position-3 event can be 4 seconds or 30 days after position-2. Use a learned embedding of the bucketed time-delta, concatenated to the token.</em><br/><br/>Pick the positional encoding for the auth-tape sequence.</>}
         options={[
-          {key:"a", text:"Below a frequency threshold, the merchant embedding is essentially random because gradients are too sparse to learn a stable representation. The model has no useful per-merchant signal. Fix: add merchant-level fallback features (MCC, country code, average ticket size, age) as a side input that the model can use when the embedding is unreliable. Implement a confidence threshold on merchant-frequency to gate which signal dominates.", correct:true},
-          {key:"b", text:"Just drop long-tail merchants."},
-          {key:"c", text:"Increase model size."},
-          {key:"d", text:"Use a random embedding always."},
+          {key:"a", text:"Standard sinusoidal positional encoding on integer position 0..N-1."},
+          {key:"b", text:"Bucket the time-delta between consecutive events (e.g., &lt;1m, 1-5m, 5-30m, 30m-2h, 2h-1d, 1-7d, 7d+) and use a learned embedding of the bucket concatenated to each token. This encodes 'how fast' the sequence is moving — the velocity signal that distinguishes a card-testing burst (delta &lt;1m repeated) from normal usage (delta hours-days). A sinusoid on integer position ignores velocity, which is one of the strongest fraud signals.", correct:true},
+          {key:"c", text:"Use absolute wall-clock time as a continuous scalar feature."},
+          {key:"d", text:"No positional encoding — let attention figure it out."},
         ]}
-        trap={<>(b) loses business volume. (c) does not address sparse-gradient root cause. (d) makes things worse.</>}
-        lens={<>(a) is the standard fix. Fallback features for cold-start tokens are a recurring pattern in any embedding-based model — search, recommendations, fraud.</>}
-        stretch={<>What frequency threshold is reasonable to switch between embedding and fallback?</>}
+        trap={<>(a) treats 4s and 3d as equivalent — kills the velocity signal. (c) leaks calendar information and ignores per-card relative timing. (d) is wrong for any causal sequence.</>}
+        lens={<>The auth-tape's irregular spacing IS the velocity signal. The positional encoding must encode delta-time, not just order.</>}
+        stretch={<>Why log-bucket the deltas instead of linear-bucket?</>}
       />
 
+      {/* C3 — pretrain/fine-tune split: catastrophic forgetting */}
       <VIS.TrapProblem
         id="trk-p4"
         difficulty="hard"
-        multiSelect
-        title="P4 — Causal-masking bugs — which symptoms point to a leak?"
-        scenario={<>You suspect a causal-masking bug. Which symptoms point to a peeking leak? Select all that apply.</>}
+        title="P4 — Per-issuer fine-tune on 8M events: full unfreeze blows away the cross-issuer priors. Fix?"
+        scenario={<><em>Discriminating insight: full unfreeze on a small issuer's 8M events catastrophically forgets the network-scale pretrain. Use LoRA / adapter / frozen-trunk-+-head so the cross-issuer priors survive.</em><br/><br/>You fine-tune on a regional issuer's 8M labeled events; offline recall climbs on their data, online recall on cross-issuer attack patterns COLLAPSES. Diagnose.</>}
         options={[
-          {key:"a", text:"Training recall is much higher than online recall by a large constant gap.", correct:true},
-          {key:"b", text:"Train and online recall are similar."},
-          {key:"c", text:"Recall on synthetic test sequences where you intentionally place the fraudulent transaction at position T is exactly the same whether the model sees positions less than T or all positions.", correct:true},
-          {key:"d", text:"Attention weight at position T includes substantial mass at positions greater than T.", correct:true},
-          {key:"e", text:"Training loss flatlines."},
-          {key:"f", text:"Per-token loss at the last token is much lower than at earlier tokens.", correct:true},
+          {key:"a", text:"The 8M events are too few — collect more before fine-tuning."},
+          {key:"b", text:"Full unfreeze caused catastrophic forgetting of the cross-issuer behavioral priors that were in the pretrained trunk. The 8M issuer-specific events overwrite the trunk weights with patterns this issuer happens to see; rare cross-issuer attack patterns (ring testing, BIN-attack sweeps) lose their signal. Fix: freeze the trunk (or use LoRA / adapter layers with low rank) and learn only a small per-issuer head + calibration on top. The pretrain priors remain intact; the head adapts to the issuer's label distribution.", correct:true},
+          {key:"c", text:"The issuer has unusual traffic — switch to GBDT."},
+          {key:"d", text:"Increase the model size."},
         ]}
-        trap={<>(b) is the absence of a leak. (e) is unrelated (likely an LR issue).</>}
-        lens={<>(a), (c), (d), (f) are the diagnostic stack for causal-mask leaks. Run all four when suspecting a leak.</>}
-        stretch={<>Which of these can you check fastest without retraining?</>}
+        trap={<>(a) does not explain the regression on cross-issuer patterns. (c) abandons the value prop. (d) makes forgetting worse.</>}
+        lens={<>Pretrain-finetune for a NETWORK model on PER-ISSUER labels is asymmetric: the trunk is the network's, the head is the issuer's. Full unfreeze inverts the asymmetry.</>}
+        stretch={<>How small does the issuer have to be before LoRA matters vs full fine-tune?</>}
       />
 
+      {/* C2 — decline-vs-fraud label mismatch */}
       <VIS.TrapProblem
         id="trk-p5"
         difficulty="hard"
-        title="P5 — Champion-challenger deployment. Why daily?"
-        scenario={<>You ship Transformer-Risk as the challenger against the existing GBDT champion. Why deploy daily-eval rather than weekly?</>}
+        title="P5 — Cheap label = 'issuer declined?'; true label = 'confirmed chargeback'. Which to train on?"
+        scenario={<><em>Discriminating insight: declines are biased by the issuer's existing policy — training on declines reproduces the policy. Confirmed chargebacks are true but arrive 30-90 days late. Use both via a two-head loss with delayed-label correction.</em><br/><br/>Pick the training objective for the auth-tape model.</>}
         options={[
-          {key:"a", text:"Card-fraud patterns drift on a sub-weekly timescale because organized fraud rings rotate attack patterns daily to evade detection. A weekly evaluation cycle gives an adversary 5 days to learn and exploit a model weakness before you measure it. Daily evaluation with automated rollback when recall-at-precision drops below a floor is the production standard.", correct:true},
-          {key:"b", text:"Weekly is fine."},
-          {key:"c", text:"Monthly is enough."},
-          {key:"d", text:"Evaluation does not matter post-launch."},
+          {key:"a", text:"Train on declines — fast feedback, plenty of data."},
+          {key:"b", text:"Train on confirmed chargebacks only — the only true label."},
+          {key:"c", text:"Two heads: (1) auxiliary 'will this issuer decline' head trained on the fast biased label, (2) primary 'is this fraud' head trained on chargebacks. Use the auxiliary head for representation shaping (it sees orders of magnitude more labels) while the primary head drives the operating score. Apply IPS / delayed-label correction so chargeback-positives that arrive 60 days later get gradient back. Decline-only would reproduce the existing policy; chargeback-only is too sparse.", correct:true},
+          {key:"d", text:"Use issuer fraud-team manual reviews as the label."},
         ]}
-        trap={<>(b), (c), (d) underestimate adversary cadence.</>}
-        lens={<>(a) is the production cadence. Daily eval + automated rollback is standard for any model in the card-authorization path.</>}
-        stretch={<>What is the right floor for precision-recall before triggering automatic rollback?</>}
+        trap={<>(a) reproduces the issuer's existing policy and learns nothing new. (b) is too sparse and 60-day lagged. (d) doesn't scale and is selection-biased toward already-suspicious cases.</>}
+        lens={<>Fraud labels are bandit-biased: you only see chargebacks for txns the issuer APPROVED. Declined-fraud is censored. The two-head + delayed-correction structure handles this.</>}
+        stretch={<>How does the censoring of declined-fraud bias the model, and what's the IPS correction?</>}
       />
 
+      {/* C2b — multi-channel attention */}
       <VIS.TrapProblem
         id="trk-p6"
         difficulty="hard"
-        title="P6 — Fraudster probes for the threshold. Defend."
-        scenario={<>An organized fraud ring probes your system with low-value transactions to learn where the threshold is, then mounts a big attack right below it. How do you defend?</>}
+        title="P6 — Card-present, e-comm CNP, ATM, P2P — should the channel be a feature, or a separate sub-vocabulary?"
+        scenario={<><em>Discriminating insight: channels have different signal distributions; treating channel as a 1-bit feature lets the model average over them. Concept-specific fix: per-channel sub-vocabularies share the trunk via channel-conditioned attention, so 'gas station card-present → luxury CNP within 5 min' lights up correctly.</em><br/><br/>Pick the channel handling.</>}
         options={[
-          {key:"a", text:"Randomize the threshold within a small band so probing yields noisy signal; route borderline scores to a second-stage human or stronger model; ensemble Transformer-Risk with a different model class (GBDT) and require both to agree at low thresholds; rate-limit per-card probing; and surface multi-card pattern detection upstream so concerted probing across cards is itself a signal.", correct:true},
-          {key:"b", text:"Raise the threshold."},
-          {key:"c", text:"Lower the threshold."},
-          {key:"d", text:"Block all transactions below the average ticket."},
+          {key:"a", text:"Add channel as a 1-of-4 categorical feature concatenated to each token."},
+          {key:"b", text:"Train 4 separate models, one per channel."},
+          {key:"c", text:"Keep one shared transformer trunk but use channel-conditioned attention: channel is part of the token tuple AND each attention layer has channel-pair-aware biases (e.g., a learned bias for 'attending from CNP back to card-present'). This lets the model treat a card-present→CNP transition (the lost-and-tested signature) as a distinct pattern, not just an averaged tuple. A flat 1-of-4 feature gets washed out by attention pooling; 4 separate models lose the CROSS-channel transitions that ARE the fraud signature.", correct:true},
+          {key:"d", text:"Drop ATM and P2P — they're noisy."},
         ]}
-        trap={<>(b) hurts revenue. (c) hurts precision. (d) destroys customer experience.</>}
-        lens={<>(a) is the senior anti-probing playbook. Randomization, secondary review, ensembling, rate-limiting, and cross-card pattern detection together raise the cost to probe.</>}
-        stretch={<>What is the right size of threshold randomization — too narrow is useless, too wide costs precision?</>}
+        trap={<>(a) loses the cross-channel transition signal. (b) loses cross-channel attention entirely. (d) discards data.</>}
+        lens={<>The fraud signal often lives at channel BOUNDARIES (lost card stolen → tested CP at gas → moved to CNP luxury). The architecture must let attention see across channels with channel-aware bias.</>}
+        stretch={<>How does this differ from "MCC as a sub-vocabulary"? Why is channel a different dimension?</>}
       />
 
+      {/* C4 — token-vocab drift Friday 3am */}
       <VIS.TrapProblem
         id="trk-p7"
         difficulty="hard"
-        title="P7 — Sequence length: too short loses context, too long blows latency"
-        scenario={<>You pick the input sequence length. Options: 16 transactions, 64, or 256. What is the senior default?</>}
+        title="P7 — Friday 3am page: a new merchant onboarded Tuesday now dominates 12% of inference. Recall on its events is random. Diagnose."
+        scenario={<><em>Discriminating insight: a new merchant_id has &lt;1k network events; its embedding is essentially random. When it suddenly dominates a cohort (e.g., new BNPL provider onboards), risk decisions on its events have no signal — fall back to MCC + BIN.</em><br/><br/>You're paged: a regional bank's recall collapsed on Friday morning. Logs show 12% of auths now hit one merchant onboarded Tuesday. Diagnose.</>}
         options={[
-          {key:"a", text:"64 is a good default. 16 is too short to capture multi-day velocity patterns; 256 blows the latency budget for diminishing returns (most fraud signal lives in the recent 30 to 50 transactions). Validate empirically on holdout but expect 64 to be near optimal. Consider per-card adaptive truncation for cards with very few transactions.", correct:true},
-          {key:"b", text:"Always 16 - shorter is faster."},
-          {key:"c", text:"Always 256 - more data is better."},
-          {key:"d", text:"Sequence length does not matter."},
+          {key:"a", text:"The transformer is over-fit; retrain from scratch."},
+          {key:"b", text:"A merchant_id with &lt;1k network events has a near-random embedding (gradient too sparse to converge). Tuesday's onboard generated insufficient pretrain data by Friday; the embedding is noise. Fix: a network-frequency switch at inference time — if merchant_id frequency &lt; threshold, ZERO the merchant_id slot and rely on MCC + BIN + amount + channel. Trigger a fast warm-up retrain incorporating the new merchant once it crosses the threshold. The token-vocabulary itself is non-stationary.", correct:true},
+          {key:"c", text:"The cardholders are committing more fraud at the new merchant."},
+          {key:"d", text:"Roll back to Tuesday's model."},
         ]}
-        trap={<>(b) loses signal. (c) does not pay for itself. (d) is wrong.</>}
-        lens={<>(a) is the empirical default. Most authorization-path transformers use sequence length around 32 to 128 in production.</>}
-        stretch={<>What does the recall-vs-sequence-length curve typically look like — linear, log, or step?</>}
+        trap={<>(a) treats a vocabulary drift as a model failure. (c) presumes the data, not the model, is the issue. (d) doesn't fix the underlying drift.</>}
+        lens={<>Token vocabularies in auth-tape models are non-stationary by definition (new merchants onboard daily). Inference must gracefully fall back when a token's embedding hasn't converged.</>}
+        stretch={<>How do you discover this fallback path is needed BEFORE the Friday 3am page?</>}
       />
 
+      {/* D4 — calibration drift across issuers */}
       <VIS.TrapProblem
         id="trk-p8"
         difficulty="hard"
-        title="P8 — Cold-card problem: new card has 3 transactions. What signal can you use?"
-        scenario={<>A brand-new card has only 3 transactions in history. The transformer's context window is mostly empty. How do you score it?</>}
+        title="P8 — Two issuers, same trunk, same logit 4.2. Issuer A blocks; Issuer B approves. Bug?"
+        scenario={<><em>Discriminating insight: a shared logit means different things to different issuers because cost ratios differ (prepaid vs co-brand vs T&amp;E card). Per-issuer calibration is mandatory and the cutoff is a business choice, not a bug.</em><br/><br/>Issuer A blocks every score &gt;3.8; Issuer B approves up to 5.0. Both run the same shared trunk. Diagnose.</>}
         options={[
-          {key:"a", text:"Use cardholder-level features as a secondary input — applicant demographics, address risk, opening-channel risk, BIN-level patterns — to compensate for the missing sequence. Pad the sequence with a learned BEGIN-OF-CARD token. Drop the model's confidence threshold for cold cards and route more to manual review until enough history accumulates.", correct:true},
-          {key:"b", text:"Block all new cards."},
-          {key:"c", text:"Always approve new cards."},
-          {key:"d", text:"Use the average score across all new cards."},
+          {key:"a", text:"It's a bug — the same score should produce the same decision."},
+          {key:"b", text:"Not a bug. Cost(FP) (block a legit user) vs Cost(FN) (approve fraud) varies by issuer portfolio: a prepaid card's fraud loss is ~face-value; a T&amp;E charge card can hit $50k; co-brand cards weight loyalty heavily. Each issuer trains a per-issuer calibration head (Platt / isotonic) on top of the shared trunk and sets the cutoff against its own cost ratio. The shared logit is correctly an UNCALIBRATED score across issuers. Cross-issuer calibration drift is intentional, not a bug.", correct:true},
+          {key:"c", text:"Issuer A has a stricter regulator."},
+          {key:"d", text:"Bug in INT8 quantization."},
         ]}
-        trap={<>(b) destroys the new-card experience. (c) is fraud-loss reckless. (d) carries no signal.</>}
-        lens={<>(a) is the standard cold-start design. Secondary cardholder-level features bridge the gap until the sequence fills out.</>}
-        stretch={<>How many transactions does a card need before the sequence model dominates the cardholder-level features?</>}
+        trap={<>(a) misreads what a shared trunk produces. (c) confuses regulation with cost ratios. (d) is unrelated.</>}
+        lens={<>Shared trunk → per-issuer calibration → per-issuer cutoff. Each layer down is a different ownership boundary.</>}
+        stretch={<>What's the right monitoring signal to detect that an issuer's calibration has drifted?</>}
       />
 
+      {/* F2 — adversarial rings */}
       <VIS.TrapProblem
         id="trk-p9"
         difficulty="hard"
-        title="P9 — Quantization at INT8: what breaks?"
-        scenario={<>You ship the transformer at INT8 quantization for latency. After deployment, recall drops 2 points and false-positive rate jumps. What broke?</>}
+        title="P9 — A card-testing ring probes the model and discovers its 'preferred' sequence patterns. Defend."
+        scenario={<><em>Discriminating insight: ML-aware rings learn that small-amount-small-amount-small-amount looks benign and chain it before the big hit. Defense: randomized thresholds + ensembled second-stage GBDT + cross-card pattern detection upstream (a single ring across 200 cards looks coordinated even if each card's tape looks clean).</em><br/><br/>A ring probes for two weeks then mounts a coordinated attack across 200 cards. Defense?</>}
         options={[
-          {key:"a", text:"Naive post-training INT8 quantization is too aggressive for the attention softmax and the embedding lookup, both of which have wide dynamic range. Use per-channel quantization for embeddings, keep softmax computation in FP16, and do quantization-aware training rather than post-hoc PTQ. The 2-point recall loss is fixable but requires careful per-layer choices.", correct:true},
-          {key:"b", text:"Quantization always loses 2 points."},
-          {key:"c", text:"Quantization is incompatible with transformers."},
-          {key:"d", text:"Use FP32 - quantization is too risky."},
+          {key:"a", text:"Raise the threshold."},
+          {key:"b", text:"Randomize the decision threshold within a small band, route borderline scores to a second-stage GBDT with diverse features (ensemble disagreement is itself signal), and add an upstream cross-card pattern detector that catches the ring at the network level (200 cards each issuing a $5 test at the same merchant within 5 minutes is invisible to per-card models but obvious cross-card). The per-card transformer cannot defend against coordinated ring behavior; the network-level detector can — and only the network sees this.", correct:true},
+          {key:"c", text:"Block all small-amount transactions."},
+          {key:"d", text:"Retrain the transformer once a quarter."},
         ]}
-        trap={<>(b) is over-general. (c) is false. (d) gives up the latency win.</>}
-        lens={<>(a) is the right read. Quantization is layer-specific; one-size-fits-all PTQ loses accuracy in attention-softmax and embedding paths. Fix with QAT and selective FP16.</>}
-        stretch={<>What is the cheapest sanity check that quantization did not break things — train-time, eval-time, or production?</>}
+        trap={<>(a) blunt-force breaks revenue. (c) destroys CX. (d) quarterly retraining is too slow vs ring cadence.</>}
+        lens={<>Per-card sequence models defend per-card fraud. Coordinated rings need cross-card / network-level signals — another place Mastercard's network position matters.</>}
+        stretch={<>How do you separate a coordinated ring from a legit promotion (everyone hits Costco at lunch)?</>}
       />
 
+      {/* A1 — distinguish from issuer-only transformer */}
       <VIS.TrapProblem
         id="trk-p10"
         difficulty="hard"
-        title="P10 — End-to-end design: card-not-present authorization scoring for a top-3 issuer"
-        scenario={<>Top-3 US card issuer, 100M cards, 50K authorizations per second peak. Card-not-present fraud is the dominant loss vector. You can ship one new model this year. Pick ONE.</>}
+        title="P10 — Issuer-only transformer trained on the issuer's full 5B/year vs Mastercard's network-pretrain. The first ALSO has lots of data. What's different?"
+        scenario={<><em>Discriminating insight: 5B/year on one issuer is still single-distribution. Cross-issuer pretrain is not just more data — it's a different DATA DISTRIBUTION that includes attack patterns this issuer rarely sees.</em><br/><br/>A top-5 issuer says 'we already have 5B/year — that's plenty.' Compare.</>}
         options={[
-          {key:"a", text:"Sequence transformer over recent 64 transactions per card with learned merchant embeddings plus fallback features, INT8 quantization with QAT, batched GPU inference at sub-50ms, daily champion-challenger evaluation with auto-rollback, ensembled with the existing GBDT champion at low-threshold borderline cases, threshold-randomization for anti-probing, paired with cardholder-level cold-start features for new cards.", correct:true},
-          {key:"b", text:"Replace GBDT entirely with the transformer, no ensembling, no cold-start path."},
-          {key:"c", text:"Keep GBDT, do not deploy transformer."},
-          {key:"d", text:"Deploy the transformer at FP32 on CPU."},
+          {key:"a", text:"They're equivalent — 5B/year is enough."},
+          {key:"b", text:"5B/year is enough volume but it's one distribution. The issuer never sees ring attacks targeting OTHER issuers; never sees a card stolen from Issuer A used at a Issuer B-only merchant; never sees BIN-attack waves rolling across the network. Cross-issuer pretrain shifts the distribution from 'this issuer's traffic + this issuer's frauds' to 'all traffic + all frauds.' The marginal attack pattern is rare on any one issuer but common across the network. Distributional coverage, not just count, is what the network advantage buys.", correct:true},
+          {key:"c", text:"The transformer architecture cares only about total count."},
+          {key:"d", text:"Mastercard has better GPUs."},
         ]}
-        trap={<>(b) breaks cold-start and removes the diversity benefit of ensembling. (c) leaves recall on the table. (d) cannot meet latency.</>}
-        lens={<>(a) is the senior design. Sequence model with fallback, latency-aware serving, daily eval, ensembled with the existing baseline, anti-probing, cold-start path. The trap is removing GBDT entirely; the right move is to layer the transformer on top.</>}
-        stretch={<>What single metric in week 1 tells you the transformer is actually adding lift beyond the GBDT?</>}
+        trap={<>(a)(c) misread distribution-coverage as volume. (d) is infra, not signal.</>}
+        lens={<>Volume vs distributional coverage is the lens. Cross-issuer = different distribution, not just more N.</>}
+        stretch={<>For which fraud types is the cross-issuer advantage smallest (i.e., where issuer-only is fine)?</>}
+      />
+
+      {/* A2 — vs RNN/LSTM */}
+      <VIS.TrapProblem
+        id="trk-p11"
+        difficulty="medium"
+        title="P11 — Would an LSTM over the auth tape work just as well?"
+        scenario={<><em>Discriminating insight: LSTM can encode order but its inductive bias compresses through a fixed-size hidden state; auth-tape patterns are long-range (yesterday's gas station, today's CNP). Attention with causal mask preserves the explicit link.</em><br/><br/>Junior teammate proposes LSTM over the same token tape. Diagnose.</>}
+        options={[
+          {key:"a", text:"Equivalent — both encode sequence."},
+          {key:"b", text:"LSTM compresses history through a fixed-size hidden state; long-range auth patterns (the gas-station card-present 18 hours ago that anchors today's CNP risk) leak through compression. Transformer attention with causal mask keeps a direct, content-addressable link to that 18-hour-old token. For auth-tape fraud the relevant antecedents are often the OLDEST events in the window; LSTM degrades there. The win is empirical (3-5pt recall) and architectural.", correct:true},
+          {key:"c", text:"LSTM cannot handle categorical inputs."},
+          {key:"d", text:"LSTM doesn't support GPU."},
+        ]}
+        trap={<>(c)(d) are factually wrong.</>}
+        lens={<>RNN's compression vs attention's direct addressing — for long-range auth-tape signals attention wins.</>}
+        stretch={<>Why don't S4 / Mamba state-space models replace transformer here despite their long-range claims?</>}
+      />
+
+      {/* A3 — counterfactual: no transformer */}
+      <VIS.TrapProblem
+        id="trk-p12"
+        difficulty="medium"
+        title="P12 — If Transformer-Risk didn't exist, what's the best Mastercard could offer issuers from network data?"
+        scenario={<><em>Discriminating insight: even without transformers, the cross-issuer signal exists. The pre-transformer SOTA was network-level aggregated features served to issuers as a "consortium model" GBDT. The transformer recovers ordering/velocity that aggregation discards.</em><br/><br/>Counterfactual.</>}
+        options={[
+          {key:"a", text:"Issuers would just use their own GBDT, no network signal."},
+          {key:"b", text:"Network-aggregated consortium features (e.g., 'this merchant's network-wide chargeback rate in the last 24h', 'velocity of declines across all issuers for this BIN') served via API to issuer-side GBDTs. This was the pre-transformer SOTA — it carried the cross-issuer SIGNAL but discarded ORDER. The transformer adds ordering and velocity recovery on top of the same network advantage; the network value is preserved with or without transformers.", correct:true},
+          {key:"c", text:"Mastercard would have nothing to sell."},
+          {key:"d", text:"Use a rules engine."},
+        ]}
+        trap={<>(a)(c) miss the consortium-features baseline. (d) is a different product layer.</>}
+        lens={<>The network advantage is in DATA; transformer adds sequence/velocity to that data; both layers stack.</>}
+        stretch={<>Why didn't consortium features alone close the gap?</>}
+      />
+
+      {/* B2 — sounds reasonable */}
+      <VIS.TrapProblem
+        id="trk-p13"
+        difficulty="hard"
+        title="P13 — 'Strip BIN from the token to reduce PII exposure.' Diagnose."
+        scenario={<><em>Discriminating insight: BIN is not PII — it's the issuer/product code, not the cardholder. Stripping it removes the signal that distinguishes issuer policy / cardholder segment. The intern's reflex is wrong on both legal grounds and signal grounds.</em><br/><br/>Privacy intern proposes dropping BIN from the token tuple. Diagnose.</>}
+        options={[
+          {key:"a", text:"Good idea — BIN is PII."},
+          {key:"b", text:"Wrong on two counts. (1) BIN (Bank Identification Number, first 6-8 digits of PAN) identifies the issuing bank / product, NOT the cardholder — it's industry-public, printed on every receipt, and not regulated as PII. (2) Dropping it removes critical signal: cards from different BINs have different baseline behavior (prepaid vs credit vs commercial), and BIN-attack patterns (where attackers iterate sequential PANs in one BIN) are visible only when BIN is in the token. Keep BIN; the PII concern is the full PAN, not the prefix.", correct:true},
+          {key:"c", text:"Good idea — replace BIN with random hash."},
+          {key:"d", text:"Wrong — drop merchant_id instead."},
+        ]}
+        trap={<>(a)(c) misread regulatory scope. (d) drops the highest-signal token.</>}
+        lens={<>PII boundary in cards = full PAN + cardholder name + CVV. BIN + MCC + merchant_id are not PII. Knowing the boundary matters for what you can put in the model.</>}
+        stretch={<>What IS PII in the auth-tape, and how do you tokenize around it?</>}
+      />
+
+      {/* B4 — when NOT to use */}
+      <VIS.TrapProblem
+        id="trk-p14"
+        difficulty="medium"
+        title="P14 — A new prepaid-card issuer has 0 history and 200k cards/month. Use Transformer-Risk?"
+        scenario={<><em>Discriminating insight: per-issuer fine-tune needs SOME issuer-specific labels; with 0 labels you can only serve the pretrained trunk + network calibration. Useful as a cold-start floor but not the full product.</em><br/><br/>Brand-new issuer, no history. Diagnose.</>}
+        options={[
+          {key:"a", text:"Yes — full Transformer-Risk."},
+          {key:"b", text:"Partial. Serve the pretrained trunk + network-default calibration head as a cold-start floor (it already encodes cross-issuer behavioral priors that apply to ANY new issuer). Skip per-issuer fine-tune until ~500k-1M labeled events accumulate. Pair with rule-based velocity caps to control tail risk during the cold-start window. The network advantage works on day 1 for cold issuers; the per-issuer adaptation comes later.", correct:true},
+          {key:"c", text:"No — wait 12 months for data."},
+          {key:"d", text:"Use a rule-based system only."},
+        ]}
+        trap={<>(a) overclaims; (c)(d) leave the network advantage on the table.</>}
+        lens={<>Cold-start issuer = no fine-tune yet, but the pretrained trunk still applies. The product degrades gracefully.</>}
+        stretch={<>What's the right MINIMUM labeled-event count to start per-issuer fine-tune?</>}
+      />
+
+      {/* C5 — sequence length */}
+      <VIS.TrapProblem
+        id="trk-p15"
+        difficulty="medium"
+        title="P15 — Sequence length: 16, 64, or 256 most recent auth events?"
+        scenario={<><em>Discriminating insight: most fraud signal lives in the recent 30-50 events; 16 misses multi-day patterns, 256 blows latency on stable cards with hundreds of events. 64 with per-card adaptive truncation is the empirical default.</em><br/><br/>Pick the context length.</>}
+        options={[
+          {key:"a", text:"16 — fastest."},
+          {key:"b", text:"64 with per-card adaptive truncation: long enough to capture multi-day velocity / merchant-substitution patterns, short enough for the latency budget. Cards with &lt;64 events use a learned BEGIN-OF-CARD token + padding. The recall-vs-length curve is concave (most lift by 32-64, diminishing returns past ~128). Going to 256 mainly costs latency; the marginal signal sits in very-rare long-range patterns.", correct:true},
+          {key:"c", text:"256 — more is always better."},
+          {key:"d", text:"Sequence length doesn't matter."},
+        ]}
+        trap={<>(a) loses multi-day signal. (c) blows latency for marginal lift. (d) is wrong.</>}
+        lens={<>Auth-tape: recall-vs-length is concave; 64 is the empirical sweet spot for sub-50ms inference.</>}
+        stretch={<>Where does the curve flatten — is it the same across card-present and CNP?</>}
+      />
+
+      {/* C3 — cold card */}
+      <VIS.TrapProblem
+        id="trk-p16"
+        difficulty="medium"
+        title="P16 — New card has 3 auth events. The sequence is mostly padding. How to score?"
+        scenario={<><em>Discriminating insight: with few events, the sequence carries little signal but the BIN + cardholder + applicant signals do. Two bridges: cardholder-level side features and the cross-issuer pretrain (which still applies even with empty sequence — BIN-level behavioral priors).</em><br/><br/>Cold-card scoring.</>}
+        options={[
+          {key:"a", text:"Block all new cards."},
+          {key:"b", text:"Lean on three substitutes: (1) cardholder-level side features (applicant risk, address, opening channel) injected as a special token at sequence start, (2) BIN-level behavioral priors from the cross-issuer pretrain (the pretrained trunk has seen what 'typical new card on BIN 412345' does network-wide), (3) lower confidence threshold + more human review until ~30 events accumulate. The cross-issuer pretrain is the unique lever here — issuer-only models have NO prior on this BIN's behavior.", correct:true},
+          {key:"c", text:"Approve all new cards."},
+          {key:"d", text:"Use the average score across all cards."},
+        ]}
+        trap={<>(a)(c) are policy extremes; (d) is signal-free.</>}
+        lens={<>Cold-start in this model uniquely benefits from the cross-issuer trunk — even at 0 card-specific events, BIN-level priors fire.</>}
+        stretch={<>How many events before per-card sequence dominates BIN-prior?</>}
+      />
+
+      {/* C5 — causal mask leak diagnosis */}
+      <VIS.TrapProblem
+        id="trk-p17"
+        difficulty="hard"
+        multiSelect
+        title="P17 — Causal-mask leak diagnostic battery. Which symptoms point to a peeking bug? Select all that apply."
+        scenario={<><em>Discriminating insight: causal-mask leaks are silent — train metrics look great, production collapses. Diagnostic battery: train/online gap, synthetic-position invariance, attention-mass on future tokens, last-token loss anomaly.</em><br/><br/>Suspect a causal-mask leak. Pick all symptoms that would confirm.</>}
+        options={[
+          {key:"a", text:"Training recall &gt;&gt; online recall by a constant gap.", correct:true},
+          {key:"b", text:"Train and online recall match."},
+          {key:"c", text:"Synthetic test: placing the fraudulent event at position T gives identical recall whether the model sees positions &lt;T or all positions.", correct:true},
+          {key:"d", text:"Attention weight at position T has substantial mass on positions &gt;T.", correct:true},
+          {key:"e", text:"Training loss flatlines."},
+          {key:"f", text:"Per-token loss at the LAST token is much lower than at earlier tokens.", correct:true},
+        ]}
+        trap={<>(b) is the absence of a leak; (e) is an LR bug, not a masking bug.</>}
+        lens={<>Run the whole battery — any one alone can be ambiguous.</>}
+        stretch={<>Which check is cheapest to run pre-deploy without retraining?</>}
+      />
+
+      {/* E1 — INT8 quantization gotcha */}
+      <VIS.TrapProblem
+        id="trk-p18"
+        difficulty="medium"
+        title="P18 — INT8 PTQ drops recall 2pt and FPR jumps. What broke?"
+        scenario={<><em>Discriminating insight: naive PTQ on attention softmax and the merchant-embedding table is too aggressive — both have wide dynamic range. Fix with QAT + selective FP16 on softmax + per-channel quantization on embeddings.</em><br/><br/>Recall drop after INT8.</>}
+        options={[
+          {key:"a", text:"Quantization always loses 2pt."},
+          {key:"b", text:"Naive PTQ over-quantizes (1) the merchant-embedding table — high-cardinality embeddings have wide per-row dynamic range; use per-channel quantization, (2) the attention softmax — keep FP16 there, INT8 ruins the score distribution and breaks calibration. Switch to quantization-aware training (QAT) and per-layer precision choices. The 2pt loss is recoverable.", correct:true},
+          {key:"c", text:"Transformers are incompatible with INT8."},
+          {key:"d", text:"Fall back to FP32."},
+        ]}
+        trap={<>(a)(c) over-generalize; (d) loses the latency win.</>}
+        lens={<>Quantization is layer-specific; embedding lookup + softmax are the danger zones.</>}
+        stretch={<>Cheapest sanity check — train, eval, or production?</>}
+      />
+
+      {/* E2 — latency budget engineering */}
+      <VIS.TrapProblem
+        id="trk-p19"
+        difficulty="hard"
+        title="P19 — 50ms p99 end-to-end auth path. Network 15ms, feature lookup 10ms, decisioning 5ms. Transformer must fit in 20ms. How?"
+        scenario={<><em>Discriminating insight: small model (4-8L, d=128-256), batched GPU with 5ms dynamic batching window, INT8 + FlashAttention, pre-warmed embedding tables, async host-device transfer. Architecture is shaped by the budget.</em><br/><br/>Fit the budget.</>}
+        options={[
+          {key:"a", text:"Run on CPU."},
+          {key:"b", text:"Small transformer (4-8 layers, hidden 128-256), batched GPU inference with a 5ms dynamic batching window, INT8 quantization with QAT, FlashAttention kernel fusion, pre-warmed merchant-embedding tables resident on device, async host-device transfer to hide PCIe latency, and a fallback to a fast GBDT if the transformer SLO blows. The model is co-designed with the serving system — you don't pick architecture first and serving second.", correct:true},
+          {key:"c", text:"Use a 100-layer transformer at FP16."},
+          {key:"d", text:"Skip the transformer for latency-sensitive paths."},
+        ]}
+        trap={<>(a)(c) miss budget by 10x. (d) abandons the use case.</>}
+        lens={<>Latency budget IS the architecture spec for auth-path models.</>}
+        stretch={<>What's the cheapest single lever after architecture is fixed?</>}
+      />
+
+      {/* E4 — daily champion-challenger */}
+      <VIS.TrapProblem
+        id="trk-p20"
+        difficulty="medium"
+        title="P20 — Why DAILY champion-challenger, not weekly?"
+        scenario={<><em>Discriminating insight: fraud rings rotate attack patterns daily; a weekly cadence gives 5 days of compromised recall before you detect it.</em><br/><br/>Pick cadence.</>}
+        options={[
+          {key:"a", text:"Weekly."},
+          {key:"b", text:"Daily, with automated rollback when recall-at-fixed-precision drops below a floor. Organized fraud rings rotate attack patterns on sub-weekly cadence specifically to evade slower evaluation. Daily eval + auto-rollback + canary on a small traffic slice is production-standard for any model in the auth path.", correct:true},
+          {key:"c", text:"Monthly."},
+          {key:"d", text:"Post-launch eval doesn't matter."},
+        ]}
+        trap={<>(a)(c) lag adversary cadence; (d) is reckless.</>}
+        lens={<>Adversary cadence sets eval cadence.</>}
+        stretch={<>What floor should trigger rollback?</>}
+      />
+
+      {/* D1 — intuitive but wrong */}
+      <VIS.TrapProblem
+        id="trk-p21"
+        difficulty="hard"
+        title="P21 — 'Bigger transformer + more data → better recall.' Where does the intuition fail for Transformer-Risk specifically?"
+        scenario={<><em>Discriminating insight: scaling up DOES help on the trunk, but the auth-tape signal is data-distribution-bound (issuer label sparsity + label delay + decline-vs-fraud mismatch), not capacity-bound. Doubling parameters won't fix labels that arrive 60 days late.</em><br/><br/>Where does the scaling intuition fail?</>}
+        options={[
+          {key:"a", text:"The intuition is fine — just scale up."},
+          {key:"b", text:"Scaling the trunk helps modestly but the binding constraint is the LABEL side: confirmed-fraud labels arrive 30-90 days late, are sparse (~0.1% of auths), and biased by issuer decline policy. Doubling parameters doesn't fix delayed/biased labels. The right lever is label quality — chargeback joins, IPS correction, multi-task auxiliary heads — and broader pretrain coverage, not raw param count.", correct:true},
+          {key:"c", text:"Transformers don't scale."},
+          {key:"d", text:"Bigger models are slower — that's the only issue."},
+        ]}
+        trap={<>(c) is contrary to evidence; (d) is the wrong constraint.</>}
+        lens={<>Capacity-bound vs data-bound regimes — auth-tape fraud sits firmly in the data/label-bound regime.</>}
+        stretch={<>Where on the parameter curve does diminishing returns set in for this task?</>}
+      />
+
+      {/* D2 — wrong-assumption cascade */}
+      <VIS.TrapProblem
+        id="trk-p22"
+        difficulty="hard"
+        title="P22 — You assume 'Transformer-Risk is just a transformer trained on transactions.' Which downstream beliefs follow that are wrong?"
+        scenario={<><em>Discriminating insight: under that assumption you skip the cross-issuer pretrain, the per-issuer fine-tune split, the decline-vs-fraud two-head, and the per-issuer calibration. Each of those breaks something specific.</em><br/><br/>Trace the cascade.</>}
+        options={[
+          {key:"a", text:"Nothing follows — the assumption is fine."},
+          {key:"b", text:"At least 4 things break. (1) 'Issuers train their own' → loses cross-issuer behavioral priors, recall on rare attacks craters. (2) 'One model serves all issuers identically' → ignores per-issuer cost ratios, calibration is wrong everywhere. (3) 'Train on the cheap decline label' → reproduces existing issuer policy, learns nothing new. (4) 'Full unfreeze on issuer data' → catastrophic forgetting of pretrain priors. Each is a different production failure traced to one wrong assumption.", correct:true},
+          {key:"c", text:"Only the calibration breaks."},
+          {key:"d", text:"Only the labels break."},
+        ]}
+        trap={<>(a)(c)(d) understate the cascade.</>}
+        lens={<>The architecture is a SYSTEM: pretrain split + finetune split + label structure + calibration are coupled.</>}
+        stretch={<>Which of the four failure modes shows up FIRST in production?</>}
+      />
+
+      {/* E6 — eval contamination */}
+      <VIS.TrapProblem
+        id="trk-p23"
+        difficulty="hard"
+        title="P23 — Offline eval: Transformer-Risk beats GBDT by 6pt recall. Production: 2pt. What hides the gap?"
+        scenario={<><em>Discriminating insight: offline eval often joins chargebacks within the train window — leaks future-fraud labels into the training period. Time-respecting eval (chargebacks resolved BEFORE the eval window) closes the gap to the truthful 2pt.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"Production is buggy."},
+          {key:"b", text:"Eval-time label leakage. Offline joins chargebacks WITHIN the training time window, so events in the train set inherit labels resolved by the time of eval — labels that wouldn't exist in real-time scoring (chargebacks take 30-90 days). The transformer benefits more than GBDT because it has more capacity to exploit the leaked future-information. Fix: time-respecting eval where chargeback labels are joined only as of a cutoff that precedes the eval period by the chargeback resolution window. After the fix, the honest lift is the production lift.", correct:true},
+          {key:"c", text:"Production has lower data quality."},
+          {key:"d", text:"Transformer is over-claimed in papers."},
+        ]}
+        trap={<>(a)(c) blame production; (d) is too broad.</>}
+        lens={<>Eval-time label leakage is THE bug to look for in fraud benchmarks. Chargeback resolution lag is the lever.</>}
+        stretch={<>What's the right horizon for the eval cutoff — 30, 60, or 90 days?</>}
+      />
+
+      {/* F1 — edge case minimizing the network advantage */}
+      <VIS.TrapProblem
+        id="trk-p24"
+        difficulty="hard"
+        title="P24 — Construct the smallest issuer profile where Transformer-Risk's network advantage is essentially zero."
+        scenario={<><em>Discriminating insight: a closed-loop issuer (single-merchant prepaid, e.g., a gift card for one chain) sees no cross-issuer transfer because there's no cross-merchant pattern AND its cards never appear in cross-issuer attack chains.</em><br/><br/>Smallest case.</>}
+        options={[
+          {key:"a", text:"Any issuer with &lt;10M events/year."},
+          {key:"b", text:"A closed-loop single-merchant prepaid issuer: e.g., an in-store gift card usable only at one retailer chain. Cross-issuer pretrain delivers little here because (1) the cards never transact at other merchants, so cross-merchant velocity patterns don't apply, (2) closed-loop cards rarely participate in cross-issuer attack chains, (3) attack patterns specific to this surface (gift-card refund-fraud, retailer-employee fraud) are NOT in the open-loop pretrain. An issuer-trained model on this surface can match Transformer-Risk.", correct:true},
+          {key:"c", text:"A bank in a country Mastercard doesn't operate."},
+          {key:"d", text:"Any digital-only issuer."},
+        ]}
+        trap={<>(a) is volume; (c) is jurisdiction; (d) is irrelevant.</>}
+        lens={<>Network advantage requires the issuer to participate in network-wide patterns. Closed-loop opts out by definition.</>}
+        stretch={<>Where between closed-loop and open-loop does the advantage start to dominate?</>}
+      />
+
+      {/* F3 — reverse engineering symptom */}
+      <VIS.TrapProblem
+        id="trk-p25"
+        difficulty="hard"
+        title="P25 — Symptom: per-card recall is stable but cross-issuer ring detection degrades over 6 months. Which design choice caused it?"
+        scenario={<><em>Discriminating insight: per-issuer fine-tune drifts the trunk away from cross-issuer priors over time as each issuer's head sends gradients back. Solution: re-pretrain the trunk on the union periodically OR fully freeze the trunk during fine-tune.</em><br/><br/>Trace the symptom.</>}
+        options={[
+          {key:"a", text:"Per-card recall is fine, so the per-issuer fine-tune is fine."},
+          {key:"b", text:"Per-issuer fine-tune (if not fully frozen-trunk) sends gradients back into the shared trunk, and over months each issuer's gradients slowly drag the trunk toward THAT issuer's local distribution. The cross-issuer behavioral priors that depend on the trunk weights degrade. Per-card / per-issuer recall stays fine because each head adapts; cross-issuer ring patterns (which need the shared priors intact) silently degrade. Fix: re-pretrain the trunk on the union at regular cadence, or fully freeze the trunk and only learn adapters / LoRA on top.", correct:true},
+          {key:"c", text:"The rings are evolving and the model is fine."},
+          {key:"d", text:"INT8 quantization drift."},
+        ]}
+        trap={<>(a) misreads the test surface. (c) blames adversary without checking model. (d) is unrelated to the 6-month drift.</>}
+        lens={<>Shared-trunk models that allow gradient through fine-tune drift toward whichever distribution sends most updates.</>}
+        stretch={<>What monitoring signal catches this drift before it's bad?</>}
+      />
+
+      {/* E5 — reproducibility */}
+      <VIS.TrapProblem
+        id="trk-p26"
+        difficulty="medium"
+        title="P26 — An academic paper claims to reproduce Transformer-Risk using public data. Why is the claim suspect?"
+        scenario={<><em>Discriminating insight: public datasets are single-issuer (Kaggle credit-card fraud, IEEE-CIS) — they CANNOT test the cross-issuer pretrain mechanism. Any reproduction misses the whole point.</em><br/><br/>Diagnose.</>}
+        options={[
+          {key:"a", text:"They probably reproduced it — academic methods are rigorous."},
+          {key:"b", text:"Public datasets (Kaggle credit-card fraud, IEEE-CIS) are single-issuer snapshots — they cannot test the cross-issuer pretrain mechanism that IS the central claim. A 'reproduction' on a single-issuer dataset reproduces a vanilla sequence transformer for fraud, not Transformer-Risk. The proprietary lever (union of all network auths) is not in any public corpus and never will be — it's regulated data. The architecture diagram is reproducible; the data advantage is not.", correct:true},
+          {key:"c", text:"They didn't have enough GPUs."},
+          {key:"d", text:"Public papers are always wrong."},
+        ]}
+        trap={<>(c) is infra; (d) is over-broad.</>}
+        lens={<>The architecture is the public part. The DATA is the moat — and it's structurally non-replicable.</>}
+        stretch={<>Could a synthetic union-of-issuers dataset reproduce the effect? What breaks?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://www.mastercard.com/news" target="_blank" rel="noopener">
+          <a href="https://www.mastercard.com/news/" target="_blank" rel="noopener">
             <strong>Mastercard AI — Sequence Transformers for Real-time Authorization Scoring</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(tech post, 2024)</span>
-          <br/>The reference post. Architecture and latency discussion are the keepers.
+          <br/>The reference post. Architecture, latency budget, and the cross-issuer-pretrain framing are the keepers.
         </li>
         <li>
           <a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">
             <strong>Jay Alammar — The Illustrated Transformer</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The clearest visual introduction to transformers. Worth re-reading if you have not internalized causal masking.
-        </li>
-        <li>
-          <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">
-            <strong>FlashAttention — fast, memory-efficient attention</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(repo, 2022)</span>
-          <br/>The standard kernel-fusion library for transformer inference. Required reading if you need sub-50ms latency.
-        </li>
-        <li>
-          <a href="https://huggingface.co/docs/transformers/main/en/quantization" target="_blank" rel="noopener">
-            <strong>Hugging Face — Quantization for transformers</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(docs)</span>
-          <br/>Practitioner guide to PTQ and QAT for transformer inference, including the layer-specific gotchas.
+          <br/>The clearest visual intro. Re-read if you haven't internalized causal masking — the P17 diagnostic battery assumes it.
         </li>
         <li>
           <a href="https://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">
             <strong>Andrej Karpathy — A Recipe for Training Neural Networks</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Field guide for debugging training failures. The causal-masking-leak diagnostic is exactly the kind of bug Karpathy warns about.
+          <br/>The "overfit a single batch" trick and the silent-bug catalog directly apply to the causal-mask leak in P17.
+        </li>
+        <li>
+          <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">
+            <strong>FlashAttention — Dao et al.</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(repo + paper, 2022-2024)</span>
+          <br/>The kernel-fusion library every sub-50ms transformer-on-auth-path uses. Required reading for P19.
+        </li>
+        <li>
+          <a href="https://huggingface.co/docs/transformers/main/en/quantization" target="_blank" rel="noopener">
+            <strong>Hugging Face — Quantization for Transformers</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(docs)</span>
+          <br/>Practitioner guide to PTQ vs QAT — the layer-specific gotchas in P18 are documented here.
+        </li>
+        <li>
+          <a href="https://lilianweng.github.io/posts/2018-12-27-embedding/" target="_blank" rel="noopener">
+            <strong>Lilian Weng — Learning Word Embedding</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
+          <br/>The sparse-gradient / long-tail embedding behavior in P7 (new-merchant Friday 3am) is the auth-tape version of the same phenomenon Weng walks through for NLP.
         </li>
       </ul>
     </VIS.Section>
