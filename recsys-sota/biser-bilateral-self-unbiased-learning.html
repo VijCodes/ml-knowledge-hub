@@ -1414,244 +1414,496 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// REDO v2 — RecSys-SOTA batch 10
+// BISER — Bilateral Self-unbiased Learning from Biased Implicit Feedback (Lee et al., SIGIR 2022)
+// Unique mechanism: TWO complementary models de-bias each OTHER's missing-not-at-random (MNAR)
+// implicit feedback. No propensity model needed; mutual self-supervision replaces it.
+// "Bilateral" = BOTH observed and unobserved item sides are debiased symmetrically.
+// Cross-visual caution: BISER is propensity-free dual-model self-supervision;
+// PopRT is serving-time output reweighting (no retrain); DRE is representation-level
+// orthogonal popularity head. Don't conflate.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Long-tail debiasing"
+      pill="RecSys SOTA · Debiasing / Long-tail"
       title="BISER — Bilateral Self-unbiased Learning"
-      subtitle="Two complementary models de-bias each other&apos;s missing-not-at-random implicit feedback &mdash; no propensity estimate required."
+      subtitle="Two models train each other under MNAR implicit feedback — no propensity estimate, no IPS, no calibration ceremony. Bilateral = symmetric correction on both observed and unobserved sides."
       byline={[
         {label: "Paper", value: "Lee et al., SIGIR 2022 (productionized through 2024)"},
-        {label: "Domain", value: "Implicit feedback recsys with strong popularity bias"},
+        {label: "Surface", value: "Implicit-feedback recsys where propensity model is untrustworthy"},
       ]}/>
 
     <VIS.TLDR>
-      <VIS.Term def="Inverse Propensity Scoring: reweight each training example by 1/propensity to correct for missing-not-at-random data. Standard tool, but only as good as the propensity estimate.">IPS</VIS.Term> depends on a correct propensity model &mdash; estimating &quot;how likely was this item to be observed?&quot; is hard and the wrong estimate makes the unbiased estimator more biased than the naive one. BISER replaces the explicit propensity with a self-supervision trick: train TWO models, each de-biases the other using a complementary view. No propensity model to misspecify. Cost: 2x training compute.
+      Implicit feedback (clicks, plays) is <VIS.Term def="Missing Not At Random — what you observe is biased by what was exposed; absence does not mean dislike.">MNAR</VIS.Term>. The classical fix is <VIS.Term def="Inverse Propensity Scoring — reweight each observation by 1/P(exposure) to undo selection bias.">IPS</VIS.Term>, which needs a correct propensity model — usually you don&apos;t have one. BISER ships TWO complementary models that DEBIAS EACH OTHER: model A&apos;s predictions become pseudo-labels for model B on items A was confident about, and vice versa. The &quot;bilateral&quot; comes from doing this symmetrically on BOTH the observed-item side AND the unobserved-item side. No propensity estimate is required. Cost: ~2&times; training compute.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        BISER trains a pair of recommenders M1 and M2 jointly. Each model produces predictions for unobserved items, and those predictions serve as &quot;pseudo-targets&quot; for the OTHER model&apos;s training. The disagreement structure between the two is what corrects the missing-not-at-random (MNAR) bias.
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  D["Implicit feedback data"]
-  D --> M1["Model 1"]
-  D --> M2["Model 2"]
-  M1 --> P1["Pseudo-labels for unseen"]
-  M2 --> P2["Pseudo-labels for unseen"]
-  P1 --> M2
-  P2 --> M1
-  M1 --> R["Serve"]
-  M2 --> R
-      `} />
+    <VIS.Section id="sec-what" title="What it is — dual-model symmetric self-supervision">
+      <VIS.Mermaid chart={`flowchart TB
+  D["Biased implicit feedback (MNAR)"]
+  MA["Model A"]
+  MB["Model B"]
+  D --> MA
+  D --> MB
+  MA -->|"pseudo-labels on items A is confident about"| MB
+  MB -->|"pseudo-labels on items B is confident about"| MA
+  MA --> S["Symmetric loss: observed side + unobserved side"]
+  MB --> S`} />
       <ul>
-        <li><strong>Two model heads</strong> &mdash; typically different architectures or different initializations to enforce complementary views.</li>
-        <li><strong>Cross-pseudo-labeling</strong> &mdash; each model&apos;s confidence on the unobserved items becomes a soft label for the other.</li>
-        <li><strong>Self-unbiased loss</strong> &mdash; the joint loss penalizes a model when it predicts confidently on items the OTHER model thinks are unlikely &mdash; this dampens popularity-driven overconfidence.</li>
+        <li><strong>Two architecturally different models</strong> — they must make different mistakes for mutual debiasing to add information. Identical models = no benefit.</li>
+        <li><strong>Bilateral = both sides</strong> — most prior dual-model methods only correct the OBSERVED-positive side. BISER also corrects the UNOBSERVED (assumed-negative) side, where most MNAR bias actually lives.</li>
+        <li><strong>No propensity model</strong> — the entire propensity-estimation pipeline (logging policy, calibration, recency drift) is replaced by mutual self-supervision.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from IPS">
-      <p>
-        IPS estimates a propensity p(observed | item, user) and reweights each example by 1/p. BISER avoids this estimator entirely.
-      </p>
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>IPS / SNIPS</th><th style={{textAlign:"left",padding:8}}>BISER</th></tr></thead>
+    <VIS.Section id="sec-diff" title="How it differs from IPS / doubly-robust / single-model methods">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Needs propensity?</th>
+          <th style={{textAlign:"left", padding:8}}>Mechanism</th>
+          <th style={{textAlign:"left", padding:8}}>Failure mode</th>
+        </tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Needs propensity model</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Yes</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>No</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Variance</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High (small propensities blow up weights)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Bounded by pseudo-label confidence</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Misspecification cost</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Catastrophic</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Bounded by model-disagreement</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Training compute</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>1x</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>2x</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Serving compute</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>1x</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>1x or 2x ensemble</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>IPS</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>YES</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>1/P(exposure) reweighting</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Wrong propensity ⇒ wrong correction</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Doubly Robust (DR)</td><td style={{padding:8}}>YES (less brittle)</td><td style={{padding:8}}>IPS + direct model</td><td style={{padding:8}}>Variance blow-up if propensity small</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Single-model self-distill</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>No</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>One model labels itself</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Confirmation bias amplifies error</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}><strong>BISER</strong></td><td style={{padding:8}}><strong>NO</strong></td><td style={{padding:8}}><strong>Two heterogeneous models debias each other, BOTH sides</strong></td><td style={{padding:8}}>If models too similar, no mutual info; 2&times; compute</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>You believe your propensity estimate is suspect &mdash; for example, MNAR governed by latent factors (taste discoverability, social proof) you cannot model.</li>
-        <li>You have compute headroom &mdash; doubling training is acceptable.</li>
-        <li>Long-tail items are critical to your KPI and IPS variance has been an empirical pain point.</li>
-        <li>You want a method that fails gracefully &mdash; bad assumptions show up as model disagreement, not catastrophic reweighting.</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 26 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the question-axis it draws from. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <ul>
-        <li><strong>2x training compute</strong> &mdash; non-trivial for billion-parameter rankers.</li>
-        <li><strong>Coupled training</strong> &mdash; you cannot independently iterate on M1 and M2; experiments require retraining both.</li>
-        <li><strong>Diversity collapse</strong> &mdash; if M1 and M2 converge to the same point, the cross-pseudo-labels lose their de-biasing power.</li>
-        <li><strong>Confirmation bias</strong> &mdash; if both models share an inductive bias (e.g., both popularity-driven), they reinforce each other and the trick fails.</li>
-        <li><strong>Cold start</strong> &mdash; works less well for brand-new items both models have no opinion on.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
-
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="bs-p1" difficulty="hard"
-        title="P1 — When does BISER&apos;s dual-model trick PROVABLY beat well-calibrated IPS?"
-        scenario={<>Suppose you have access to the TRUE propensity function. Does BISER still beat IPS?</>}
+        id="biser-p1" difficulty="hard"
+        title="P1 — When does BISER provably beat well-calibrated IPS?"
+        scenario={<><em>Discriminating insight: IPS is unbiased ONLY when the propensity model is correct. In MNAR with non-stationary logging policies (typical production), propensity drifts and IPS becomes badly biased. BISER&apos;s mutual self-supervision sidesteps the propensity estimate entirely.</em><br/>You have a propensity model that&apos;s correct on offline replay but the logging policy changed last quarter. Which method handles this best?</>}
         options={[
-          {key:"a", text:"Yes &mdash; BISER&apos;s pseudo-labeling adds information IPS lacks."},
-          {key:"b", text:"No &mdash; with true propensities, IPS is the BLUE estimator (Best Linear Unbiased) and BISER has no edge.", correct:true},
-          {key:"c", text:"Always &mdash; BISER is strictly better."},
-          {key:"d", text:"Only if M1 and M2 are non-linear."},
+          {key:"a", text:"BISER — it has no propensity model to be stale. The dual-model mutual labeling works on the current data distribution, not the logged one.", correct:true},
+          {key:"b", text:"IPS — just retrain the propensity."},
+          {key:"c", text:"Doubly Robust — handles policy drift by definition."},
+          {key:"d", text:"Single-model self-distill."},
         ]}
-        trap={<>(a) and (c) ignore the theoretical fact: BISER&apos;s value is in AVOIDING propensity misspecification. With true propensities, IPS is provably efficient. (d) is unsupported.</>}
-        lens={<>BISER wins ONLY when propensity estimation is the bottleneck &mdash; which is almost always in practice (latent confounders, sparse data, model misspecification). With a perfect propensity oracle, IPS is the right answer. This is why BISER is an alternative, not a strict improvement.</>}
-        stretch={<>What is the variance comparison when propensity is misspecified by a factor of 2x?</>}
+        trap={<>(b) assumes you CAN retrain propensity correctly &mdash; usually you can&apos;t, that&apos;s why we&apos;re here. (c) DR still depends on propensity quality. (d) confirmation-bias amplifier.</>}
+        lens={<>BISER&apos;s edge is regime-specific: when propensity is unreliable, BISER wins. With perfect propensity, IPS is competitive at half the compute.</>}
+        stretch={<>How would you measure propensity-model staleness?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="bs-p2" difficulty="hard" multiSelect
-        title="P2 — What makes M1 and M2 &quot;complementary enough&quot;?"
-        scenario={<>For BISER&apos;s trick to work, M1 and M2 must give complementary views. Which choices ACTUALLY produce complementary models? Select all that apply.</>}
+        id="biser-p2" difficulty="hard"
+        title="P2 — Why BILATERAL? What does the second side fix?"
+        scenario={<><em>Discriminating insight: most prior dual-model debiasing only fixes the OBSERVED-positive side (clicks that did happen). The UNOBSERVED side (items the user never saw) is where most MNAR bias lives &mdash; you treat all unobserved items as negative, but they include items the user would have liked if shown.</em><br/>Why does BISER correct BOTH sides instead of just observed positives?</>}
         options={[
-          {key:"a", text:"M1 = matrix factorization with implicit ALS; M2 = neural collaborative filtering with BPR loss.", correct:true},
-          {key:"b", text:"M1 and M2 are the same architecture with different random seeds."},
-          {key:"c", text:"M1 trained on user-user signals; M2 trained on item-item signals.", correct:true},
-          {key:"d", text:"M1 = LightGCN; M2 = LightGCN with different layer count."},
-          {key:"e", text:"M1 emphasizes recent interactions; M2 emphasizes historical interactions.", correct:true},
+          {key:"a", text:"Most MNAR bias lives on the UNOBSERVED side — treating all un-clicked items as negative confounds 'wasn't shown' with 'wouldn't like'. BISER's bilateral correction lets each model identify likely false negatives in the other's unobserved set.", correct:true},
+          {key:"b", text:"For symmetry's sake."},
+          {key:"c", text:"To increase compute cost."},
+          {key:"d", text:"To match the IPS formula."},
         ]}
-        trap={<>(b) and (d) give models with HIGH correlation &mdash; the trick fails. Same architecture, similar configs, similar inductive biases &rarr; same biases get reinforced, not corrected.</>}
-        lens={<>True complementarity needs structurally different inductive biases: different loss families (a), different perspectives on the same data (c), or different temporal windows (e). Variations within one family give variance reduction, not bias correction.</>}
-        stretch={<>How would you MEASURE the &quot;complementarity&quot; of M1 and M2?</>}
+        trap={<>(b) aesthetic. (c) absurd. (d) IPS does not have a bilateral structure.</>}
+        lens={<>Implicit-feedback debiasing is asymmetric: the observed positives are noisy but visible; the unobserved positives are invisible until another model surfaces them.</>}
+        stretch={<>What metric would show whether you fixed the unobserved-side bias?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="bs-p3" difficulty="hard"
-        title="P3 — Both models predict the same popular items strongly. What happened?"
-        scenario={<>You shipped BISER. After 5 epochs, both M1 and M2 predict the same head items with high confidence, including for cold users. NDCG@10 has not improved over a naive baseline. Diagnose.</>}
+        id="biser-p3" difficulty="hard"
+        title="P3 — BISER vs single-model self-distillation"
+        scenario={<><em>Discriminating insight: single-model self-distill amplifies the model&apos;s own bias (confirmation cascade). BISER&apos;s two models are heterogeneous; their independent error structures provide mutual information that breaks confirmation bias.</em><br/>Why doesn&apos;t a single self-distilled model work like BISER?</>}
         options={[
-          {key:"a", text:"Confirmation bias collapse &mdash; M1 and M2 share enough inductive bias that pseudo-labels reinforce rather than correct popularity bias.", correct:true},
-          {key:"b", text:"Training did not converge."},
-          {key:"c", text:"Loss weight is too high."},
-          {key:"d", text:"The pseudo-labels are correct &mdash; head items are actually best."},
+          {key:"a", text:"A single model labeling itself amplifies its own biases (confirmation cascade) — wherever it's wrong it teaches itself to be wronger. BISER's two HETEROGENEOUS models make different mistakes; their pseudo-labels carry mutual information.", correct:true},
+          {key:"b", text:"Self-distill is computationally cheaper."},
+          {key:"c", text:"BISER uses contrastive learning."},
+          {key:"d", text:"They are equivalent."},
         ]}
-        trap={<>(b) is generic. (c) is a hyperparameter symptom but not root cause. (d) is the rationalization &mdash; the whole point of de-biasing is that head items SEEM correct because of the bias itself.</>}
-        lens={<>This is the failure mode the paper explicitly warns about: when M1 and M2 share a popularity-prior bias, their disagreement on tail items is small and the pseudo-label correction is weak. Fix: force diversity (different architectures or different sampling strategies).</>}
-        stretch={<>How would you detect this failure mode early, before 5 epochs?</>}
+        trap={<>(b) true but irrelevant. (c) BISER does not require contrastive. (d) false.</>}
+        lens={<>The HETEROGENEITY of the two models is load-bearing. Twin BISER (same architecture twice) does not work.</>}
+        stretch={<>How different must the architectures be?</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="bs-p4" difficulty="medium"
-        title="P4 — Single-stage IPS just diverged: should you switch to BISER?"
-        scenario={<>Your IPS training is unstable &mdash; loss oscillates and a few examples with tiny propensities (0.001) blow up gradients. Should BISER help here?</>}
+        id="biser-p4" difficulty="medium"
+        title="P4 — What does BISER DROP vs IPS?"
+        scenario={<><em>Discriminating insight: BISER drops the propensity-estimation pipeline entirely &mdash; logging policy modeling, propensity calibration, recency-drift handling. It replaces this with a second model.</em><br/>Which IPS-stack component does BISER remove?</>}
         options={[
-          {key:"a", text:"Yes &mdash; BISER&apos;s pseudo-label-based correction does not have the small-propensity-explosion failure mode.", correct:true},
-          {key:"b", text:"No &mdash; switch to SNIPS instead."},
-          {key:"c", text:"No &mdash; gradient clipping is enough."},
-          {key:"d", text:"Yes &mdash; BISER eliminates all variance."},
+          {key:"a", text:"The entire propensity-estimation pipeline (logging policy modeling, calibration, drift handling) — replaced by a second heterogeneous model.", correct:true},
+          {key:"b", text:"The notion of bias."},
+          {key:"c", text:"Item embeddings."},
+          {key:"d", text:"The training loss."},
         ]}
-        trap={<>(b) SNIPS is a normalization fix that helps but still uses propensities. (c) clipping masks the symptom. (d) overstates &mdash; BISER reduces variance, does not eliminate it.</>}
-        lens={<>BISER&apos;s variance is bounded by pseudo-label confidence (in [0,1]), not by 1/propensity (which is unbounded). This is the right architectural switch for chronic IPS instability. (b) is a valid lighter alternative if you want to keep the propensity machinery.</>}
-        stretch={<>What is the theoretical variance ratio between BISER and IPS for an item with propensity 0.001?</>}
+        trap={<>(b)(c)(d) are not removed.</>}
+        lens={<>You trade a propensity model (often miscalibrated) for a second base model (audit-able). Choose your headache.</>}
+        stretch={<>When is the propensity-model headache smaller than the second-model headache?</>}
       />
 
+      {/* axis: B1 */}
       <VIS.TrapProblem
-        id="bs-p5" difficulty="hard" multiSelect
-        title="P5 — Serving choices at inference time"
-        scenario={<>You trained BISER. At serving time, which strategies are valid? Select all that apply.</>}
+        id="biser-p5" difficulty="hard" multiSelect
+        title="P5 — When does BISER&apos;s mechanism actually pay off?"
+        scenario={<><em>Discriminating insight: BISER wins when (i) propensity is untrustworthy AND (ii) you can afford 2x training compute AND (iii) you can field two heterogeneous architectures.</em><br/>Pick scenarios where BISER beats IPS. Select all that apply.</>}
         options={[
-          {key:"a", text:"Serve M1 only &mdash; M2 was just a training-time helper.", correct:true},
-          {key:"b", text:"Serve M1+M2 as a 2-model ensemble; average the scores.", correct:true},
-          {key:"c", text:"Pick M1 or M2 based on which had lower val loss.", correct:true},
-          {key:"d", text:"Serve both at full cost always &mdash; BISER requires it."},
-          {key:"e", text:"Use M2 only for tail items, M1 for head items.", correct:true},
+          {key:"a", text:"Logging policy has changed multiple times in the last quarter; propensity model is stale; you don't have logged-bandit data.", correct:true},
+          {key:"b", text:"You can field two heterogeneous architectures (e.g., DLRM + transformer) and have 2× training budget.", correct:true},
+          {key:"c", text:"Implicit feedback is heavily skewed by popularity exposure; missing data is overwhelmingly MNAR.", correct:true},
+          {key:"d", text:"You have perfect propensity scores from a randomized exposure experiment."},
+          {key:"e", text:"Training budget is tight; one model is the limit."},
         ]}
-        trap={<>(d) is the trap: you do NOT need both at serving. BISER is a training-time scheme; the inference choice is independent.</>}
-        lens={<>All four other options are valid. (a) cheapest, (b) classic ensemble for accuracy at 2x cost, (c) val-loss-driven selection, (e) head/tail routing exploits the fact that M1 and M2 might excel in different popularity slices. Choose based on your latency budget and the model-diversity outcome.</>}
-        stretch={<>How would you decide between (a) and (b) operationally?</>}
+        trap={<>(d) IPS is competitive with perfect propensity. (e) compute does not allow BISER.</>}
+        lens={<>Goldilocks: propensity-poor AND compute-rich AND architecture-diverse.</>}
+        stretch={<>What is the cheapest second-model option?</>}
       />
 
+      {/* axis: B2 */}
       <VIS.TrapProblem
-        id="bs-p6" difficulty="medium"
-        title="P6 — Cold item: brand new SKU just listed today"
-        scenario={<>A new item was just listed today. Neither M1 nor M2 has any interactions involving it. Will BISER help recommend it?</>}
+        id="biser-p6" difficulty="medium"
+        title="P6 — When NOT to use BISER"
+        scenario={<><em>Discriminating insight: BISER fails when you only have budget for one model, when the two models would be near-identical, or when you have access to randomized exposure data that gives clean propensities.</em><br/>Strongest argument AGAINST BISER for your team?</>}
         options={[
-          {key:"a", text:"Yes &mdash; BISER de-biases popular items, automatically boosting cold ones."},
-          {key:"b", text:"No &mdash; BISER&apos;s pseudo-labels rely on model predictions, and neither model has any signal for a 0-interaction item. Need content features.", correct:true},
-          {key:"c", text:"Partially &mdash; the de-biasing helps but slowly."},
-          {key:"d", text:"Yes &mdash; the pseudo-labels are random, providing a fair starting point."},
+          {key:"a", text:"You ran a 5% randomized exposure experiment last month; propensities are clean and stable. BISER doubles compute for no expected lift.", correct:true},
+          {key:"b", text:"BISER uses two models."},
+          {key:"c", text:"BISER is for implicit feedback."},
+          {key:"d", text:"BISER requires GPUs."},
         ]}
-        trap={<>(a) and (d) confuse popularity de-biasing with cold-start. (c) is the false-compromise.</>}
-        lens={<>BISER is for popularity bias on items the models KNOW; cold-start is a separate problem requiring content features, content-based item encoders, or meta-learning. Conflating the two is a senior-bar mistake.</>}
-        stretch={<>How would you combine BISER with a content-based cold-start booster?</>}
+        trap={<>(b)(c)(d) are descriptive, not arguments against.</>}
+        lens={<>With clean propensities, IPS at half the compute is the better choice.</>}
+        stretch={<>How long do randomized propensities stay clean?</>}
       />
 
+      {/* axis: B3 */}
       <VIS.TrapProblem
-        id="bs-p7" difficulty="hard" mode="ordered"
-        title="P7 — Order your debugging steps when BISER&apos;s tail NDCG worsens overnight"
-        scenario={<>Tail NDCG dropped 2% overnight. Order your investigation. Wrong moves do not get ranked.</>}
+        id="biser-p7" difficulty="hard"
+        title="P7 — Stakeholder pitch hinging on the UNIQUE mechanism"
+        scenario={<><em>Discriminating insight: pitch must name bilateral debiasing + propensity-free + dual-model mutual supervision. Generic &quot;reduces bias&quot; pitches survive redaction.</em><br/>VP asks &quot;why BISER over our IPS pipeline?&quot; in 2 sentences. Pick the pitch that does NOT generalize to any debiasing method.</>}
         options={[
-          {key:"a", text:"Check whether M1 and M2 converged closer overnight (correlation diagnostic).", order:1},
-          {key:"b", text:"Diff the pseudo-label distributions before/after.", order:2},
-          {key:"c", text:"Inspect the head vs tail score-gap evolution.", order:3},
-          {key:"d", text:"Disable BISER and revert to IPS."},
-          {key:"e", text:"Ship a hotfix model immediately."},
+          {key:"a", text:"BISER replaces our stale propensity model with a second heterogeneous ranker; the two debias each other symmetrically on BOTH observed clicks and unobserved-but-likely-positives, the side where most MNAR bias lives. No propensity to retrain, no calibration ceremony.", correct:true},
+          {key:"b", text:"BISER reduces popularity bias."},
+          {key:"c", text:"BISER improves long-tail recall."},
+          {key:"d", text:"BISER is state of the art."},
         ]}
-        trap={<>(d) is destructive without diagnosis. (e) is premature.</>}
-        lens={<>Correlation diagnostic &rarr; pseudo-label drift &rarr; head/tail gap is the natural diagnostic for self-supervised pair systems. If M1 and M2 converged, the trick stopped working; if pseudo-labels drifted, an input distribution shifted; if the gap collapsed, head took over.</>}
-        stretch={<>What instrumentation would catch model-pair convergence in real time?</>}
+        trap={<>(b)(c)(d) survive redaction &mdash; could apply to PopRT or DRE.</>}
+        lens={<>Name the unique combo: bilateral + propensity-free + heterogeneous-dual.</>}
+        stretch={<>What dashboard metric would justify the ongoing 2x cost?</>}
       />
 
+      {/* axis: C1 */}
       <VIS.TrapProblem
-        id="bs-p8" difficulty="medium"
-        title="P8 — Doubly Robust vs BISER"
-        scenario={<>You have a working <VIS.Term def="Doubly Robust estimator: combines a propensity model and a direct outcome model; unbiased if EITHER is correct.">Doubly Robust</VIS.Term> estimator. Should you switch to BISER?</>}
+        id="biser-p8" difficulty="hard"
+        title="P8 — Architectural heterogeneity requirement"
+        scenario={<><em>Discriminating insight: identical model architectures share inductive biases and tend to make the same mistakes &mdash; mutual labeling adds no information. Heterogeneity in architecture, init, or training data is the load-bearing axis.</em><br/>Two LightGCN models with different seeds are used. Will BISER work?</>}
         options={[
-          {key:"a", text:"Yes &mdash; BISER is always better."},
-          {key:"b", text:"Depends &mdash; DR gives you double protection (either propensity OR outcome model correct); BISER gives you neither. If your outcome model is decent, stay with DR.", correct:true},
-          {key:"c", text:"No &mdash; BISER is theoretically weaker than DR."},
-          {key:"d", text:"Yes &mdash; BISER is simpler to implement."},
+          {key:"a", text:"Marginally — same architecture means same inductive bias and largely correlated errors. The mutual information in pseudo-labels is small. Use architecturally distinct models (e.g., GCN + sequence-transformer) for the full effect.", correct:true},
+          {key:"b", text:"Yes — different seeds are enough."},
+          {key:"c", text:"Yes — only the data matters."},
+          {key:"d", text:"No — must use the exact paper architectures."},
         ]}
-        trap={<>(a) and (d) ignore that DR is a strong baseline when EITHER component is right. (c) overstates &mdash; the regime where BISER beats DR is when BOTH propensity AND outcome models are wrong.</>}
-        lens={<>DR is the right baseline when you have a credible outcome OR propensity model. BISER is the right choice when BOTH are suspect &mdash; the dual-model trick replaces both components with self-supervision.</>}
-        stretch={<>What is the relationship between BISER&apos;s pseudo-labels and DR&apos;s direct-method outcome predictions?</>}
+        trap={<>(b)(c) underestimate inductive-bias correlation. (d) too strict.</>}
+        lens={<>BISER&apos;s edge comes from independent error structures. Plan for it.</>}
+        stretch={<>How would you measure model-pair error correlation?</>}
       />
 
+      {/* axis: C2 */}
       <VIS.TrapProblem
-        id="bs-p9" difficulty="hard"
-        title="P9 — Tuning the pseudo-label loss weight"
-        scenario={<>BISER&apos;s loss is L_supervised + alpha * L_pseudo. You sweep alpha in {0, 0.1, 0.5, 1.0, 10}. NDCG: 0.40, 0.43, 0.46, 0.45, 0.30. Why does alpha=10 fall off a cliff?</>}
+        id="biser-p9" difficulty="hard"
+        title="P9 — Fragile knob"
+        scenario={<><em>Discriminating insight: the confidence threshold for pseudo-label trust is the fragile knob. Too low ⇒ noise floods training. Too high ⇒ no mutual information transferred.</em><br/>What is BISER&apos;s most fragile hyperparameter?</>}
         options={[
-          {key:"a", text:"alpha=10 makes pseudo-labels dominate supervised data, drifting both models away from observed ground truth toward each other&apos;s confusion.", correct:true},
-          {key:"b", text:"Numerical instability at high alpha."},
-          {key:"c", text:"Gradient explosion."},
-          {key:"d", text:"Pseudo-labels are noisier than supervised labels."},
+          {key:"a", text:"The pseudo-label confidence threshold (how confident model A must be before its label is used to supervise model B). 2× too low and noise dominates; 2× too high and no information flows.", correct:true},
+          {key:"b", text:"Learning rate."},
+          {key:"c", text:"Batch size."},
+          {key:"d", text:"Embedding dim."},
         ]}
-        trap={<>(b) and (c) are generic. (d) is true in general but does not explain WHY there is a cliff specifically at alpha=10.</>}
-        lens={<>This is the classic self-supervised collapse: when pseudo-labels weigh more than ground truth, the system feeds on its own confusion. alpha=0.5 is the sweet spot here &mdash; enough pseudo signal to de-bias, not enough to dominate ground truth.</>}
-        stretch={<>What is the alpha-tuning protocol you would use in practice?</>}
+        trap={<>(b)(c)(d) are generic.</>}
+        lens={<>Treat the confidence threshold as the regularization knob; ablate carefully.</>}
+        stretch={<>How would you tune it without target labels?</>}
       />
 
+      {/* axis: C3 */}
       <VIS.TrapProblem
-        id="bs-p10" difficulty="hard" multiSelect
-        title="P10 — When NOT to use BISER"
-        scenario={<>In which scenarios is BISER the WRONG choice? Select all that apply.</>}
+        id="biser-p10" difficulty="medium"
+        title="P10 — Robust knob"
+        scenario={<><em>Discriminating insight: batch size is robust; learning rate within reasonable range is robust; the load-bearing knobs are the confidence threshold + the heterogeneity gap.</em><br/>Which hyperparameter is robust in BISER (within reason)?</>}
         options={[
-          {key:"a", text:"You have a well-calibrated propensity estimator already in production.", correct:true},
-          {key:"b", text:"Training compute is the binding constraint and 2x is infeasible.", correct:true},
-          {key:"c", text:"Cold-start is the main pain point, not popularity bias.", correct:true},
-          {key:"d", text:"Popularity bias is the main pain point and you have GPU headroom."},
-          {key:"e", text:"You cannot find two truly complementary model architectures.", correct:true},
+          {key:"a", text:"Batch size — within order-of-magnitude variation, BISER's mutual labeling is unaffected.", correct:true},
+          {key:"b", text:"Confidence threshold."},
+          {key:"c", text:"Architectural diversity."},
+          {key:"d", text:"Bilateral loss weight."},
         ]}
-        trap={<>(d) is the right scenario for BISER, not the wrong one.</>}
-        lens={<>BISER is wrong when (a) you have a good propensity model (use IPS), (b) compute is binding, (c) the bias is cold-start not popularity, or (e) you cannot get complementary models. The honest engineering answer is &quot;BISER&quot; only when popularity bias is binding AND propensities are unreliable AND compute is available.</>}
-        stretch={<>How would you decide between BISER and DRO (distributionally robust optimization)?</>}
+        trap={<>(b)(c)(d) are the fragile ones.</>}
+        lens={<>Focus tuning effort where the fragility lives.</>}
+        stretch={<>How would you ablate to verify a knob is robust?</>}
       />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="biser-p11" difficulty="hard"
+        title="P11 — The bilateral loss structure"
+        scenario={<><em>Discriminating insight: BISER&apos;s loss has TWO terms per model &mdash; one for observed (positive) items, one for unobserved (potential positive) items surfaced by the other model. Single-term self-distill ≠ BISER.</em><br/>Which loss structure correctly describes BISER for model A?</>}
+        options={[
+          {key:"a", text:"L_A = BCE(A, observed) + λ × BCE(A, items B is confident are positive but A treats as negative). Both observed AND unobserved-but-likely-positive corrections.", correct:true},
+          {key:"b", text:"L_A = BCE(A, observed) only."},
+          {key:"c", text:"L_A = MSE between A and B."},
+          {key:"d", text:"L_A = adversarial loss on A vs B."},
+        ]}
+        trap={<>(b) drops the bilateral part. (c) too symmetric &mdash; collapses heterogeneity. (d) wrong family.</>}
+        lens={<>The bilateral structure is what fixes the MNAR-unobserved bias. Drop the second term and you have generic co-training.</>}
+        stretch={<>What does λ control practically?</>}
+      />
+
+      {/* axis: D1 */}
+      <VIS.TrapProblem
+        id="biser-p12" difficulty="hard"
+        title="P12 — Common misconception: &quot;BISER is just co-training&quot;"
+        scenario={<><em>Discriminating insight: co-training (Blum-Mitchell 1998) requires conditionally-independent VIEWS of the data. BISER does not split data into views &mdash; it uses two models on the SAME data with bilateral correction on observed AND unobserved sides.</em><br/>What does BISER do that classical co-training does not?</>}
+        options={[
+          {key:"a", text:"Bilateral correction: explicit pseudo-labeling on the UNOBSERVED side (likely false negatives), not just the observed positives. Classical co-training also assumes view-independence, which BISER does not require.", correct:true},
+          {key:"b", text:"Nothing different — they are the same."},
+          {key:"c", text:"Co-training uses GANs."},
+          {key:"d", text:"Co-training is supervised."},
+        ]}
+        trap={<>(b) misses the bilateral piece. (c)(d) factually wrong.</>}
+        lens={<>BISER ≠ co-training. The unobserved-side correction is the load-bearing addition.</>}
+        stretch={<>Could you frame BISER as a special case of pseudo-labeling?</>}
+      />
+
+      {/* axis: D2 */}
+      <VIS.TrapProblem
+        id="biser-p13" difficulty="hard"
+        title="P13 — Cause looks like A but is actually B"
+        scenario={<><em>Discriminating insight: BISER&apos;s tail-recall regression often LOOKS like &quot;model is overfitting to popular items&quot; but is specifically &quot;the two models have converged to be too similar; their errors are now correlated; mutual info is zero&quot;. Different fix.</em><br/>Tail recall regresses month 3. Generic reading: &quot;model drifted&quot;. BISER-specific reading?</>}
+        options={[
+          {key:"a", text:"Models A and B may have converged to be too similar — their pseudo-labels stopped carrying mutual information. Diagnose with error correlation between A and B; fix by re-introducing architectural diversity or data-split heterogeneity.", correct:true},
+          {key:"b", text:"Roll back."},
+          {key:"c", text:"Add dropout."},
+          {key:"d", text:"Retrain on more data."},
+        ]}
+        trap={<>(b)(c)(d) generic moves that miss BISER&apos;s collapse mode.</>}
+        lens={<>BISER-specific failure: model convergence kills mutual info. Probe it directly.</>}
+        stretch={<>What error-correlation threshold would alert you?</>}
+      />
+
+      {/* axis: D3 */}
+      <VIS.TrapProblem
+        id="biser-p14" difficulty="medium"
+        title="P14 — Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: framing BISER as &quot;just use two models and ensemble&quot; misses the bilateral pseudo-labeling. Ensembling does not fix MNAR bias.</em><br/>Pick the framing root that cascades into bad implementation.</>}
+        options={[
+          {key:"a", text:"Treating BISER as a 2-model ENSEMBLE rather than a mutual SUPERVISION method — leads to averaging predictions instead of using each model to label the other's unobserved items.", correct:true},
+          {key:"b", text:"Treating BISER as IPS with two propensities."},
+          {key:"c", text:"Treating BISER as a single model with dropout."},
+          {key:"d", text:"Treating BISER as contrastive learning."},
+        ]}
+        trap={<>(b)(c)(d) all miss the mutual-supervision insight.</>}
+        lens={<>Mutual supervision ≠ ensembling. The information flow is between TRAINING, not inference.</>}
+        stretch={<>Could you ensemble A and B at serving as well?</>}
+      />
+
+      {/* axis: D4 */}
+      <VIS.TrapProblem
+        id="biser-p15" difficulty="medium"
+        title="P15 — Junior gets right but misses senior point"
+        scenario={<><em>Discriminating insight: junior says &quot;BISER trains two models that label each other&quot;. Senior point: bilateral (BOTH sides) is the load-bearing piece; heterogeneity is the load-bearing requirement.</em><br/>Pick the answer that is TRUE but misses the senior point.</>}
+        options={[
+          {key:"a", text:"BISER trains two models that label each other to debias implicit feedback.", correct:true},
+          {key:"b", text:"BISER's bilateral correction on the unobserved side is what fixes MNAR bias; ensembling doesn't."},
+          {key:"c", text:"BISER requires architecturally heterogeneous models or mutual info goes to zero."},
+          {key:"d", text:"BISER drops the propensity-estimation pipeline."},
+        ]}
+        trap={<>(a) is true and also true of any dual-model debiasing &mdash; it does not name BISER&apos;s discriminator.</>}
+        lens={<>Senior point: bilateral + heterogeneity + propensity-free. Not just &quot;two models&quot;.</>}
+        stretch={<>Smallest experiment to ablate &quot;bilateral&quot;?</>}
+      />
+
+      {/* axis: E1 */}
+      <VIS.TrapProblem
+        id="biser-p16" difficulty="hard"
+        title="P16 — Friday 3am page: BISER-unique symptom"
+        scenario={<><em>Discriminating insight: page-grade symptom is &quot;error correlation between models A and B spiked + tail recall regressed&quot;. Either alone is a generic regression signal.</em><br/>Page: tail recall -3%, model-A vs model-B error correlation 0.85 (was 0.55). Root cause?</>}
+        options={[
+          {key:"a", text:"Models A and B converged to be too similar — mutual information collapsed. Either training schedule pulled them together, or a data refresh removed the heterogeneity. Reintroduce diversity (warm-restart B from a different init, swap one model's architecture).", correct:true},
+          {key:"b", text:"Generic data drift."},
+          {key:"c", text:"Embedding store corrupted."},
+          {key:"d", text:"Logging policy changed."},
+        ]}
+        trap={<>(b)(c)(d) generic; the conjunction is BISER-unique.</>}
+        lens={<>BISER&apos;s health metric is &quot;how heterogeneous are the two models, still?&quot;.</>}
+        stretch={<>What is the error-correlation alert threshold?</>}
+      />
+
+      {/* axis: E2 */}
+      <VIS.TrapProblem
+        id="biser-p17" difficulty="medium"
+        title="P17 — Open-source default that bites"
+        scenario={<><em>Discriminating insight: most repos default to twin architectures (same model, different seed). The published BISER numbers depend on architecturally distinct models. Twin default ⇒ BISER reduces to noisy self-distill.</em><br/>You fork a BISER repo. Default-config trap?</>}
+        options={[
+          {key:"a", text:"Both 'models' default to the same architecture with different seeds — silently reduces BISER to noisy self-distillation. Swap one for a heterogeneous architecture before reading any numbers.", correct:true},
+          {key:"b", text:"Learning rate is too high."},
+          {key:"c", text:"Batch size defaults to 1."},
+          {key:"d", text:"Adam vs SGD."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Always inspect the second model&apos;s architecture. If it equals the first, the &quot;published numbers&quot; do not transfer.</>}
+        stretch={<>What unit test would catch this regression?</>}
+      />
+
+      {/* axis: E3 */}
+      <VIS.TrapProblem
+        id="biser-p18" difficulty="hard" mode="ordered"
+        title="P18 — Order the BISER rollout phases"
+        scenario={<><em>Discriminating insight: pick the heterogeneous-pair BEFORE training; probe error correlation in offline eval BEFORE shadow; calibrate confidence threshold LAST.</em><br/>Order. Wrong moves do not get ranked.</>}
+        options={[
+          {key:"a", text:"Choose two heterogeneous architectures (e.g., GCN + sequence-transformer); verify expected error decorrelation on offline replay.", order:1},
+          {key:"b", text:"Train BISER with default confidence threshold; verify both models converge.", order:2},
+          {key:"c", text:"Shadow A/B against current IPS pipeline.", order:3},
+          {key:"d", text:"Ablate confidence threshold to calibrate.", order:4},
+          {key:"e", text:"Skip the architecture choice; use twin models."},
+          {key:"f", text:"Roll to 100% on day 1."},
+        ]}
+        trap={<>(e)(f) skip safety.</>}
+        lens={<>Heterogeneity first; then training; then shadow; then calibrate.</>}
+        stretch={<>Rollback signal?</>}
+      />
+
+      {/* axis: F1 */}
+      <VIS.TrapProblem
+        id="biser-p19" difficulty="hard"
+        title="P19 — Failure: explicit-feedback regime"
+        scenario={<><em>Discriminating insight: BISER is designed for IMPLICIT MNAR feedback. With explicit ratings (1-5 stars on items the user CHOSE to rate), the MNAR-unobserved-side correction does not apply &mdash; you already have the labels.</em><br/>You have a 1-5 star explicit-rating dataset. Does BISER&apos;s bilateral correction help?</>}
+        options={[
+          {key:"a", text:"No — explicit ratings are observed labels; there is no 'unobserved-positive' side to correct. BISER's bilateral structure is for implicit MNAR feedback only. Use regression-based methods instead.", correct:true},
+          {key:"b", text:"Yes — works on any data."},
+          {key:"c", text:"Yes — better than collaborative filtering."},
+          {key:"d", text:"Partially."},
+        ]}
+        trap={<>(b)(c)(d) misread BISER&apos;s scope.</>}
+        lens={<>Method scope is bounded by data type. Implicit MNAR ⇒ BISER; explicit ⇒ different stack.</>}
+        stretch={<>Could you adapt BISER for explicit ratings?</>}
+      />
+
+      {/* axis: F2 */}
+      <VIS.TrapProblem
+        id="biser-p20" difficulty="hard"
+        title="P20 — Adversarial input that breaks BISER specifically"
+        scenario={<><em>Discriminating insight: an attacker can poison one of the two models (e.g., Sybil clicks targeting one architecture&apos;s blind spot) &mdash; the poisoned model then teaches the clean model false-positive labels, propagating the attack.</em><br/>Which adversarial input most specifically breaks BISER?</>}
+        options={[
+          {key:"a", text:"Targeted poisoning that exploits ONE of the two architectures' blind spot — the poisoned model then propagates false pseudo-labels to the clean model via the bilateral loss. Mitigation: monitor per-model error rates; require agreement before promoting pseudo-labels.", correct:true},
+          {key:"b", text:"Random click noise."},
+          {key:"c", text:"Popular-item flooding."},
+          {key:"d", text:"Long user history."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>The bilateral channel is a feature AND an attack surface. Add agreement-based gating.</>}
+        stretch={<>What agreement threshold would you set?</>}
+      />
+
+      {/* axis: F3 */}
+      <VIS.TrapProblem
+        id="biser-p21" difficulty="medium"
+        title="P21 — Edge case: claim collapses"
+        scenario={<><em>Discriminating insight: BISER&apos;s mechanism collapses when (i) propensities are clean (IPS wins), or (ii) the two models converge to similarity (no mutual info).</em><br/>Two distinct edge cases where BISER&apos;s mechanism collapses?</>}
+        options={[
+          {key:"a", text:"(i) Clean randomized-exposure propensities make IPS competitive at half the cost. (ii) The two models converge to architectural similarity; mutual info collapses.", correct:true},
+          {key:"b", text:"Too much data; too little data."},
+          {key:"c", text:"Wrong LR; wrong batch size."},
+          {key:"d", text:"Mac vs Linux."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Both edge cases attack the mechanism specifically.</>}
+        stretch={<>How would you detect (ii) early in training?</>}
+      />
+
+      {/* axis: F4 */}
+      <VIS.TrapProblem
+        id="biser-p22" difficulty="hard"
+        title="P22 — BISER vs PopRT vs DRE — pick the right tool"
+        scenario={<><em>Discriminating insight: BISER is MNAR-bias-via-mutual-supervision; PopRT is serving-time output reweighting (no retrain) for popularity bias; DRE is representation-level orthogonal popularity head. Different problems, different tools.</em><br/>You have a long-tail problem driven by MNAR exposure bias (not just popularity skew). Which method?</>}
+        options={[
+          {key:"a", text:"BISER — MNAR exposure bias is exactly what bilateral self-supervision targets. PopRT addresses popularity-skew at serving-time without changing exposure modeling; DRE works on representation symmetry, not exposure bias.", correct:true},
+          {key:"b", text:"PopRT — long-tail problems all use PopRT."},
+          {key:"c", text:"DRE — sparse tail with content similarity."},
+          {key:"d", text:"All three together."},
+        ]}
+        trap={<>(b)(c) misdiagnose &mdash; the root is MNAR bias, not popularity skew per se. (d) overkill.</>}
+        lens={<>Match the method to the bias TYPE: MNAR ⇒ BISER; popularity-skew at serving ⇒ PopRT; representation bias ⇒ DRE.</>}
+        stretch={<>What diagnostic distinguishes MNAR bias from popularity skew?</>}
+      />
+
+      {/* axis: F5 */}
+      <VIS.TrapProblem
+        id="biser-p23" difficulty="medium"
+        title="P23 — Paper-admitted limitation"
+        scenario={<><em>Discriminating insight: the paper explicitly admits 2x training compute and dependence on architectural heterogeneity.</em><br/>Which limitation does the paper itself admit?</>}
+        options={[
+          {key:"a", text:"2× training compute + dependence on heterogeneity between the two models.", correct:true},
+          {key:"b", text:"Cannot handle implicit feedback."},
+          {key:"c", text:"Worse than random on tail."},
+          {key:"d", text:"Requires GPUs."},
+        ]}
+        trap={<>(b)(c)(d) are not paper-admitted.</>}
+        lens={<>Read the limitations section.</>}
+        stretch={<>Cheapest mitigation for 2x compute?</>}
+      />
+
+      {/* axis: F6 */}
+      <VIS.TrapProblem
+        id="biser-p24" difficulty="medium"
+        title="P24 — Reproducibility"
+        scenario={<><em>Discriminating insight: BISER&apos;s reproducibility hinges on the EXACT pair of architectures &mdash; swap one and the numbers shift.</em><br/>What must you fix to reproduce the paper?</>}
+        options={[
+          {key:"a", text:"The EXACT pair of architectures (model A's family + hyperparameters AND model B's family + hyperparameters) — the bilateral effect is paired-architecture-specific.", correct:true},
+          {key:"b", text:"Just the seed."},
+          {key:"c", text:"Just the LR."},
+          {key:"d", text:"Just the dataset."},
+        ]}
+        trap={<>(b)(c)(d) miss the paired-architecture insight.</>}
+        lens={<>The experimental artifact is the PAIR, not either model alone.</>}
+        stretch={<>How would you publish a reproducible BISER experiment?</>}
+      />
+
+      {/* axis: F7 */}
+      <VIS.TrapProblem
+        id="biser-p25" difficulty="hard"
+        title="P25 — Stacking BISER with IPS"
+        scenario={<><em>Discriminating insight: BISER and IPS are not mutually exclusive. You can use IPS-corrected pseudo-labels as a third signal, OR use BISER&apos;s outputs to calibrate the propensity model.</em><br/>Can BISER and IPS be combined?</>}
+        options={[
+          {key:"a", text:"Yes — use BISER's stable predictions as a soft target for calibrating the propensity model; OR use IPS-corrected pseudo-labels as a third supervised signal alongside the two BISER models. Both directions exist.", correct:true},
+          {key:"b", text:"No — they are mutually exclusive."},
+          {key:"c", text:"Only via ensembling at inference."},
+          {key:"d", text:"Only via different domains."},
+        ]}
+        trap={<>(b) overstates. (c)(d) miss the actual integration patterns.</>}
+        lens={<>Debiasing methods compose in non-obvious ways. BISER + IPS is a real stack.</>}
+        stretch={<>Which direction would you try first?</>}
+      />
+
+      {/* axis: F8 */}
+      <VIS.TrapProblem
+        id="biser-p26" difficulty="medium"
+        title="P26 — Cost structure"
+        scenario={<><em>Discriminating insight: training is 2x; serving is 1x (you can serve only the better-performing model, or ensemble &mdash; engineering choice). Storage is 2x for trained checkpoints.</em><br/>Where is BISER&apos;s extra cost concentrated?</>}
+        options={[
+          {key:"a", text:"Training (2× compute for two models) and checkpoint storage (2× model weights). Serving is 1× if you pick one model; 2× if you ensemble.", correct:true},
+          {key:"b", text:"Serving latency."},
+          {key:"c", text:"Network I/O."},
+          {key:"d", text:"Embedding store size."},
+        ]}
+        trap={<>(b)(c)(d) misread.</>}
+        lens={<>Training-vs-serving asymmetry: pay at training time. Serving choice is yours.</>}
+        stretch={<>When would you ensemble at serving?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="http://www.joonseok.net/papers/biser.pdf" target="_blank" rel="noopener">Lee et al. &mdash; <em>Bilateral Self-unbiased Learning from Biased Implicit Feedback</em> (SIGIR 2022)</a> &mdash; primary source. The Section-4 ablation tables show which model-pair configurations work.</li>
-        <li><a href="https://eugeneyan.com/writing/counterfactual-evaluation/" target="_blank" rel="noopener">Eugene Yan &mdash; <em>Counterfactual Evaluation for Recommendation Systems</em> (blog)</a> &mdash; practitioner-grade primer on IPS, DR, and why propensity estimation is hard.</li>
-        <li><a href="https://www.cs.cornell.edu/~tj/publications/joachims_etal_17a.pdf" target="_blank" rel="noopener">Joachims et al. &mdash; <em>Unbiased Learning-to-Rank with Biased Feedback</em> (WSDM 2017)</a> &mdash; canonical IPS-for-ranking paper. Read first to understand what BISER is replacing.</li>
-        <li><a href="https://arxiv.org/abs/1602.05352" target="_blank" rel="noopener">Schnabel et al. &mdash; <em>Recommendations as Treatments: Debiasing Learning and Evaluation</em> (ICML 2016)</a> &mdash; the propensity-scoring foundation for recsys.</li>
-        <li><a href="https://lilianweng.github.io/posts/2022-04-15-data-gen/" target="_blank" rel="noopener">Lilian Weng &mdash; <em>Learning with not Enough Data Part 1: Semi-Supervised Learning</em> (blog)</a> &mdash; co-training and cross-pseudo-labeling background. BISER is a recsys-specific instance of these patterns.</li>
+        <li><a href="http://www.joonseok.net/papers/biser.pdf" target="_blank" rel="noopener">Lee et al. — <em>Bilateral Self-unbiased Learning from Biased Implicit Feedback</em> (SIGIR 2022)</a> — primary source.</li>
+        <li><a href="https://www.cs.cornell.edu/people/tj/publications/joachims_etal_17a.pdf" target="_blank" rel="noopener">Joachims et al. — <em>Unbiased Learning-to-Rank with Biased Feedback</em> (WSDM 2017)</a> — the IPS-for-LTR canonical paper BISER reacts to.</li>
+        <li><a href="https://eugeneyan.com/writing/recsys-causal/" target="_blank" rel="noopener">Eugene Yan — <em>Causal Inference for Recommendations</em> (blog)</a> — practitioner framing for MNAR + propensity discipline.</li>
+        <li><a href="https://lilianweng.github.io/posts/2021-05-31-contrastive/" target="_blank" rel="noopener">Lilian Weng — <em>Contrastive Representation Learning</em> (blog)</a> — adjacent self-supervision intuition.</li>
+        <li><a href="https://en.wikipedia.org/wiki/Co-training" target="_blank" rel="noopener">Wikipedia — <em>Co-training</em></a> — historical mutual-supervision context that BISER extends with bilateral correction.</li>
       </ul>
     </VIS.Section>
   </main>

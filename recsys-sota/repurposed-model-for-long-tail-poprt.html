@@ -1414,239 +1414,499 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// REDO v2 — RecSys-SOTA batch 10
+// PopRT — Bypassing the Popularity Bias: Repurposing Models for Better Long-Tail Recommendation
+// (arXiv 2410.02776, 2024)
+// Unique mechanism: REPURPOSE the existing head-item model at SERVING time via output reweighting
+// (or a routed tail-specialist) — NO retrain, NO change to the training objective.
+// Cross-visual caution: BISER is dual-model self-supervision under MNAR;
+// DRE is representation-level orthogonal popularity head;
+// PopRT is serving-time output reweighting (no retrain). Don't conflate.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA · Long-tail debiasing"
-      title="PopRT — Repurposed Models for Long-Tail Recommendation"
-      subtitle="Keep the head-model sharp; train a second tail-only specialist; route queries by a popularity-context detector."
+      pill="RecSys SOTA · Debiasing / Long-tail"
+      title="PopRT — Repurposed head-item model for the tail"
+      subtitle="No retrain. No new loss. At serving time, reweight outputs (or route via a popularity-context detector) so the SAME trained model becomes a tail recommender."
       byline={[
         {label: "Paper", value: "arXiv 2410.02776 (2024)"},
-        {label: "Domain", value: "Catalogs with extreme 80/20 popularity skew"},
+        {label: "Surface", value: "Catalogs with extreme 80/20 skew where one global model can't be sharp on both head and tail"},
       ]}/>
 
     <VIS.TLDR>
-      <VIS.Term def="Inverse Propensity Weighting: down-weight popular-item training examples (and up-weight rare ones) so the loss does not over-fit to the head.">IPW</VIS.Term> reweighting penalizes head-item gradients globally and HURTS head accuracy. PopRT keeps the head model untouched, trains a SECOND model on long-tail items only, and uses a lightweight router to send each request to whichever specialist is more appropriate. Two sharp specialists beat one over-regularized generalist &mdash; if the router calibrates correctly.
+      Classical popularity-bias fixes change the TRAINING loss (<VIS.Term def="Inverse Propensity Weighting — reweight training examples by 1/popularity to undo skew.">IPW</VIS.Term>, BISER) and pay the price of degrading head performance. PopRT&apos;s twist: keep the head-item model and its loss UNTOUCHED. Repurpose it for the tail at SERVING time, either by output reweighting against a learned popularity prior, or by routing tail-context queries to a small tail-specialist that shares the head backbone. The head stays sharp; the tail gets a dedicated handler. The fragile knob is the popularity-context router (or, in the reweighting variant, the calibration of the popularity prior).
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
-      <p>
-        Three-component architecture, all trained or repurposed from existing infra:
-      </p>
-      <VIS.Mermaid chart={`
-flowchart TB
-  Q["User request and candidate item"] --> D["Popularity-context detector"]
-  D -->|Head context| H["Head model"]
-  D -->|Tail context| T["Tail-only specialist"]
-  H --> S["Score"]
-  T --> S
-      `} />
+    <VIS.Section id="sec-what" title="What it is — serving-time repurposing">
+      <VIS.Mermaid chart={`flowchart TB
+  Q["Query: user u, context c"]
+  HM["Frozen HEAD-trained model (untouched)"]
+  RT["Popularity-context router OR output reweighter"]
+  TS["Tail specialist (lightweight, optional)"]
+  S["Final tail-aware ranking"]
+  Q --> RT
+  Q --> HM
+  HM --> RT
+  RT -->|"context suggests tail intent"| TS
+  RT -->|"head intent or low-confidence"| HM
+  TS --> S
+  HM --> S`} />
       <ul>
-        <li><strong>Head model</strong> &mdash; your existing trained recommender. Untouched.</li>
-        <li><strong>Tail specialist</strong> &mdash; a second model trained only on long-tail items (items outside the top-K popularity percentile). Uses the same architecture or a smaller one.</li>
-        <li><strong>Router</strong> &mdash; a popularity-context detector that decides which model to use per (user, candidate-item) request. Could be rule-based (item popularity threshold) or learned.</li>
+        <li><strong>No retrain</strong> — the head-item model is frozen. PopRT does not touch its weights or its loss.</li>
+        <li><strong>Serving-time intervention</strong> — at inference, either (i) reweight the head model&apos;s output scores by an inverse popularity prior, OR (ii) route via a popularity-context detector to a small tail-specialist that shares the backbone.</li>
+        <li><strong>Fragile knob</strong> — the router threshold (or reweighting calibration). Mis-calibrated, you get a fuzzy seam where head-vs-tail predictions disagree.</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from IPW reweighting">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>IPW reweighting</th><th style={{textAlign:"left",padding:8}}>PopRT</th></tr></thead>
+    <VIS.Section id="sec-diff" title="How it differs from IPW / BISER / DRE">
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}>
+          <th style={{textAlign:"left", padding:8}}>Method</th>
+          <th style={{textAlign:"left", padding:8}}>Touches training?</th>
+          <th style={{textAlign:"left", padding:8}}>Mechanism</th>
+          <th style={{textAlign:"left", padding:8}}>Head-model cost</th>
+        </tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Head accuracy</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Hurt by down-weighting</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Preserved (head model untouched)</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Tail accuracy</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Gradient-starved, still weak</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Specialist is sharp on tail</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Training compute</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>1x</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>1x + tail-model training</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Serving compute</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>1 model</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>2 models behind router</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Failure mode</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Global degradation</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Router miscalibration at head/tail boundary</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>IPW reweighting</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>YES (loss)</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Reweight per-example gradients</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Head sharpness DEGRADES</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>BISER</td><td style={{padding:8}}>YES (dual training)</td><td style={{padding:8}}>Bilateral mutual supervision under MNAR</td><td style={{padding:8}}>2× training cost</td></tr>
+          <tr><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>DRE</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>YES (representation)</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Aux orthogonal popularity head</td><td style={{padding:8, borderTop:"1px solid #e2e8f0"}}>Joint training overhead</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}><strong>PopRT</strong></td><td style={{padding:8}}><strong>NO — serving-time only</strong></td><td style={{padding:8}}><strong>Output reweighting OR popularity-context routing</strong></td><td style={{padding:8}}><strong>Head stays sharp</strong></td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>Extreme 80/20 (or 95/5) skew where one global model cannot be sharp on both ends.</li>
-        <li>Head and tail items have meaningfully different feature distributions (different interaction densities, different feature reliability).</li>
-        <li>Your existing head model is high-quality and you do not want to risk it.</li>
-        <li>You can afford a second model in serving (cost, latency).</li>
-        <li>Tail items have enough volume that a tail-only model is trainable (not pure cold-start).</li>
-      </ul>
-    </VIS.Section>
+    <VIS.Section id="sec-drill" title="Drill — 26 trap problems">
+      <p style={{color:"#475569"}}>Each problem cites the question-axis it draws from. Pick, then reveal.</p>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <ul>
-        <li><strong>Router calibration</strong> &mdash; the head/tail boundary is fuzzy; mis-routes cause regressions exactly at the seam (medium-popularity items).</li>
-        <li><strong>Boundary discontinuity</strong> &mdash; A/B users see a score jump as items cross the threshold; can cause UI artifacts (item suddenly disappears or rises).</li>
-        <li><strong>2x serving cost</strong> &mdash; both models loaded, plus router overhead.</li>
-        <li><strong>Two systems to maintain</strong> &mdash; experiments now require updating two models or one model + router.</li>
-        <li><strong>Tail data quality</strong> &mdash; tail items have noisier interaction signals; the tail specialist inherits this.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
-
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="pr-p1" difficulty="hard" multiSelect
-        title="P1 — Compare IPW reweighting vs head/tail specialists: list two failure modes of each."
-        scenario={<>Pick the genuine failure modes for each approach. Select all that apply.</>}
+        id="poprt-p1" difficulty="hard"
+        title="P1 — PopRT vs IPW reweighting"
+        scenario={<><em>Discriminating insight: IPW penalizes head-item gradients GLOBALLY in training &mdash; head sharpness degrades by design. PopRT leaves the head model untouched and adds a serving-time handler for tail intent.</em><br/>What is the load-bearing difference between PopRT and IPW for popularity bias?</>}
         options={[
-          {key:"a", text:"IPW: down-weighting head items starves head learning &mdash; head accuracy drops materially.", correct:true},
-          {key:"b", text:"IPW: high-variance weights for very rare items cause gradient instability.", correct:true},
-          {key:"c", text:"PopRT: router miscalibration causes score discontinuity at the head/tail boundary.", correct:true},
-          {key:"d", text:"PopRT: requires twice the training data."},
-          {key:"e", text:"PopRT: doubles serving cost for two specialists.", correct:true},
-          {key:"f", text:"IPW: requires a separate router."},
+          {key:"a", text:"PopRT operates at SERVING time without retraining; the head model's training is untouched. IPW operates in TRAINING by reweighting gradients, which globally penalizes head items and degrades head sharpness.", correct:true},
+          {key:"b", text:"PopRT uses more parameters."},
+          {key:"c", text:"IPW is slower at serving."},
+          {key:"d", text:"They are equivalent."},
         ]}
-        trap={<>(d) is false &mdash; PopRT uses the SAME data sliced differently, not double data. (f) confuses methods.</>}
-        lens={<>IPW&apos;s real failure modes are head-starvation (a) and gradient variance (b). PopRT&apos;s real failure modes are router error at the boundary (c) and 2x serving (e). Misattributing failure modes is a senior-bar trap.</>}
-        stretch={<>Which failure mode is more recoverable in production?</>}
+        trap={<>(b)(c) misstate. (d) false.</>}
+        lens={<>The intervention point (training vs serving) is the load-bearing inversion. Pay at serving, harvest the sharp head.</>}
+        stretch={<>What is the back-of-envelope NDCG-head gain by NOT using IPW?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="pr-p2" difficulty="hard"
-        title="P2 — Where should the head/tail boundary go?"
-        scenario={<>Your catalog has 1M items. Top 10k items get 80% of interactions. Top 100k get 95%. Where should you set the head/tail boundary for PopRT?</>}
+        id="poprt-p2" difficulty="hard"
+        title="P2 — PopRT vs BISER (both target long-tail problems)"
+        scenario={<><em>Discriminating insight: BISER fixes MNAR-bias at training via dual-model mutual supervision; PopRT does no training intervention &mdash; it is purely serving-time. Different problems, different scopes.</em><br/>Long-tail problem driven by MNAR EXPOSURE bias (not just popularity skew). Which method?</>}
         options={[
-          {key:"a", text:"Top 10k for head, rest for tail."},
-          {key:"b", text:"Top 100k for head, rest for tail."},
-          {key:"c", text:"Sweep the boundary on a held-out set; pick the threshold that maximizes combined NDCG, not the Pareto-frontier knee.", correct:true},
-          {key:"d", text:"Use a learned router that does not need an explicit boundary."},
+          {key:"a", text:"BISER — its bilateral self-supervision corrects MNAR exposure bias by surfacing likely-positive items the head model never saw. PopRT's serving-time reweighting does not fix exposure bias; it only redistributes scores.", correct:true},
+          {key:"b", text:"PopRT — long-tail problems all use PopRT."},
+          {key:"c", text:"Both at the same time."},
+          {key:"d", text:"Neither — must use IPW."},
         ]}
-        trap={<>(a) and (b) are arbitrary &mdash; the right boundary depends on where the head model starts losing tail items and the tail model starts losing learnable signal. (d) ducks the question; even learned routers benefit from a sensible starting prior.</>}
-        lens={<>The boundary is a hyperparameter to be tuned, not declared. Sweep with NDCG (or whatever your KPI is) and pick the empirical optimum. The paper&apos;s ablations show the answer is dataset-specific and rarely at a round number.</>}
-        stretch={<>What is the relationship between the boundary and the relative training-set sizes of head vs tail?</>}
+        trap={<>(b) misdiagnoses bias type. (c) overkill without diagnosis. (d) IPW is what BISER replaces.</>}
+        lens={<>Bias TYPE dictates the method: MNAR exposure ⇒ BISER; popularity-skew at serving ⇒ PopRT.</>}
+        stretch={<>What diagnostic separates MNAR from popularity-skew?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="pr-p3" difficulty="hard"
-        title="P3 — Boundary discontinuity in production"
-        scenario={<>A previously-tail item suddenly becomes popular and crosses the head/tail threshold. The router now sends it to the head model, which gives it a very different score than the tail model did 5 minutes ago. Users see the item disappear from their recommendation feed. Most appropriate fix?</>}
+        id="poprt-p3" difficulty="hard"
+        title="P3 — PopRT vs DRE (both target tail recall)"
+        scenario={<><em>Discriminating insight: DRE augments tail embeddings via content-similar head items at REPRESENTATION level. PopRT does NOT touch embeddings &mdash; it reweights or routes at the output level. DRE fails when tail items are content-alien from head; PopRT does not require content similarity.</em><br/>Your tail items are content-ALIEN from head (e.g., niche musical genres unrelated to mainstream). Which method?</>}
         options={[
-          {key:"a", text:"Smooth the router decision &mdash; for items near the boundary, blend scores from both models weighted by a sigmoid of popularity.", correct:true},
-          {key:"b", text:"Refit both models more frequently."},
-          {key:"c", text:"Lock the head/tail boundary &mdash; do not let items cross."},
-          {key:"d", text:"Use only the head model."},
+          {key:"a", text:"PopRT — works without requiring content similarity. DRE's contrastive enhancement assumes head-tail content similarity and fails when tail is alien.", correct:true},
+          {key:"b", text:"DRE — always wins for tail."},
+          {key:"c", text:"BISER — content alien is MNAR."},
+          {key:"d", text:"Train a new model."},
         ]}
-        trap={<>(b) helps marginally but the discontinuity exists at every refresh. (c) is operationally insane &mdash; items naturally rise and fall in popularity. (d) reverts to the original problem.</>}
-        lens={<>The score blending at the boundary is the standard mixture-of-experts trick. A sigmoid (or any monotone smooth function) of popularity creates a gradual handoff, removing the discontinuity. The router becomes a soft assignment rather than a hard switch.</>}
-        stretch={<>What is the latency cost of blending vs hard-switching?</>}
+        trap={<>(b) ignores DRE&apos;s assumption. (c) misdiagnoses bias type.</>}
+        lens={<>Method match must respect the data assumptions. PopRT&apos;s freedom from content-similarity is a real advantage here.</>}
+        stretch={<>What is the smallest content-similarity threshold where DRE works?</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="pr-p4" difficulty="medium" multiSelect
-        title="P4 — Training the tail specialist"
-        scenario={<>You are training the tail-only specialist. Which design choices are correct? Select all that apply.</>}
+        id="poprt-p4" difficulty="medium"
+        title="P4 — What does PopRT DROP vs IPW?"
+        scenario={<><em>Discriminating insight: PopRT drops the GLOBAL gradient reweighting of IPW &mdash; head items stop being penalized in training. The cost dropped is "training-time popularity intervention".</em><br/>Which IPW-stack component does PopRT remove?</>}
         options={[
-          {key:"a", text:"Train only on items below the popularity threshold; do not include head items in the training set.", correct:true},
-          {key:"b", text:"Use the same architecture as the head model but a smaller version (fewer parameters).", correct:true},
-          {key:"c", text:"Include some head items as negatives to help the tail model learn what NOT to rank highly.", correct:true},
-          {key:"d", text:"Train with the same hyperparameters as the head model."},
-          {key:"e", text:"Train with stronger regularization &mdash; tail data is noisier.", correct:true},
+          {key:"a", text:"Training-time global gradient reweighting — head items are no longer penalized during training. PopRT moves the intervention to serving.", correct:true},
+          {key:"b", text:"The model itself."},
+          {key:"c", text:"Item embeddings."},
+          {key:"d", text:"The evaluation metric."},
         ]}
-        trap={<>(d) ignores the data shift; tail data needs different tuning.</>}
-        lens={<>Tail-only positive sampling (a) keeps the specialist focused. Smaller arch (b) prevents overfitting on smaller tail data. Negative sampling from head (c) teaches contrast. Different hyperparameters (e) reflect different data statistics. (d) is the trap &mdash; copying head&apos;s hyperparameters is the easy-but-wrong default.</>}
-        stretch={<>What is the right regularization knob to tune for the tail specialist?</>}
+        trap={<>(b)(c)(d) are not removed.</>}
+        lens={<>The dropped piece is "training-time reweighting". Everything else stays.</>}
+        stretch={<>What does this imply for offline-online metric reconciliation?</>}
       />
 
+      {/* axis: B1 */}
       <VIS.TrapProblem
-        id="pr-p5" difficulty="hard"
-        title="P5 — Router as a learned model: features?"
-        scenario={<>You decide to use a LEARNED router instead of a popularity-threshold. What features should the router use?</>}
+        id="poprt-p5" difficulty="hard" multiSelect
+        title="P5 — When does PopRT's mechanism actually pay off?"
+        scenario={<><em>Discriminating insight: PopRT wins when (i) head model is already sharp and expensive to retrain, AND (ii) tail intent can be detected from query context, AND (iii) catalog is severely 80/20 skewed.</em><br/>Pick scenarios where PopRT beats IPW. Select all that apply.</>}
         options={[
-          {key:"a", text:"Item popularity (interaction count) only."},
-          {key:"b", text:"Item popularity, user context, item context (category, age, content type) &mdash; the router learns when each specialist is more reliable.", correct:true},
-          {key:"c", text:"User features only."},
-          {key:"d", text:"Just the candidate&apos;s ID."},
+          {key:"a", text:"Existing head-item model is heavily tuned and retraining is a multi-week project; tail is critical for engagement.", correct:true},
+          {key:"b", text:"Tail intent is detectable from query/session context (search query 'obscure 70s prog rock' vs 'top hits').", correct:true},
+          {key:"c", text:"Catalog has extreme 80/20 skew (movie streaming, book retail).", correct:true},
+          {key:"d", text:"Catalog is uniformly distributed; no head-tail split."},
+          {key:"e", text:"You can afford 2× training cost and the head model can be retrained from scratch."},
         ]}
-        trap={<>(a) is the rule-based version, not learned. (c) and (d) miss the point &mdash; the decision depends on which specialist will be more accurate FOR THIS CANDIDATE, which requires item features.</>}
-        lens={<>The learned router is a classification head over (user, item, context) features predicting &quot;which specialist will be more accurate?&quot; Training labels: use cross-validation on head/tail model accuracy on each example. This is mixture-of-experts gating.</>}
-        stretch={<>What loss function should the router be trained with?</>}
+        trap={<>(d) no skew = no need. (e) BISER becomes viable; PopRT is over-engineering.</>}
+        lens={<>The "Goldilocks zone": skewed catalog + detectable tail intent + expensive-to-retrain head.</>}
+        stretch={<>What is the minimum head-tail ratio where PopRT starts to pay?</>}
       />
 
+      {/* axis: B2 */}
       <VIS.TrapProblem
-        id="pr-p6" difficulty="hard" mode="ordered"
-        title="P6 — Order your debugging steps when overall NDCG drops 0.5% after PopRT launch"
-        scenario={<>Overall NDCG fell 0.5% post-PopRT launch. Order your investigation. Wrong moves do not get ranked.</>}
+        id="poprt-p6" difficulty="medium"
+        title="P6 — When NOT to use PopRT"
+        scenario={<><em>Discriminating insight: PopRT fails when tail intent is undetectable from context, when catalog is uniform, or when router cannot be calibrated for lack of tail eval data.</em><br/>Strongest argument AGAINST PopRT?</>}
         options={[
-          {key:"a", text:"Slice NDCG by head/tail &mdash; is the regression in head, tail, or boundary items?", order:1},
-          {key:"b", text:"Inspect router decisions on a sample &mdash; is the boundary calibrated?", order:2},
-          {key:"c", text:"Compare PopRT scores vs head-only scores for boundary items.", order:3},
-          {key:"d", text:"Roll back PopRT immediately."},
-          {key:"e", text:"Retrain both models from scratch."},
+          {key:"a", text:"Tail intent is not detectable from query/session context AND tail evals are too sparse to calibrate the router — the router will swing randomly between head and tail handlers, regressing both.", correct:true},
+          {key:"b", text:"PopRT uses two models."},
+          {key:"c", text:"PopRT does not retrain the model."},
+          {key:"d", text:"PopRT is for long-tail."},
         ]}
-        trap={<>(d) is destructive. (e) is over-eager and probably wasteful.</>}
-        lens={<>Head/tail slicing &rarr; router inspection &rarr; boundary score diff is the natural diagnostic for ensemble systems. Most PopRT regressions trace to the boundary (router miscalibration) rather than either model individually.</>}
-        stretch={<>What dashboard metric would have caught this BEFORE the user-visible drop?</>}
+        trap={<>(b)(c)(d) are descriptive, not arguments against.</>}
+        lens={<>The router is the load-bearing piece. Without signal to calibrate it, PopRT collapses to the head model alone.</>}
+        stretch={<>What is the minimum tail-eval volume to calibrate?</>}
       />
 
+      {/* axis: B3 */}
       <VIS.TrapProblem
-        id="pr-p7" difficulty="medium"
-        title="P7 — Tail data is too sparse to train a specialist"
-        scenario={<>Your tail items have only 0.5 interactions per item on average. The tail specialist trained on this data is barely better than random. What do you do?</>}
+        id="poprt-p7" difficulty="hard"
+        title="P7 — Stakeholder pitch hinging on the UNIQUE mechanism"
+        scenario={<><em>Discriminating insight: pitch must name no-retrain + serving-time + head-stays-sharp. Generic "fixes long tail" pitches survive redaction.</em><br/>VP asks "why PopRT?" in 2 sentences. Pick the pitch that does NOT generalize to any long-tail method.</>}
         options={[
-          {key:"a", text:"Drop PopRT &mdash; tail is too sparse; use content-based or hybrid methods instead."},
-          {key:"b", text:"Combine PopRT with content features: a tail specialist using content embeddings (not just collaborative signals) is learnable even at 0.5 interactions/item.", correct:true},
-          {key:"c", text:"Increase the boundary so head is smaller and tail has more items."},
-          {key:"d", text:"Retrain on more epochs."},
+          {key:"a", text:"PopRT improves tail without retraining the head — the head model stays sharp and we add a serving-time popularity-context router + tail specialist. Zero risk to the head NDCG that the existing business depends on.", correct:true},
+          {key:"b", text:"PopRT improves long-tail recall."},
+          {key:"c", text:"PopRT is state of the art."},
+          {key:"d", text:"PopRT reduces popularity bias."},
         ]}
-        trap={<>(a) is the giving-up answer. (c) does not add data per tail item. (d) overfits faster, does not help.</>}
-        lens={<>When pure collaborative signal is insufficient for the tail, you augment with content (text/image embeddings of items). A content-aware tail specialist can learn from item attributes when interaction data is too sparse. This is the standard recipe for very long-tail catalogs.</>}
-        stretch={<>What is the failure mode when the content features themselves are weak?</>}
+        trap={<>(b)(c)(d) survive redaction.</>}
+        lens={<>Name the unique combo: no-retrain + serving-time + head-untouched.</>}
+        stretch={<>What dashboard metric defends the ongoing router complexity?</>}
       />
 
+      {/* axis: C1 */}
       <VIS.TrapProblem
-        id="pr-p8" difficulty="hard"
-        title="P8 — Why does naive IPW hurt the head?"
-        scenario={<>Walk through WHY IPW reweighting reduces head accuracy.</>}
+        id="poprt-p8" difficulty="hard"
+        title="P8 — Where does the popularity correction live?"
+        scenario={<><em>Discriminating insight: in the serving stack, between the head model&apos;s score output and the final ranking. NOT in the embeddings, not in the loss, not in the data pipeline.</em><br/>Where, architecturally, does PopRT's intervention sit?</>}
         options={[
-          {key:"a", text:"IPW divides each example by its propensity. Head items have high propensity, so their gradients shrink. The head model learns from fewer effective head examples and accuracy drops.", correct:true},
-          {key:"b", text:"IPW adds noise to head examples."},
-          {key:"c", text:"IPW changes the loss to be biased toward tail."},
-          {key:"d", text:"IPW is theoretically unbiased; head accuracy cannot drop."},
+          {key:"a", text:"In the serving stack, between the head model's score outputs and the final ranking — either as output-score reweighting or a router that diverts tail-intent queries to a small tail specialist.", correct:true},
+          {key:"b", text:"In the loss function."},
+          {key:"c", text:"In the embedding store."},
+          {key:"d", text:"In the data pipeline."},
         ]}
-        trap={<>(b) is wrong mechanism. (c) is a near-miss &mdash; IPW corrects bias but the cost is reduced effective sample size on the head. (d) is the theoretical fantasy that ignores finite-sample reality.</>}
-        lens={<>IPW is unbiased in expectation but reduces the effective sample size on high-propensity items. Head items, by definition, have high propensity. So head learning suffers gradient starvation. PopRT&apos;s insight: do not pay this cost &mdash; keep the head as-is.</>}
-        stretch={<>What is the effective sample size formula for IPW estimators?</>}
+        trap={<>(b)(c)(d) are all places PopRT explicitly does NOT touch.</>}
+        lens={<>Serving-time intervention is the architectural inversion vs IPW/BISER/DRE.</>}
+        stretch={<>What about latency impact at the serving layer?</>}
       />
 
+      {/* axis: C2 */}
       <VIS.TrapProblem
-        id="pr-p9" difficulty="medium" multiSelect
-        title="P9 — Metric design for evaluating PopRT"
-        scenario={<>You are evaluating PopRT vs a single-model baseline. Which metrics are essential to monitor? Select all that apply.</>}
+        id="poprt-p9" difficulty="hard"
+        title="P9 — Fragile knob: the router"
+        scenario={<><em>Discriminating insight: the router threshold (or reweighting calibration) is the fragile knob. Mis-calibrated, it produces a fuzzy seam where head-confident vs tail-confident queries disagree.</em><br/>Which knob, mis-set, most reliably breaks PopRT?</>}
         options={[
-          {key:"a", text:"Overall NDCG.", correct:true},
-          {key:"b", text:"NDCG sliced by head/medium/tail item popularity buckets.", correct:true},
-          {key:"c", text:"Item-coverage in top-K recommendations (how many distinct items shown).", correct:true},
-          {key:"d", text:"Score discontinuity at the head/tail boundary.", correct:true},
-          {key:"e", text:"Training loss only."},
+          {key:"a", text:"The popularity-context router threshold — the boundary between 'route to head model' and 'route to tail specialist'. Mis-calibrated, you get a fuzzy seam region where regressions appear.", correct:true},
+          {key:"b", text:"Learning rate."},
+          {key:"c", text:"Batch size."},
+          {key:"d", text:"Optimizer."},
         ]}
-        trap={<>(e) is necessary but not sufficient.</>}
-        lens={<>Four metrics matter: (a) the overall KPI, (b) the per-segment KPI to verify both specialists are pulling their weight, (c) coverage as the tail-health signal, (d) boundary discontinuity as the PopRT-specific failure mode. Slice-by-popularity is what reveals whether the head/tail split helped at all.</>}
-        stretch={<>How would you set an alert threshold on (d)?</>}
+        trap={<>(b)(c)(d) are generic, not PopRT-specific.</>}
+        lens={<>The router IS PopRT. Treat its threshold as the regularization knob.</>}
+        stretch={<>How would you A/B the threshold safely?</>}
       />
 
+      {/* axis: C3 */}
       <VIS.TrapProblem
-        id="pr-p10" difficulty="hard"
-        title="P10 — Three-segment vs two-segment routing"
-        scenario={<>Should you generalize PopRT to head/medium/tail (three segments) instead of head/tail (two)?</>}
+        id="poprt-p10" difficulty="medium"
+        title="P10 — Robust knob"
+        scenario={<><em>Discriminating insight: the tail specialist&apos;s capacity is robust within range; the head model is untouched (its hyperparameters were already tuned).</em><br/>Which knob is robust in PopRT?</>}
         options={[
-          {key:"a", text:"Yes &mdash; more segments are always better."},
-          {key:"b", text:"No &mdash; never."},
-          {key:"c", text:"Depends &mdash; three segments add a model AND two boundaries to calibrate. Worth it only if the middle segment has distinct properties (different feature reliability or interaction density) from both head and tail.", correct:true},
-          {key:"d", text:"Yes &mdash; the paper recommends it."},
+          {key:"a", text:"Tail-specialist model capacity (within order-of-magnitude variation) — the head's pre-existing tuning dominates total performance.", correct:true},
+          {key:"b", text:"Router threshold."},
+          {key:"c", text:"Reweighting calibration."},
+          {key:"d", text:"Head model's LR."},
         ]}
-        trap={<>(a) ignores the additional engineering cost. (b) is too absolute. (d) is fictional &mdash; the paper sticks with two segments.</>}
-        lens={<>Three segments require a third model, third training pipeline, and TWO calibrated boundaries (head/medium and medium/tail). The win must justify these costs. In practice, it does only when the medium segment has a genuinely distinct distribution (e.g., items with bimodal popularity history). Otherwise, two segments wins on simplicity.</>}
-        stretch={<>How would you decide empirically whether the middle segment is &quot;distinct enough&quot;?</>}
+        trap={<>(b)(c) are the fragile ones. (d) head model is untouched, so its LR is moot.</>}
+        lens={<>Focus tuning effort on the router; the specialist is robust.</>}
+        stretch={<>What does "robust" mean quantitatively here?</>}
       />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="poprt-p11" difficulty="hard"
+        title="P11 — The seam problem"
+        scenario={<><em>Discriminating insight: the boundary between head-route and tail-route creates a SEAM where the two handlers disagree on borderline queries. Regressions concentrate here.</em><br/>Where do PopRT regressions concentrate?</>}
+        options={[
+          {key:"a", text:"At the boundary of the popularity-context router — borderline queries (moderately popular items, ambiguous intent) get inconsistent treatment from head vs tail handlers, producing local NDCG regressions on the seam.", correct:true},
+          {key:"b", text:"On head queries."},
+          {key:"c", text:"On tail queries only."},
+          {key:"d", text:"On uniform-distribution queries."},
+        ]}
+        trap={<>(b)(c)(d) miss the seam-specific failure mode.</>}
+        lens={<>The seam is a real ops concern. Smooth-routing (soft mixture instead of hard route) is the common mitigation.</>}
+        stretch={<>How would you measure the seam width?</>}
+      />
+
+      {/* axis: D1 */}
+      <VIS.TrapProblem
+        id="poprt-p12" difficulty="medium"
+        title="P12 — Common misconception: 'PopRT is just IPW with extra steps'"
+        scenario={<><em>Discriminating insight: PopRT does NOT touch training. IPW does. The whole point of PopRT is to AVOID the head-degrading effect of training-time reweighting.</em><br/>"PopRT is just IPW deployed slightly differently." Correct?</>}
+        options={[
+          {key:"a", text:"No — IPW reweights gradients during training (degrades head). PopRT does no training intervention; reweighting (or routing) happens at SERVING, where the head model stays untouched. Different intervention point, different cost profile.", correct:true},
+          {key:"b", text:"Yes — same thing."},
+          {key:"c", text:"Yes — both reweight."},
+          {key:"d", text:"Yes — both target popularity."},
+        ]}
+        trap={<>(b)(c)(d) miss the intervention-point distinction.</>}
+        lens={<>Same goal, different intervention point, different cost.</>}
+        stretch={<>When would you still prefer IPW?</>}
+      />
+
+      {/* axis: D2 */}
+      <VIS.TrapProblem
+        id="poprt-p13" difficulty="hard"
+        title="P13 — Cause looks like A but is actually B"
+        scenario={<><em>Discriminating insight: tail-recall regression often LOOKS like "tail specialist is broken" but is specifically "router threshold drifted; tail queries are being routed to the head model" &mdash; different fix surface.</em><br/>Tail NDCG drops. Generic reading: "specialist broken". PopRT-specific reading?</>}
+        options={[
+          {key:"a", text:"Likely a router-threshold drift — popularity-context router is mis-classifying tail-intent queries as head-intent, so they get routed to the head model (which under-serves them). Diagnose via router-output distribution; fix by recalibrating the threshold.", correct:true},
+          {key:"b", text:"Roll back."},
+          {key:"c", text:"Add dropout."},
+          {key:"d", text:"Retrain head."},
+        ]}
+        trap={<>(b)(c)(d) are generic.</>}
+        lens={<>The first PopRT-specific diagnostic is router output distribution.</>}
+        stretch={<>How would you instrument continuous router monitoring?</>}
+      />
+
+      {/* axis: D3 */}
+      <VIS.TrapProblem
+        id="poprt-p14" difficulty="medium"
+        title="P14 — Wrong-assumption cascade"
+        scenario={<><em>Discriminating insight: framing PopRT as "must build a separate model for the tail" cascades into a multi-week training project. The actual paper presents the REWEIGHTING variant as the no-retrain option.</em><br/>Pick the framing root that cascades into avoidable infra work.</>}
+        options={[
+          {key:"a", text:"Assuming PopRT requires a separately trained tail model — leads to a 4-week training project, when the lightweight variant is just output reweighting against a popularity prior, deployable in days.", correct:true},
+          {key:"b", text:"Assuming PopRT requires GPUs."},
+          {key:"c", text:"Assuming PopRT is for explicit feedback."},
+          {key:"d", text:"Assuming PopRT changes the head model."},
+        ]}
+        trap={<>(b)(c) are local. (d) is also true and bad but the cascade in (a) is larger.</>}
+        lens={<>Pick the cheapest PopRT variant that gives the lift you need.</>}
+        stretch={<>When does the routed-specialist variant beat reweighting?</>}
+      />
+
+      {/* axis: D4 */}
+      <VIS.TrapProblem
+        id="poprt-p15" difficulty="medium"
+        title="P15 — Junior gets right but misses senior point"
+        scenario={<><em>Discriminating insight: junior says "specialist for tail". Senior point: no retrain + serving-time intervention + the SEAM is the load-bearing risk.</em><br/>Pick the answer that is TRUE but misses the senior point.</>}
+        options={[
+          {key:"a", text:"PopRT uses a specialist model for tail items.", correct:true},
+          {key:"b", text:"PopRT's value is no retrain — head sharpness is preserved at zero training cost."},
+          {key:"c", text:"PopRT's failure mode is at the seam between head and tail routing."},
+          {key:"d", text:"PopRT can also be deployed as pure output reweighting without a specialist."},
+        ]}
+        trap={<>(a) is true and survives redaction &mdash; could describe any head-tail multi-model system.</>}
+        lens={<>Senior point: no retrain + serving-time + seam-as-risk.</>}
+        stretch={<>Smallest ablation that proves the no-retrain claim?</>}
+      />
+
+      {/* axis: E1 */}
+      <VIS.TrapProblem
+        id="poprt-p16" difficulty="hard"
+        title="P16 — Friday 3am page: PopRT-unique symptom"
+        scenario={<><em>Discriminating insight: page-grade symptom is "router output distribution shifted + tail NDCG regressed". Generic drift would not move router output.</em><br/>Page: tail NDCG -3%, router-output distribution shifted to 90% head-route from 60%. Root cause?</>}
+        options={[
+          {key:"a", text:"Popularity-context features used by the router drifted (e.g., new content categories, query-string vocabulary shift). Router is mis-routing tail queries to the head model. Recalibrate router; rebuild popularity-context features.", correct:true},
+          {key:"b", text:"Generic data drift."},
+          {key:"c", text:"Embedding store corrupted."},
+          {key:"d", text:"Logging policy changed."},
+        ]}
+        trap={<>(b)(c)(d) generic; the conjunction is PopRT-unique.</>}
+        lens={<>Router output is the canonical PopRT health metric.</>}
+        stretch={<>What is the alert threshold?</>}
+      />
+
+      {/* axis: E2 */}
+      <VIS.TrapProblem
+        id="poprt-p17" difficulty="medium"
+        title="P17 — Open-source default that bites"
+        scenario={<><em>Discriminating insight: most PopRT implementations default the router threshold to a fixed 50th percentile of popularity &mdash; rarely correct for your catalog. Always recalibrate per-deployment.</em><br/>Default-config trap?</>}
+        options={[
+          {key:"a", text:"Router threshold defaults to the 50th percentile of training-set popularity — usually wrong for your serving distribution. Recalibrate against held-out tail-eval before believing any numbers.", correct:true},
+          {key:"b", text:"Learning rate."},
+          {key:"c", text:"Adam optimizer."},
+          {key:"d", text:"Batch size."},
+        ]}
+        trap={<>(b)(c)(d) generic.</>}
+        lens={<>Always inspect the router threshold default. Calibrate to your data.</>}
+        stretch={<>What unit test would enforce this?</>}
+      />
+
+      {/* axis: E3 */}
+      <VIS.TrapProblem
+        id="poprt-p18" difficulty="hard" mode="ordered"
+        title="P18 — Order the PopRT rollout"
+        scenario={<><em>Discriminating insight: keep head model frozen; build router; offline-eval router; shadow against pure-head baseline; calibrate threshold last.</em><br/>Order. Wrong moves do not get ranked.</>}
+        options={[
+          {key:"a", text:"Snapshot the head model; build popularity-context features for the router.", order:1},
+          {key:"b", text:"Train router (or fit reweighting calibration) on held-out tail eval.", order:2},
+          {key:"c", text:"Shadow A/B vs pure head model.", order:3},
+          {key:"d", text:"Calibrate router threshold against live traffic.", order:4},
+          {key:"e", text:"Retrain the head model."},
+          {key:"f", text:"Roll to 100% on day 1."},
+        ]}
+        trap={<>(e) violates PopRT's no-retrain claim. (f) skips safety.</>}
+        lens={<>Head-frozen + build router + shadow + calibrate.</>}
+        stretch={<>Rollback signal?</>}
+      />
+
+      {/* axis: F1 */}
+      <VIS.TrapProblem
+        id="poprt-p19" difficulty="medium"
+        title="P19 — Failure: uniform catalog"
+        scenario={<><em>Discriminating insight: when popularity distribution is uniform, there is no "head" and "tail" to separate. PopRT collapses to the head model alone.</em><br/>Catalog is uniform (no 80/20 skew). PopRT outcome?</>}
+        options={[
+          {key:"a", text:"PopRT collapses to the head model alone — the router has no popularity gradient to exploit, and reweighting against a uniform prior is the identity. No lift, just added latency from the router pass-through.", correct:true},
+          {key:"b", text:"Strong lift on long tail."},
+          {key:"c", text:"Strong lift on head."},
+          {key:"d", text:"Random behavior."},
+        ]}
+        trap={<>(b)(c)(d) misread the mechanism.</>}
+        lens={<>No skew, no benefit. Match the method to the data shape.</>}
+        stretch={<>What is the minimum skew where PopRT pays?</>}
+      />
+
+      {/* axis: F2 */}
+      <VIS.TrapProblem
+        id="poprt-p20" difficulty="hard"
+        title="P20 — Adversarial input that breaks PopRT specifically"
+        scenario={<><em>Discriminating insight: an attacker can craft queries that LOOK like tail-intent (popularity-context features) but should route to head. Forces the router to mis-classify, exploiting the seam.</em><br/>Which adversarial input most specifically breaks PopRT?</>}
+        options={[
+          {key:"a", text:"Queries crafted to manipulate the popularity-context router into the wrong handler — exploit the seam. Mitigation: smooth (mixture) routing instead of hard route; monitor router-output distribution for anomalies.", correct:true},
+          {key:"b", text:"Random click noise."},
+          {key:"c", text:"Popular-item flooding."},
+          {key:"d", text:"Long user history."},
+        ]}
+        trap={<>(b)(c)(d) are generic.</>}
+        lens={<>The router is the attack surface. Smooth-route to limit adversarial leverage.</>}
+        stretch={<>How would you detect router manipulation in flight?</>}
+      />
+
+      {/* axis: F3 */}
+      <VIS.TrapProblem
+        id="poprt-p21" difficulty="hard"
+        title="P21 — Reweighting vs routing variants — when which?"
+        scenario={<><em>Discriminating insight: REWEIGHTING is cheaper (no second model) but blunter (cannot specialize for tail patterns). ROUTING is heavier but sharper for tail.</em><br/>You have a tight latency budget (50ms p99). Which PopRT variant?</>}
+        options={[
+          {key:"a", text:"Output reweighting — adds a multiplicative pass over candidate scores, ~1ms overhead. The routed-specialist variant adds a second model forward, blowing the budget.", correct:true},
+          {key:"b", text:"Routed specialist — always sharper."},
+          {key:"c", text:"Both, ensembled."},
+          {key:"d", text:"Neither."},
+        ]}
+        trap={<>(b) ignores latency. (c) doubles cost. (d) gives up.</>}
+        lens={<>Variant choice has a latency-vs-quality tradeoff. Tight p99 ⇒ reweighting.</>}
+        stretch={<>What is the NDCG gap between variants?</>}
+      />
+
+      {/* axis: F4 */}
+      <VIS.TrapProblem
+        id="poprt-p22" difficulty="medium"
+        title="P22 — Edge case: claim collapses"
+        scenario={<><em>Discriminating insight: PopRT&apos;s advantage collapses when (i) catalog is uniform OR (ii) router cannot be calibrated OR (iii) head intent equals tail intent (no detectable context).</em><br/>Pick the case where PopRT&apos;s advantage shrinks to ~zero.</>}
+        options={[
+          {key:"a", text:"No detectable signal that separates tail-intent from head-intent queries — router output is near-random, and reweighting against an irrelevant prior adds noise.", correct:true},
+          {key:"b", text:"Large head-tail gap."},
+          {key:"c", text:"Tail items have rich content."},
+          {key:"d", text:"Existing head model is sharp."},
+        ]}
+        trap={<>(b)(c)(d) all SUPPORT PopRT&apos;s edge.</>}
+        lens={<>Without signal, no router can work.</>}
+        stretch={<>How would you quantify "detectable signal"?</>}
+      />
+
+      {/* axis: F5 */}
+      <VIS.TrapProblem
+        id="poprt-p23" difficulty="medium"
+        title="P23 — Paper-admitted limitation"
+        scenario={<><em>Discriminating insight: paper admits router calibration is fragile + the seam causes local regressions. Compute cost is not the admitted limit (PopRT is cheap).</em><br/>Which is the paper-admitted limitation?</>}
+        options={[
+          {key:"a", text:"Router calibration is fragile, and the boundary between head-route and tail-route ('seam') causes local regressions on borderline queries.", correct:true},
+          {key:"b", text:"Compute cost is too high."},
+          {key:"c", text:"Cannot handle uniform catalog."},
+          {key:"d", text:"Needs item embeddings."},
+        ]}
+        trap={<>(b) opposite of truth. (c) true but not the paper&apos;s framed limit. (d) generic.</>}
+        lens={<>Always read the limitations section.</>}
+        stretch={<>Smallest mitigation for the seam?</>}
+      />
+
+      {/* axis: F6 */}
+      <VIS.TrapProblem
+        id="poprt-p24" difficulty="medium"
+        title="P24 — Cost structure"
+        scenario={<><em>Discriminating insight: training cost is zero (head model unchanged); serving cost adds a router pass + optionally a specialist forward. Storage adds the specialist&apos;s weights.</em><br/>Where is PopRT&apos;s extra cost concentrated?</>}
+        options={[
+          {key:"a", text:"Serving only: a router forward (small) + optionally a tail-specialist forward (modest). Training cost is zero by design.", correct:true},
+          {key:"b", text:"Training."},
+          {key:"c", text:"Labeling."},
+          {key:"d", text:"Embedding store."},
+        ]}
+        trap={<>(b)(c)(d) misread.</>}
+        lens={<>Pay at serving, harvest the sharp head and the cold-deploy.</>}
+        stretch={<>What is the back-of-envelope latency overhead?</>}
+      />
+
+      {/* axis: F7 */}
+      <VIS.TrapProblem
+        id="poprt-p25" difficulty="hard"
+        title="P25 — Stacking PopRT with BISER or DRE"
+        scenario={<><em>Discriminating insight: PopRT (serving-time) and BISER (training-time) operate at different intervention points and can compose. DRE (representation-time) can also stack but you must order: train DRE-augmented model first, then deploy with PopRT routing.</em><br/>Can PopRT compose with BISER or DRE?</>}
+        options={[
+          {key:"a", text:"Yes — different intervention points. Train BISER (debias at training) for the head model; then deploy under PopRT router for tail intent. Same for DRE-augmented head. The interventions are orthogonal.", correct:true},
+          {key:"b", text:"No — they conflict."},
+          {key:"c", text:"Only with IPW."},
+          {key:"d", text:"Only at inference ensembling."},
+        ]}
+        trap={<>(b) overstates. (c)(d) miss the composition pattern.</>}
+        lens={<>Intervention-point composability: training-time methods stack under PopRT cleanly.</>}
+        stretch={<>Which combo would you try first?</>}
+      />
+
+      {/* axis: F8 */}
+      <VIS.TrapProblem
+        id="poprt-p26" difficulty="medium"
+        title="P26 — Reproducibility"
+        scenario={<><em>Discriminating insight: PopRT&apos;s reproducibility hinges on the EXACT router-feature set + threshold + (if used) specialist architecture. Head model details are inherited.</em><br/>What must be fixed to reproduce?</>}
+        options={[
+          {key:"a", text:"Router feature set + threshold + (if routed-variant) tail-specialist architecture. The head model is whatever you used; PopRT is the wrapper.", correct:true},
+          {key:"b", text:"Just the seed."},
+          {key:"c", text:"Just the LR."},
+          {key:"d", text:"Just the head model."},
+        ]}
+        trap={<>(b)(c) generic. (d) misses the wrapper.</>}
+        lens={<>The experimental artifact is the SERVING-WRAPPER config.</>}
+        stretch={<>How would you publish a reproducible PopRT setup?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://arxiv.org/abs/2410.02776" target="_blank" rel="noopener">Anonymous &mdash; <em>Bypassing the Popularity Bias: Repurposing Models for Better Long-Tail Recommendation</em> (arXiv 2024)</a> &mdash; primary source. Section 4 contains the router-design ablations.</li>
-        <li><a href="https://eugeneyan.com/writing/popularity/" target="_blank" rel="noopener">Eugene Yan &mdash; <em>Patterns for Popularity Bias in Recommendation Systems</em> (blog)</a> &mdash; practitioner roundup; PopRT, IPW, DRO, and content-based augmentation in one place.</li>
-        <li><a href="https://arxiv.org/abs/2010.03240" target="_blank" rel="noopener">Wei et al. &mdash; <em>Model-Agnostic Counterfactual Reasoning for Eliminating Popularity Bias in Recommender System</em> (KDD 2021)</a> &mdash; counterfactual alternative to PopRT; useful contrast.</li>
-        <li><a href="https://lilianweng.github.io/posts/2022-05-26-mixture-of-experts/" target="_blank" rel="noopener">Lilian Weng &mdash; <em>Mixture of Experts</em> (blog)</a> &mdash; the gating-network theory PopRT&apos;s router is a special case of.</li>
-        <li><a href="https://arxiv.org/abs/2202.08533" target="_blank" rel="noopener">Zhang et al. &mdash; <em>Causal Intervention for Leveraging Popularity Bias in Recommendation</em> (SIGIR 2021)</a> &mdash; causal-graph alternative; different philosophy, same problem.</li>
+        <li><a href="https://arxiv.org/abs/2410.02776" target="_blank" rel="noopener">Bypassing the Popularity Bias: Repurposing Models for Better Long-Tail Recommendation (arXiv 2024)</a> — primary source.</li>
+        <li><a href="https://eugeneyan.com/writing/long-tail/" target="_blank" rel="noopener">Eugene Yan — <em>How to Find Your Niche in Recommendations (long tail)</em> (blog)</a> — practitioner framing for long-tail product strategy.</li>
+        <li><a href="https://medium.com/@bugraa/the-fairness-of-recommender-systems-d8d3a32a6648" target="_blank" rel="noopener">Bugra Akyildiz — <em>Fairness and Long-Tail in Recommender Systems</em> (blog)</a> — head/tail split mental model.</li>
+        <li><a href="https://www.cs.cornell.edu/people/tj/publications/joachims_etal_17a.pdf" target="_blank" rel="noopener">Joachims et al. — <em>Unbiased Learning-to-Rank with Biased Feedback</em> (WSDM 2017)</a> — the IPW baseline PopRT diverges from.</li>
+        <li><a href="https://distill.pub/2020/circuits/" target="_blank" rel="noopener">Distill — <em>Circuits</em></a> — visual intuition for "what the head model already knows", relevant to no-retrain interventions.</li>
       </ul>
     </VIS.Section>
   </main>
