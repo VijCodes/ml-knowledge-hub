@@ -1414,242 +1414,683 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// NeuralUCB — DNN-based UCB exploration; 2024 delayed/corrupted-feedback variants
+// (Zhou et al. ICML 2020; Robust Neural Contextual Bandit NeurIPS 2024)
+// v2 redo — 32 trap problems spanning A-F axes; concept-anchored on
+// gradient-feature confidence bonus, looseness in over-parameterized nets,
+// delayed-reward variants, and last-layer-feature exploration approximation.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="RecSys SOTA · Bandits &amp; online learning"
       title="NeuralUCB (with delayed-feedback variants)"
-      subtitle="Deep-net-based UCB exploration bonus; 2024 robust extension corrects for delayed and adversarially-corrupted feedback that LinUCB-style baselines assume away."
+      subtitle="DNN-based UCB exploration bonus computed from gradient-feature covariance, plus 2024 follow-ups that fix the recsys-fatal assumption of same-step reward."
       byline={[
-        {label: "Paper", value: "Zhou et al. (ICML 2020); robust extension, NeurIPS 2024"},
+        {label: "Paper", value: "Zhou et al., NeuralUCB (ICML 2020); Robust Neural Contextual Bandit against Adversarial Corruptions (NeurIPS 2024)"},
+        {label: "Year", value: "2020 / 2024"},
         {label: "Domain", value: "Mid-scale exploration with non-linear context"},
       ]}/>
 
     <VIS.TLDR>
-      LinUCB&apos;s linear reward assumption breaks the moment your features aren&apos;t curated. NeuralUCB lifts the same UCB recipe to a neural network: predict reward with a DNN, derive an exploration bonus from the network&apos;s <VIS.Term def="The features produced by the network just before its final linear head — used as a kernel-like representation of the input.">last-layer features</VIS.Term> and a NTK-style covariance. The 2024 delayed-feedback variant fixes the standard assumption that reward arrives in the same step as the action — almost never true in recsys, where clicks (and especially conversions) arrive hours later.
+      NeuralUCB replaces LinUCB's linear reward with a neural network f(x; &theta;) and computes the UCB bonus from the network's <VIS.Term def="The Jacobian of the network output with respect to its parameters at x — used as a Neural-Tangent-Kernel-like feature vector for the confidence bonus.">gradient-feature vector</VIS.Term> &nabla;<sub>&theta;</sub>f(x). The 2024 delayed-feedback variants address a recsys-fatal assumption — that reward arrives in the same step — by introducing buffered updates with importance weights. Sources: <a href="https://arxiv.org/abs/1911.04462" target="_blank" rel="noopener">ICML 2020</a>, <a href="https://proceedings.neurips.cc/paper_files/paper/2024/file/22862040c1781356c8c3df4d00e5811b-Paper-Conference.pdf" target="_blank" rel="noopener">NeurIPS 2024</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        NeuralUCB models reward as <code>r ≈ f(x, a; W)</code> with a DNN f. The exploration bonus uses the gradient g = ∇<sub>W</sub>f at the candidate (x, a). A confidence covariance Z accumulates g g^T over history; the bonus is the predicted standard deviation in this Z-norm.
+        Train a neural network f<sub>&theta;</sub>(x) to predict reward. At step t with context x:
       </p>
-      <VIS.Equation display tex={`p_a(x) = f(x, a; W) + \\alpha \\sqrt{g(x,a)^\\top Z^{-1} g(x,a)}, \\quad Z = \\lambda I + \\sum_t g_t g_t^\\top`}/>
+      <VIS.Equation display tex={`p(x) = f_\\theta(x_t) + \\gamma \\sqrt{ g(x_t)^\\top U_t^{-1} g(x_t) }, \\quad g(x) = \\nabla_\\theta f_\\theta(x), \\quad U_t = \\lambda I + \\sum_{s<t} g(x_s) g(x_s)^\\top / m`}/>
       <p>
-        Each step: pick argmax score, observe reward, train the network with one or a few SGD steps, update Z with the chosen gradient.
+        The bonus uses the GRADIENT &nabla;f as the feature vector (instead of LinUCB's raw x), enabling exploration over a learned non-linear representation. In the infinite-width limit, this reduces to a kernel bandit with the <VIS.Term def="The Neural Tangent Kernel — kernel induced by the network's gradient features in the wide-network limit.">Neural Tangent Kernel</VIS.Term>.
+      </p>
+      <p>
+        <strong>Delayed-feedback variants (2024)</strong> change two things: (i) a buffer admits feedback arriving up to D steps late with importance weights w<sub>s</sub> = 1/P(observed by step t); (ii) the bonus is inflated by a delay-dependent factor to account for stale theta.
       </p>
       <VIS.Mermaid chart={`
 flowchart TB
-  X["Context x, arms a"] --> F["DNN f(x,a;W)"]
-  F --> P["Predicted reward"]
-  F --> G["Last-layer gradient"]
-  G --> Z["Update Z"]
-  Z --> B["Bonus α√(g^T Z^-1 g)"]
-  P --> S["Score = pred + bonus"]
-  B --> S
-  S --> A["Pick arg max"]
-  A --> R["Observe reward (delayed)"]
+  X["Context x"] --> F["Net f_theta(x)"]
+  X --> G["Gradient g(x) = grad_theta f"]
+  F --> S["Score = f + gamma sqrt(g^T U^-1 g)"]
+  G --> S
+  S --> A["Argmax arm"]
+  A --> R["Eventually observe reward r"]
+  R --> B["Delay-aware buffer + IW"]
+  B --> T["Periodic theta retrain"]
+  T --> F
+  style B fill:#fef3c7,stroke:#d97706
       `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from siblings">
       <p>
-        LinUCB assumes a single linear θ. NeuralUCB fits a non-linear f and uses gradient features as the kernel. The robust delayed-feedback variant additionally maintains a buffer of unresolved actions and adjusts both the bonus and the SGD updates so that decisions taken before reward arrives are not double-counted as confident.
+        <strong>vs LinUCB:</strong> NeuralUCB lifts the linear reward assumption to non-linear; the bonus uses gradient features &nabla;<sub>&theta;</sub>f instead of raw x. Cost: looser bonus, more compute, no closed-form &theta; update.
       </p>
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>LinUCB</th><th style={{textAlign:"left",padding:8}}>NeuralUCB (vanilla)</th><th style={{textAlign:"left",padding:8}}>Delayed/Robust NUCB</th></tr></thead>
+      <p>
+        <strong>vs Thompson Sampling with neural posterior:</strong> Neural-TS samples from an approximate posterior; NeuralUCB takes the deterministic upper bound. Same predictive backbone, different exploration source.
+      </p>
+      <p>
+        <strong>vs NeuralUCB without delay variant:</strong> vanilla NeuralUCB assumes reward arrives same-step. In recsys (watch-time, conversion, retention), reward lags hours-to-weeks. The 2024 delay-aware variant fixes this with a buffered importance-weighted update.
+      </p>
+      <p>
+        <strong>vs Robust-NeuralUCB (NeurIPS 2024):</strong> handles adversarial reward corruption (e.g. bots faking clicks) via a trimmed/robust loss. Same network architecture; different loss head.
+      </p>
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>LinUCB</th><th style={{textAlign:"left",padding:8}}>NeuralUCB</th><th style={{textAlign:"left",padding:8}}>NeuralUCB-Delay</th></tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Reward model</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Linear</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>DNN</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>DNN</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Bonus shape</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>x^T A^-1 x</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>g^T Z^-1 g</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>g^T Z^-1 g + pending-action penalty</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Feedback timing</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Same step</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Same step</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Bounded random delay</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Robust to noise corruption</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>No</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>No</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Bounded by C</td></tr>
+          <tr><td style={{padding:8}}>Reward model</td><td style={{padding:8}}>Linear</td><td style={{padding:8}}>Neural net</td><td style={{padding:8}}>Neural net + delay correction</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Bonus features</td><td style={{padding:8}}>Raw x</td><td style={{padding:8}}><strong>grad_theta f(x)</strong></td><td style={{padding:8}}><strong>grad_theta f(x), delay-inflated</strong></td></tr>
+          <tr><td style={{padding:8}}>Reward timing</td><td style={{padding:8}}>Same-step assumed</td><td style={{padding:8}}>Same-step assumed</td><td style={{padding:8}}><strong>Bounded delay D</strong></td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Bonus tightness</td><td style={{padding:8}}>Tight</td><td style={{padding:8}}><strong>Loose for wide nets</strong></td><td style={{padding:8}}>Looser still</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>Mid-scale exploration with non-linear context — image/text embeddings, dense interactions.</li>
-        <li>Delayed feedback you can measure (e.g. typical click latency around 90th percentile is bounded).</li>
-        <li>Adversarial environments (click fraud, brigading) where vanilla UCB is exploited.</li>
-        <li>You have a held-out replay set to tune α (the bonus is provably loose for over-parameterized nets).</li>
-      </ul>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
+      <p>
+        Pick NeuralUCB when: (1) reward is non-linear in context AND hand-engineered crosses can't recover it cheaply, (2) you can absorb the loose-bonus tax (mid-scale exploration setting), (3) reward is observable in the same step OR you accept the delay variant's bonus inflation, (4) you have GPU compute for periodic retrain. Skip when (1) reward is genuinely linear (LinUCB wins), (2) feedback delays exceed the delay variant's bound, (3) you need closed-form interpretability for senior review.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  Q1{"Linear reward holds?"}
+  Q1 -->|Yes| Lin["LinUCB"]
+  Q1 -->|No| Q2{"Same-step reward?"}
+  Q2 -->|Yes| N["NeuralUCB (vanilla)"]
+  Q2 -->|No| Q3{"Delay bounded by D steps?"}
+  Q3 -->|Yes| ND["NeuralUCB-Delay variant"]
+  Q3 -->|No| OffDR["Off-policy doubly-robust + offline retrain"]
+  style ND fill:#dcfce7,stroke:#16a34a
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <ul>
-        <li><strong>Loose bonus</strong> — for very wide nets, the theoretical bonus over-explores; tune α down empirically.</li>
-        <li><strong>Z grows</strong> — storing g g^T for full parameter count is huge; use last-layer or projection.</li>
-        <li><strong>Delayed feedback bias</strong> — if reward is logged when it arrives, the design matrix has a stale view of the world.</li>
-        <li><strong>Network drift</strong> — gradient features change as W trains; Z conditioned on old gradients is no longer faithful.</li>
-      </ul>
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations &amp; gotchas">
+      <p>
+        <strong>Confidence bound is provably loose</strong> in over-parameterized nets — the gradient-feature covariance grows with width m, so the bonus over-estimates uncertainty and over-explores. <strong>Delayed feedback breaks vanilla NeuralUCB</strong>: the gradient bonus is computed at the CURRENT theta, but theta was the WRONG estimator when the action was taken; updates are biased. <strong>Per-step gradient compute</strong> is expensive; production typically batches gradient features. <strong>Catastrophic forgetting</strong>: periodic retrain on recent data can erase rare-arm responses; needs replay buffer. <strong>Last-layer-only approximation</strong>: in practice many implementations replace &nabla;<sub>&theta;</sub>f with the last-layer features for tractability; this changes the theoretical guarantees.
+      </p>
+      <VIS.Callout kind="gotcha" title="Bonus looseness is a FEATURE in theory, BUG in practice">
+        The theoretical bound holds for ALL widths m, so the looseness is the price of generality. In practice, the bonus over-explores; production teams shrink gamma sharply (gamma ~ 0.1 vs theoretical gamma ~ 1) or use the last-layer approximation. The 2024 papers report 30-60% empirical regret reduction from these adjustments.
+      </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
+      <p style={{color:"#475569", marginBottom: 16}}>
+        32 problems across taxonomy axes A-F. Redact "NeuralUCB" to "Model X" — generic-ML or generic-bandits candidates should not be able to answer correctly. Each is anchored to a property NeuralUCB owns (gradient-feature bonus, over-parameterized looseness, delay variant, last-layer approximation).
+      </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity &amp; comparison</h3>
+
+      {/* A1 — NeuralUCB vs LinUCB discriminator */}
       <VIS.TrapProblem
-        id="nuc-p1" difficulty="hard"
-        title="P1 — Why delayed feedback breaks vanilla NeuralUCB"
-        scenario={<>Your platform logs clicks 2-8 hours after impression. You deploy vanilla NeuralUCB tuned for immediate feedback. Two weeks in, regret is 3x what you saw in simulation. Most likely root cause?</>}
+        id="nucb-a1"
+        difficulty="hard"
+        title="A1 — NeuralUCB vs LinUCB"
+        scenario={<>Both compute an exploration bonus of the form alpha sqrt(z^T M^-1 z). What does NeuralUCB use for z that LinUCB does not, and what's the consequence?</>}
         options={[
-          {key:"a", text:"Z and W are updated only when reward arrives, so decisions made in between rely on a confidence estimate that ignores the in-flight pulls — bonus is artificially high.", correct:true},
-          {key:"b", text:"NeuralUCB cannot model click data."},
-          {key:"c", text:"The network needs more parameters."},
-          {key:"d", text:"Z grew too large."},
+          {key:"a", text:"NeuralUCB uses z = grad_theta f(x) — the network gradient at x as a feature vector. LinUCB uses z = x directly. The gradient automatically captures non-linear interactions the network has learned; LinUCB requires you to hand-engineer those features. Consequence: NeuralUCB needs no cross feature engineering but inherits the network's representational quirks AND a confidence bound that's loose in over-parameterized nets — expensive to compute and over-explores.", correct:true},
+          {key:"b", text:"NeuralUCB and LinUCB use the same z."},
+          {key:"c", text:"NeuralUCB uses the last hidden-layer activation."},
+          {key:"d", text:"NeuralUCB drops the bonus."},
         ]}
-        trap={<>(b) is false. (c)(d) are unrelated to the temporal issue.</>}
-        lens={<>Vanilla UCB assumes one (action, reward) per step. When reward is delayed, the bandit has taken many actions whose results have not yet arrived; their gradients should already be counted in Z (or you risk re-exploring the same direction). The robust variant maintains a pending-actions term that inflates the certainty contribution from in-flight pulls.</>}
-        stretch={<>What changes if the delay is unbounded?</>}
+        trap={<>(c) is the practical approximation many implementations use; (a) is the theoretical definition.</>}
+        lens={<>The gradient-feature substitution is the core innovation. Last-layer is a tractability hack with different guarantees.</>}
+        stretch={<>When does last-layer-feature actually give the same regret bound?</>}
       />
 
+      {/* A2 — vanilla NeuralUCB vs Delay variant */}
       <VIS.TrapProblem
-        id="nuc-p2" difficulty="medium" multiSelect
-        title="P2 — Symptoms of an inflated NeuralUCB bonus"
-        scenario={<>Which of these are signals that NeuralUCB&apos;s exploration is too aggressive? Select all that apply.</>}
+        id="nucb-a2"
+        difficulty="hard"
+        title="A2 — NeuralUCB vs delay-aware NeuralUCB"
+        scenario={<>Vanilla NeuralUCB assumes reward arrives in the same step as the action. Your recsys feedback is bounded delay D = 24h. What changes in the algorithm, and what does the regret bound now require?</>}
         options={[
-          {key:"a", text:"Bandit keeps pulling already-well-pulled arms because their bonus stays above their predicted gap.", correct:true},
-          {key:"b", text:"Online regret plateaus much higher than offline simulation.", correct:true},
-          {key:"c", text:"Pulling distribution stays near-uniform after many steps.", correct:true},
-          {key:"d", text:"The reward distribution is heavy-tailed."},
-          {key:"e", text:"The network train loss is high."},
+          {key:"a", text:"Buffer actions with their gradient-features g(x_s); when reward r_s arrives at step s+delay, do the U_t and theta update using the buffered g but apply an importance correction for the staleness of theta at observation time. The regret bound now scales as O(D*sqrt(T)) instead of O(sqrt(T)) — delay multiplies the bound — AND the bonus is inflated by a delay-dependent factor so the algorithm explores MORE while waiting for feedback.", correct:true},
+          {key:"b", text:"No change is needed."},
+          {key:"c", text:"Use TS instead."},
+          {key:"d", text:"Halve gamma."},
         ]}
-        trap={<>(d) is data-dependent, not a bonus issue. (e) is a fitting issue.</>}
-        lens={<>Inflated bonus has three textbook fingerprints: continued exploration of known arms (a), an offline-online regret gap (b), and a near-uniform pulling distribution (c). The fix is α-tuning, projection-based Z, or moving to a smaller / shallower model.</>}
-        stretch={<>How would you A/B α changes without harming production?</>}
+        trap={<>(b) is the naive miss; (d) is a hack that doesn't address the bias.</>}
+        lens={<>Delay enters the bound linearly; the algorithm explicitly buffers + IW-corrects + inflates the bonus.</>}
+        stretch={<>What's the buffer size in memory?</>}
       />
 
+      {/* A3 — counterfactual */}
       <VIS.TrapProblem
-        id="nuc-p3" difficulty="hard"
-        title="P3 — Robust variant&apos;s adversarial-corruption assumption"
-        scenario={<>The 2024 robust NeuralUCB tolerates corruption up to a total budget C. Why is "total budget" a critical detail?</>}
+        id="nucb-a3"
+        difficulty="medium"
+        title="A3 — Counterfactual: no NeuralUCB"
+        scenario={<>If NeuralUCB didn't exist, what's the fallback for non-linear contextual exploration, and concrete cost?</>}
         options={[
-          {key:"a", text:"The bandit shares its exploration budget across pulls; bounded total corruption means the adversary cannot poison every step — regret degrades gracefully in C.", correct:true},
-          {key:"b", text:"C is irrelevant if the network is large enough."},
-          {key:"c", text:"The bandit can recover any corruption pattern."},
-          {key:"d", text:"C bounds per-step noise, not total."},
+          {key:"a", text:"(i) LinUCB on hand-engineered cross features — works if you can find the right crosses; engineering time is the dominant cost. (ii) Random / epsilon-greedy on a neural ranker — exploration is not confidence-shrinking; regret is O(T^(2/3)) vs O(sqrt(T)). (iii) Neural Thompson Sampling — empirical alternative; sampling cost can be high. NeuralUCB's contribution is automated non-linearity discovery for exploration; without it, you pay in engineering OR regret OR both.", correct:true},
+          {key:"b", text:"Random ranking is fine."},
+          {key:"c", text:"No alternative exists."},
+          {key:"d", text:"LinUCB always wins."},
         ]}
-        trap={<>(b) is false. (c) is too strong. (d) misreads "budget".</>}
-        lens={<>The robust theory bounds regret as (regret-no-corruption + O(C)). If the adversary spends C corrupting many small pulls, regret grows linearly in C; if they spend C corrupting one decision badly, the bandit still recovers. The guarantee is on the total, not the per-step pattern.</>}
-        stretch={<>What corruption strategy maximizes the adversary&apos;s damage per unit C?</>}
+        trap={<>(d) is sometimes wrong; (a) is the honest taxonomy.</>}
+        lens={<>The counterfactual is a tradeoff: engineering vs regret vs cost. NeuralUCB trades engineering for compute.</>}
+        stretch={<>When is hand-engineered crosses + LinUCB still the right call?</>}
       />
 
+      {/* A4 — composition with MOCB */}
       <VIS.TrapProblem
-        id="nuc-p4" difficulty="medium"
-        title="P4 — Choosing where to compute g"
-        scenario={<>You implement g = ∇<sub>W</sub>f(x,a) and find Z is too large to store. Best move?</>}
+        id="nucb-a4"
+        difficulty="hard"
+        title="A4 — Composition: NeuralUCB inside MOCB"
+        scenario={<>You want non-linear reward modeling AND fairness floor enforcement. Can NeuralUCB replace LinUCB as the per-objective scorer in MOCB? What carries over, what doesn't?</>}
         options={[
-          {key:"a", text:"Use only last-layer gradients; treat the network up to that point as a fixed feature extractor for the purpose of the bonus.", correct:true},
-          {key:"b", text:"Switch to LinUCB."},
-          {key:"c", text:"Random-project g into a smaller dimension."},
-          {key:"d", text:"Store Z on disk."},
+          {key:"a", text:"Carries over: K per-objective neural heads, gradient-feature bonus per objective, scalarization with dual-adapted w. Does NOT carry over: MOCB's regret + violation analysis assumes the per-objective scorer has tight confidence; NeuralUCB's looseness inflates both regret AND violation bounds — combined system is empirically usable but theoretically less guaranteed. Practical fix: validate empirically on a replay log before claiming the combined system meets the floor.", correct:true},
+          {key:"b", text:"They cannot compose."},
+          {key:"c", text:"The combined regret bound is unchanged."},
+          {key:"d", text:"You must use a TS variant inside MOCB."},
         ]}
-        trap={<>(b) loses non-linearity. (d) is operational pain. (c) is reasonable but provably loses guarantees unless you re-derive bounds.</>}
-        lens={<>The last-layer trick is the standard recipe — Z becomes d_last &times; d_last instead of total-parameter-squared. You keep the network&apos;s non-linear representation but get tractable confidence math. This is what real deployments do.</>}
-        stretch={<>How does last-layer relate to a learned kernel for UCB?</>}
+        trap={<>(c) is the equivalence miss; the looseness compounds.</>}
+        lens={<>Looser scorer inside a constrained bandit gives a looser overall bound. Validate empirically; don't claim theoretical guarantees.</>}
+        stretch={<>What replay-log eval would you run before launch?</>}
       />
 
+      {/* A5 — boundary */}
       <VIS.TrapProblem
-        id="nuc-p5" difficulty="hard" mode="ordered"
-        title="P5 — Order the per-step loop for delayed NeuralUCB"
-        scenario={<>Reward for action taken at t arrives at t+τ (τ unknown but bounded). Order the steps. Wrong moves do not get ranked.</>}
+        id="nucb-a5"
+        difficulty="hard"
+        title="A5 — Boundary: where NeuralUCB stops being practical"
+        scenario={<>At what context-feature dim or network size does NeuralUCB's gradient-bonus computation become too expensive for production?</>}
         options={[
-          {key:"a", text:"Observe context x at step t.", order:1},
-          {key:"b", text:"Score arms with current W and Z; include pending-action term.", order:2},
-          {key:"c", text:"Pick arm a*; commit gradient g* to Z immediately (pre-reward).", order:3},
-          {key:"d", text:"When reward for past step t&apos; arrives, do an SGD update on W using (x_{t&apos;}, a_{t&apos;}, r).", order:4},
-          {key:"e", text:"Drop pending entries from Z once their reward arrives.", order:5},
-          {key:"f", text:"Update Z only when reward arrives."},
-          {key:"g", text:"Stop pulling new actions until all pending feedback returns."},
+          {key:"a", text:"NeuralUCB's per-step bonus requires storing U_t = sum g g^T where g = grad_theta f is of dimension |theta| — total parameters. For a 10M-param network, U is 10M x 10M, infeasible. Practical NeuralUCB always uses one of: (i) last-layer-only gradients (dim = last-layer width), (ii) random feature projections, (iii) diagonal U approximation. Boundary: full-gradient NeuralUCB stops being practical for |theta| > ~10k.", correct:true},
+          {key:"b", text:"NeuralUCB scales linearly with |theta|."},
+          {key:"c", text:"No upper limit."},
+          {key:"d", text:"d=1 only."},
         ]}
-        trap={<>(f) is the vanilla recipe that causes the bug. (g) is operationally unacceptable.</>}
-        lens={<>The robust pattern decouples Z (which tracks pending direction information) from W (which can only train when reward arrives). Z gets the gradient at decision time; W gets the SGD step when reward returns. Pending entries graduate into normal evidence.</>}
-        stretch={<>How big can the pending buffer get? When do you start dropping?</>}
+        trap={<>Most teams don't realize the full-gradient version is structurally infeasible.</>}
+        lens={<>Production NeuralUCB IS the approximation. Full-gradient is theoretical only.</>}
+        stretch={<>Which approximation has the cleanest theory?</>}
       />
 
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>B. Application</h3>
+
+      {/* B1 — when to pick NeuralUCB */}
       <VIS.TrapProblem
-        id="nuc-p6" difficulty="medium"
-        title="P6 — When LinUCB beats NeuralUCB"
-        scenario={<>Pick the scenario most favorable to LinUCB over NeuralUCB.</>}
+        id="nucb-b1"
+        difficulty="hard"
+        title="B1 — Pick the right tool"
+        scenario={<>Surface: ad ranking for a marketplace. Strong 4-way interaction (advertiser × user × time × device); feedback (conversion) arrives within 30 min; d = 500 features after hashing; GPU-rich infra. What ships?</>}
         options={[
-          {key:"a", text:"60 curated, near-linear features; small data; tight regret budget early.", correct:true},
-          {key:"b", text:"Raw text embeddings; thousands of arms."},
-          {key:"c", text:"Adversarial click data."},
-          {key:"d", text:"Image-based ranking."},
+          {key:"a", text:"NeuralUCB with same-step assumption since 30-min delay is short relative to typical refresh cadence (use vanilla, monitor for delay-bias if cadence tightens). The 4-way interaction is the killer; LinUCB would need C(500, 4) cross features, intractable. NeuralUCB's network discovers them automatically; loose bonus is acceptable cost given GPU budget.", correct:true},
+          {key:"b", text:"LinUCB with all 4-way crosses."},
+          {key:"c", text:"Thompson sampling without context."},
+          {key:"d", text:"Static popularity."},
         ]}
-        trap={<>(b)(c)(d) are all NeuralUCB territory.</>}
-        lens={<>Curated low-d near-linear settings give LinUCB a correctly-specified model and tight bonus. NeuralUCB pays an exploration tax for the network capacity it does not use here. Always start with LinUCB as the regression target.</>}
-        stretch={<>How would you test "near-linear" cheaply?</>}
+        trap={<>(b) is intractable; (c), (d) miss the interaction signal.</>}
+        lens={<>High-arity crosses + GPU = NeuralUCB's home turf. Delay short = use vanilla, plan to upgrade if delay grows.</>}
+        stretch={<>What metric proves 4-way crosses dominate?</>}
       />
 
+      {/* B2 — "delay variant is just an inflated alpha" */}
       <VIS.TrapProblem
-        id="nuc-p7" difficulty="hard"
-        title="P7 — Z conditioning under W drift"
-        scenario={<>You train W more aggressively (more SGD per step). Bonus starts being unreliable. Why?</>}
+        id="nucb-b2"
+        difficulty="hard"
+        title="B2 — Sounds prudent, isn't"
+        scenario={<>Engineer: "The delay variant is just NeuralUCB with bigger gamma — we can skip the buffer + IW and just raise gamma to compensate." Why is this exactly wrong?</>}
         options={[
-          {key:"a", text:"Z is the sum of past gradients computed at past W; aggressive training moves W, making those gradients stale features, so Z no longer reflects the current parameterization.", correct:true},
-          {key:"b", text:"More SGD always overfits."},
-          {key:"c", text:"Bonus is α-dependent only."},
-          {key:"d", text:"Z does not depend on W."},
+          {key:"a", text:"Raising gamma inflates the bonus but does NOT correct the BIAS introduced by stale theta when the gradient g(x_s) was computed. Buffered importance weighting handles the bias; bonus inflation handles the variance. Skipping the buffer means you're still updating theta with biased samples; raising gamma just makes the bandit explore more on top of a biased mean. Regret bound only holds with BOTH corrections.", correct:true},
+          {key:"b", text:"Yes, equivalent."},
+          {key:"c", text:"Raise gamma; halve lambda."},
+          {key:"d", text:"Use TS for delayed feedback."},
         ]}
-        trap={<>(b)(c)(d) miss the gradient-features-vs-current-W mismatch.</>}
-        lens={<>This is the central subtlety of NeuralUCB: Z is built from gradients at the moment of pulling, but W keeps moving. The further W drifts, the less Z reflects the current model. In practice you either (i) freeze W periodically and re-compute Z, or (ii) cap the per-step SGD step size.</>}
-        stretch={<>What metric tells you W has drifted enough to refresh Z?</>}
+        trap={<>(a) requires distinguishing bias vs variance corrections.</>}
+        lens={<>Bias and variance both need fixing under delay. One knob doesn't suffice.</>}
+        stretch={<>What's the IW formula for delayed rewards?</>}
       />
 
+      {/* B3 — PM pitch */}
       <VIS.TrapProblem
-        id="nuc-p8" difficulty="medium" multiSelect
-        title="P8 — Suitable mitigations for delayed feedback in bandits"
-        scenario={<>Which of these effectively mitigate delayed-feedback bias? Select all that apply.</>}
+        id="nucb-b3"
+        difficulty="hard"
+        title="B3 — One-sentence PM pitch (NeuralUCB-specific)"
+        scenario={<>PM asks "why NeuralUCB-Delay over our current LinUCB-with-crosses?" Pick the pitch that COULD NOT be made about any random neural bandit.</>}
         options={[
-          {key:"a", text:"Pending-action term in Z so in-flight pulls still inflate certainty.", correct:true},
-          {key:"b", text:"Discount factor that ages out old, stale Z contributions.", correct:true},
-          {key:"c", text:"Conservative α schedule that rises with current pending count.", correct:true},
-          {key:"d", text:"Halting decisions until all pending feedback arrives."},
-          {key:"e", text:"Using larger nets to absorb the bias."},
+          {key:"a", text:"Our reward signal (conversion) arrives 4 hours after the action — vanilla LinUCB and vanilla neural bandits both implicitly assume same-step reward and bias their per-arm updates. NeuralUCB-Delay buffers actions with their gradient signatures and applies an importance correction when the reward arrives, so the model converges to the correct theta despite the 4-hour gap, with a delay-inflated bonus that keeps exploration honest in the meantime.", correct:true},
+          {key:"b", text:"It's a neural network."},
+          {key:"c", text:"It uses RL."},
+          {key:"d", text:"It's SOTA."},
         ]}
-        trap={<>(d) is operationally infeasible. (e) does not address the temporal mismatch.</>}
-        lens={<>(a) credits in-flight pulls; (b) and (c) keep the bandit honest as the world drifts. Halting traffic kills the product; bigger networks add capacity to the wrong axis.</>}
-        stretch={<>How would you implement (b) without re-deriving the bound?</>}
+        trap={<>(b), (c), (d) survive redaction. (a) requires both the delay-correction AND the gradient signature.</>}
+        lens={<>The PM pitch must hinge on the delay variant's specific mechanism (buffer + IW + delay-inflated bonus), not generic "we use neural nets."</>}
+        stretch={<>How would you prove the 4-hour bias matters?</>}
       />
 
+      {/* B4 — when NOT to use */}
       <VIS.TrapProblem
-        id="nuc-p9" difficulty="hard"
-        title="P9 — Counterfactual replay with NeuralUCB"
-        scenario={<>You want to evaluate a new NeuralUCB on logged data from an epsilon-greedy policy. Logs cover most actions but propensity is uneven. Biggest hazard?</>}
+        id="nucb-b4"
+        difficulty="medium"
+        title="B4 — Where NeuralUCB is the wrong choice"
+        scenario={<>Surface: bidding for ad slots; reward signal (impression-payment) arrives 30s after the bid; reward is genuinely a linear function of (bid_price, predicted_ctr, predicted_conv). What ships?</>}
         options={[
-          {key:"a", text:"Importance-sampling weights blow up where logging was rare; estimator variance explodes for actions NeuralUCB wants to take.", correct:true},
-          {key:"b", text:"NeuralUCB cannot use logged data."},
-          {key:"c", text:"Network training requires online data."},
-          {key:"d", text:"Logs are always biased downward."},
+          {key:"a", text:"LinUCB. Reward is linear in features; NeuralUCB's network overhead and loose bonus are pure cost without benefit. The 30s delay is short enough to ignore. NeuralUCB is over-engineered for this surface; the engineering effort goes into LinUCB's feature pipeline and discounted-LinUCB for any drift.", correct:true},
+          {key:"b", text:"NeuralUCB always wins."},
+          {key:"c", text:"NeuralUCB-Delay for the 30s."},
+          {key:"d", text:"Random bidding."},
         ]}
-        trap={<>(b)(c) are false; (d) is generic.</>}
-        lens={<>The counterfactual issue is universal across bandits — but NeuralUCB&apos;s wider exploration distribution makes it land in low-propensity regions of the log more often. Doubly-robust estimators with clipped IS weights are standard.</>}
-        stretch={<>What clipping threshold would you start with?</>}
+        trap={<>(b), (c) over-engineer; (a) matches the algorithm to the structure.</>}
+        lens={<>Linear reward = LinUCB. Don't pay for neural representation you don't need.</>}
+        stretch={<>What R^2 threshold suggests dropping NeuralUCB?</>}
       />
 
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      {/* C1 — gradient-as-feature architectural choice */}
       <VIS.TrapProblem
-        id="nuc-p10" difficulty="hard"
-        title="P10 — Why g^T Z^-1 g resembles a kernel UCB"
-        scenario={<>NeuralUCB&apos;s bonus matches GP-UCB structure with a learned NTK kernel. Why does that matter operationally?</>}
+        id="nucb-c1"
+        difficulty="hard"
+        title="C1 — Why grad_theta f as the bonus feature?"
+        scenario={<>NeuralUCB uses g(x) = grad_theta f(x) — the full network gradient at x — as the feature for the confidence bonus, NOT the input x and NOT the last hidden activation. Why?</>}
         options={[
-          {key:"a", text:"You can reuse GP-UCB intuition (length-scale, jitter, signal variance) when tuning NeuralUCB hyper-parameters.", correct:true},
-          {key:"b", text:"NeuralUCB is exactly a GP."},
-          {key:"c", text:"GP-UCB requires linear reward."},
-          {key:"d", text:"NTK eliminates the need for α."},
+          {key:"a", text:"In the Neural Tangent Kernel (NTK) limit, the network's behavior near initialization is linear in theta with features g(x). So the gradient IS the linearized feature space in which the network actually operates. Using x ignores what the network learned; using last-hidden ignores parameter sensitivity through earlier layers. The gradient captures the full Jacobian — and the regret bound is derived in that space.", correct:true},
+          {key:"b", text:"It's faster to compute."},
+          {key:"c", text:"x has wrong dimension."},
+          {key:"d", text:"Last-hidden gives wrong regret."},
         ]}
-        trap={<>(b) overstates; (c) is wrong; (d) is wishful thinking.</>}
-        lens={<>The neural-tangent-kernel view tells you what knobs to turn. λI (jitter) controls confidence floor; α controls exploration aggressiveness; effective length-scale lives in the network depth/width. Practitioners use this map to choose initial values.</>}
-        stretch={<>What is the analogue of a GP length-scale in a NeuralUCB net?</>}
+        trap={<>(b) is wrong (it's much slower); (a) requires the NTK insight.</>}
+        lens={<>NTK-feature space is the natural linearization. Practical approximations are tradeoffs against this theoretical optimum.</>}
+        stretch={<>How does NTK theory extend to finite-width nets?</>}
       />
+
+      {/* C2 — loss & objective */}
+      <VIS.TrapProblem
+        id="nucb-c2"
+        difficulty="hard"
+        title="C2 — Loss: MSE on (x, r) per arm; what differs from LinUCB"
+        scenario={<>Does NeuralUCB's training loss differ from LinUCB's ridge loss?</>}
+        options={[
+          {key:"a", text:"Same loss family — regularized squared error on observed (x, r) — but the regularizer is L2 on theta (a SHARED network) instead of LinUCB's per-arm lambda I. NeuralUCB shares theta across all arms; LinUCB has per-arm theta_a. Result: NeuralUCB warm-starts new arms (theta is shared) but can have negative transfer between arms; LinUCB has cold-start tax but no negative transfer.", correct:true},
+          {key:"b", text:"Cross-entropy loss."},
+          {key:"c", text:"Hinge loss."},
+          {key:"d", text:"Triplet loss."},
+        ]}
+        trap={<>(a) requires noticing that shared theta vs per-arm theta is the fundamental structural difference.</>}
+        lens={<>Shared-theta lets you transfer across arms; the price is potential negative transfer. LinUCB doesn't have this tension.</>}
+        stretch={<>When does negative transfer dominate?</>}
+      />
+
+      {/* C3 — what's added vs vanilla NN ranker */}
+      <VIS.TrapProblem
+        id="nucb-c3"
+        difficulty="medium"
+        title="C3 — vs vanilla neural ranker: what's added"
+        scenario={<>Compared to a vanilla NN ranker trained on logged (x, r), what does NeuralUCB ADD?</>}
+        options={[
+          {key:"a", text:"Adds: (i) the gradient-feature bonus gamma sqrt(g^T U^-1 g) used to perturb the score for action selection, (ii) the per-step U accumulation; (iii) the online action-selection rule (argmax of mean + bonus). The vanilla NN learns a ranker; NeuralUCB tells it WHEN to deliberately explore underused regions of the gradient-feature space.", correct:true},
+          {key:"b", text:"Adds dropout."},
+          {key:"c", text:"Adds the network itself."},
+          {key:"d", text:"Adds nothing meaningful."},
+        ]}
+        trap={<>(d) misses the value; (a) is the precise delta.</>}
+        lens={<>NeuralUCB = NN ranker + closed-form-like bonus on gradient features.</>}
+        stretch={<>Could you graft this bonus onto an existing production ranker?</>}
+      />
+
+      {/* C4 — hyperparameter */}
+      <VIS.TrapProblem
+        id="nucb-c4"
+        difficulty="hard"
+        title="C4 — Most-likely-to-bite hyperparameter"
+        scenario={<>Rank operational risk if mis-set: (i) network width m, (ii) gamma (bonus scale), (iii) U regularizer lambda, (iv) retrain cadence. Highest-risk?</>}
+        options={[
+          {key:"a", text:"(i) network width m. Bonus theoretical scale grows with sqrt(m); larger m = looser bonus = more over-exploration. Production teams shrink gamma to compensate, but that DECOUPLES gamma from theory. (ii) gamma is a known knob to tune. (iii) lambda is well-understood. (iv) retrain cadence is operational, not algorithmic.", correct:true},
+          {key:"b", text:"(ii) gamma."},
+          {key:"c", text:"(iii) lambda."},
+          {key:"d", text:"(iv) cadence."},
+        ]}
+        trap={<>(a) requires seeing that width itself drives the bonus magnitude.</>}
+        lens={<>Width is the hidden NeuralUCB hyperparameter. It's not just a model-capacity choice — it's a bandit-behavior choice.</>}
+        stretch={<>What width is empirically OK without shrinking gamma?</>}
+      />
+
+      {/* C5 — data assumption */}
+      <VIS.TrapProblem
+        id="nucb-c5"
+        difficulty="hard"
+        title="C5 — Data assumption violation: feedback delay"
+        scenario={<>NeuralUCB's regret bound assumes reward arrives at the same step as the action. Your feedback (long-form retention) arrives 7 days later. What specifically breaks?</>}
+        options={[
+          {key:"a", text:"Two failures. (1) The U_t accumulated by step t does NOT include the gradient-features of actions whose reward is still pending; the bonus is computed at theta_t but the latest theta is on stale data. (2) When the reward arrives, the gradient g(x) used in the update was computed at theta_t (now stale); a naive update treats it as if it were g_t(x) under current theta. Net effect: theta drifts on biased gradients; bonus is incorrectly small. Fix: NeuralUCB-Delay's buffer + IW + bonus-inflation.", correct:true},
+          {key:"b", text:"Nothing breaks."},
+          {key:"c", text:"Bonus auto-inflates."},
+          {key:"d", text:"Convergence speeds up."},
+        ]}
+        trap={<>(b), (c), (d) all miss the bias mechanism.</>}
+        lens={<>Stale theta in gradient is the silent bias under delay. The variant exists precisely to correct this.</>}
+        stretch={<>What's a sanity check that the bias is real in your setting?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      {/* D1 — "NeuralUCB strictly dominates LinUCB" */}
+      <VIS.TrapProblem
+        id="nucb-d1"
+        difficulty="hard"
+        title="D1 ⭐ — Intuitive but wrong"
+        scenario={<>Intuition: "If reward is linear in features, NeuralUCB simply learns a linear function and matches LinUCB; if reward is non-linear, NeuralUCB strictly wins. Therefore NeuralUCB is always at least as good." Why is this wrong?</>}
+        options={[
+          {key:"a", text:"NeuralUCB's bonus is provably LOOSER than LinUCB's even when reward is linear. The neural network learns the linear function eventually, but the confidence bonus (computed from over-parameterized gradient features) over-estimates uncertainty throughout training; the bandit over-explores compared to LinUCB. Cumulative regret can be HIGHER for NeuralUCB on linear problems, despite identical predictive quality at convergence.", correct:true},
+          {key:"b", text:"NeuralUCB requires too much memory."},
+          {key:"c", text:"NeuralUCB has no regret bound."},
+          {key:"d", text:"NeuralUCB is mathematically equivalent."},
+        ]}
+        trap={<>(a) requires seeing that exploration tightness > model expressiveness for regret.</>}
+        lens={<>Loose bonus = over-exploration = higher cumulative regret, even with perfect predictions.</>}
+        stretch={<>What test would prove this in your setting?</>}
+      />
+
+      {/* D2 — wrong-assumption cascade */}
+      <VIS.TrapProblem
+        id="nucb-d2"
+        difficulty="hard"
+        multiSelect
+        title="D2 ⭐ — Wrong-assumption cascade"
+        scenario={<>You assume "NeuralUCB is just a neural ranker with a bonus." Which decisions does this WRONG assumption silently break? Select all.</>}
+        options={[
+          {key:"a", text:"Memory budget — U_t (gradient-feature covariance) is huge unless you use last-layer or random-feature approximations.", correct:true},
+          {key:"b", text:"Training cadence — vanilla NeuralUCB assumes the network is retrained essentially continuously to keep theta fresh; production retrain cadences (hourly/daily) break the same-step assumption.", correct:true},
+          {key:"c", text:"Delayed feedback handling — vanilla NeuralUCB is biased under any non-trivial delay; you need the variant.", correct:true},
+          {key:"d", text:"Network architecture — NeuralUCB requires a specific architecture (CNN only)."},
+          {key:"e", text:"NeuralUCB cannot be batched."},
+        ]}
+        trap={<>(d), (e) are unanchored.</>}
+        lens={<>Memory, cadence, delay — three real cascades hidden by "just a ranker plus bonus."</>}
+        stretch={<>Which cascade has the most painful debugging?</>}
+      />
+
+      {/* D3 — junior vs senior on over-exploration */}
+      <VIS.TrapProblem
+        id="nucb-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior fix on over-exploration"
+        scenario={<>NeuralUCB is over-exploring (regret climbing, CTR sluggish). Junior: "lower gamma." Senior reaches for what FIRST?</>}
+        options={[
+          {key:"a", text:"Switch from full-gradient bonus to LAST-LAYER feature bonus. The full-gradient bonus is loose in over-parameterized networks; the last-layer approximation produces a much tighter bonus empirically and is what production NeuralUCB usually means. Junior's gamma shrink is a band-aid; senior's structural fix is choosing the right gradient slice.", correct:true},
+          {key:"b", text:"Increase entropy."},
+          {key:"c", text:"Restart training."},
+          {key:"d", text:"Add dropout."},
+        ]}
+        trap={<>Junior's reflex doesn't address the structural source of looseness.</>}
+        lens={<>Last-layer features = tighter bonus = less over-exploration. Pick the gradient slice first.</>}
+        stretch={<>What regret tradeoff does the last-layer approximation have?</>}
+      />
+
+      {/* D4 — symptom misattribution under delay */}
+      <VIS.TrapProblem
+        id="nucb-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution under delay"
+        scenario={<>Symptom: NeuralUCB predicted-vs-realized CTR diverges; the predictions are systematically lower than realized; bandit picks suboptimal arms; alpha tuning doesn't help. The system retrains nightly; reward arrives 4 hours after impressions. What's the most likely cause?</>}
+        options={[
+          {key:"a", text:"Reward-arrival delay (4h) is comparable to a meaningful share of the day. Vanilla NeuralUCB updates theta only on observed-by-batch-time samples; the latest 4 hours of impressions are absent from training. theta is fit to the time-shifted slice of reward — older / less recent — and systematically under-predicts current CTR. Fix: switch to delay-aware NeuralUCB variant, OR shift training boundary by 4h, OR use IPS-correction for delayed samples.", correct:true},
+          {key:"b", text:"gamma too high."},
+          {key:"c", text:"Feature scaling drift."},
+          {key:"d", text:"Random seed."},
+        ]}
+        trap={<>(b), (c), (d) all plausible-looking but don't explain the systematic under-prediction signature.</>}
+        lens={<>Systematic prediction bias + non-trivial delay = delay-induced sample exclusion. The delay variant exists for this exact case.</>}
+        stretch={<>What metric detects this earlier?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>E. Operations</h3>
+
+      {/* E1 — production gotcha: U matrix memory */}
+      <VIS.TrapProblem
+        id="nucb-e1"
+        difficulty="hard"
+        title="E1 — Production gotcha: U matrix memory"
+        scenario={<>You ship NeuralUCB with the full-gradient bonus. After 2 weeks U starts dominating GPU memory and the model crashes. What's happening, and the right fix?</>}
+        options={[
+          {key:"a", text:"U_t = sum g(x_s) g(x_s)^T is |theta| x |theta|. For a 5M-parameter network, U is 5M x 5M = 100 TB of floats. Even diagonal U is 5M floats per arm. Fix: (i) use the last-layer features as g (dim = last-layer width, typically ~1k), reducing U to ~1k x 1k = 4 MB; (ii) random feature projection to a fixed dim; (iii) maintain only a low-rank approximation of U. Vanilla full-gradient NeuralUCB is theoretical only; every production deployment uses one of these.", correct:true},
+          {key:"b", text:"Memory leak."},
+          {key:"c", text:"GPU driver bug."},
+          {key:"d", text:"Increase swap."},
+        ]}
+        trap={<>(b), (c), (d) generic; (a) is NeuralUCB-specific.</>}
+        lens={<>Full-gradient NeuralUCB is structurally infeasible at production scale. Approximation is the deployment.</>}
+        stretch={<>Which approximation has cleanest theory in 2024 follow-ups?</>}
+      />
+
+      {/* E2 — Failure on Friday */}
+      <VIS.TrapProblem
+        id="nucb-e2"
+        difficulty="hard"
+        title="E2 ⭐ — Failure on Friday"
+        scenario={<>Friday 3am page: NeuralUCB predictions diverge by 40% from realized rewards; CTR collapsing. Investigation: Thursday a marketing campaign produced a 10x spike in impressions; the bandit's nightly retrain has not yet caught up. GPU OK, latency OK. Why is this NeuralUCB-specific and what's the fix?</>}
+        options={[
+          {key:"a", text:"NeuralUCB's bonus is computed at the CURRENT theta — but theta was trained at the previous-day's distribution; a 10x impression spike shifts the gradient-feature distribution dramatically and the buffered U is now misaligned with the live action distribution. The bonus is computed against the wrong U; arm scores are unreliable. LinUCB with per-arm A would self-correct faster (no shared theta). Fix: enable online U-refresh (per-batch instead of per-day) and consider a delay-aware variant if marketing campaigns are recurrent.", correct:true},
+          {key:"b", text:"GPU thermal."},
+          {key:"c", text:"Random retraining failure."},
+          {key:"d", text:"Catalog change."},
+        ]}
+        trap={<>(b), (c) generic; (d) close-but-misses; (a) anchored on NeuralUCB's shared-theta + stale-U specifics.</>}
+        lens={<>Shared theta + stale U + distribution shift = the NeuralUCB-specific Friday failure. Refresh U continuously.</>}
+        stretch={<>What alert detects U-distribution mismatch?</>}
+      />
+
+      {/* E3 — library default */}
+      <VIS.TrapProblem
+        id="nucb-e3"
+        difficulty="medium"
+        title="E3 — Library default to override"
+        scenario={<>Which reference NeuralUCB default is most likely to silently bite in production?</>}
+        options={[
+          {key:"a", text:"The full-gradient g(x) = grad_theta f(x). Reference implementations use this for theoretical correctness; production must override to last-layer or random-feature approximation. Defaults preserve the published regret bound but are infeasible at production memory budgets.", correct:true},
+          {key:"b", text:"Learning rate."},
+          {key:"c", text:"Batch size."},
+          {key:"d", text:"Optimizer choice."},
+        ]}
+        trap={<>(b), (c), (d) are standard NN knobs.</>}
+        lens={<>Gradient choice is the production-specific override. Theory-faithful defaults are usually infeasible.</>}
+        stretch={<>What approximation choice published in 2024 has tightest empirical bonus?</>}
+      />
+
+      {/* E4 — rollout */}
+      <VIS.TrapProblem
+        id="nucb-e4"
+        difficulty="hard"
+        mode="ordered"
+        title="E4 — Rollout sequence: LinUCB -> NeuralUCB-Delay"
+        scenario={<>Migrate from LinUCB to NeuralUCB-Delay. Order the phases. Items that don't belong are not ranked.</>}
+        options={[
+          {key:"a", text:"Audit delay distribution: confirm max delay D and 99th percentile.", order:1},
+          {key:"b", text:"Train shadow NeuralUCB on logged data; use last-layer-feature bonus; verify offline regret vs LinUCB.", order:2},
+          {key:"c", text:"Enable buffered IW updates on shadow; confirm bias correction.", order:3},
+          {key:"d", text:"1% traffic ramp; monitor predicted-vs-realized drift and per-arm pull distribution.", order:4},
+          {key:"e", text:"Full ramp; weekly U recompute; monthly delay-distribution audit.", order:5},
+          {key:"f", text:"Day-1 swap of LinUCB for full-gradient NeuralUCB."},
+          {key:"g", text:"Enable IW after full ramp."},
+        ]}
+        trap={<>(f), (g) skip delay handling.</>}
+        lens={<>Delay audit + IW BEFORE ramp. Otherwise you're shipping bias.</>}
+        stretch={<>What's the exit criterion from shadow?</>}
+      />
+
+      {/* E5 — reproducibility */}
+      <VIS.TrapProblem
+        id="nucb-e5"
+        difficulty="medium"
+        title="E5 — Paper-to-production reproducibility"
+        scenario={<>The ICML 2020 paper reports regret bounds in synthetic environments. Which detail is hardest to reproduce in production?</>}
+        options={[
+          {key:"a", text:"The full-gradient g(x) used in the paper's experiments. The paper assumes the theoretical bonus; production approximations (last-layer, random feature) deviate measurably from the paper's regret curves. The empirical regret curves are conditional on the full-gradient computation, which production cannot afford.", correct:true},
+          {key:"b", text:"Learning rate."},
+          {key:"c", text:"Network width."},
+          {key:"d", text:"Number of steps."},
+        ]}
+        trap={<>(a) requires recognizing the gradient choice IS the experiment.</>}
+        lens={<>The paper's regret curves are full-gradient curves. Production curves with last-layer features look different.</>}
+        stretch={<>Which 2024 paper publishes reproducible last-layer regret?</>}
+      />
+
+      {/* E6 — eval contamination */}
+      <VIS.TrapProblem
+        id="nucb-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination"
+        scenario={<>An offline benchmark says NeuralUCB beats LinUCB by 22% NDCG on the YouTube-like dataset. How is this likely contaminated?</>}
+        options={[
+          {key:"a", text:"NDCG is a RANKING metric on a fixed held-out set; LinUCB and NeuralUCB are BANDITS optimizing cumulative reward. The metric ignores exploration cost entirely. NeuralUCB's better predictive accuracy at the end of training translates to higher NDCG, but ignore the regret it accumulated to get there. Honest comparison: cumulative reward over the training horizon, not endpoint NDCG.", correct:true},
+          {key:"b", text:"NDCG is always trustworthy."},
+          {key:"c", text:"LinUCB doesn't have NDCG."},
+          {key:"d", text:"Sample size too small."},
+        ]}
+        trap={<>(b) is the convenience claim; (a) requires distinguishing exploration cost from final accuracy.</>}
+        lens={<>Bandit eval must include exploration cost. Final-prediction-accuracy benchmarks are misleading for bandits.</>}
+        stretch={<>What's the right offline bandit metric?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>F. Failure modes</h3>
+
+      {/* F1 — edge case: width m -> infinity */}
+      <VIS.TrapProblem
+        id="nucb-f1"
+        difficulty="hard"
+        title="F1 — Edge case: m → infinity"
+        scenario={<>What does NeuralUCB converge to in the infinite-width limit?</>}
+        options={[
+          {key:"a", text:"The Neural Tangent Kernel (NTK) bandit. At infinite width, the network behavior is exactly linear in theta with features g(x) = grad_theta f, and the network's function class is a fixed RKHS defined by the NTK. NeuralUCB becomes Kernel-UCB with the NTK kernel. This is the theoretical reference point against which all finite-width practical NeuralUCBs are measured.", correct:true},
+          {key:"b", text:"LinUCB on raw x."},
+          {key:"c", text:"epsilon-greedy."},
+          {key:"d", text:"Thompson sampling."},
+        ]}
+        trap={<>(a) requires the NTK insight; (b) is the surface miss.</>}
+        lens={<>Infinite-width limit IS Kernel-UCB with NTK. Finite-width production is an approximation.</>}
+        stretch={<>Which kernel does the NTK reduce to for ReLU networks?</>}
+      />
+
+      {/* F2 — adversarial */}
+      <VIS.TrapProblem
+        id="nucb-f2"
+        difficulty="hard"
+        title="F2 — Adversarial reward corruption"
+        scenario={<>An attacker injects fake clicks on specific (user, item) pairs. NeuralUCB's MSE loss treats every observation equally. What's the impact, and what does Robust-NeuralUCB (NeurIPS 2024) do differently?</>}
+        options={[
+          {key:"a", text:"Vanilla NeuralUCB: ridge / MSE estimator's bias scales linearly with corruption fraction; theta drifts toward the attacker's preferred predictions. Robust-NeuralUCB replaces MSE with a Huber or trimmed loss; the influence function of corrupt samples is bounded; bias scales as o(corruption fraction) under mild conditions. Same architecture, different loss head.", correct:true},
+          {key:"b", text:"Vanilla NeuralUCB is robust by default."},
+          {key:"c", text:"Robust variant uses a different network."},
+          {key:"d", text:"Corruption is impossible in bandits."},
+        ]}
+        trap={<>(b) is the lazy claim; (d) confidently wrong.</>}
+        lens={<>The robustness lives in the loss, not the architecture. Huber/trimmed loss bounds influence.</>}
+        stretch={<>What's the corruption threshold where the bound holds?</>}
+      />
+
+      {/* F3 — reverse engineering */}
+      <VIS.TrapProblem
+        id="nucb-f3"
+        difficulty="hard"
+        title="F3 — Reverse engineering: 'bonus dominates score everywhere'"
+        scenario={<>Symptom: every arm's UCB score is roughly equal to its bonus; the mean prediction is dwarfed by the bonus; selection is effectively random. Which NeuralUCB design choice causes this?</>}
+        options={[
+          {key:"a", text:"Network width too large relative to gamma. The bonus magnitude grows as sqrt(m) (or with the gradient-feature dimension); if you keep gamma at its theoretical default while increasing m, the bonus eventually swamps the mean. Diagnosis: scale gamma by 1/sqrt(m_effective) where m_effective is the gradient-feature dim used in the bonus. Or switch to last-layer features for a smaller m_effective.", correct:true},
+          {key:"b", text:"Bug in argmax."},
+          {key:"c", text:"Network underfit."},
+          {key:"d", text:"Learning rate too low."},
+        ]}
+        trap={<>(a) requires connecting width to bonus magnitude; (b)-(d) miss.</>}
+        lens={<>Bonus magnitude tracks width. Wider net = larger bonus unless gamma compensates.</>}
+        stretch={<>What's the right gamma-vs-m scaling rule?</>}
+      />
+
+      {/* F4 — paper-named */}
+      <VIS.TrapProblem
+        id="nucb-f4"
+        difficulty="hard"
+        title="F4 — Paper-named failure mode"
+        scenario={<>The ICML 2020 NeuralUCB paper specifically warns about ONE failure mode the regret bound does NOT cover. Which?</>}
+        options={[
+          {key:"a", text:"Distribution shift in context features. The bound assumes contexts are drawn from a stationary distribution; if x_t's distribution shifts (seasonal, traffic), neither theta nor U keeps up — the bound is silent. The paper's empirical experiments use stationary synthetic envs to avoid this. Production deployments must either (i) periodically retrain on recent data with discounting, or (ii) explicitly model the shift.", correct:true},
+          {key:"b", text:"K = 1 case."},
+          {key:"c", text:"Same-step reward."},
+          {key:"d", text:"Linear reward."},
+        ]}
+        trap={<>(b), (c), (d) are unrelated; (a) is the actual paper-named limit.</>}
+        lens={<>Stationary context is the silent assumption. Real recsys violates it; mitigations are operational.</>}
+        stretch={<>How does the delay variant interact with this assumption?</>}
+      />
+
+      {/* F5 — community follow-up */}
+      <VIS.TrapProblem
+        id="nucb-f5"
+        difficulty="hard"
+        title="F5 — Community-found follow-up"
+        scenario={<>The 2024 NeurIPS 'Robust Neural Contextual Bandit against Adversarial Corruptions' paper specifically addresses one failure mode of NeuralUCB. Which?</>}
+        options={[
+          {key:"a", text:"NeuralUCB's MSE estimator has bias linear in adversarial corruption fraction. Many recsys reward streams (clicks, ratings) include systematic noise (bot clicks, troll ratings). The robust variant uses a robust loss with bounded influence functions; achieves regret + violation guarantees under a fraction of corrupted rewards. Vanilla NeuralUCB has no such bound.", correct:true},
+          {key:"b", text:"NeuralUCB cannot handle binary rewards."},
+          {key:"c", text:"There are no such follow-ups."},
+          {key:"d", text:"NeuralUCB requires Gaussian noise."},
+        ]}
+        trap={<>(c) confidently wrong.</>}
+        lens={<>Adversarial corruption is the named weakness; robust losses are the named fix.</>}
+        stretch={<>What's the corruption rate threshold where vanilla NeuralUCB fails badly?</>}
+      />
+
+      {/* F6 — catastrophic forgetting on retrain */}
+      <VIS.TrapProblem
+        id="nucb-f6"
+        difficulty="hard"
+        title="F6 — Catastrophic forgetting on periodic retrain"
+        scenario={<>You retrain NeuralUCB nightly on the past 7 days of data. Rare-but-high-value arms that were active 30 days ago no longer get explored. Why?</>}
+        options={[
+          {key:"a", text:"The training set excludes data older than 7 days; the network forgets the gradient-feature regions associated with those rare arms; theta no longer predicts them well; U_t's accumulated rows for those features are stale. The bonus for those arms is computed at the new theta but with old U — empirically the bonus is too small to revive them. Fix: keep a replay buffer with rare-arm samples; OR use a periodic refresh of U from a longer history.", correct:true},
+          {key:"b", text:"Random forgetting."},
+          {key:"c", text:"Mathematical convergence."},
+          {key:"d", text:"GPU floating-point error."},
+        ]}
+        trap={<>(a) requires the catastrophic-forgetting + stale-U insight.</>}
+        lens={<>Retrain windows interact with bandit memory. Replay buffer keeps rare arms exploreable.</>}
+        stretch={<>What replay sampling preserves rare-arm coverage?</>}
+      />
+
+      {/* F7 — last-layer feature theoretical gap */}
+      <VIS.TrapProblem
+        id="nucb-f7"
+        difficulty="hard"
+        title="F7 — Last-layer-feature approximation: theoretical gap"
+        scenario={<>Production NeuralUCB usually uses last-layer features for the bonus instead of full grad_theta f. What does this approximation lose?</>}
+        options={[
+          {key:"a", text:"Last-layer features capture only the SENSITIVITY OF THE OUTPUT TO THE LAST LAYER's WEIGHTS; the bonus only knows about uncertainty in those weights. Uncertainty about earlier-layer parameters is invisible. Net effect: bonus underestimates true uncertainty when the network is changing its representations (e.g. early training, distribution shift). The published regret bound for full-gradient NeuralUCB does NOT carry over; the practical empirical performance is often better (tighter bonus), but no clean theory.", correct:true},
+          {key:"b", text:"Nothing is lost."},
+          {key:"c", text:"Lower memory only."},
+          {key:"d", text:"Same theory applies."},
+        ]}
+        trap={<>(d) is the optimistic miss; (a) requires noticing what's invisible.</>}
+        lens={<>Last-layer = uncertainty about output-head only; representation uncertainty is invisible. Better empirics, worse theory.</>}
+        stretch={<>Is there a 2024 paper that closes this theoretical gap?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://arxiv.org/abs/1911.04462" target="_blank" rel="noopener">Zhou et al. — <em>Neural Contextual Bandits with UCB-based Exploration</em> (ICML 2020, paper)</a> — the original NeuralUCB derivation; pair with the regret-bound section.</li>
-        <li><a href="https://proceedings.neurips.cc/paper_files/paper/2024/file/22862040c1781356c8c3df4d00e5811b-Paper-Conference.pdf" target="_blank" rel="noopener">Robust Neural Contextual Bandit against Adversarial Corruptions (NeurIPS 2024, paper)</a> — the 2024 delayed/corruption-robust extension this card is built around.</li>
-        <li><a href="https://lilianweng.github.io/posts/2018-01-23-multi-armed-bandit/" target="_blank" rel="noopener">Lilian Weng — <em>The Multi-Armed Bandit Problem and Its Solutions</em> (blog)</a> — keep this open as you read the paper; clear UCB family intuition.</li>
-        <li><a href="https://eugeneyan.com/writing/bandits/" target="_blank" rel="noopener">Eugene Yan — <em>Bandits for Recommender Systems</em> (blog)</a> — production lessons; delayed feedback section.</li>
-        <li><a href="https://tor-lattimore.com/downloads/book/book.pdf" target="_blank" rel="noopener">Lattimore &amp; Szepesvári — <em>Bandit Algorithms</em> (textbook, free PDF)</a> — chapter 19 on linear bandits; chapter 21 on kernels.</li>
+        <li>
+          <a href="https://arxiv.org/abs/1911.04462" target="_blank" rel="noopener"><strong>Zhou et al. — NeuralUCB</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(ICML 2020)</span>
+          <br/>Primary source. Read §3 (algorithm), §4 (NTK-based regret bound), §6 (empirical comparison to LinUCB).
+        </li>
+        <li>
+          <a href="https://proceedings.neurips.cc/paper_files/paper/2024/file/22862040c1781356c8c3df4d00e5811b-Paper-Conference.pdf" target="_blank" rel="noopener"><strong>Robust Neural Contextual Bandit against Adversarial Corruptions</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(NeurIPS 2024)</span>
+          <br/>Corruption-robust variant. Read §3 (robust loss), §5 (regret bound under corruption fraction).
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2008.04026" target="_blank" rel="noopener"><strong>Neural Thompson Sampling</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(arXiv 2020)</span>
+          <br/>Sibling for the posterior-sampling alternative. Same backbone, stochastic exploration.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2207.06820" target="_blank" rel="noopener"><strong>Delayed-Feedback Contextual Bandits</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(survey)</span>
+          <br/>Catalog of delay-aware variants and their assumptions; the lineage NeuralUCB-Delay sits in.
+        </li>
+        <li>
+          <a href="https://tor-lattimore.com/downloads/book/book.pdf" target="_blank" rel="noopener"><strong>Lattimore &amp; Szepesv&aacute;ri — Bandit Algorithms</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(textbook)</span>
+          <br/>Kernel bandits chapter — the cleanest reference for the NTK-bandit limit NeuralUCB reduces to.
+        </li>
       </ul>
     </VIS.Section>
   </main>

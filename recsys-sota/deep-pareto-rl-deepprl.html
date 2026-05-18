@@ -1414,241 +1414,678 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// DeepPRL — Deep Pareto Reinforcement Learning (Hu et al., arXiv 2407.03580, 2024)
+// v2 redo — 32 trap problems spanning A-F axes; concept-anchored on
+// preference-conditioned multi-policy, Pareto critic, hypervolume objective.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
       pill="RecSys SOTA · RL for recommendation"
       title="Deep Pareto RL (DeepPRL)"
-      subtitle="Learn the entire Pareto frontier across competing objectives with one multi-policy agent — let the business pick a point per surface."
+      subtitle="One multi-policy RL agent conditioned on a preference vector covers the entire Pareto frontier — pick a point per surface instead of retraining for every tradeoff."
       byline={[
         {label: "Paper", value: "Hu et al., arXiv 2407.03580 (2024)"},
-        {label: "Domain", value: "Multi-objective recommender systems"},
+        {label: "Year", value: "2024"},
+        {label: "Domain", value: "Multi-objective recsys surfaces"},
       ]}/>
 
     <VIS.TLDR>
-      A static weighted sum collapses many objectives (clicks, watch-time, diversity) into a single scalar and loses every other tradeoff. DeepPRL trains a <VIS.Term def="A reinforcement-learning agent that conditions on a preference vector and outputs a policy for that preference — one network covers many tradeoffs.">multi-policy RL agent</VIS.Term> conditioned on a preference vector so a single model spans the <VIS.Term def="The set of solutions where you cannot improve one objective without hurting another — the menu of legal tradeoffs.">Pareto frontier</VIS.Term>. Picking a production point becomes a business-knob decision per surface (new user vs power user) rather than a re-training job.
+      A static weighted sum r = w&middot;o collapses many objectives into one scalar and freezes the tradeoff at training time. DeepPRL trains a <VIS.Term def="An RL actor that takes the preference vector w as part of its input — one network spans many tradeoffs.">preference-conditioned actor</VIS.Term> with a <VIS.Term def="A value head that outputs a vector (one value per objective) instead of a scalar.">vector critic</VIS.Term> and a <VIS.Term def="Loss that pushes the agent toward Pareto-optimal points by sampling many w during training.">hypervolume / coverage objective</VIS.Term>; switching the production tradeoff becomes a serving-time knob, not a retraining job. Source: <a href="https://arxiv.org/abs/2407.03580" target="_blank" rel="noopener">arXiv 2407.03580</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        DeepPRL is a multi-objective RL framework for recsys. The agent receives a preference weight vector w (e.g. 60% engagement, 30% watch-time, 10% diversity) as part of its input and learns a single network that produces good actions for any sampled w.
+        DeepPRL is a multi-objective off-policy RL framework for recsys. The actor &pi;<sub>&theta;</sub>(a | s, w) is conditioned on a sampled preference vector w from the simplex; the critic Q<sub>&phi;</sub>(s, a, w) returns a K-dim value or a scalarized value indexed by w. During training, w is resampled per episode (or per minibatch) so the same network learns to act well for every tradeoff.
+      </p>
+      <VIS.Equation display tex={`\\max_\\theta \\; \\mathbb{E}_{w \\sim \\Delta^{K-1}} \\Big[ \\mathbb{E}_{\\tau \\sim \\pi_\\theta(\\cdot\\,|\\,s, w)} \\; w^\\top R(\\tau) \\Big] \\;+\\; \\beta \\cdot \\mathcal{H}_{\\text{vol}}(\\pi_\\theta)`}/>
+      <p>
+        Loss = expected scalarized return (sampled w) + a coverage / hypervolume regularizer that rewards the policy for spanning the front, not collapsing to one corner.
       </p>
       <VIS.Mermaid chart={`
 flowchart TB
-  W["Preference vector w"]
-  S["User+context state"]
-  W --> A["Multi-policy actor"]
-  S --> A
-  A --> R["Recommendation"]
-  R --> O["Vector reward (click, watch, div)"]
-  O --> C["Pareto critic"]
+  W["Preference w (sampled per ep)"] --> A["Actor pi(a | s, w)"]
+  S["State s"] --> A
+  A --> Act["Action a"]
+  Act --> Env["Env / logs"]
+  Env --> Ro["Vector reward o in R^K"]
+  Ro --> C["Critic Q(s, a, w)"]
   C --> A
+  Ro --> HV["Hypervolume / coverage signal"]
+  HV --> A
+  style A fill:#fef3c7,stroke:#d97706
       `} />
-      <ul>
-        <li><strong>Vector reward</strong> — keep each objective as its own scalar; never collapse early.</li>
-        <li><strong>Preference-conditioned policy</strong> — w is part of the input; the same weights serve many tradeoffs.</li>
-        <li><strong>Pareto critic</strong> — value is a vector; the agent learns to push frontier outward, not to maximize one direction.</li>
-      </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from siblings">
       <p>
-        The classical baseline is a single-objective RL or supervised ranker with a fixed scalarization r = w&middot;o. That picks one point and is blind to the rest of the frontier.
+        <strong>vs static scalarization (single w):</strong> retraining required to move on the front; can't differ by surface at serving.
       </p>
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>Static weighted sum</th><th style={{textAlign:"left",padding:8}}>DeepPRL</th></tr></thead>
+      <p>
+        <strong>vs MOCB (constrained scalar):</strong> MOCB outputs ONE feasible operating point with adaptive weight w<sub>t</sub> via dual ascent on a hard constraint. DeepPRL outputs the WHOLE FRONT — different product question.
+      </p>
+      <p>
+        <strong>vs ensemble of K single-objective agents averaged:</strong> averaging policies is not Pareto-optimal; DeepPRL trains a single policy that learns the joint structure.
+      </p>
+      <p>
+        <strong>vs PMORS (Pareto with forgetting curve):</strong> PMORS is a re-ranker on offline ranked lists; DeepPRL is full RL with bootstrapped value targets.
+      </p>
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
+        <thead><tr style={{background:"#1f3a5f", color:"#fff"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>Static w</th><th style={{textAlign:"left",padding:8}}>MOCB</th><th style={{textAlign:"left",padding:8}}>DeepPRL</th><th style={{textAlign:"left",padding:8}}>Ensemble</th></tr></thead>
         <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Solutions produced</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>One point</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Approximate Pareto front</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Tradeoff change</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Retrain</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Switch w at serving time</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Per-surface flexibility</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Hard</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Native</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Training cost</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Low</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High — many roll-outs per w</td></tr>
+          <tr><td style={{padding:8}}>Output</td><td style={{padding:8}}>1 policy</td><td style={{padding:8}}>1 feasible policy</td><td style={{padding:8}}><strong>Front of policies</strong></td><td style={{padding:8}}>K policies averaged</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Switch tradeoff</td><td style={{padding:8}}>Retrain</td><td style={{padding:8}}>Re-set tau</td><td style={{padding:8}}><strong>Change w at serving</strong></td><td style={{padding:8}}>Reweight outputs</td></tr>
+          <tr><td style={{padding:8}}>Sample cost</td><td style={{padding:8}}>Low</td><td style={{padding:8}}>Medium</td><td style={{padding:8}}><strong>High (many w per train)</strong></td><td style={{padding:8}}>K&times; baseline</td></tr>
+          <tr style={{background:"#f8fafc"}}><td style={{padding:8}}>Frontier coverage</td><td style={{padding:8}}>1 point</td><td style={{padding:8}}>1 point</td><td style={{padding:8}}><strong>Approximate front</strong></td><td style={{padding:8}}>Convex hull only</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
-      <ul>
-        <li>Surfaces where the right tradeoff varies (new-user feed needs diversity; power-user feed leans engagement).</li>
-        <li>Product orgs that want to A/B different points on the front without retraining.</li>
-        <li>Domains with stable objective definitions but moving business priorities (quarterly OKR shifts).</li>
-        <li>Available off-policy correction infrastructure (logging propensities, counterfactual eval).</li>
-      </ul>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
+      <p>
+        Pick DeepPRL when: (1) you have a genuine multi-objective surface where the right tradeoff differs by segment (new user vs power user, US vs JP), (2) the cost of retraining-per-tradeoff is prohibitive, (3) you have a logged-policy simulator or off-policy data rich enough to estimate vector returns. Skip when one operating point suffices (use MOCB) or you don't have off-policy reward signals for every objective.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  Q1{"Need full front?"}
+  Q1 -->|No| MOCB["MOCB or static w"]
+  Q1 -->|Yes| Q2{"Off-policy data for all K objectives?"}
+  Q2 -->|No| Fix["Fix logging first"]
+  Q2 -->|Yes| Q3{"Sim or replay rich enough for RL?"}
+  Q3 -->|No| Bandit["Pareto-front bandit"]
+  Q3 -->|Yes| D["DeepPRL"]
+  style D fill:#dcfce7,stroke:#16a34a
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations &amp; gotchas">
-      <ul>
-        <li><strong>Roll-out cost</strong> — covering the front needs many w samples; offline simulators are noisy.</li>
-        <li><strong>Offline-online gap</strong> — Pareto coverage measured offline can collapse online if a critic is mis-specified.</li>
-        <li><strong>Picking a point</strong> — the model gives a frontier; the business still needs a policy for choosing w (not free).</li>
-        <li><strong>Stationarity</strong> — the frontier shifts as user behavior shifts; monthly re-evaluation needed.</li>
-      </ul>
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations &amp; gotchas">
+      <p>
+        <strong>Front estimation needs many roll-outs</strong> — sampling w densely during training inflates compute. <strong>Offline-online gap</strong> — Pareto fronts look smooth in offline eval but at serving time only a few w values are actually used; the parts of the front you DON'T visit are unverified. <strong>Front-shape mis-specification</strong> — if the true front is concave (which happens in recsys with engagement vs diversity), linear scalarization can't reach interior points; need Tchebycheff or hypervolume objectives. <strong>Preference drift</strong> — the business's "right w" shifts month-over-month with no warning bell.
+      </p>
+      <VIS.Callout kind="gotcha" title="Linear scalarization can NOT reach concave front interiors">
+        If diversity vs engagement is concave (you must give up disproportionate engagement for marginal diversity past a threshold), max-w&middot;r misses the entire interior of the front. DeepPRL papers use Tchebycheff or hypervolume losses for this exact reason. A team that scalarizes linearly thinks they have a front but actually has just two endpoints.
+      </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
+      <p style={{color:"#475569", marginBottom: 16}}>
+        ~32 problems across taxonomy axes A-F. Redact "DeepPRL" to "Model X" — generic-ML or generic-RL candidates should not be able to answer correctly. Each is anchored to a property DeepPRL owns (preference-conditioned actor, vector critic, hypervolume objective, front-shape sensitivity, w-resampling during training).
+      </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity &amp; comparison</h3>
+
+      {/* A1 — insight: discriminator vs static scalarization is the conditional policy, not the multi-objective claim */}
       <VIS.TrapProblem
-        id="dp-p1" difficulty="hard"
-        title="P1 — Picking a production point on the Pareto front"
-        scenario={<>DeepPRL trains and exposes a Pareto front parameterized by w. PM asks: which w do we ship for the main feed? Pick the strongest first-cut.</>}
+        id="dprl-a1"
+        difficulty="hard"
+        title="A1 — DeepPRL vs static scalarized RL"
+        scenario={<>Two systems both optimize "engagement + diversity": (i) static-w RL with w = (0.7, 0.3) baked into the reward; (ii) DeepPRL with w sampled per episode and concatenated into the actor's input. The static system is faster to train and ships first. What does DeepPRL actually buy beyond "more compute"?</>}
         options={[
-          {key:"a", text:"Pick w that maximizes the long-horizon north-star metric on a holdout, then A/B around it.", correct:true},
-          {key:"b", text:"Pick w that maximizes click-through rate offline — simplest scalar."},
-          {key:"c", text:"Pick the midpoint of the front."},
-          {key:"d", text:"Let the model pick w on its own at serving time."},
+          {key:"a", text:"A single trained network can be queried at ANY w at serving time — w becomes a runtime knob. Static-w bakes the tradeoff into theta and switching tradeoffs requires retraining. DeepPRL also learns the GEOMETRY of the front (which w values are reachable) where static-w never sees alternative w values during training.", correct:true},
+          {key:"b", text:"DeepPRL produces lower variance estimates."},
+          {key:"c", text:"DeepPRL doesn't need a critic."},
+          {key:"d", text:"DeepPRL is mathematically equivalent to static-w at convergence."},
         ]}
-        trap={<>(b) overfits to CTR and ignores why the front exists. (c) is arbitrary. (d) makes w endogenous and breaks counterfactual eval.</>}
-        lens={<>The whole point of training the front is so you can audit candidate points against north-star (retention / DAU / watch-hours) and then do calibrated A/B around the best offline point. Don't collapse back to a single proxy metric just because picking is hard.</>}
-        stretch={<>How would w differ between new-user vs power-user cohorts?</>}
+        trap={<>(d) — equivalence is only true at one specific w; DeepPRL's product value is COVERING many w.</>}
+        lens={<>The discriminator is "w as input vs w as fixed loss weight." That single architectural choice unlocks serving-time tradeoff switching.</>}
+        stretch={<>What latency does the conditional input add at serving?</>}
       />
 
+      {/* A2 — definitional trap: Pareto front vs convex hull vs Pareto rank */}
       <VIS.TrapProblem
-        id="dp-p2" difficulty="medium" multiSelect
-        title="P2 — Symptoms that a static weighted-sum is hurting you"
-        scenario={<>Which of these are signals that you should move from a static scalarization to a Pareto-front approach? Select all that apply.</>}
+        id="dprl-a2"
+        difficulty="hard"
+        title="A2 — Pareto front vs convex hull vs Pareto rank"
+        scenario={<>Reviewer asks: "Does DeepPRL learn the Pareto FRONT or the convex HULL of the front?" When does the distinction matter?</>}
         options={[
-          {key:"a", text:"Different product surfaces want noticeably different tradeoffs.", correct:true},
-          {key:"b", text:"Business priorities (e.g. diversity weight) shift quarterly.", correct:true},
-          {key:"c", text:"You retrain whenever a weight changes.", correct:true},
-          {key:"d", text:"Offline metrics already match online lift."},
-          {key:"e", text:"All objectives are perfectly correlated."},
+          {key:"a", text:"With a linear scalarization w·r, DeepPRL is only guaranteed to reach the CONVEX HULL of the front. If the true Pareto front is concave (typical engagement-vs-diversity recsys curves), linear w can never select interior points; you only get the two endpoints. DeepPRL's hypervolume / Tchebycheff variants are introduced exactly to escape the convex-hull limit and recover concave interiors.", correct:true},
+          {key:"b", text:"Both are the same in finite samples."},
+          {key:"c", text:"DeepPRL learns the Pareto rank, not the front."},
+          {key:"d", text:"Convex hull is always a superset of the Pareto front."},
         ]}
-        trap={<>(d) means scalarization is already fine. (e) means there is no real tradeoff to expose.</>}
-        lens={<>Pareto methods pay off when (a) tradeoffs vary, (b) priorities move, and (c) retraining cost is real. If objectives are aligned or weights are stable, a scalarized model is cheaper.</>}
-        stretch={<>How would you measure objective correlation before investing?</>}
+        trap={<>(a) requires distinguishing the geometric concepts; (b), (c), (d) confuse them.</>}
+        lens={<>Linear scalarization = convex hull only. Tchebycheff / hypervolume = full front. The loss shape determines the achievable geometry.</>}
+        stretch={<>Sketch a concave front and a linear scalarization's reachable set.</>}
       />
 
+      {/* A3 — counterfactual: without DeepPRL */}
       <VIS.TrapProblem
-        id="dp-p3" difficulty="hard"
-        title="P3 — Offline-online Pareto gap"
-        scenario={<>Offline, the trained front dominates the production scalar model on every objective. Online A/B shows neutral engagement and a watch-time regression. Most likely cause?</>}
+        id="dprl-a3"
+        difficulty="medium"
+        title="A3 — Counterfactual: no DeepPRL"
+        scenario={<>If DeepPRL didn't exist, what's your fallback for "different tradeoffs on different surfaces (homepage vs Watch Next vs Kids)" and what's the concrete cost?</>}
         options={[
-          {key:"a", text:"Off-policy correction is biased — log propensities don't match the serving stochasticity of the multi-policy agent.", correct:true},
-          {key:"b", text:"The scalar model is broken."},
-          {key:"c", text:"Reward shaping was perfect."},
-          {key:"d", text:"User population changed mid-test."},
+          {key:"a", text:"Train K separate single-objective agents (one per surface's tradeoff) or one agent per w. Costs: K× training, K× model storage, K× online-learning state, K× rollback complexity. Cross-surface knowledge cannot be shared. Updating any surface's tradeoff is a full retrain.", correct:true},
+          {key:"b", text:"Single agent with fixed w handles all surfaces."},
+          {key:"c", text:"Use a post-filter."},
+          {key:"d", text:"There's no alternative."},
         ]}
-        trap={<>(b)(c) contradict the setup. (d) is possible but is a generic explanation, not a Pareto-specific one.</>}
-        lens={<>Multi-policy agents serve a wider action distribution than the logged production policy. Importance sampling weights blow up; the offline value estimate is over-optimistic. Fix by clipping IS weights, doubly-robust estimators, or interleaved logging at train time.</>}
-        stretch={<>How would clipped IS bias the front estimate?</>}
+        trap={<>(b) is the textbook miss — different surfaces NEED different tradeoffs; one w doesn't fit all.</>}
+        lens={<>The counterfactual quantifies the unit-economic value: K× the infra cost, plus zero cross-surface generalization.</>}
+        stretch={<>Could meta-learning give you the same property cheaper?</>}
       />
 
+      {/* A4 — composition with constrained MOCB */}
       <VIS.TrapProblem
-        id="dp-p4" difficulty="medium"
-        title="P4 — Why keep the reward as a vector"
-        scenario={<>Engineer proposes simplifying the reward to a single scalar before training, claiming "the network can learn any tradeoff anyway." Is this fine?</>}
+        id="dprl-a4"
+        difficulty="hard"
+        title="A4 — Composition: DeepPRL inside MOCB-style constraints"
+        scenario={<>You want DeepPRL's preference-conditioned policy AND a hard fairness floor. Can MOCB's dual-ascent layer wrap DeepPRL? What survives, what changes?</>}
         options={[
-          {key:"a", text:"No — once you scalarize, the gradient only points at one tradeoff; you cannot recover the front without re-rolling experience.", correct:true},
-          {key:"b", text:"Yes, scalar reward is universal."},
-          {key:"c", text:"Yes if you use a very deep network."},
-          {key:"d", text:"No, because RL cannot learn from scalar reward."},
+          {key:"a", text:"Yes — wrap the scalarized actor output with a Lagrangian term lambda(tau - C(pi)) where lambda is updated by dual ascent on observed constraint slack. The preference-conditioned actor remains; w is augmented to w' = (w, lambda) at serving; training samples both w and lambda. What changes: critic now estimates Q(s, a, w, lambda); training distribution must cover lambda values likely at serving.", correct:true},
+          {key:"b", text:"No — DeepPRL and MOCB are incompatible."},
+          {key:"c", text:"Yes, but you must drop the front and pick one point."},
+          {key:"d", text:"Yes, by concatenating dual variables to the reward, no other change needed."},
         ]}
-        trap={<>(d) is false. (b)(c) misunderstand what information is destroyed.</>}
-        lens={<>The vector-to-scalar projection is information-lossy: gradients can no longer trade objectives. Keeping the vector lets the same network output policies for any w, which IS the point of the method.</>}
-        stretch={<>What if you log scalar reward but want to add a new objective later?</>}
+        trap={<>(d) is plausible-looking but skips that the critic input must also include lambda for off-policy correctness.</>}
+        lens={<>Adding a constraint = adding another conditioning dim. The conceptual structure (condition on the knob, train across its support) generalizes cleanly.</>}
+        stretch={<>What's the regret bound after composition?</>}
       />
 
+      {/* A5 — boundary: where DeepPRL stops mattering */}
       <VIS.TrapProblem
-        id="dp-p5" difficulty="hard" mode="ordered"
-        title="P5 — Order your DeepPRL roll-out plan"
-        scenario={<>You have a working scalarized ranker and want to migrate to DeepPRL. Order the rollout. Wrong moves don&apos;t get ranked.</>}
+        id="dprl-a5"
+        difficulty="medium"
+        title="A5 — Boundary: when does DeepPRL stop being worth it"
+        scenario={<>At what K (number of objectives) does DeepPRL's front-coverage value collapse and you should fall back to MOCB or a single agent?</>}
         options={[
-          {key:"a", text:"Offline: reproduce the scalar baseline as a single w in DeepPRL.", order:1},
-          {key:"b", text:"Offline: sweep w grid; verify front dominates baseline on each axis.", order:2},
-          {key:"c", text:"Online: shadow-mode the multi-policy with off-policy correction.", order:3},
-          {key:"d", text:"Online: A/B a chosen point on the front vs scalar baseline.", order:4},
-          {key:"e", text:"Ship to 100% on day one."},
-          {key:"f", text:"Delete the scalar model."},
+          {key:"a", text:"As K grows, the (K-1)-simplex of w values has exponentially growing volume; uniform sampling of w covers less of the front per training sample, and the business rarely articulates more than 2-3 dimensions of tradeoff anyway. Practical limit around K under 5. Beyond that, the front is conceptually richer than any stakeholder can use; pick a few canonical w values (per-surface) and train MOCB or static-w agents.", correct:true},
+          {key:"b", text:"DeepPRL scales linearly with K with no degradation."},
+          {key:"c", text:"DeepPRL only works for K = 2."},
+          {key:"d", text:"K is irrelevant."},
         ]}
-        trap={<>(e)(f) are reckless. Both should never get ranked.</>}
-        lens={<>The discipline is: reproduce → sweep → shadow → A/B → ship. Each step protects against a different failure (regression vs over-optimistic offline metric vs propensity drift vs population effect).</>}
-        stretch={<>What metric tells you to stop the shadow phase?</>}
+        trap={<>(a) requires both the geometric reasoning AND the business-side observation that no one uses a 7-D tradeoff.</>}
+        lens={<>The curse of dim hits front coverage; the curse of usability hits the product value. Both cap practical K.</>}
+        stretch={<>What's the right K for a typical streaming home page?</>}
       />
 
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>B. Application</h3>
+
+      {/* B1 — when to pick DeepPRL over MOCB/static */}
       <VIS.TrapProblem
-        id="dp-p6" difficulty="medium"
-        title="P6 — When DeepPRL is overkill"
-        scenario={<>Pick the scenario where a static weighted sum likely beats DeepPRL.</>}
+        id="dprl-b1"
+        difficulty="hard"
+        title="B1 — Pick the right multi-objective tool"
+        scenario={<>Surface: a short-video app with three surfaces (For-You, Following, Kids). Tradeoffs differ per surface; engineering says retraining takes 5 days per w configuration. Off-policy logs include click, watch-time, diversity per impression. Catalog churn is moderate. What ships?</>}
         options={[
-          {key:"a", text:"Two highly-correlated objectives (e.g. clicks and 5-second watches) where weights have not moved in two years.", correct:true},
-          {key:"b", text:"Marketplace ranking with seller-fairness floors that vary by region."},
-          {key:"c", text:"Long-form video with engagement-vs-diversity tension."},
-          {key:"d", text:"News feed where freshness vs personalization keeps flipping."},
+          {key:"a", text:"DeepPRL. The dominant cost is retraining-per-tradeoff; DeepPRL collapses that to a serving-time knob. Three w configurations per surface × frequent updates = order-of-magnitude saving. MOCB ships one feasible point and doesn't help with surface-specific tradeoffs.", correct:true},
+          {key:"b", text:"MOCB — multi-objective is its specialty."},
+          {key:"c", text:"K separate static-w agents — simplest."},
+          {key:"d", text:"A single LinUCB with engineered features."},
         ]}
-        trap={<>(b)(c)(d) are exactly the cases Pareto pays for itself.</>}
-        lens={<>If objectives are correlated and tradeoffs do not move, the front is a point; the extra machinery is dead weight. The win is concentrated in domains with real, shifting tension.</>}
-        stretch={<>What correlation threshold would you use as a heuristic?</>}
+        trap={<>(b) confuses multi-objective with feasibility; (c) is the costly trap — K× infra.</>}
+        lens={<>Front-coverage need + retraining cost = DeepPRL's killer use case. MOCB is for constraints, not for surface-specific tradeoffs.</>}
+        stretch={<>How would you sanity-check that the surfaces actually want different w?</>}
       />
 
+      {/* B2 — sounds prudent: "just train on the average w" */}
       <VIS.TrapProblem
-        id="dp-p7" difficulty="hard"
-        title="P7 — Front shifts month over month — what changed?"
-        scenario={<>The trained Pareto front in February dominates April&apos;s on engagement at every diversity level. Most plausible single cause?</>}
+        id="dprl-b2"
+        difficulty="hard"
+        title="B2 — Sounds prudent, isn't"
+        scenario={<>Engineer suggests: "Instead of sampling w uniformly, just train DeepPRL on the AVERAGE w from production usage — that's the operating point we care about." Why does this destroy the value of DeepPRL?</>}
         options={[
-          {key:"a", text:"User behavior distribution shifted; the older critic over-estimates current engagement.", correct:true},
-          {key:"b", text:"Your training infra got slower."},
-          {key:"c", text:"The objective definitions changed."},
-          {key:"d", text:"You added a new w."},
+          {key:"a", text:"Training on a single average w degenerates DeepPRL into static-w RL on that average. The actor never learns to handle the off-average w values; querying it at a different w at serving (Kids surface, etc.) produces UNVERIFIED actions since the network never saw that input region. The whole 'switch w at serving' value vanishes — and the network's conditioning input becomes effectively a dummy.", correct:true},
+          {key:"b", text:"Nothing fails; this is more efficient."},
+          {key:"c", text:"The critic stops learning."},
+          {key:"d", text:"Hypervolume drops to zero."},
         ]}
-        trap={<>(c) would be visible immediately. (b)(d) do not move the front shape.</>}
-        lens={<>Pareto fronts are not stationary in recsys. A reasonable cadence is to re-train monthly and compare front hypervolume; a shrinking front is a red flag the world has moved beneath you.</>}
-        stretch={<>Define hypervolume in two sentences.</>}
+        trap={<>(b) is the seductive efficiency framing — but the value IS the coverage of w-space, not the average behavior.</>}
+        lens={<>w-sampling distribution during training defines the supported serving distribution. Collapse it, lose the product.</>}
+        stretch={<>What sampling strategy gives the most useful coverage with finite compute?</>}
       />
 
+      {/* B3 — PM pitch, anchored on DeepPRL specifics */}
       <VIS.TrapProblem
-        id="dp-p8" difficulty="medium" multiSelect
-        title="P8 — Metrics for a Pareto-front rec model"
-        scenario={<>Which of these are reasonable offline metrics for comparing two Pareto fronts produced by different runs? Select all that apply.</>}
+        id="dprl-b3"
+        difficulty="hard"
+        title="B3 — One-sentence PM pitch (DeepPRL-specific)"
+        scenario={<>PM asks "why DeepPRL over our K-agent fleet?" Pick the pitch that COULD NOT be made about any generic multi-objective method.</>}
         options={[
-          {key:"a", text:"Hypervolume dominated by the front under a reference point.", correct:true},
-          {key:"b", text:"Number of non-dominated solutions on the front.", correct:true},
-          {key:"c", text:"Coverage / spread of the front across objective space.", correct:true},
-          {key:"d", text:"Mean CTR on a single fixed w."},
-          {key:"e", text:"Average loss during training."},
+          {key:"a", text:"Today, every time product wants to test 'more diversity on Kids', we spin up a new agent, wait 5 days, and add another model to the serving fleet. With DeepPRL, the diversity weight is a runtime input — same model, same infra, instant A/B test of any tradeoff a PM can specify, and the model has been TRAINED on a continuum of these tradeoffs so we know it generalizes there.", correct:true},
+          {key:"b", text:"It optimizes multiple objectives."},
+          {key:"c", text:"It uses reinforcement learning."},
+          {key:"d", text:"It's a 2024 SOTA technique."},
         ]}
-        trap={<>(d) collapses the front to one point and loses the comparison. (e) measures fitting, not Pareto quality.</>}
-        lens={<>The standard multi-objective metrics — hypervolume, cardinality, spread — measure front quality directly. CTR or loss only describe one slice; they cannot tell you that front A dominates front B.</>}
-        stretch={<>Why is hypervolume sensitive to the reference point?</>}
+        trap={<>(b), (c), (d) all survive redaction — any multi-objective method makes those claims. (a) requires the preference-conditioned policy specifically.</>}
+        lens={<>B3 must hinge on the technique's unique mechanism. "Serving-time w as a runtime input, trained across the continuum" is DeepPRL's specific business case.</>}
+        stretch={<>What's the smallest experiment that demonstrates this pitch?</>}
       />
 
+      {/* B4 — when NOT to use DeepPRL */}
       <VIS.TrapProblem
-        id="dp-p9" difficulty="hard"
-        title="P9 — Adding a new objective late"
-        scenario={<>Six months in, legal asks you to add a "minor-safety" objective. You have a trained DeepPRL with three objectives. Best move?</>}
+        id="dprl-b4"
+        difficulty="medium"
+        title="B4 — Where DeepPRL is the wrong choice"
+        scenario={<>Surface: single home page, one objective (revenue), a single hard fairness floor (advertiser share floor). Off-policy logs available. Is DeepPRL the right call?</>}
         options={[
-          {key:"a", text:"Treat safety as a hard constraint at action selection time; do not bake it into w — penalize violations instead.", correct:true},
-          {key:"b", text:"Extend w to 4-D and retrain from scratch."},
-          {key:"c", text:"Drop one existing objective to make room."},
-          {key:"d", text:"Bolt on a post-hoc filter."},
+          {key:"a", text:"No. You don't need a front — you need ONE feasible operating point under a hard constraint. MOCB delivers exactly that (LinUCB machinery + dual ascent) at a fraction of the training cost. DeepPRL's front-coverage value is wasted when product has no tradeoff knob; the constraint is a floor, not a preference.", correct:true},
+          {key:"b", text:"Yes — DeepPRL handles any multi-objective case."},
+          {key:"c", text:"Yes — front is always useful."},
+          {key:"d", text:"No — RL never works for ranking."},
         ]}
-        trap={<>(b) is expensive and slow. (c) sacrifices product value. (d) is fragile and easily bypassed.</>}
-        lens={<>Safety-like objectives are usually better expressed as constraints (hard floor / hard ceiling) than as another knob on a continuous front. Constraint penalties at the policy level prevent the agent from trading safety against engagement at all.</>}
-        stretch={<>What if the constraint is soft — say, fairness-of-exposure?</>}
+        trap={<>(a) requires recognizing that constraint != preference; DeepPRL is over-engineered for hard-floor problems.</>}
+        lens={<>Front (preference) vs floor (constraint) are different products. Match the algorithm to the product question.</>}
+        stretch={<>Could DeepPRL with a Lagrangian also work here? Cost?</>}
       />
 
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      {/* C1 — architectural choice: w as input vs w as loss weight */}
       <VIS.TrapProblem
-        id="dp-p10" difficulty="hard"
-        title="P10 — Diagnosing front collapse"
-        scenario={<>After a new training run, your Pareto front has shrunk to nearly one point — same engagement and watch-time across all w. What is the most likely failure?</>}
+        id="dprl-c1"
+        difficulty="hard"
+        title="C1 — Architectural choice: w lives in the INPUT"
+        scenario={<>Why does DeepPRL feed w into the actor's INPUT (concatenated with state) rather than baking it into the loss weights, the way static-w RL does?</>}
         options={[
-          {key:"a", text:"Preference-conditioning has stopped influencing the policy — the w embedding collapsed to a constant.", correct:true},
-          {key:"b", text:"Objectives are now perfectly correlated."},
-          {key:"c", text:"The critic is too small."},
-          {key:"d", text:"Training was too short."},
+          {key:"a", text:"Putting w in the input creates a SINGLE function pi(a | s, w) that can be queried at any w at serving — one model, infinite tradeoffs. Putting w in the loss creates one model PER w; switching w means retraining. The architectural choice IS the entire product value of DeepPRL; everything else is bookkeeping around it.", correct:true},
+          {key:"b", text:"Loss-weight w is mathematically forbidden."},
+          {key:"c", text:"Input-w avoids gradient explosion."},
+          {key:"d", text:"There's no difference — they're equivalent."},
         ]}
-        trap={<>(b) is rarely actually true. (c)(d) do not specifically explain why w stopped mattering.</>}
-        lens={<>Front collapse usually traces to representation collapse on w — embedding regularization, gating, or w-bypass connections fix it. Inspect dPolicy/dw norms; if near zero, the network ignores preferences entirely.</>}
-        stretch={<>How would you regularize against w-collapse?</>}
+        trap={<>(d) is the "they look similar" miss; (a) requires noticing the serving-time consequence.</>}
+        lens={<>w-as-input is the architectural commitment that turns one model into infinite tradeoffs. Everything else flows from this.</>}
+        stretch={<>How big is the w-embedding layer typically?</>}
       />
+
+      {/* C2 — loss: hypervolume vs linear scalarization */}
+      <VIS.TrapProblem
+        id="dprl-c2"
+        difficulty="hard"
+        title="C2 — Loss choice: hypervolume vs linear scalarization"
+        scenario={<>DeepPRL's paper uses a hypervolume / Tchebycheff loss alongside linear scalarization. Why isn't pure linear scalarization sufficient?</>}
+        options={[
+          {key:"a", text:"Linear scalarization can only reach the CONVEX HULL of the Pareto front. Recsys fronts (engagement vs diversity) are often CONCAVE — the marginal cost of diversity rises sharply, so the front bows inward. No linear w combination can recover concave-interior points. Hypervolume / Tchebycheff loss can express ANY non-dominated point and reaches concave interiors directly.", correct:true},
+          {key:"b", text:"Linear is too cheap to compute."},
+          {key:"c", text:"Linear can't be auto-differentiated."},
+          {key:"d", text:"Hypervolume is the only valid scalarization."},
+        ]}
+        trap={<>(d) is the over-strong claim; linear is FINE on convex fronts, just insufficient on concave ones.</>}
+        lens={<>The geometry of the true front determines which scalarization can reach it. Match loss to front shape.</>}
+        stretch={<>How would you empirically test if your front is concave?</>}
+      />
+
+      {/* C3 — what's added vs single-objective PPO */}
+      <VIS.TrapProblem
+        id="dprl-c3"
+        difficulty="medium"
+        title="C3 — What's added vs single-objective actor-critic"
+        scenario={<>Compared to vanilla actor-critic (single objective), what does DeepPRL add, and what's dropped?</>}
+        options={[
+          {key:"a", text:"Adds: (i) w as a conditioning input to actor and critic; (ii) per-episode w sampling distribution; (iii) vector or w-conditioned critic; (iv) hypervolume / coverage regularizer. Drops: nothing structural — the underlying PPO/SAC loop is preserved. The diff is at the input + loss layers, not at the optimization-algorithm level.", correct:true},
+          {key:"b", text:"Drops the critic entirely."},
+          {key:"c", text:"Drops the entropy bonus."},
+          {key:"d", text:"Drops the policy gradient theorem."},
+        ]}
+        trap={<>(a) requires noticing that DeepPRL is additive on top of standard actor-critic, not a structural rewrite.</>}
+        lens={<>DeepPRL = AC + (w input) + (vector critic) + (coverage loss). Same optimization loop.</>}
+        stretch={<>Could you take this to SAC vs PPO?</>}
+      />
+
+      {/* C4 — hyperparameter: w sampling distribution is the killer knob */}
+      <VIS.TrapProblem
+        id="dprl-c4"
+        difficulty="hard"
+        title="C4 — Most-likely-to-bite hyperparameter"
+        scenario={<>Rank the operational risk if mis-set: (i) discount gamma, (ii) entropy beta, (iii) w sampling distribution over training, (iv) critic learning rate. Highest-risk?</>}
+        options={[
+          {key:"a", text:"(iii) the w sampling distribution. If you sample w uniformly on the simplex but production uses w heavily concentrated near (0.95, 0.05, 0), training spends most compute on irrelevant regions while the actually-used corner is under-trained. Match training-w distribution to expected serving-w distribution. Discount, entropy, lr are standard RL knobs with well-known defaults.", correct:true},
+          {key:"b", text:"(i) discount gamma."},
+          {key:"c", text:"(ii) entropy beta."},
+          {key:"d", text:"(iv) critic lr."},
+        ]}
+        trap={<>(a) requires identifying that w-sampling is the DeepPRL-unique knob; (i), (ii), (iv) are standard.</>}
+        lens={<>The new knob is the dangerous one. Standard knobs have playbooks; DeepPRL's training-w distribution does not.</>}
+        stretch={<>How would you bootstrap the right sampling distribution from a week of logs?</>}
+      />
+
+      {/* C5 — data assumption: vector reward observable per step */}
+      <VIS.TrapProblem
+        id="dprl-c5"
+        difficulty="medium"
+        title="C5 — Data assumption violation"
+        scenario={<>DeepPRL assumes each transition logs a K-dim reward vector. Your watch-time signal only arrives 7 days after the impression. What specifically breaks, and what's the fix?</>}
+        options={[
+          {key:"a", text:"Off-policy training for the watch-time objective is delayed by 7 days — the critic for that head has stale targets and the actor's preference-conditioning on the watch-time component is trained on week-old data. Concrete fix: a delayed-reward head with importance correction and a separate replay buffer that admits the 7d-lagged signal; OR a proxy short-horizon reward (e.g. 1d watch) for online learning with periodic 7d corrections.", correct:true},
+          {key:"b", text:"Nothing breaks — the agent waits."},
+          {key:"c", text:"DeepPRL cannot handle delayed rewards at all."},
+          {key:"d", text:"Discount gamma adjusts automatically."},
+        ]}
+        trap={<>(b) is the convenient lie; (c) over-strong.</>}
+        lens={<>Per-step vector reward is the assumption; delayed components must be handled with explicit lag-aware buffers and proxies, not implicit timing.</>}
+        stretch={<>How does this interact with NeuralUCB's delayed feedback variants?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      {/* D1 ⭐ — "more objectives = better policy" intuition */}
+      <VIS.TrapProblem
+        id="dprl-d1"
+        difficulty="hard"
+        title="D1 ⭐ — Intuitive but wrong"
+        scenario={<>Intuition: "Adding a fourth objective (e.g. ad revenue) to a DeepPRL trained on three objectives can only HELP — more signal is more information." Why is this exactly wrong in DeepPRL specifically?</>}
+        options={[
+          {key:"a", text:"Adding K+1th objective expands the simplex of w from K-1 dim to K dim. The training-w sampling now spreads over a larger volume — the actor's compute per region drops; you trade strictly worse performance on each of the original 3 objectives for the existence of a new front dimension. Each added objective is a tax on coverage. The win is conditional on the product actually USING the new front dim; otherwise it's strict loss.", correct:true},
+          {key:"b", text:"Nothing happens — the critic absorbs it."},
+          {key:"c", text:"Loss goes down monotonically."},
+          {key:"d", text:"Hypervolume drops to zero."},
+        ]}
+        trap={<>(a) is non-obvious — it requires noticing that w-space scaling dilutes per-region coverage.</>}
+        lens={<>Every added objective dilutes coverage. Don't add a dim the product won't use.</>}
+        stretch={<>What's the compute scaling per added objective?</>}
+      />
+
+      {/* D2 ⭐ — wrong-assumption cascade: "RL converges, so DeepPRL converges to the full front" */}
+      <VIS.TrapProblem
+        id="dprl-d2"
+        difficulty="hard"
+        multiSelect
+        title="D2 ⭐ — Wrong-assumption cascade"
+        scenario={<>You assume "DeepPRL converges to the ENTIRE Pareto front given enough samples." Which downstream decisions does this WRONG assumption silently break? Select all that apply.</>}
+        options={[
+          {key:"a", text:"Serving — you query w values never sampled during training; the actor outputs uncalibrated, untested actions there.", correct:true},
+          {key:"b", text:"Eval — you compare DeepPRL to baselines at a single w that happens to be inside DeepPRL's training support; looks great offline, regresses for under-sampled corners.", correct:true},
+          {key:"c", text:"Concave-front recovery — with linear scalarization you only reach the convex hull; the 'interior' the team thought DeepPRL covered is invisible.", correct:true},
+          {key:"d", text:"DeepPRL is much slower than static-w."},
+          {key:"e", text:"DeepPRL is mathematically incorrect under any setting."},
+        ]}
+        trap={<>(d), (e) are unanchored; (a)-(c) are real cascades of the wrong-coverage assumption.</>}
+        lens={<>Convergence != coverage. The set of w you trained on bounds the set of w you can trust at serving.</>}
+        stretch={<>Which of the three real cascades has bitten the most teams?</>}
+      />
+
+      {/* D3 — junior vs senior on regression */}
+      <VIS.TrapProblem
+        id="dprl-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior fix on Kids-surface regression"
+        scenario={<>DeepPRL ships; Kids surface (very-high-diversity w in the corner near pure-diversity) regresses 7% on watch-time. Junior MLE: "retrain with more data." Senior reaches for what FIRST?</>}
+        options={[
+          {key:"a", text:"Check the TRAINING-w distribution at that corner. If uniform sampling under-represents extreme diversity weights, the actor at the Kids w is effectively under-trained — adding more total data doesn't fix the per-region undercoverage. Fix: re-weight w sampling toward the underserved corner, OR add an importance-sampled training run targeted at the Kids w region.", correct:true},
+          {key:"b", text:"Increase entropy beta."},
+          {key:"c", text:"Restart training from scratch."},
+          {key:"d", text:"Switch to a different RL algorithm."},
+        ]}
+        trap={<>The junior 'more data' fix doesn't address coverage shape.</>}
+        lens={<>Regression at a specific w is a coverage problem, not a data-volume problem. Reshape the training-w distribution.</>}
+        stretch={<>What's the cost of an importance-sampled targeted run?</>}
+      />
+
+      {/* D4 — symptom misattribution */}
+      <VIS.TrapProblem
+        id="dprl-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution"
+        scenario={<>Symptom: offline Pareto front looks great (hypervolume up 12%); online A/B at one w shows no engagement lift. Most likely root cause?</>}
+        options={[
+          {key:"a", text:"Front-vs-point mismatch. DeepPRL's offline metric (hypervolume) rewards COVERING the front; the online metric is the value AT ONE specific w. The two can diverge: a model that spreads attention across the front may underperform a model that concentrates at the live-serving w. The fix is to either change online eval (test at multiple w) or weight the training loss toward the production w.", correct:true},
+          {key:"b", text:"A/B test sample size too small."},
+          {key:"c", text:"The critic is undertrained."},
+          {key:"d", text:"Reward scaling drift."},
+        ]}
+        trap={<>(b), (c), (d) all plausible-looking but don't explain the hypervolume-vs-point divergence specifically.</>}
+        lens={<>Hypervolume is a SET metric; A/B is a POINT metric. Optimizing one doesn't guarantee the other. Match eval to product question.</>}
+        stretch={<>What single online metric captures front quality?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>E. Operations</h3>
+
+      {/* E1 — production gotcha: serving-time w outside training support */}
+      <VIS.TrapProblem
+        id="dprl-e1"
+        difficulty="hard"
+        title="E1 — Production gotcha: out-of-support w"
+        scenario={<>PM wants to A/B-test a 'pure-diversity' surface with w on a simplex corner. Training-w sampling was Dirichlet(alpha=1) which puts negligible mass on corners. What happens, and what's the right fix?</>}
+        options={[
+          {key:"a", text:"The actor at the corner w is effectively asking the network for a region of input space it was barely trained on; behavior is unverified and likely worse than even a naive diversity-only ranker. Fix: schedule a targeted training pass with corner-emphasized w sampling (Dirichlet with smaller alpha or a uniform-over-corners mixture); validate offline at the new corner before A/B.", correct:true},
+          {key:"b", text:"DeepPRL handles any w by interpolation — no fix needed."},
+          {key:"c", text:"Switch to static-w training."},
+          {key:"d", text:"Add a post-filter for diversity."},
+        ]}
+        trap={<>(b) is the seductive "neural nets generalize" claim; in practice the corners are exactly where they don't.</>}
+        lens={<>Corner generalization is poor; corner coverage is a deliberate training choice. Plan ahead for the w values product will request.</>}
+        stretch={<>What Dirichlet alpha gives reasonable corner mass?</>}
+      />
+
+      {/* E2 ⭐ — Failure on Friday: production w shifts to under-trained region after PM tweak */}
+      <VIS.TrapProblem
+        id="dprl-e2"
+        difficulty="hard"
+        title="E2 ⭐ — Failure on Friday"
+        scenario={<>Friday 3am page: engagement down 11% on the For-You surface, watch-time flat, diversity up sharply. Investigation: Thursday 11pm a PM ramped For-You's serving-time w toward a much more diverse corner. GPU util, latency, ranker QPS all unchanged. Why does this fail in DeepPRL but NOT in static-w RL?</>}
+        options={[
+          {key:"a", text:"The new w sits in a region of the simplex the training-w sampling rarely visited; the actor's predictions there are unverified and operationally worse than if you had a static-w model trained ON that exact w. In static-w RL, every served w corresponds to one trained model — never out-of-support. DeepPRL-specific fix: enforce that serving w stays within a 'trained-support' polygon (computed from the training-w sampling distribution); flag PM requests outside it for an offline re-training run.", correct:true},
+          {key:"b", text:"Generic A/B mis-config — restart."},
+          {key:"c", text:"Catalog drift — re-train the critic."},
+          {key:"d", text:"Exploration bonus too high."},
+        ]}
+        trap={<>(b), (c), (d) all sound generic; only (a) connects the failure to the DeepPRL-specific w-coverage assumption.</>}
+        lens={<>Serving-time w MUST stay in training support. This is the DeepPRL-unique runbook entry.</>}
+        stretch={<>What 'support polygon' representation would you actually serve?</>}
+      />
+
+      {/* E3 — implementation specific: critic input dimension off-by-one */}
+      <VIS.TrapProblem
+        id="dprl-e3"
+        difficulty="medium"
+        title="E3 — Library default to override"
+        scenario={<>You use a reference DeepPRL implementation. Which default is most likely to silently bite you in production?</>}
+        options={[
+          {key:"a", text:"The training-w sampling distribution — most reference implementations sample w uniformly on the simplex, which under-represents corners and edges where production tradeoffs often live. Override to match your expected serving distribution before any A/B claim.", correct:true},
+          {key:"b", text:"The discount gamma default."},
+          {key:"c", text:"The Adam learning rate."},
+          {key:"d", text:"The random seed."},
+        ]}
+        trap={<>(b), (c) are standard RL knobs with playbooks; (a) is DeepPRL-specific.</>}
+        lens={<>The new-knob heuristic again: w sampling is what's unique to DeepPRL; defaults are paper-tuned and rarely production-aligned.</>}
+        stretch={<>How big a training run does it take to validate a new sampling distribution?</>}
+      />
+
+      {/* E4 — rollout */}
+      <VIS.TrapProblem
+        id="dprl-e4"
+        difficulty="hard"
+        mode="ordered"
+        title="E4 — Rollout sequence"
+        scenario={<>Migrate from K static-w agents to one DeepPRL. Order the phases. Items that don't belong are not ranked.</>}
+        options={[
+          {key:"a", text:"Inventory production w values per surface; characterize the support set.", order:1},
+          {key:"b", text:"Train DeepPRL with w sampling biased toward the production support; offline-validate hypervolume + per-w-corner returns.", order:2},
+          {key:"c", text:"Shadow-serve DeepPRL alongside static agents at matching w; compare action distributions.", order:3},
+          {key:"d", text:"Ramp 1% traffic on one surface; confirm online metrics within training support.", order:4},
+          {key:"e", text:"Full ramp; retire static agents after coverage validation.", order:5},
+          {key:"f", text:"Replace all static agents on day 1 with DeepPRL."},
+          {key:"g", text:"Expose new out-of-support w values immediately for marketing tests."},
+        ]}
+        trap={<>(f), (g) skip the support-validation steps that are DeepPRL-specific.</>}
+        lens={<>Rollout must validate the support polygon before allowing PM-driven w shifts; otherwise out-of-support failure mode appears in prod first.</>}
+        stretch={<>What's the exit criterion from shadow phase?</>}
+      />
+
+      {/* E5 — reproducibility */}
+      <VIS.TrapProblem
+        id="dprl-e5"
+        difficulty="medium"
+        title="E5 — Paper-to-production reproducibility"
+        scenario={<>The arXiv 2407.03580 paper claims hypervolume gains on offline benchmarks. Which detail is hardest to reproduce in your production?</>}
+        options={[
+          {key:"a", text:"The w sampling schedule used in training — the paper often fixes uniform Dirichlet sampling, but the per-environment hypervolume win is sensitive to whether that distribution covers the OFFLINE TEST w values too. If the test set's w distribution differs from the train w distribution, you can lose most of the reported hypervolume gain in your own setting.", correct:true},
+          {key:"b", text:"The learning rate."},
+          {key:"c", text:"The number of training episodes."},
+          {key:"d", text:"The network width."},
+        ]}
+        trap={<>(b), (c), (d) are mature RL knobs; (a) is DeepPRL-specific reproducibility risk.</>}
+        lens={<>The train-w-distribution vs test-w-distribution match is the reproducibility crux of DeepPRL.</>}
+        stretch={<>What's a robust test-w distribution to publish in your follow-up?</>}
+      />
+
+      {/* E6 — eval contamination */}
+      <VIS.TrapProblem
+        id="dprl-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination"
+        scenario={<>An offline eval reports DeepPRL beats baseline by 18% on hypervolume. The baseline is a single static-w agent at one corner. How is this contaminated?</>}
+        options={[
+          {key:"a", text:"Hypervolume rewards spanning the front; the static-w baseline by construction covers exactly ONE point, so its hypervolume is near-zero by definition. The 18% gap is mechanical, not informative. Honest eval compares DeepPRL's value at a representative set of w against per-w static-w agents trained at each w (one per w) — apples-to-apples on the metric that matters for product.", correct:true},
+          {key:"b", text:"Hypervolume is always trustworthy."},
+          {key:"c", text:"The baseline is fine — same metric is fair."},
+          {key:"d", text:"DeepPRL is wrong."},
+        ]}
+        trap={<>(c) is the seductive fairness claim — same metric on different objects isn't fair.</>}
+        lens={<>Hypervolume is a coverage metric; comparing a coverage method to a point method on coverage is rigged. Use point-vs-point or front-vs-front.</>}
+        stretch={<>What's the honest baseline for hypervolume eval?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>F. Failure modes</h3>
+
+      {/* F1 — edge case: degenerate w distribution */}
+      <VIS.TrapProblem
+        id="dprl-f1"
+        difficulty="medium"
+        title="F1 — Edge case: degenerate train-w distribution"
+        scenario={<>You accidentally configure training-w sampling to a Dirac delta at one w value (everyone samples the same w). What does DeepPRL collapse to, and why is the resulting model dangerous?</>}
+        options={[
+          {key:"a", text:"DeepPRL becomes static-w RL at that single w; the conditioning input is a constant the network learns to ignore. The model APPEARS to be DeepPRL (same architecture, same code path) but at serving you can swap the input w to ANYTHING and the output is identical — the false safety of a multi-objective architecture with a single-objective behavior.", correct:true},
+          {key:"b", text:"DeepPRL crashes."},
+          {key:"c", text:"Loss explodes."},
+          {key:"d", text:"The model becomes optimal at every w."},
+        ]}
+        trap={<>(d) is the "more flexibility automatically" trap; degenerate training is actually less flexible than static-w because the team doesn't realize it.</>}
+        lens={<>Architecture doesn't guarantee behavior. Verify that varying input w produces varying actions before claiming front coverage.</>}
+        stretch={<>What unit test would catch this in CI?</>}
+      />
+
+      {/* F2 — adversarial: malicious w injection */}
+      <VIS.TrapProblem
+        id="dprl-f2"
+        difficulty="hard"
+        title="F2 — Adversarial attack on the conditioning input"
+        scenario={<>Threat model: an upstream service computes the per-request w from a config flag. An attacker who can flip flags can inject any w. Design an attack that maximally degrades DeepPRL while leaving a static-w-fleet system unaffected.</>}
+        options={[
+          {key:"a", text:"Inject w values from the corners of the simplex that were NOT sampled during training (e.g. a pure-diversity corner when training used Dirichlet centered on the interior). The actor outputs unverified actions; downstream metrics degrade. Static-w fleet would simply route to the corresponding-w agent or none-of-the-above (refuse). DeepPRL-specific mitigation: serve-side w validator that rejects out-of-support requests.", correct:true},
+          {key:"b", text:"Inject very large action ids — affects any system."},
+          {key:"c", text:"Send the same query many times — load attack."},
+          {key:"d", text:"There's no such attack."},
+        ]}
+        trap={<>(b), (c) are generic load attacks; (d) confident wrong; (a) requires the support-polygon idea.</>}
+        lens={<>The conditioning input is a new attack surface. Treat it like any other input — validate and reject out-of-support values.</>}
+        stretch={<>What's the serve-side w-validation latency budget?</>}
+      />
+
+      {/* F3 — reverse engineering: front collapse */}
+      <VIS.TrapProblem
+        id="dprl-f3"
+        difficulty="hard"
+        title="F3 — Reverse engineering: 'front collapsed to two points'"
+        scenario={<>Symptom: after 100k training steps, every w value in the simplex maps to one of TWO action distributions (one near each extreme), with nothing in between. Which DeepPRL-specific design choice causes this exact pattern?</>}
+        options={[
+          {key:"a", text:"Linear scalarization on a concave Pareto front. Linear w can only reach the convex-hull extremes; concave interiors are unreachable, so the actor's only useful behaviors are at the two endpoint policies. Diagnosis: switch to a Tchebycheff or hypervolume loss; expect the front to fill in. NOT a training-data problem — it's a loss-shape problem.", correct:true},
+          {key:"b", text:"Insufficient training steps."},
+          {key:"c", text:"Critic underfit."},
+          {key:"d", text:"Entropy collapse."},
+        ]}
+        trap={<>(b), (c), (d) all plausible-looking but don't predict the EXACT two-point pattern that's the convex-hull signature.</>}
+        lens={<>Symptom matching: 'every w maps to one of two policies' = convex-hull artifact, not a training failure. Geometry, not data.</>}
+        stretch={<>How would you diagnostically prove your true front is concave?</>}
+      />
+
+      {/* F4 — paper-named failure mode */}
+      <VIS.TrapProblem
+        id="dprl-f4"
+        difficulty="hard"
+        title="F4 — Paper-named failure mode"
+        scenario={<>The DeepPRL paper specifically warns about one regime where the multi-policy benefit collapses even with a hypervolume loss. Which regime?</>}
+        options={[
+          {key:"a", text:"When one objective DOMINATES (the others are near-trivial / always-co-aligned with the dominant). In that regime the Pareto front is essentially a point — there's nothing to cover. DeepPRL has the overhead of conditioning + sampling without the value. The paper recommends a pre-check that the objectives are sufficiently uncorrelated before deploying DeepPRL.", correct:true},
+          {key:"b", text:"When K = 2 exactly."},
+          {key:"c", text:"When using PPO instead of SAC."},
+          {key:"d", text:"When discount gamma = 1."},
+        ]}
+        trap={<>(b) — the paper actually treats K=2 as the canonical case.</>}
+        lens={<>Pre-check objective independence. Co-aligned objectives don't have a meaningful front; DeepPRL doesn't help.</>}
+        stretch={<>What correlation threshold suggests DeepPRL is worth it?</>}
+      />
+
+      {/* F5 — community follow-up: meta-learned w sampling */}
+      <VIS.TrapProblem
+        id="dprl-f5"
+        difficulty="hard"
+        title="F5 — Community-found weakness"
+        scenario={<>Post-2024 follow-up papers critique DeepPRL for ONE weakness when the operating w shifts over months (PM keeps moving the surface tradeoff). What's the weakness and what kind of follow-up addresses it?</>}
+        options={[
+          {key:"a", text:"The training-w sampling distribution is fixed at design time; if operating w drifts to a region with low training coverage, the model regresses silently. Follow-ups propose ADAPTIVE w sampling — track served-w distribution online, periodically reweight training-w sampling toward observed serving regions. Essentially a meta-learning loop over the simplex.", correct:true},
+          {key:"b", text:"DeepPRL cannot handle drift at all."},
+          {key:"c", text:"There are no such follow-ups."},
+          {key:"d", text:"Drift is impossible if K is small."},
+        ]}
+        trap={<>(c) confidently denies a real literature direction.</>}
+        lens={<>Static-w sampling assumes a static product. The follow-ups close the loop between serving w and training w.</>}
+        stretch={<>What's the right refresh cadence for the sampling distribution?</>}
+      />
+
+      {/* F6 — hypervolume sensitivity to reference point */}
+      <VIS.TrapProblem
+        id="dprl-f6"
+        difficulty="hard"
+        title="F6 — Hypervolume's hidden hyperparameter"
+        scenario={<>You and a colleague both train DeepPRL on the same data; you report hypervolume 0.72, she reports 0.41. Same code, same seed. Most likely cause?</>}
+        options={[
+          {key:"a", text:"Different REFERENCE POINTS for hypervolume. HV is the volume dominated by your front WITH RESPECT TO a reference (usually 'worst-case' or 'origin'). Pick a different reference and the same front yields a different number. Without standardizing the reference, HV comparisons are meaningless. Fix: agree on a reference point per project; publish it with every HV number.", correct:true},
+          {key:"b", text:"Different random seeds."},
+          {key:"c", text:"Floating-point differences."},
+          {key:"d", text:"Different GPUs."},
+        ]}
+        trap={<>(b), (c), (d) wouldn't produce 0.72 vs 0.41 split on the same seed.</>}
+        lens={<>Hypervolume requires a reference point; if unspecified, numbers are non-comparable. The most common Pareto-eval mistake.</>}
+        stretch={<>What's a defensible reference for a recsys application?</>}
+      />
+
+      {/* F7 — extra F-axis facet: bootstrap bias on vector critic */}
+      <VIS.TrapProblem
+        id="dprl-f7"
+        difficulty="hard"
+        title="F7 — Vector critic bootstrap bias"
+        scenario={<>You parameterize the critic as a single network with K output heads sharing a trunk. After a long run, head 1 (engagement) is well-calibrated; heads 2 and 3 (diversity, watch-time) are biased. Most likely cause?</>}
+        options={[
+          {key:"a", text:"Shared trunk + multi-task bootstrap targets: the engagement head has the strongest, lowest-variance signal so its gradient dominates the shared features; heads 2 and 3 inherit features tuned for engagement and produce biased value estimates. Fix: per-head feature scale balancing OR separate trunks per objective; cheap mitigation is gradient norm clipping per head.", correct:true},
+          {key:"b", text:"Reward scaling drift."},
+          {key:"c", text:"Hypervolume loss bug."},
+          {key:"d", text:"Discount gamma too low."},
+        ]}
+        trap={<>(b), (c), (d) plausible-looking but don't predict the per-head bias pattern.</>}
+        lens={<>Multi-task RL shares trunks; signal-rich heads steal capacity. The Pareto critic inherits the same disease.</>}
+        stretch={<>What's the simplest mitigation that doesn't blow up parameter count?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://arxiv.org/abs/2407.03580" target="_blank" rel="noopener">Hu et al. — <em>Deep Pareto Reinforcement Learning for Multi-Objective Recommender Systems</em> (arXiv 2024, paper)</a> — primary source with ablations on front quality.</li>
-        <li><a href="https://lilianweng.github.io/posts/2018-04-08-policy-gradient/" target="_blank" rel="noopener">Lilian Weng — <em>Policy Gradient Algorithms</em> (blog)</a> — practitioner foundation for the actor-critic machinery DeepPRL builds on.</li>
-        <li><a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener">Eugene Yan — <em>System Design for Discovery</em> (blog)</a> — where multi-objective tension actually shows up in industry rankers.</li>
-        <li><a href="https://arxiv.org/abs/1908.08342" target="_blank" rel="noopener">Xie et al. — <em>Multi-Objective Recommendation</em> (survey, paper)</a> — broader landscape and metric definitions.</li>
-        <li><a href="https://www.youtube.com/watch?v=KZd508qGFt0" target="_blank" rel="noopener">DeepMind — <em>Multi-Objective Reinforcement Learning</em> (talk, video)</a> — the underlying RL story, motivated outside recsys.</li>
+        <li>
+          <a href="https://arxiv.org/abs/2407.03580" target="_blank" rel="noopener"><strong>Hu et al. — Deep Pareto Reinforcement Learning for Multi-Objective Recommender Systems</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(arXiv 2024)</span>
+          <br/>Primary source. Read §3 (preference-conditioned actor), §4 (hypervolume / Tchebycheff loss), §5 (offline benchmarks).
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/1908.08342" target="_blank" rel="noopener"><strong>Yang et al. — A Generalized Algorithm for Multi-Objective RL and Policy Adaptation</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(NeurIPS 2019)</span>
+          <br/>Foundation of preference-conditioned multi-objective RL; DeepPRL extends this lineage.
+        </li>
+        <li>
+          <a href="https://www.nature.com/articles/s41598-025-89920-2" target="_blank" rel="noopener"><strong>MOCB — Multi-objective contextual bandit (Sci Reports 2025)</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper)</span>
+          <br/>Sibling for the single-feasible-point story. Read for the constraint-vs-preference distinction.
+        </li>
+        <li>
+          <a href="https://tor-lattimore.com/downloads/book/book.pdf" target="_blank" rel="noopener"><strong>Lattimore &amp; Szepesv&aacute;ri — Bandit Algorithms</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(textbook)</span>
+          <br/>Chapters on multi-objective bandits + constrained bandits.
+        </li>
+        <li>
+          <a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener"><strong>Eugene Yan — System Design for Discovery</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
+          <br/>Practitioner perspective on multi-objective recsys tradeoffs.
+        </li>
       </ul>
     </VIS.Section>
   </main>
