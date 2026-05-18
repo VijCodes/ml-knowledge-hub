@@ -1414,258 +1414,528 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
+// Generative Slate RL — Liu et al., WSDM 2023 (deployed extensions 2024)
+// v2 redo — 30+ trap problems across A-F taxonomy axes.
+
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="RecSys SOTA &middot; RL for recommendation"
+      pill="RecSys SOTA · RL for recommendation"
       title="Generative Slate RL"
-      subtitle="Generate the slate as a sequence with an autoregressive decoder; train on long-term engagement via policy gradient instead of pointwise CTR."
+      subtitle="Treat the whole slate as an autoregressively-generated sequence; train via policy gradient on long-term user-engagement reward — not pointwise CTR."
       byline={[
-        {label: "Paper", value: "Liu et al., WSDM 2023 (deployed extensions 2024)"},
-        {label: "Domain", value: "Homepage feeds, carousels, multi-slot surfaces"},
+        {label: "Paper", value: "Liu et al., WSDM 2023"},
+        {label: "Year", value: "2023 / deployed 2024"},
+        {label: "Domain", value: "Slate / feed recommendation"},
       ]}/>
 
     <VIS.TLDR>
-      Pointwise rankers score each item independently and lose the intra-slate interactions (diversity, position bias, complementarity). Generative Slate RL treats the slate as a <VIS.Term def="A sequence is generated one element at a time, where each element conditions on those generated before it.">sequence to autoregressively decode</VIS.Term>, then trains the decoder by <VIS.Term def="Policy gradient: a reinforcement-learning algorithm that adjusts a policy&apos;s parameters in the direction of higher expected reward, computed via the log-derivative trick.">policy gradient</VIS.Term> on long-term engagement reward. The result captures slate-level effects pointwise scoring cannot.
+      <VIS.Term def="Generative Slate RL — autoregressive decoder generates the slate item by item; trained with policy gradient on a slate-level long-term reward.">Generative Slate RL</VIS.Term> attacks intra-slate interactions (positional cannibalization, diversity, sequence-dependent engagement) by treating the slate as a sequence and optimizing slate-level reward, not pointwise CTR. The cost is policy-gradient variance and reward sparsity.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        At inference, an autoregressive decoder emits item IDs (or item embeddings) one slot at a time, each conditioned on the user context and the items already placed. Training optimizes a session-level or long-term reward (dwell time, return-visit, downstream-click) via policy gradient with a learned value baseline.
+        A pointwise ranker scores each candidate independently and concatenates top-K. The result is often a slate with redundant items (top scorers all look alike) or with poor sequencing (the best-CTR item at position 1 cannibalizes engagement on subsequent items). Generative Slate RL trains a model that DECODES the slate one item at a time, attending to already-placed items, and is rewarded for the slate's long-term outcome (watch-time, session length, conversion), not just one click.
       </p>
       <VIS.Mermaid chart={`
 flowchart TB
-  U["User context"]
-  S1["Slot 1 decode"]
-  S2["Slot 2 decode"]
-  S3["Slot N decode"]
-  R["Session reward"]
-  PG["Policy gradient"]
-  U --> S1
-  S1 --> S2
-  S2 --> S3
-  S1 --> R
-  S2 --> R
-  S3 --> R
-  R --> PG
-  PG --> S1
+  U["User state"] --> D["Autoregressive decoder"]
+  D --> S1["Slot 1: item a₁"]
+  S1 --> D
+  D --> S2["Slot 2: item a₂ | a₁"]
+  S2 --> D
+  D --> SK["Slot K: a_K | a_{1..K-1}"]
+  SK --> R["Slate-level reward (watch-time, etc.)"]
+  R --> PG["Policy gradient update"]
+  style D fill:#dbeafe,stroke:#1e40af
+  style R fill:#dcfce7,stroke:#16a34a
       `} />
-      <ul>
-        <li><strong>Sequence model</strong> — transformer or LSTM decoder over an item vocabulary or embedding space.</li>
-        <li><strong>Reward</strong> — long-horizon engagement, not single-item CTR. Often a learned reward model trained from session signals.</li>
-        <li><strong>Policy gradient</strong> — REINFORCE with a learned baseline, or off-policy actor-critic with IPS-corrected advantage.</li>
-        <li><strong>Beam vs sampling</strong> — at serve time, beam search for safety or sampling for diversity.</li>
-      </ul>
+      <VIS.Equation display tex="\nabla_\theta J(\theta) = \mathbb{E}_{\pi_\theta}\left[ R(\mathbf{s}) \cdot \sum_{k=1}^K \nabla_\theta \log \pi_\theta(a_k \mid s, a_{1:k-1}) \right]" />
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from pointwise / list-wise ranking">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead><tr style={{background:"#f1f5f9"}}><th style={{textAlign:"left",padding:8}}>Property</th><th style={{textAlign:"left",padding:8}}>Pointwise CTR</th><th style={{textAlign:"left",padding:8}}>List-wise rank</th><th style={{textAlign:"left",padding:8}}>Generative Slate RL</th></tr></thead>
-        <tbody>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Target</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Per-item CTR</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>NDCG-style</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Long-term reward</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Intra-slate interaction</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Ignored</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Partial (pair-wise)</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Captured by decoder state</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Position bias</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Needs propensity correction</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Reward shaping</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Built into reward</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Reward signal</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Dense clicks</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Dense ranking labels</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Sparse, delayed</td></tr>
-          <tr><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Training variance</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Low</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>Moderate</td><td style={{padding:8,borderTop:"1px solid #e2e8f0"}}>High (PG)</td></tr>
-        </tbody>
-      </table>
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from siblings">
       <p>
-        The concrete example: if pointwise scoring picks the top three highest-CTR thrillers, the user sees three similar movies and may bounce. The generative model conditions slot 2 and slot 3 on slot 1, learning that &quot;two thrillers and a comedy&quot; outperforms three thrillers in session-level reward.
+        <strong>Pointwise ranker (DLRM-style).</strong> Independent scores per item; assemble top-K. No intra-slate awareness. Cheap, well-calibrated, plateaus when intra-slate effects matter.
+      </p>
+      <p>
+        <strong>Listwise / Listnet.</strong> Loss is slate-level but model is still typically pointwise + reranker; supervised on slate-level CTR. Better than pointwise; still myopic.
+      </p>
+      <p>
+        <strong>Determinantal Point Process (DPP).</strong> Post-hoc diversity reranker via determinant maximization. Heuristic; not RL.
+      </p>
+      <p>
+        <strong>Generative Slate RL.</strong> Autoregressive decoder + policy gradient on long-term reward. Captures intra-slate AND temporal effects. Pays in variance.
+      </p>
+      <p>
+        <strong>Contextual Bandit slate.</strong> Single-step RL on slate-level reward. No sequence model; treats slate as one action.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick / where it wins">
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
       <ul>
-        <li>Surfaces with strong positional interaction effects — homepage feeds, carousels, multi-row layouts.</li>
-        <li>Sessions where the right metric is downstream engagement (dwell, return-visit) not per-impression click.</li>
-        <li>Domains where catalog complementarity matters (videos, news, shopping baskets).</li>
-        <li>Production teams with the budget for off-policy correction, reward modeling, and policy-gradient infra.</li>
+        <li>Surfaces with strong intra-slate interactions: home feeds, carousels, recipe cards where item-i affects engagement on item-{(i+1)}.</li>
+        <li>Long-term reward matters more than per-impression CTR — session length, return-day-+1, retention.</li>
+        <li>GPU-rich serving (autoregressive decoding costs more than pointwise scoring).</li>
+        <li>You have enough exploration in logs to train policy gradient reliably (or use off-policy with logged π₀).</li>
       </ul>
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
       <ul>
-        <li><strong>Reward sparsity</strong> — long-term rewards are rare and delayed; signal-to-noise on the gradient is poor without reward shaping.</li>
-        <li><strong>Policy-gradient variance</strong> — REINFORCE has notoriously high variance; needs learned baselines (advantage actor-critic) and trust regions (PPO-style).</li>
-        <li><strong>Off-policy correction</strong> — training data was logged under a different policy; IPS / DR weights are needed and they themselves explode under low overlap.</li>
-        <li><strong>Catastrophic-action exploration</strong> — autoregressive sampling can place degenerate slates during training; clip or pretrain with supervised data.</li>
-        <li><strong>Latency</strong> — autoregressive decoding is sequential; throughput is lower than pointwise scoring even with batched beam search.</li>
+        <li><strong>Policy gradient variance.</strong> Slate-level reward gives one signal per slate (compared to K signals per slate in pointwise). Requires variance reduction (baselines, advantage normalization).</li>
+        <li><strong>Reward sparsity.</strong> Long-term reward arrives delayed; credit assignment across the slate is hard.</li>
+        <li><strong>Exploration vs exploitation.</strong> Pure exploitation in autoregressive decoding can lock into modes; needs explicit exploration mechanisms.</li>
+        <li><strong>Off-policy correction.</strong> Logged slates were generated by the OLD slate policy; IPS correction at slate granularity has very low overlap.</li>
+        <li><strong>Latency.</strong> Autoregressive decoding is K× slower than pointwise per-slate scoring.</li>
       </ul>
-      <VIS.Callout kind="gotcha" title="Reward shaping is the real research project">
-        Most teams underestimate how much engineering goes into the reward. Raw &quot;session dwell time&quot; is too noisy; binary &quot;return next day&quot; is too sparse. The shipped reward is usually a weighted combination of immediate click, watch fraction, post-session return, and negative signals (skip, dislike). Without careful shaping, policy gradient finds reward-hacking exploits within weeks.
+      <VIS.Callout kind="gotcha" title="Pointwise top-K is not the same slate">
+        Even if your pointwise CTR model is perfect, top-K-by-pointwise-score is provably suboptimal when intra-slate interactions matter. The classic example: a music slate where two top-CTR songs are too similar, splitting attention; a slightly-lower-CTR diverse song wins on session length.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
-      <p style={{color:"#475569"}}>Pick, then reveal.</p>
+    <VIS.Section id="sec-drill" title="Drill — trap problems (A-F axes)">
+      <p style={{color:"#475569", marginBottom: 16}}>
+        Every problem hinges on Generative Slate RL's specific autoregressive-decoding-with-PG-on-slate-reward mechanism — generic RL or generic slate-ranking questions are out.
+      </p>
 
-      <VIS.TrapProblem
-        id="gsrl-p1" difficulty="hard"
-        title="P1 — Why pointwise CTR underperforms on slates"
-        scenario={<>You score 10 items by pointwise CTR and take the top 3 for a carousel. They are all thrillers. Engagement at the carousel level is mediocre. Why does generative slate RL beat this?</>}
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
+      <VIS.TrapProblem id="gsr-a1" difficulty="hard"
+        title="A1 — Generative Slate RL vs DPP rerank: the discriminator"
+        scenario={<>Both improve slate quality over pointwise top-K. What's the actual discriminator?</>}
         options={[
-          {key:"a", text:"Pointwise scoring ignores intra-slate interactions; slot 2 should condition on slot 1 because users dislike near-duplicate slates. Generative decoding learns this from session reward.", correct:true},
-          {key:"b", text:"Pointwise CTR is computed with the wrong loss."},
-          {key:"c", text:"The pointwise model is too small."},
-          {key:"d", text:"Thrillers have lower CTR than romance films."},
+          {key:"a", text:"DPP is a fixed post-hoc heuristic (determinant of a similarity kernel); Generative Slate RL LEARNS the slate-construction policy end-to-end from reward. DPP can't capture domain-specific intra-slate effects that aren't in the similarity kernel; Generative Slate RL can.", correct:true},
+          {key:"b", text:"DPP is faster."},
+          {key:"c", text:"DPP doesn't use neural nets."},
+          {key:"d", text:"They are the same algorithm with different names."},
         ]}
-        trap={<>(b)(c)(d) miss the structural issue.</>}
-        lens={<>Pointwise CTR is independent per item. It cannot represent &quot;a slate is more than the sum of its items.&quot; The first thriller raises CTR; the second adds little; the third actively bores the user. Generative slate RL conditions each slot on the slate-so-far, learning the diversity effect directly from session reward.</>}
-        stretch={<>What pointwise tweak (without sequence modeling) approximates this?</>}
+        trap={<>(b)(c) miss the learning-vs-heuristic distinction. (d) is false.</>}
+        lens={<>DPP encodes one specific intra-slate effect (similarity diversity) via a fixed math object. Generative Slate RL discovers whatever intra-slate effects the reward exposes — including non-similarity-based ones like "users prefer one banner ad max per slate."</>}
+        stretch={<>When would DPP be preferred over Generative Slate RL?</>}
       />
 
-      <VIS.TrapProblem
-        id="gsrl-p2" difficulty="hard" multiSelect
-        title="P2 — Sources of training variance in generative slate RL"
-        scenario={<>Pick the components that contribute most to high variance in policy-gradient training for generative slate RL. Select all that apply.</>}
+      <VIS.TrapProblem id="gsr-a2" difficulty="hard"
+        title="A2 — Generative Slate RL vs Listwise"
+        scenario={<>Listwise uses slate-level loss. Generative Slate RL uses slate-level reward + autoregressive decoder. Pick the real deltas.</>}
+        multiSelect
         options={[
-          {key:"a", text:"Sparse, delayed session reward — most slates have near-zero reward.", correct:true},
-          {key:"b", text:"REINFORCE gradient depends on full-trajectory return, which has high variance.", correct:true},
-          {key:"c", text:"Off-policy IPS weights blow up when the new policy diverges from logged policy.", correct:true},
-          {key:"d", text:"Embedding dimension is too small."},
-          {key:"e", text:"Beam search at training time."},
+          {key:"a", text:"Listwise typically still SCORES items independently (loss is over the slate but score is pointwise); Generative Slate RL CONSTRUCTS the slate via attention to already-placed items.", correct:true},
+          {key:"b", text:"Listwise is supervised on labels (CTR ground truth); Generative Slate RL trains via policy gradient on a reward signal.", correct:true},
+          {key:"c", text:"Listwise can't capture sequence-dependent effects; Generative Slate RL can.", correct:true},
+          {key:"d", text:"Listwise is older."},
+          {key:"e", text:"They are the same algorithm."},
         ]}
-        trap={<>(d) is unrelated. (e) does not apply at training time.</>}
-        lens={<>The three real variance sources: sparse reward, full-trajectory return in REINFORCE, and off-policy importance weights. Production fixes: learned value baseline (A2C), advantage shaping, weight clipping. Each fix introduces some bias for big variance reduction.</>}
-        stretch={<>Which fix gives the largest variance reduction per unit bias?</>}
+        trap={<>(e) is wrong. (d) is true but not a delta.</>}
+        lens={<>Three real deltas: scoring vs construction, supervised vs RL, intra-slate sequence modeling vs none. Each has implementation consequences (Listwise can fit on existing training infra; Generative Slate RL needs RL infra).</>}
+        stretch={<>Which delta is the most cost-significant to implement?</>}
       />
 
-      <VIS.TrapProblem
-        id="gsrl-p3" difficulty="hard"
-        title="P3 — Reward hacking in production"
-        scenario={<>Two weeks after launch, the generative slate model is favoring clickbait thumbnails. Online CTR is up but downstream engagement is down. What happened?</>}
+      <VIS.TrapProblem id="gsr-a3" difficulty="hard"
+        title="A3 — Counterfactual: if Generative Slate RL didn't exist"
+        scenario={<>If Generative Slate RL were never proposed, what's the path of least regret for capturing intra-slate effects?</>}
         options={[
-          {key:"a", text:"The reward proxy (clicks) was the wrong target; the policy found a reward-hacking exploit. Fix the reward to include post-click engagement (dwell, return).", correct:true},
-          {key:"b", text:"Off-policy correction failed."},
-          {key:"c", text:"Beam search width is too small."},
-          {key:"d", text:"The decoder is overfitting to the validation set."},
+          {key:"a", text:"DPP + heavy feature engineering on positional context features; quality plateaus on whatever the engineered features capture and never discovers reward-driven intra-slate effects the way an end-to-end policy can.", correct:true},
+          {key:"b", text:"Just use pointwise — intra-slate effects don't matter."},
+          {key:"c", text:"Train deeper pointwise models."},
+          {key:"d", text:"There's no alternative."},
         ]}
-        trap={<>(b)(c)(d) are unrelated to the symptom.</>}
-        lens={<>Goodhart&apos;s law in RL: optimize a proxy and the policy will exploit its gap with the true objective. The fix is reward shaping that ties the reward to the actual business outcome (post-click engagement, retention). This is where most generative-slate-RL projects spend their second quarter of effort.</>}
-        stretch={<>How would you detect this within a week instead of two?</>}
+        trap={<>(b)(d) over-state. (c) doesn't capture intra-slate.</>}
+        lens={<>The DPP + engineering path was the pre-RL state of the art and what most companies still do. The gain of Generative Slate RL is "no longer cap quality on what humans encode in features."</>}
+        stretch={<>How would you A/B test the DPP+engineering vs Generative Slate RL path?</>}
       />
 
-      <VIS.TrapProblem
-        id="gsrl-p4" difficulty="medium"
-        title="P4 — Latency tradeoff"
-        scenario={<>Autoregressive decoding is sequential. Your 10-slot carousel takes 80ms with generative slate RL vs 20ms with pointwise scoring. The product team wants the model anyway. What is the cheapest mitigation?</>}
+      <VIS.TrapProblem id="gsr-a4" difficulty="hard"
+        title="A4 — Compose Generative Slate RL with HSTU"
+        scenario={<>HSTU is a generative ranker over single next-action. Generative Slate RL is a generative slate. What happens when stacked?</>}
         options={[
-          {key:"a", text:"Use parallel sampling (multiple slates in batch) + a learned non-autoregressive teacher head for first-pass decoding when latency is tight.", correct:true},
-          {key:"b", text:"Switch to pointwise CTR."},
-          {key:"c", text:"Use a deeper decoder."},
-          {key:"d", text:"Reduce slate length to 3."},
+          {key:"a", text:"Compatible — HSTU's user encoding can be the conditioning state s for Generative Slate RL's slate decoder. Both share the autoregressive paradigm. The composition is roughly 'HSTU for user understanding, Slate-RL for slate construction.'", correct:true},
+          {key:"b", text:"Incompatible — both are generative."},
+          {key:"c", text:"Slate RL replaces HSTU."},
+          {key:"d", text:"HSTU replaces Slate RL."},
         ]}
-        trap={<>(b) abandons the whole project. (c) makes latency worse. (d) is a product compromise, not an engineering fix.</>}
-        lens={<>The standard mitigations are parallel batched decoding, beam-width tuning, distillation to a non-autoregressive student, and KV-cache reuse across slots. Each trades a small quality regression for a big latency win.</>}
-        stretch={<>What KV-cache pattern works best for slate decoding?</>}
+        trap={<>(b)(c)(d) miss the layering structure.</>}
+        lens={<>HSTU and Generative Slate RL attack different layers — HSTU is user representation + next-action scoring; Slate-RL is slate construction. They compose naturally.</>}
+        stretch={<>What's the practical interaction between HSTU's per-item probabilities and Slate-RL's autoregressive decoder?</>}
       />
 
-      <VIS.TrapProblem
-        id="gsrl-p5" difficulty="hard" mode="ordered"
-        title="P5 — Building a generative slate RL stack"
-        scenario={<>Your team agrees to invest in generative slate RL. Order the workstreams. Wrong moves are unranked.</>}
+      <VIS.TrapProblem id="gsr-a5" difficulty="hard"
+        title="A5 — Boundary: when does Generative Slate RL stop beating pointwise?"
+        scenario={<>At what intra-slate-effect strength does the policy-gradient variance overhead of Generative Slate RL outweigh its gains?</>}
         options={[
-          {key:"a", text:"Pretrain the decoder with supervised slate reconstruction on logged slates.", order:1},
-          {key:"b", text:"Build a reward model from session-level signals; validate against business metrics.", order:2},
-          {key:"c", text:"Run policy gradient with IPS correction on offline logs; tune variance controls.", order:3},
-          {key:"d", text:"Shadow online next to the production ranker; compare reward proxies.", order:4},
-          {key:"e", text:"Roll into production A/B with strict guardrails.", order:5},
-          {key:"f", text:"Jump straight to online RL without pretraining or shadow."},
+          {key:"a", text:"When intra-slate effects contribute < ~5% to long-term reward variance — at that level, the policy-gradient variance overhead and reward-sparsity penalty exceed the modeling gain over a well-tuned pointwise + DPP.", correct:true},
+          {key:"b", text:"Always."},
+          {key:"c", text:"Never — Slate-RL always wins."},
+          {key:"d", text:"At 50%."},
         ]}
-        trap={<>(f) is the &quot;learn online&quot; cowboy move; the catastrophic-exploration cost outweighs any time saved.</>}
-        lens={<>The order is risk-controlled: supervised pretrain (so the decoder produces sensible slates), reward model first (so the gradient direction is right), offline RL with off-policy correction (cheap), shadow (measure without exposing users), then A/B.</>}
-        stretch={<>What gate triggers moving from shadow to A/B?</>}
+        trap={<>(b)(c) over-state. (d) is too high.</>}
+        lens={<>The crossover is roughly at 5% intra-slate-effect contribution to reward variance. Below that, pointwise + DPP wins on the variance-vs-gain trade. Above that, Slate-RL pays off. Measure on your surface before migrating.</>}
+        stretch={<>How would you measure intra-slate-effect contribution on a live surface?</>}
       />
 
-      <VIS.TrapProblem
-        id="gsrl-p6" difficulty="medium" multiSelect
-        title="P6 — Off-policy correction in slate RL"
-        scenario={<>Training data was logged under the old pointwise ranker. The new policy is a generative decoder. What off-policy mechanics do you need? Select all that apply.</>}
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>B. Application</h3>
+
+      <VIS.TrapProblem id="gsr-b1" difficulty="hard"
+        title="B1 — Pick: home feed, watch-time goal, ~10-item slates"
+        scenario={<>Home video feed, 10-item slate per request, optimize for session watch-time (not per-item CTR). Pointwise CTR-optimized DLRM in prod. Pick.</>}
         options={[
-          {key:"a", text:"Per-slot importance weights, combined multiplicatively over the slate.", correct:true},
-          {key:"b", text:"Weight clipping or self-normalization to control variance.", correct:true},
-          {key:"c", text:"A Doubly Robust correction with an imputed-reward baseline.", correct:true},
-          {key:"d", text:"Set all importance weights to 1 to simplify training."},
-          {key:"e", text:"Train fully on-policy by serving live during training."},
+          {key:"a", text:"Generative Slate RL — intra-slate effects are large in feeds (autoplay carries engagement across items), reward is long-term (session length), reward-CTR mismatch breaks pointwise optimization. Slate-RL's autoregressive decoder + slate reward is the right fit.", correct:true},
+          {key:"b", text:"DLRM — keep what's working."},
+          {key:"c", text:"DPP rerank only."},
+          {key:"d", text:"Listwise rerank only."},
         ]}
-        trap={<>(d) re-introduces the bias OPE was meant to remove. (e) is dangerous in production.</>}
-        lens={<>Slate-level IS is the product of per-slot IS, which compounds variance. Clipping, SNIPS-style normalization, and DR with q-hat are all standard. On-policy training is technically purer but requires online exploration on real users, which is rarely acceptable.</>}
-        stretch={<>How does the product of weights grow with slate length?</>}
+        trap={<>(b) ignores the watch-time goal. (c)(d) are intermediate moves; Slate-RL is the full solution for this surface.</>}
+        lens={<>Feeds with long-term reward and strong intra-slate effects are THE Generative Slate RL use case. The migration cost is real but the upside (watch-time gains) is documented.</>}
+        stretch={<>What's the smallest A/B test cell size you'd run to detect Slate-RL's gain?</>}
       />
 
-      <VIS.TrapProblem
-        id="gsrl-p7" difficulty="hard"
-        title="P7 — Beam search vs sampling at serve time"
-        scenario={<>At serve time, do you decode the slate with beam search (deterministic top-k) or sampling? Pick the better default for a homepage feed.</>}
+      <VIS.TrapProblem id="gsr-b2" difficulty="hard"
+        title="B2 — Sounds reasonable, isn't: 'just use slate-level CTR labels'"
+        scenario={<>A junior says "skip RL — just label slates by total CTR and train listwise loss." Why is this wrong specifically for Generative Slate RL's target problem?</>}
         options={[
-          {key:"a", text:"Sampling with temperature, plus a safety filter — gives slate diversity across users and avoids degenerate beam collapse on long-tail contexts.", correct:true},
-          {key:"b", text:"Beam search with width 1 — fastest and always safe."},
-          {key:"c", text:"Random shuffling of pointwise scores."},
-          {key:"d", text:"Greedy decoding without temperature."},
+          {key:"a", text:"Slate-level CTR is a sum of per-item CTRs; it doesn't capture sequence-dependent effects (item-i affects engagement on item-{(i+1)}) or long-term effects (session length). Listwise loss optimizes the sum, which is essentially pointwise-with-fancy-loss.", correct:true},
+          {key:"b", text:"Listwise loss is illegal."},
+          {key:"c", text:"It's identical to Slate-RL."},
+          {key:"d", text:"Listwise is always worse than pointwise."},
         ]}
-        trap={<>(b) is greedy decoding under another name. (c)(d) abandon the model.</>}
-        lens={<>Greedy/beam favors the single highest-probability slate, which collapses diversity across users (everyone sees the same carousel) and amplifies any reward-hacking exploit. Temperature sampling preserves diversity and lets you tune the exploration-exploitation knob at serve time without retraining.</>}
-        stretch={<>What temperature schedule do production teams use?</>}
+        trap={<>(b)(c)(d) miss the reward-decomposition issue.</>}
+        lens={<>The reward design is the crux. If your reward decomposes additively over items, listwise is fine. If it doesn't (session length, multi-step engagement), Slate-RL's slate-level reward captures what listwise can't.</>}
+        stretch={<>Name three rewards that DO decompose additively, and three that don't.</>}
       />
 
-      <VIS.TrapProblem
-        id="gsrl-p8" difficulty="hard"
-        title="P8 — When generative slate RL is overkill"
-        scenario={<>Pick the surface where generative slate RL provides little lift over pointwise scoring.</>}
+      <VIS.TrapProblem id="gsr-b3" difficulty="medium"
+        title="B3 — Business pitch: Slate-RL over pointwise + DPP"
+        scenario={<>Pitch Generative Slate RL to a VP whose current stack is DLRM + DPP rerank. Give the one-sentence pitch REQUIRING understanding of Slate-RL's specific autoregressive-decode + slate-reward mechanism.</>}
         options={[
-          {key:"a", text:"A single-result query (1-slot SERP, like a featured snippet) — there is no intra-slate interaction to model.", correct:true},
-          {key:"b", text:"A 20-row TikTok-style For-You feed."},
-          {key:"c", text:"A homepage with 5 horizontal carousels."},
-          {key:"d", text:"A multi-row Netflix homepage."},
+          {key:"a", text:"'DPP encodes one human-chosen intra-slate effect (similarity diversity). Slate-RL learns whichever intra-slate effects move OUR session watch-time, including ones nobody's added to the kernel yet — that's why our peers ship +3% watch-time we can't match.'", correct:true},
+          {key:"b", text:"'It's more accurate.' (Generic.)"},
+          {key:"c", text:"'It uses RL.' (Generic.)"},
+          {key:"d", text:"'It's a 2024 paper.' (Generic.)"},
         ]}
-        trap={<>(b)(c)(d) all have strong slate effects.</>}
-        lens={<>Single-slot surfaces have no intra-slate interaction to exploit; pointwise scoring is sufficient. Generative slate RL pays off only when the slate has multiple slots whose joint composition matters.</>}
-        stretch={<>What is the smallest slate length where slate RL starts to win?</>}
+        trap={<>(b)(c)(d) pass redaction.</>}
+        lens={<>The pitch anchors on the specific failure of DPP (human-encoded effects) and the specific gain of Slate-RL (learned effects from reward). Anything else could be said about a different model.</>}
+        stretch={<>How would you measure the DPP-not-captured intra-slate effects empirically?</>}
       />
 
-      <VIS.TrapProblem
-        id="gsrl-p9" difficulty="medium"
-        title="P9 — Reward model quality dominates"
-        scenario={<>Your team is debating where to invest engineering effort. The decoder is solid; the policy-gradient infra works. Where will the next 6 months of gains come from?</>}
+      <VIS.TrapProblem id="gsr-b4" difficulty="hard"
+        title="B4 — When NOT to use Generative Slate RL"
+        scenario={<>Pick the surface where Slate-RL is the wrong choice.</>}
         options={[
-          {key:"a", text:"The reward model — a sharper, less hackable reward is the highest-leverage investment for any RL-based ranker.", correct:true},
-          {key:"b", text:"Deeper decoder."},
-          {key:"c", text:"Wider beam search."},
-          {key:"d", text:"Increasing slate length."},
+          {key:"a", text:"Ads ranking where slates are 1-2 items, reward is per-impression CTR, and you can't afford autoregressive latency — the autoregressive overhead is wasted on a 1-item 'slate'.", correct:true},
+          {key:"b", text:"Home feeds."},
+          {key:"c", text:"Carousels."},
+          {key:"d", text:"Recipe slates."},
         ]}
-        trap={<>(b)(c)(d) hit diminishing returns quickly.</>}
-        lens={<>Once the decoder and gradient infra are stable, the reward shaping is the lever. Better-aligned reward → better gradient direction → all downstream gains compound. This is the AI alignment lesson applied to recsys.</>}
-        stretch={<>What single signal would you add to a click-based reward?</>}
+        trap={<>(b)(c)(d) are all good Slate-RL surfaces.</>}
+        lens={<>Slate-RL's overhead doesn't pay off if there's no intra-slate to model. K=1-2 slates with per-impression reward are pointwise problems.</>}
+        stretch={<>At what K does Slate-RL start to dominate pointwise + DPP, empirically?</>}
       />
 
-      <VIS.TrapProblem
-        id="gsrl-p10" difficulty="hard" multiSelect
-        title="P10 — Catastrophic exploration"
-        scenario={<>During offline RL training, the policy produces a slate of 10 identical items for a small fraction of users. What is going on and how do you prevent shipping it? Select all that apply.</>}
+      <VIS.TrapProblem id="gsr-b5" difficulty="hard"
+        title="B5 — Cold-start: 10K events, can you train Slate-RL?"
+        scenario={<>New surface with 10K logged slates. Can you train Generative Slate RL?</>}
         options={[
-          {key:"a", text:"The decoder collapsed to a high-probability degenerate mode for under-represented contexts; pretraining on supervised slates was insufficient.", correct:true},
-          {key:"b", text:"Add a slate-diversity reward term penalizing exact duplicates.", correct:true},
-          {key:"c", text:"Add a serve-time safety filter that rejects degenerate slates and falls back to the prior ranker.", correct:true},
-          {key:"d", text:"Increase the learning rate to escape the collapse."},
-          {key:"e", text:"Disable off-policy correction entirely."},
+          {key:"a", text:"No — policy gradient is high-variance, needs millions of slates for stable gradients. Pre-train via supervised behavior cloning on logged slates first, then RL-finetune; or use offline RL with off-policy correction.", correct:true},
+          {key:"b", text:"Yes — 10K is enough."},
+          {key:"c", text:"Yes — initialize random."},
+          {key:"d", text:"Yes — just train for more epochs."},
         ]}
-        trap={<>(d) amplifies catastrophic exploration. (e) loses unbiasedness.</>}
-        lens={<>Mode collapse is a known failure of policy gradient on sparse rewards. The defenses are layered: better supervised pretraining (start from a sensible policy), explicit diversity reward (penalize duplicates), and a serve-time guardrail (degenerate-slate detector that triggers a fallback). All three together cost a small accuracy hit and protect against catastrophic exposure.</>}
-        stretch={<>What is the simplest degenerate-slate detector in production?</>}
+        trap={<>(b)(c)(d) ignore PG variance requirements.</>}
+        lens={<>Pre-training via behavior cloning then RL-finetuning is the standard recipe at small N. Pure PG from random init at 10K slates is unstable and rarely converges to a good policy.</>}
+        stretch={<>What's the BC-pretrain → RL-finetune ratio you'd use?</>}
       />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      <VIS.TrapProblem id="gsr-c1" difficulty="hard"
+        title="C1 — Why autoregressive decoder, not joint?"
+        scenario={<>Why does Generative Slate RL decode the slate AUTOREGRESSIVELY instead of generating the joint distribution over all K slots at once?</>}
+        options={[
+          {key:"a", text:"Joint generation over K slots requires modeling the full K-dimensional action space (|I|^K), which is intractable at production catalog sizes. Autoregressive decoding factorizes π(a₁,…,a_K) = Π π(a_k | a_{1..k-1}), making each step a |I|-way softmax instead.", correct:true},
+          {key:"b", text:"Joint is faster."},
+          {key:"c", text:"Autoregressive is a convention."},
+          {key:"d", text:"Joint doesn't exist."},
+        ]}
+        trap={<>(b)(c)(d) miss the action-space explosion.</>}
+        lens={<>The autoregressive factorization is the same trick LLMs use for text — make a |Vocab|^K problem into K |Vocab| problems. Slate-RL inherits this from sequence modeling literature.</>}
+        stretch={<>What's the variance cost of autoregressive vs joint, theoretically?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-c2" difficulty="hard"
+        title="C2 — Loss / objective: PG over slates"
+        scenario={<>Policy gradient on a slate has one reward per slate but K log-probability terms. What variance reduction is critical?</>}
+        options={[
+          {key:"a", text:"Baseline subtraction — subtract a state-dependent baseline b(s) from the reward to reduce variance without bias: ∇J = E[(R - b(s)) · Σ_k ∇log π(a_k | …)]. Without baseline, even small reward variance amplifies via the K log-prob sum.", correct:true},
+          {key:"b", text:"Use Adam."},
+          {key:"c", text:"More layers."},
+          {key:"d", text:"Larger batch."},
+        ]}
+        trap={<>(b)(c)(d) help generically but don't address PG variance.</>}
+        lens={<>Baseline (value-function head) is the standard PG variance reduction. Advantage normalization comes second. Without these, training is unstable and diverges.</>}
+        stretch={<>What's the bias-variance trade of advantage normalization?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-c3" difficulty="hard"
+        title="C3 — What's dropped vs pointwise? What replaces it?"
+        scenario={<>Pointwise has per-item gradient signal. Slate-RL has per-slate gradient signal — K× less. What replaces the granularity?</>}
+        options={[
+          {key:"a", text:"Reward shaping + intermediate rewards — assign partial rewards (e.g., dwell on item-1, click on item-2) to give per-item credit; combined with the slate-final reward this restores some granularity without giving up the slate-level optimization.", correct:true},
+          {key:"b", text:"Nothing — the K× loss is inherent."},
+          {key:"c", text:"More data."},
+          {key:"d", text:"Bigger model."},
+        ]}
+        trap={<>(b)(c)(d) miss the reward-shaping recovery.</>}
+        lens={<>Reward shaping is the standard tool. Be careful: shaped rewards introduce bias toward whatever heuristic the shape encodes, partially defeating Slate-RL's "learn the effects from reward" promise. Compromise: reward shaping for early training, slate-only reward for fine-tuning.</>}
+        stretch={<>What's the risk of over-shaping in Slate-RL?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-c4" difficulty="hard"
+        mode="ordered"
+        title="C4 — Rank Slate-RL knobs by 'production-breaking if mis-set'"
+        scenario={<>Order from most catastrophic to least: (a) reward design, (b) entropy bonus coefficient, (c) baseline (value-fn) head, (d) batch size.</>}
+        options={[
+          {key:"a", text:"Reward design — wrong reward gives a perfect policy for the wrong thing (paperclip maximizer); affects business outcome directly with no warning sign.", order:1},
+          {key:"b", text:"Entropy bonus — too low → mode collapse; too high → random slates; affects training stability and exploration.", order:2},
+          {key:"c", text:"Baseline head — affects PG variance; mis-set means longer / unstable training but eventually converges.", order:3},
+          {key:"d", text:"Batch size — affects gradient noise but mostly within standard tuning."},
+        ]}
+        trap={<>Many candidates rank entropy first because it's a flashy RL knob. Reward design is the silent killer.</>}
+        lens={<>Reward design is the load-bearing assumption. A perfect Slate-RL on the wrong reward is worse than a mediocre pointwise on the right metric. Reward audits before launch.</>}
+        stretch={<>How would you audit a slate reward function before deployment?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-c5" difficulty="hard"
+        title="C5 — Data assumption violations"
+        scenario={<>Which violation breaks Slate-RL most severely?</>}
+        options={[
+          {key:"a", text:"Logged slates were generated by a deterministic policy (no exploration) — autoregressive decoding can only learn from action sequences π₀ actually produced; without exploration, support is missing and off-policy correction can't recover.", correct:true},
+          {key:"b", text:"Reward noise."},
+          {key:"c", text:"User-segment imbalance."},
+          {key:"d", text:"Slate size variation."},
+        ]}
+        trap={<>(b)(c)(d) are real but secondary.</>}
+        lens={<>Exploration in logging is the prerequisite for any RL learning, especially off-policy. Slate-RL inherits this requirement from RL fundamentals — and slate-granularity makes it harder because the space is K-dimensional.</>}
+        stretch={<>What exploration scheme would you require at slate granularity?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      <VIS.TrapProblem id="gsr-d1" difficulty="hard"
+        title="D1 — Intuitive but wrong: 'better per-item ranking → better slate'"
+        scenario={<>A staff eng says "if we make the pointwise model better, the slate will be better too." Why is this wrong when intra-slate effects matter?</>}
+        options={[
+          {key:"a", text:"Top-K-by-pointwise-score selects items in isolation; even a perfect pointwise CTR model will assemble top-CTR items that cannibalize each other on a slate where the goal is session watch-time. The slate-level optimum requires lower-individual-CTR items that diversify.", correct:true},
+          {key:"b", text:"Per-item ranking is always optimal."},
+          {key:"c", text:"Slate quality doesn't matter."},
+          {key:"d", text:"You can't improve slate without changing the model."},
+        ]}
+        trap={<>(b)(c)(d) miss the slate-vs-item optimum gap.</>}
+        lens={<>Slate optimum ≠ top-K-by-item-optimum when intra-slate effects exist. Even an oracle pointwise ranker can produce a poor slate. This is the textbook motivation for Slate-RL.</>}
+        stretch={<>Construct a 2-item example where the slate-optimal differs from top-2-by-pointwise.</>}
+      />
+
+      <VIS.TrapProblem id="gsr-d2" difficulty="hard"
+        title="D2 — Wrong-assumption cascade: 'Slate-RL = pointwise + RL trim'"
+        scenario={<>A staff eng assumes Slate-RL is "pointwise model + an RL layer." List the WRONG downstream consequences.</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Assumes per-item loss is the same — wrong, Slate-RL's loss is slate-level (PG on R(s)).", correct:true},
+          {key:"b", text:"Assumes serving latency is similar — wrong, autoregressive decoding is K× slower than pointwise per slate.", correct:true},
+          {key:"c", text:"Assumes calibration is the same — wrong, Slate-RL outputs a distribution over slate sequences, not per-item probabilities.", correct:true},
+          {key:"d", text:"Assumes you can A/B with the same eval — wrong, slate-level reward requires session-aware eval, not per-impression metrics.", correct:true},
+          {key:"e", text:"Assumes you can train on the same GPUs — fine, both run on standard transformer infra."},
+        ]}
+        trap={<>(e) is the only one unchanged.</>}
+        lens={<>Slate-RL is not "pointwise + epsilon." It's a different training, eval, and serving paradigm. The cascade hits four downstream systems.</>}
+        stretch={<>Which of these is the cheapest vs hardest to migrate?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-d3" difficulty="hard"
+        title="D3 — Junior fix: 'more data'. Senior fix?"
+        scenario={<>Slate-RL gradient is noisy; training is unstable. Junior says "10× more data." Senior says ?</>}
+        options={[
+          {key:"a", text:"Add a baseline head (value function) to subtract reward variance; the PG variance scales with reward variance, not n alone. Pre-train with behavior cloning then RL-finetune to bootstrap stable gradients before scaling data.", correct:true},
+          {key:"b", text:"10× more data."},
+          {key:"c", text:"Use Adam."},
+          {key:"d", text:"Bigger learning rate."},
+        ]}
+        trap={<>(b) is the data-scaling reflex. (c)(d) are generic.</>}
+        lens={<>PG variance is governed by reward variance, baseline quality, and exploration. Adding baseline head is the surgical fix; more data helps only marginally if the variance source is reward shape.</>}
+        stretch={<>How does GAE (generalized advantage estimation) compare to a vanilla baseline?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-d4" difficulty="hard"
+        title="D4 — Plausible misattribution: 'Slate-RL improved offline NDCG, online watch-time didn't change'"
+        scenario={<>Offline slate-NDCG up; online watch-time flat. Plausible causes: (1) candidate-set mismatch online, (2) eval distribution shift, (3) the reward optimized was slate-level CTR not watch-time. Which?</>}
+        options={[
+          {key:"a", text:"(3) reward mismatch — Slate-RL maximizes the reward you trained on; if that's slate-level CTR not watch-time, offline NDCG (a sum of CTRs) improves while the actual business metric (watch-time) doesn't. Re-train with watch-time as reward.", correct:true},
+          {key:"b", text:"(1) candidate-set mismatch."},
+          {key:"c", text:"(2) eval distribution shift."},
+          {key:"d", text:"GPU error."},
+        ]}
+        trap={<>(b)(c) are real concerns but the reward-design issue is the most-likely Slate-RL-specific cause.</>}
+        lens={<>Reward = what gets optimized. If reward ≠ business metric, you'll get the wrong policy. Always validate offline metric against business metric end-to-end before scaling.</>}
+        stretch={<>What's the reward-design audit process you'd recommend?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>E. Operations</h3>
+
+      <VIS.TrapProblem id="gsr-e1" difficulty="hard"
+        title="E1 — Production gotcha: autoregressive latency"
+        scenario={<>Slate-RL serves at p99 600ms vs DLRM's 80ms. K=10. Why and what's the fix?</>}
+        options={[
+          {key:"a", text:"Autoregressive decoding does K=10 sequential forward passes per slate; even with KV-cache, that's ~10× DLRM's single-pass scoring. Fix: parallel decoding (non-autoregressive variants), speculative decoding, or precompute slate prefix for popular contexts.", correct:true},
+          {key:"b", text:"Larger batch."},
+          {key:"c", text:"More GPUs."},
+          {key:"d", text:"Quantize to INT4."},
+        ]}
+        trap={<>(b)(c)(d) help marginally but don't address the K× sequential factor.</>}
+        lens={<>Autoregressive decoding's cost scales with K. KV-cache trims constant factors; the only way to break O(K) is non-autoregressive decoding (with quality trade) or precomputation.</>}
+        stretch={<>What quality do you lose moving from autoregressive to non-autoregressive?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-e2" difficulty="hard"
+        title="E2 — Friday 3am: Slate-RL collapsed to repeating one item"
+        scenario={<>Slate-RL shipped Thursday. Friday 3am: every slate has the same item repeated K times. What happened?</>}
+        options={[
+          {key:"a", text:"Mode collapse — the policy converged to a single high-reward item; without entropy bonus or temperature, autoregressive decoding picks the same argmax each step. Reduce temperature, add entropy regularization, or use diverse decoding.", correct:true},
+          {key:"b", text:"GPU error."},
+          {key:"c", text:"Logs got corrupted."},
+          {key:"d", text:"User behavior changed."},
+        ]}
+        trap={<>(b)(c)(d) are ops red herrings.</>}
+        lens={<>Mode collapse is a Slate-RL-specific failure under aggressive optimization. The fix is exploration during decoding (temperature, top-k sampling, entropy bonus during training).</>}
+        stretch={<>What's the monitoring metric for "policy collapse" you'd add?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-e3" difficulty="hard"
+        title="E3 — Implementation specifics: PG with logged data"
+        scenario={<>You're training Slate-RL offline from logged slates. Which is the right framing?</>}
+        options={[
+          {key:"a", text:"Off-policy PG with IPS correction: ∇J ≈ Σ (π_θ/π₀) · (R - b) · ∇log π_θ. Requires logged π₀ at slate granularity. Without correction, optimizes for what π₀ already does well.", correct:true},
+          {key:"b", text:"On-policy PG with logged data — no correction needed."},
+          {key:"c", text:"Q-learning."},
+          {key:"d", text:"Imitation learning only."},
+        ]}
+        trap={<>(b) is wrong — logged data is off-policy. (c) is a different framework. (d) ignores reward.</>}
+        lens={<>Slate-RL from logs is off-policy by construction. IPS correction at slate granularity has VERY low overlap (the slate-level weight is the product of K item-level ratios — overlap exponentially small in K). Often needs auxiliary techniques (per-step weighting, doubly-robust slate-level).</>}
+        stretch={<>What's the slate-level IPS weight bound, and how do you fix the explosion?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-e4" difficulty="hard"
+        mode="ordered"
+        title="E4 — Rollout: migrate from DLRM to Slate-RL"
+        scenario={<>Order the migration steps.</>}
+        options={[
+          {key:"a", text:"Audit reward design end-to-end: confirm chosen reward correlates with business metric on historical data.", order:1},
+          {key:"b", text:"Behavior-clone (BC) on logged slates to initialize Slate-RL near π₀.", order:2},
+          {key:"c", text:"Add value-function baseline head; train with PG + baseline.", order:3},
+          {key:"d", text:"Run shadow scoring: compare Slate-RL slates with DLRM slates offline for one week.", order:4},
+          {key:"e", text:"Ramp traffic 1% → 10% → 100% with online monitoring of session metrics.", order:5},
+          {key:"f", text:"Skip BC and start from random init."},
+        ]}
+        trap={<>(f) is the unstable-PG-from-scratch anti-pattern.</>}
+        lens={<>BC-init is essentially mandatory at any production scale. Reward audit first; BC second; PG with baseline third; shadow fourth; ramp fifth.</>}
+        stretch={<>When CAN you skip BC?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-e5" difficulty="hard"
+        title="E5 — Reproducibility: replicating a Slate-RL paper result"
+        scenario={<>What must you match to reproduce a Slate-RL paper's headline number?</>}
+        options={[
+          {key:"a", text:"The reward function definition AND the off-policy correction technique — both substantially shift the resulting policy and the headline metric; papers that gloss either are not reproducible.", correct:true},
+          {key:"b", text:"The GPU."},
+          {key:"c", text:"The Python version."},
+          {key:"d", text:"The seed."},
+        ]}
+        trap={<>(b)(c)(d) are minor.</>}
+        lens={<>Reward and OPE correction are the load-bearing details. Same model, same data, different reward = different headline. Always demand both in methods.</>}
+        stretch={<>What's the minimum reward-spec disclosure that makes a Slate-RL paper reproducible?</>}
+      />
+
+      <h3 style={{marginTop:32, color:"#1f3a5f"}}>F. Failure modes</h3>
+
+      <VIS.TrapProblem id="gsr-f1" difficulty="hard"
+        title="F1 — Edge case: K=1 slate"
+        scenario={<>What happens to Slate-RL on a K=1 'slate'?</>}
+        options={[
+          {key:"a", text:"It collapses to a contextual bandit — one action per request, reward per request. The autoregressive decoder reduces to one step; the slate-level reward IS the per-action reward. All of Slate-RL's overhead becomes pure waste.", correct:true},
+          {key:"b", text:"It works just as well."},
+          {key:"c", text:"It fails to train."},
+          {key:"d", text:"It produces random output."},
+        ]}
+        trap={<>(b) over-states the gain. (c)(d) under-state.</>}
+        lens={<>Slate-RL's value scales with intra-slate effects. At K=1, there's no slate; contextual bandit (or LinUCB-style) is the right framework.</>}
+        stretch={<>At what K does Slate-RL start to pay off empirically?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-f2" difficulty="hard"
+        title="F2 — Adversarial: design a reward that breaks Slate-RL"
+        scenario={<>Design a reward function that, when optimized by Slate-RL, produces a slate that maximizes the reward but loses business utility.</>}
+        options={[
+          {key:"a", text:"Reward = sum of per-item clicks WITHOUT a session-length term. Slate-RL fills the slate with clickbait — each item clicked once, total CTR maximized, session length crashes because users bounce after one click. The reward is gamed by satisfying its letter, not its spirit.", correct:true},
+          {key:"b", text:"Random reward."},
+          {key:"c", text:"Negative reward."},
+          {key:"d", text:"Use reward = 0."},
+        ]}
+        trap={<>(b)(c)(d) don't construct an adversarial reward.</>}
+        lens={<>Reward gaming (paperclip maximizer) is the canonical Slate-RL failure. The defense is multi-objective reward design (CTR + dwell + return) and post-hoc business-metric monitoring.</>}
+        stretch={<>What's the multi-objective reward formulation you'd recommend?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-f3" difficulty="hard"
+        title="F3 — Reverse engineering: symptom → Slate-RL-specific cause"
+        scenario={<>Symptom: training loss converges but online metric flat. Reward function correlates with online metric on historical data. Which is the Slate-RL-specific cause?</>}
+        options={[
+          {key:"a", text:"Off-policy gap — Slate-RL's policy diverged enough from π₀ that the IPS correction is dominated by a few high-weight slates, training signal becomes noise around them; offline reward looks fine but online behavior is on slates training never effectively saw.", correct:true},
+          {key:"b", text:"Random seed."},
+          {key:"c", text:"Bug in code."},
+          {key:"d", text:"User behavior changed."},
+        ]}
+        trap={<>(b)(c)(d) miss the off-policy gap.</>}
+        lens={<>The π-vs-π₀ divergence is the Slate-RL-specific failure. Slate-granularity IPS weights are very high-variance; the policy can drift into regions training never weighted. Limit per-step divergence (KL constraint, TRPO/PPO-style).</>}
+        stretch={<>How would you measure π-vs-π₀ divergence at slate granularity in production?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-f4" difficulty="hard"
+        title="F4 — Paper-named failure: 'reward sparsity'"
+        scenario={<>The Generative Slate RL paper specifically calls out one failure mode. Which?</>}
+        options={[
+          {key:"a", text:"Reward sparsity + high variance — slate-level reward is one signal per slate (vs K for pointwise), making PG noisy and credit-assignment across the slate hard. Auxiliary rewards (per-step shaping) and value-baseline heads are the recommended mitigations.", correct:true},
+          {key:"b", text:"GPU OOM."},
+          {key:"c", text:"Slow training."},
+          {key:"d", text:"Memory."},
+        ]}
+        trap={<>(b)(c)(d) are red herrings.</>}
+        lens={<>Sparsity + variance is THE named failure. It's why pure Slate-RL is hard; BC-init and reward shaping are standard mitigations.</>}
+        stretch={<>What's the reward-shaping recipe you'd start with?</>}
+      />
+
+      <VIS.TrapProblem id="gsr-f5" difficulty="hard"
+        title="F5 — Community-found: slate-level OPE variance explodes"
+        scenario={<>Follow-up papers note that slate-level IPS for Slate-RL OPE has weight = Π π/π₀ over K steps. What's the consequence?</>}
+        options={[
+          {key:"a", text:"Slate-level weight grows EXPONENTIALLY with K — even moderate per-step divergence between π and π₀ amplifies into huge slate-level weights. K=10 with per-step weight 1.5 gives slate weight 57; OPE on logged slates is essentially impossible without per-step decomposition (Doubly Robust slate, R-MDR, etc.).", correct:true},
+          {key:"b", text:"It scales linearly."},
+          {key:"c", text:"It stays constant."},
+          {key:"d", text:"Variance decreases."},
+        ]}
+        trap={<>(b)(c)(d) miss the multiplicative explosion.</>}
+        lens={<>The curse of dimensionality for slate-OPE. Decomposed estimators (per-step IPS, DR slate variants) are essentially mandatory at K > 3.</>}
+        stretch={<>Sketch a doubly-robust slate-OPE estimator.</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
-        <li><a href="https://dl.acm.org/doi/10.1145/3539597.3570412" target="_blank" rel="noopener">Liu et al. — <em>Generative Slate Recommendation with Reinforcement Learning</em> (WSDM 2023, paper)</a> — primary reference for the autoregressive-slate-as-sequence formulation.</li>
-        <li><a href="https://lilianweng.github.io/posts/2018-04-08-policy-gradient/" target="_blank" rel="noopener">Lilian Weng — <em>Policy Gradient Algorithms</em> (blog)</a> — derivation of REINFORCE, A2C, PPO; the algorithmic backbone behind slate RL.</li>
-        <li><a href="https://eugeneyan.com/writing/system-design-for-discovery/" target="_blank" rel="noopener">Eugene Yan — <em>System Design for Discovery</em> (blog)</a> — production rec-system architecture; where slate RL slots in vs the cascade.</li>
-        <li><a href="https://arxiv.org/abs/1812.02353" target="_blank" rel="noopener">Chen et al. — <em>Top-K Off-Policy Correction for a REINFORCE Recommender System</em> (WSDM 2019, paper)</a> — YouTube&apos;s production RL recommender; off-policy mechanics for slate-style problems.</li>
-        <li><a href="https://karpathy.github.io/2016/05/31/rl/" target="_blank" rel="noopener">Andrej Karpathy — <em>Deep Reinforcement Learning: Pong from Pixels</em> (blog)</a> — best intuition-builder for policy gradient; the math transfers directly to slate decoding.</li>
+        <li><a href="https://dl.acm.org/doi/10.1145/3539597.3570412" target="_blank" rel="noopener">Liu et al. — <em>Generative Slate Recommendation with Reinforcement Learning</em> (WSDM 2023)</a> — original paper.</li>
+        <li><a href="https://arxiv.org/abs/1905.12767" target="_blank" rel="noopener">Ie et al. — <em>SlateQ</em> (IJCAI 2019)</a> — slate-decomposed Q-learning, a prior baseline.</li>
+        <li><a href="https://arxiv.org/abs/2008.05526" target="_blank" rel="noopener">Sun et al. — <em>Off-Policy Evaluation of Slate Recommenders</em> (2020)</a> — slate-OPE machinery.</li>
       </ul>
     </VIS.Section>
   </main>
 );
+
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
