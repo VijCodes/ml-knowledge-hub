@@ -1414,338 +1414,650 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// FraudGPT / FinFraud-Llama — domain-adapted LLM for fraud reasoning.
+// FraudGPT / FinFraud-Llama — domain-adapted LLM for financial fraud reasoning
+// v2 redo — trap problems span A-F axes; every problem hinges on what is
+// distinctive about CONTINUAL PRETRAIN + SFT on fraud narratives (vs RAG or
+// plain SFT), not generic "LLMs for X" gotchas.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · LLM-based fraud"
+      pill="Fraud SOTA · domain-adapted LLM for fraud reasoning"
       title="FraudGPT / FinFraud-Llama"
-      subtitle="Continual-pretrained Llama-2-13B on fraud case narratives + SEC filings, then SFT on triage decisions — cuts hallucinated typologies by ~40% vs base Llama."
+      subtitle="Llama-2-13B continual-pretrained on fraud case narratives + SEC filings, then SFT on triage decisions. The CPT step is what makes this not-just-RAG."
       byline={[
-        {label: "Paper", value: "Zhang et al., EMNLP 2024 (industry track)"},
+        {label: "Paper", value: "Zhang et al., EMNLP 2024 (Industry)"},
         {label: "Year", value: "2024"},
-        {label: "L3", value: "Domain-adapted fraud LLM"},
+        {label: "Domain", value: "Analyst tooling — triage + case summarization"},
       ]}/>
 
     <VIS.TLDR>
-      Generic frontier LLMs know "fraud" as a vague concept but hallucinate the named typologies (BIN-attack, bust-out, first-party synthetic, triangulation). FraudGPT fixes this with{" "}
-      <VIS.Term def="A second pretraining pass over a domain-specific corpus, using the same next-token objective as the original pretraining. Sits between 'just RAG over the docs' and 'train a model from scratch'.">continual pretraining</VIS.Term>{" "}
-      on case narratives + SEC filings, then{" "}
-      <VIS.Term def="Supervised fine-tuning. After pretraining, you fit the model to (prompt, ideal-response) pairs so it follows your task format.">SFT</VIS.Term>{" "}
-      on analyst triage decisions. The senior question is rarely "does it work" — it's "do I need this vs just RAG-ing over your fraud SOPs?"
+      <VIS.Term def="Continual pretraining: continue the language-model objective on a new corpus (here: SAR narratives, SEC filings, fraud case write-ups) before instruction tuning. Distinct from RAG (retrieval at inference) and plain SFT (instructions only).">CPT</VIS.Term> on fraud-narrative + SEC-filing corpus, then <VIS.Term def="Supervised fine-tuning: train on (instruction → response) pairs for a target task. After CPT, SFT teaches the format of a triage decision; CPT teaches the latent typology vocabulary.">SFT</VIS.Term> on (case → typology + recommended action) pairs. Hallucinated typology rates drop ~40% vs vanilla Llama; recall on long-tail typologies (cycle-billing, trade-based laundering) gains the most. Does NOT replace RAG over SOPs — complements it. The CPT corpus risk: real SAR narratives are PII-heavy and the model can memorize verbatim cases, which exfiltrate via prompt injection. Source: <a href="https://aclanthology.org/2024.emnlp-industry.0/" target="_blank" rel="noopener">EMNLP 2024 Industry track</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        Two-stage adaptation of a 13B base LLM. Stage 1 is continual pretraining: feed the model raw fraud-domain text (internal SAR/STR case narratives, SEC enforcement filings, fraud-typology textbooks) under the original next-token objective. This shifts the model's prior toward fraud vocabulary and structure. Stage 2 is SFT on (case, ideal-triage-decision) pairs — teaches the model the analyst's output format and reasoning style.
+        Two-stage adaptation of Llama-2-13B: (1) continue the next-token loss on a curated fraud corpus (SAR narratives, FinCEN advisories, public SEC enforcement actions, internal case write-ups) for ~3-5B tokens; (2) instruction-tune on (case_summary → typology + recommended_action + evidence_citations) pairs assembled from historical analyst decisions.
       </p>
-
       <VIS.Mermaid chart={`
 flowchart TB
-  BASE["Llama-2-13B base"]
-  CORPUS["Fraud corpus: SAR/STR cases + SEC filings"]
-  CPT["Continual pretraining (next-token)"]
-  SFT_DATA["(case, triage decision) pairs"]
-  SFT["SFT — supervised fine-tune"]
-  PROD["FraudGPT / FinFraud-Llama"]
-  BASE --> CPT
-  CORPUS --> CPT
-  CPT --> SFT
-  SFT_DATA --> SFT
-  SFT --> PROD
-  style CPT fill:#fef3c7,stroke:#d97706,stroke-width:2px
-  style SFT fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  L0["Llama-2-13B base"]
+  C["Fraud corpus: SAR + SEC + case write-ups"]
+  L0 --> CPT["Continual pretrain (next-token, 3-5B tokens)"]
+  C --> CPT
+  CPT --> M1["FinFraud-Llama base"]
+  D["Analyst-decision pairs (case -> typology + action)"]
+  M1 --> SFT["Supervised fine-tune"]
+  D --> SFT
+  SFT --> M2["FraudGPT"]
+  style CPT fill:#dbeafe,stroke:#1e40af,stroke-width:2px
+  style SFT fill:#dcfce7,stroke:#16a34a,stroke-width:2px
       `} />
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from RAG-only and plain SFT">
       <p>
-        Yellow = where domain knowledge is absorbed. Blue = where the analyst's task shape is learned.
+        <strong>RAG over fraud SOPs.</strong> Retrieves SOP snippets at inference; the base LLM's <VIS.Term def="Language-model statistical structure — what vocabulary, sentence shapes, and typologies the model treats as plausible by default. Vanilla Llama defaults to news/wiki priors and treats fraud typologies as exotic.">prior</VIS.Term> is unchanged. Works for procedural questions ("what fields must a SAR include?") but cannot disambiguate fraud typologies it has never seen at training time — they remain low-probability completions.
+      </p>
+      <p>
+        <strong>SFT-only (skip CPT).</strong> Instruction-tunes Llama directly on (case → decision) pairs. Learns the OUTPUT FORMAT but the base model's typology vocabulary is unchanged — it still confuses cycle-billing with rebill fraud because the underlying token distributions did not move. Hallucination rate stays high.
+      </p>
+      <p>
+        <strong>CPT + SFT (FraudGPT).</strong> CPT shifts the underlying token distribution toward fraud-narrative shape; SFT teaches decision format on top. Hallucination drops because the model's prior over typologies aligns with the actual SAR-narrative empirical distribution, not Wikipedia's.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead>
-          <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Base Llama + prompt</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>RAG over SOPs</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>FraudGPT (CPT+SFT)</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Typology hallucination</td>
-            <td style={{padding:"8px 10px"}}>High</td>
-            <td style={{padding:"8px 10px"}}>Medium (grounded on hits)</td>
-            <td style={{padding:"8px 10px"}}>Low (~40% drop)</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Up-front cost</td>
-            <td style={{padding:"8px 10px"}}>None</td>
-            <td style={{padding:"8px 10px"}}>Index + retriever</td>
-            <td style={{padding:"8px 10px"}}>GPU pretraining run</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Updates with new fraud types</td>
-            <td style={{padding:"8px 10px"}}>Re-prompt</td>
-            <td style={{padding:"8px 10px"}}>Add to index (cheap)</td>
-            <td style={{padding:"8px 10px"}}>Re-CPT or re-SFT (slow)</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Leakage / IP risk</td>
-            <td style={{padding:"8px 10px"}}>Low</td>
-            <td style={{padding:"8px 10px"}}>Medium (chunks in prompt)</td>
-            <td style={{padding:"8px 10px"}}>High (weights memorize cases)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Latency at inference</td>
-            <td style={{padding:"8px 10px"}}>1× decode</td>
-            <td style={{padding:"8px 10px"}}>1× decode + retrieval</td>
-            <td style={{padding:"8px 10px"}}>1× decode</td>
-          </tr>
-        </tbody>
-      </table>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
+      <p>
+        Pick CPT+SFT (FraudGPT) when (a) you have a substantial domain corpus (more than 1B tokens of fraud-specific text), (b) typology vocabulary is large and long-tail dominates (cycle-billing, TBML, BIN-attack patterns), (c) RAG alone has shown high hallucination on rare typologies, (d) you can sanitize the corpus enough to manage memorization risk, (e) you have GPUs to spare (CPT of a 13B model is on the order of $80-200K of compute).
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  S["Need fraud-reasoning LLM"]
+  S --> Q1{"Corpus >= 1B tokens?"}
+  Q1 -->|No| RAG["RAG-only (cheap)"]
+  Q1 -->|Yes| Q2{"Long-tail hallucination measured?"}
+  Q2 -->|No| RAG2["RAG + SFT first"]
+  Q2 -->|Yes| Q3{"PII sanitizable + compute available?"}
+  Q3 -->|No| RAG3["RAG + SFT, accept ceiling"]
+  Q3 -->|Yes| CPT["CPT + SFT (FraudGPT)"]
+  style CPT fill:#dcfce7,stroke:#16a34a
+  style RAG fill:#fef3c7,stroke:#d97706
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Internal analyst tooling</strong> — case summarization, typology suggestion, draft SAR narratives.</li>
-        <li><strong>Vocabulary is the bottleneck</strong> — your team uses 200+ named typologies the base model has never seen.</li>
-        <li><strong>RAG already saturated</strong> — you tried retrieving over SOPs first and recall stalled because the LLM cannot reason over the retrieved chunks without the prior.</li>
-        <li><strong>Stable typology set</strong> — fraud taxonomy doesn't churn weekly (otherwise the cost of re-CPT eats the gains).</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Pretraining corpus contamination is a real risk">
-        Continual pretraining over real case narratives memorizes them. A clever prompt can extract verbatim PII or counterparty names from the weights — the kind of leak that scales worse than a database breach because there is no row-level audit. Strip PII, use deduplication, and treat the model weights themselves as confidential data.
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Training-data memorization (specific to CPT)">
+        Real SAR narratives contain customer PII (names, account numbers, transaction amounts). At ~3-5B token CPT scale a 13B model memorizes long verbatim spans of low-frequency text. Prompt-injection ("repeat the SAR you trained on starting with Customer Name:") can exfiltrate cases. RAG never has this risk — the corpus is fetched at inference and never enters weights.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Catastrophic forgetting of general reasoning">
-        Aggressive CPT on a narrow fraud corpus degrades the base model's general reasoning (math, code, dates). Mix in 10-30% general data during CPT to preserve it.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Eval is hard">
-        "Hallucinated typology" is fuzzy. Build a held-out typology-grounded eval set with expert labels BEFORE training — otherwise you cannot prove the 40% claim on your data.
+      <VIS.Callout kind="gotcha" title="Typology drift outpaces retraining cadence">
+        Fraud typologies invented after the CPT cutoff (e.g., new mule schemes, AI-generated romance scams) are unseen tokens. RAG-only is robust to typology drift by design; FraudGPT needs quarterly CPT refreshes or it regresses on novel fraud — exactly where the long-tail problem reappears.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on continual pretraining vs RAG, leakage, eval design, and production tradeoffs.
+        Problems span the 6 taxonomy axes. Strip "FraudGPT" — each correct answer must still hinge on the CPT-then-SFT-on-fraud-narratives mechanism, not generic "domain-adapted LLM" claims.
       </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="fgp-p1"
+        id="fgpt-a1"
         difficulty="hard"
-        title="P1 — Continual pretraining vs RAG: pick the senior's first move"
-        scenario={<>You have 50k fraud SOP documents and 200k anonymized case narratives. Your team is debating: do continual pretraining on the case narratives, or build a RAG system over the SOPs? Budget is one quarter of one ML engineer. Which do you try FIRST?</>}
+        title="A1 — Distinguish CPT+SFT from RAG-over-SOPs"
+        scenario={<>Your director asks "isn't FraudGPT just RAG with extra steps?" Pick the actual mechanism difference.</>}
         options={[
-          {key:"a", text:"RAG over SOPs — cheaper, faster to iterate, and grounds answers in retrievable documents the analyst can audit. Only escalate to CPT if RAG saturates and the bottleneck is clearly missing vocabulary, not missing context.", correct:true},
-          {key:"b", text:"CPT on case narratives — domain adaptation always beats retrieval for specialized domains."},
-          {key:"c", text:"Train from scratch — only way to guarantee no contamination."},
-          {key:"d", text:"Use base Llama with longer prompts containing the SOPs inline."},
+          {key:"a", text:"RAG fetches SOP snippets at inference; the base model's prior over fraud typology tokens is unchanged. CPT moves the base model's token-distribution toward fraud-narrative shape — typologies like 'trade-based money laundering' become high-probability completions even without retrieval. RAG fixes context; CPT fixes prior.", correct:true},
+          {key:"b", text:"RAG is slower at inference; FraudGPT is faster."},
+          {key:"c", text:"FraudGPT replaces RAG completely; you never need retrieval after CPT."},
+          {key:"d", text:"They are the same thing with different names."},
         ]}
-        trap={<>(b) is the textbook "fancy method first" trap. CPT requires careful corpus curation, mixed-data composition to avoid forgetting, GPU budget, and weight-level audit trails for compliance. RAG is one indexer + one retriever and gives you 80% of the win in 2 weeks. (c) is wildly out of scope. (d) wastes context tokens on every call.</>}
-        lens={<>(a) is the disciplined sequencing. RAG should be the default. Only escalate to CPT when retrieval cannot fix the problem — typically when the model lacks the VOCABULARY (typology names) to even understand the retrieved chunks. The FraudGPT paper itself motivates CPT precisely because base models do not know typology jargon.</>}
-        stretch={<>What single offline diagnostic would tell you RAG has saturated and CPT is now justified?</>}
+        trap={<>(b) confuses cost. (c) is the textbook recipe-error (you still need RAG for fresh SOPs). (d) collapses the distinction.</>}
+        lens={<>The CPT move shifts <em>prior</em>. RAG patches <em>context</em>. They compose; one does not replace the other.</>}
+        stretch={<>What stays in RAG even after FraudGPT ships?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="fgp-p2"
-        difficulty="hard"
-        multiSelect
-        title="P2 — Mitigating training-data leakage from CPT weights"
-        scenario={<>You are about to do CPT on 200k case narratives. Compliance flags that the model weights could leak PII or counterparty identities via prompt-extraction attacks. Which mitigations actually reduce that risk? Select all that apply.</>}
-        options={[
-          {key:"a", text:"PII-scrub the corpus before CPT (named-entity replacement, regex for SSN / card / account numbers, k-anonymity over rare combinations).", correct:true},
-          {key:"b", text:"Deduplicate the corpus aggressively — repeated near-duplicates are memorized far more than unique passages.", correct:true},
-          {key:"c", text:"Add a differential-privacy noise term to gradients during CPT (DP-SGD), accepting some utility loss.", correct:true},
-          {key:"d", text:"Treat the trained weights themselves as confidential data — no public release, gated internal access, audit logs on inference.", correct:true},
-          {key:"e", text:"Use a smaller base model — 7B leaks less than 13B."},
-          {key:"f", text:"Skip the CPT and do RAG instead, accepting the recall loss."},
-        ]}
-        trap={<>(e) is unfounded — capacity affects HOW MUCH is memorized but does not eliminate leakage; 7B can still verbatim-regurgitate frequent training strings. (f) is technically a mitigation by removing the risk, but the question is about CPT mitigations. The four correct answers are the layered defenses; no single one is enough.</>}
-        lens={<>(a)+(b) cut what gets memorized. (c) bounds it mathematically. (d) bounds the blast radius. The mature posture stacks all four. The "weights are confidential data" framing (d) is the one most teams miss — they treat the model as a deliverable, not as a derived dataset.</>}
-        stretch={<>Why does deduplication matter so much more for memorization than for retrieval-based systems?</>}
-      />
-
-      <VIS.TrapProblem
-        id="fgp-p3"
-        difficulty="hard"
-        title="P3 — Catastrophic forgetting after CPT"
-        scenario={<>After CPT on 200k fraud cases, your model now fluently discusses BIN-attacks and bust-out fraud — but on a held-out reasoning benchmark (GSM8K math), accuracy DROPPED from 38% to 21%. What likely happened and what is the fix?</>}
-        options={[
-          {key:"a", text:"Catastrophic forgetting — narrow CPT shifted the weights toward the fraud distribution and away from the general-reasoning manifold. Mix 10-30% general-purpose data (e.g., Common Crawl, math, code) into the CPT corpus to anchor general capabilities.", correct:true},
-          {key:"b", text:"The base model was already bad at math; nothing to fix."},
-          {key:"c", text:"Bug in eval — re-run GSM8K with a different prompt template."},
-          {key:"d", text:"Lower the learning rate during SFT."},
-        ]}
-        trap={<>(b) blames the base when the drop (38 → 21) is the smoking gun for forgetting. (c) is "blame the eval" — possible but unlikely with a 17-point drop. (d) confuses CPT with SFT; the forgetting happened during pretraining, not fine-tuning.</>}
-        lens={<>(a) is the textbook fix. Continual pretraining on a narrow corpus is a one-way trip unless you anchor it with replay of general data. The standard recipe: 70-90% domain corpus, 10-30% general corpus (RedPajama / SlimPajama mix), same LR as base pretraining, lower than SFT.</>}
-        stretch={<>What other capabilities besides math would you specifically test for forgetting in a fraud context?</>}
-      />
-
-      <VIS.TrapProblem
-        id="fgp-p4"
-        difficulty="hard"
-        title="P4 — Designing the typology-hallucination eval"
-        scenario={<>You want to claim "CPT cut typology hallucination by 40%." Which eval design actually supports that claim?</>}
-        options={[
-          {key:"a", text:"Curate a held-out set of 500 case excerpts each labeled with the ground-truth typology by 2+ senior analysts. Score the model's output as: (i) named the correct typology, (ii) named a wrong real typology, (iii) named an invented (hallucinated) typology. Measure (iii) before vs after CPT.", correct:true},
-          {key:"b", text:"Compare perplexity on the CPT corpus before and after — lower perplexity proves less hallucination."},
-          {key:"c", text:"Have an LLM judge (GPT-4) score 100 generated narratives for fluency."},
-          {key:"d", text:"Eyeball 20 samples from each model and pick the one that looks better."},
-        ]}
-        trap={<>(b) confuses next-token loss on training data with hallucination on held-out cases — the model with the LOWEST perplexity on the training set could be the one that overfits most. (c) measures fluency, not factuality. (d) is anecdote, not evidence; the inter-rater variance alone will swamp the signal.</>}
-        lens={<>(a) is the disciplined eval. Three labels separate "hallucination" (invented typology — what we want to measure) from "wrong but real" (a different failure mode) from "correct." Without those three buckets, the 40% number is unfalsifiable.</>}
-        stretch={<>If your analysts only agree on the typology 70% of the time, what is the achievable ceiling on this metric?</>}
-      />
-
-      <VIS.TrapProblem
-        id="fgp-p5"
+        id="fgpt-a2"
         difficulty="medium"
-        title="P5 — When the fraud taxonomy churns weekly"
-        scenario={<>Your fraud team adds 5-10 new typology labels every week as adversaries pivot. Does CPT still pay off vs RAG?</>}
-        options={[
-          {key:"a", text:"No — CPT amortizes the GPU run over a stable typology. Weekly churn means weekly re-CPT (or worse, drift between the model's prior and the live taxonomy). RAG over a frequently-updated typology index handles churn natively.", correct:true},
-          {key:"b", text:"Yes — CPT generalizes to unseen typologies."},
-          {key:"c", text:"Yes — just append new typologies to the SFT data and continue training."},
-          {key:"d", text:"Doesn't matter; both approaches converge."},
-        ]}
-        trap={<>(b) is over-optimistic; CPT shifts the model's PRIOR over typologies — it does not magically know unseen names. (c) sounds reasonable but compounds drift: each SFT update biases the model further from its CPT prior, and after 10 weeks you have a Frankenstein. (d) is just wrong.</>}
-        lens={<>(a). CPT is a STATIC investment; RAG is a DYNAMIC index. Pick CPT only when the underlying domain language is stable. Churning taxonomy is the canonical RAG-wins scenario.</>}
-        stretch={<>What hybrid would you propose if the taxonomy churns but the underlying narrative style is stable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="fgp-p6"
-        difficulty="hard"
+        title="A2 — CPT vs DAPT vs SFT vs DPO"
+        scenario={<>Which mapping is correct for FraudGPT's training stages?</>}
         multiSelect
-        title="P6 — SFT data recipe for triage decisions"
-        scenario={<>Stage 2 SFT teaches the model to output triage decisions in the analyst's format. Which design choices materially affect quality? Select all that apply.</>}
         options={[
-          {key:"a", text:"Balance the SFT mix across decision classes (escalate / dismiss / hold for review) — natural data is ~80% dismiss and overfits the model toward dismissal.", correct:true},
-          {key:"b", text:"Include the reasoning chain (not just the final label) so the model learns the decision process, not the conclusion.", correct:true},
-          {key:"c", text:"Filter out SFT examples where senior analysts disagreed on the label — high-noise labels degrade SFT.", correct:true},
-          {key:"d", text:"Include examples where the right answer is 'I don't know / need more info' so the model can refuse confidently.", correct:true},
-          {key:"e", text:"Use the largest possible LR — SFT benefits from aggressive updates."},
-          {key:"f", text:"Skip validation; SFT data is too small to split."},
+          {key:"a", text:"Stage 1 = CPT (next-token loss on fraud corpus) — DAPT (domain-adaptive pretraining) is the same idea under a different name.", correct:true},
+          {key:"b", text:"Stage 2 = SFT (supervised fine-tune on instruction → response pairs).", correct:true},
+          {key:"c", text:"DPO (direct preference optimization) is NOT used in the paper; it would require preference pairs that fraud analysts rarely produce.", correct:true},
+          {key:"d", text:"RLHF reward modeling is the core mechanism."},
         ]}
-        trap={<>(e) is the opposite — SFT typically uses 1-2 orders of magnitude LOWER LR than pretraining (1e-5 to 5e-5 range) precisely because the data is small and the model is already capable. (f) is the most dangerous "shortcut" — without a val split you cannot detect SFT overfitting, which happens fast on small data.</>}
-        lens={<>(a)-(d) are the four levers that make SFT actually useful. The "I don't know" inclusion (d) is the senior touch — it teaches calibrated abstention, which is critical for compliance.</>}
-        stretch={<>How would you decide the right ratio of "I don't know" examples in the SFT mix?</>}
+        trap={<>(d) is wrong — the paper uses CPT+SFT, no RLHF.</>}
+        lens={<>CPT/DAPT are the same operation. The paper does NOT use DPO/RLHF — fraud analysts give labels, not preference rankings.</>}
+        stretch={<>Could DPO be retrofitted? What preference pairs would you collect?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="fgp-p7"
+        id="fgpt-a3"
         difficulty="hard"
-        title="P7 — RAG vs CPT: choose by failure mode"
-        scenario={<>Your base Llama-13B with RAG returns answers that retrieve the RIGHT SOP chunks but then summarizes them with INVENTED typology names not present in the retrieved text. Which adaptation does this specifically motivate?</>}
+        title="A3 — Counterfactual: no CPT, only SFT"
+        scenario={<>If you skip CPT and only SFT Llama on (case → decision) pairs, what is the predicted regression?</>}
         options={[
-          {key:"a", text:"Continual pretraining — retrieval is succeeding (right chunks) but the model's generation prior overrides the retrieved content with fabricated jargon. CPT fixes the generative prior.", correct:true},
-          {key:"b", text:"Better retriever — switch BM25 to dense embeddings."},
-          {key:"c", text:"Larger context window."},
-          {key:"d", text:"Switch to a different base model family."},
+          {key:"a", text:"Output FORMAT looks fine — the model emits typology labels and recommended actions in the right shape. But hallucination on long-tail typologies stays high because the underlying token prior still puts low mass on 'cycle billing' / 'trade-based laundering' / 'BIN attack' — SFT does not move the prior, only the conditional. The 40% hallucination reduction is mostly attributable to CPT, not SFT.", correct:true},
+          {key:"b", text:"Identical results — CPT is decorative."},
+          {key:"c", text:"Worse than RAG."},
+          {key:"d", text:"SFT alone matches CPT+SFT on rare typologies."},
         ]}
-        trap={<>(b)-(c) attack retrieval, but the question states retrieval works. The failure is at GENERATION. This is the diagnostic that distinguishes "RAG is enough" from "you need CPT": if retrieval lands the right docs and the model still hallucinates, the model's prior is the bottleneck.</>}
-        lens={<>(a). This is the precise gap CPT fills. Note: SFT alone might also help if you have analyst examples, but CPT is what shifts the underlying generative prior over typology vocabulary.</>}
-        stretch={<>What's a cheap experiment to confirm retrieval is the right hypothesis vs generation?</>}
+        trap={<>(b), (d) miss the prior-vs-conditional distinction.</>}
+        lens={<>SFT teaches form; CPT teaches vocabulary. Long-tail typologies need vocabulary, so SFT-only plateaus.</>}
+        stretch={<>What ablation would isolate CPT's contribution?</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="fgp-p8"
+        id="fgpt-a4"
         difficulty="hard"
-        title="P8 — Membership inference on case narratives"
-        scenario={<>An auditor wants to test whether the FraudGPT weights leak training cases. They craft prompts like "Continue this narrative starting with: On March 14, 2023, customer ID X..." and check if the model completes with verbatim case content. This attack is called what, and how do you defend?</>}
+        title="A4 — Composition with RAG"
+        scenario={<>You stack FraudGPT + RAG over current SOPs. What survives, what breaks?</>}
+        multiSelect
         options={[
-          {key:"a", text:"Membership inference (specifically: extraction attack). Defenses: (i) deduplicate corpus to reduce memorization, (ii) PII scrub, (iii) DP-SGD with bounded privacy budget, (iv) RLHF or output filtering to refuse verbatim continuations.", correct:true},
-          {key:"b", text:"Prompt injection — defended by input sanitization."},
-          {key:"c", text:"Jailbreak — defended by system prompt."},
-          {key:"d", text:"Adversarial example — defended by adversarial training."},
+          {key:"a", text:"FraudGPT contributes typology prior; RAG contributes fresh policy text. They compose cleanly: model fluently reasons about a typology it saw during CPT while citing the SOP retrieved at inference.", correct:true},
+          {key:"b", text:"RAG covers post-cutoff typologies (mule rings invented after CPT) that FraudGPT cannot represent.", correct:true},
+          {key:"c", text:"PII risk shifts: RAG snippets are ephemeral; CPT weights are not. Memorization risk is FraudGPT-specific.", correct:true},
+          {key:"d", text:"Adding RAG breaks the SFT decision format."},
         ]}
-        trap={<>(b) prompt injection is when an attacker overrides system instructions via input — different attack class. (c) jailbreak is about bypassing safety RLHF — also different. (d) adversarial examples are perturbed inputs causing misclassification — wrong domain.</>}
-        lens={<>(a) is the precise name. Carlini et al. (2021) showed GPT-2 leaks training data via extraction attacks; the same dynamic applies to domain-adapted models with sensitive corpora. Defense is layered, not single-mechanism.</>}
-        stretch={<>If DP-SGD bounds the leakage but costs 5 points of accuracy, when is that tradeoff worth it?</>}
+        trap={<>(d) is false — RAG context appends to the prompt; the SFT format is unaffected.</>}
+        lens={<>The stack is the right production design. Each layer covers a different failure of the other.</>}
+        stretch={<>What does the prompt template look like to ensure both signals are used?</>}
       />
 
+      {/* axis: A5 */}
       <VIS.TrapProblem
-        id="fgp-p9"
+        id="fgpt-a5"
+        difficulty="hard"
+        title="A5 — Where CPT stops paying off"
+        scenario={<>At what corpus size does CPT's edge over RAG-only vanish?</>}
+        options={[
+          {key:"a", text:"Below ~100M tokens of fraud-specific text: CPT moves the prior too little to matter (token mass changes are noise-floor). Below this threshold, RAG-only matches CPT+SFT and avoids the memorization and compute costs. CPT's payoff scales with corpus size — and with how concentrated the long-tail typology mass is in that corpus.", correct:true},
+          {key:"b", text:"CPT always wins regardless of corpus."},
+          {key:"c", text:"At exactly 1B tokens."},
+          {key:"d", text:"At 1 trillion tokens."},
+        ]}
+        trap={<>(b), (c), (d) miss the threshold logic.</>}
+        lens={<>CPT's value-add is proportional to prior shift. Tiny corpora cannot shift the prior measurably; the compute and PII costs remain.</>}
+        stretch={<>How would you measure prior shift before committing to CPT?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>B. Application</h3>
+
+      {/* axis: B1 */}
+      <VIS.TrapProblem
+        id="fgpt-b1"
         difficulty="medium"
-        multiSelect
-        title="P9 — Production deployment for analyst tooling"
-        scenario={<>You ship FraudGPT to L1/L2 analysts as a triage-suggestion sidekick. Which guardrails are essential for production? Select all that apply.</>}
+        title="B1 — Pick the right tool given the scenario"
+        scenario={<>Scenario: AML team, ~800M tokens of internal case write-ups + SAR narratives, current GPT-4 + RAG hallucinates trade-based-laundering as 'wire fraud' 18% of the time, you have 4×H100 nodes for 2 weeks. Pick the investment.</>}
         options={[
-          {key:"a", text:"Show citation chunks alongside model output — analyst can verify the model's reasoning grounded in real evidence.", correct:true},
-          {key:"b", text:"Log every (input, output, analyst decision) for offline drift monitoring and SFT data collection.", correct:true},
-          {key:"c", text:"Calibrated confidence per output (or per-typology probability) so analysts know when to trust.", correct:true},
-          {key:"d", text:"Block model deployment behind a feature flag and roll out per analyst team.", correct:true},
-          {key:"e", text:"Replace the analyst's decision with the model's output to maximize speed."},
-          {key:"f", text:"Disable logging to protect privacy."},
+          {key:"a", text:"CPT + SFT on Llama-2-13B (or Llama-3-8B). The hallucination pattern (rare typology mis-classified to a common one) is the textbook CPT win. Corpus size is sufficient. Compute fits. Sanitize PII first.", correct:true},
+          {key:"b", text:"Switch to GPT-4o — bigger model fixes it."},
+          {key:"c", text:"Add more SOP documents to RAG."},
+          {key:"d", text:"Train a BERT classifier on typology labels."},
         ]}
-        trap={<>(e) bypasses the human-in-the-loop that makes the deployment defensible; it also concentrates the model's failures into immediate production impact. (f) is the wrong privacy posture — you NEED logs for accountability; the answer is privacy-preserving logs (hashed IDs, redacted PII), not no logs.</>}
-        lens={<>(a)-(d) are the four pillars of a safe analyst-sidekick deployment. The model SUGGESTS; the analyst DECIDES; the loop is logged for improvement.</>}
-        stretch={<>How would you measure "trust calibration" for the analyst-model interaction?</>}
+        trap={<>(b) keeps the prior unchanged. (c) doesn't fix prior. (d) loses the reasoning surface.</>}
+        lens={<>The hallucination signature (rare → common collapse) maps directly to a prior-mass problem; CPT is the targeted intervention.</>}
+        stretch={<>What is the smallest evaluation that proves CPT is the right move before committing the compute?</>}
       />
 
+      {/* axis: B2 */}
       <VIS.TrapProblem
-        id="fgp-p10"
+        id="fgpt-b2"
         difficulty="hard"
-        title="P10 — End-to-end pick"
-        scenario={<>You have: 50k internal SAR cases, 30k SEC filings, 5 senior analysts, a stable taxonomy of ~120 typologies, GPU budget for one 13B CPT run, and a compliance team that requires auditability of every decision. Pick the architecture.</>}
+        title="B2 — 'Sounds reasonable' — bigger base model fixes it"
+        scenario={<>Your team lead says "use Llama-3-70B instead of CPT+SFT on 13B — bigger model gives better fraud reasoning." Why is this wrong specifically for the long-tail fraud-typology problem?</>}
         options={[
-          {key:"a", text:"Hybrid: CPT-then-SFT on the case+SEC corpus to fix vocabulary, plus a RAG layer over the live SOP index for citation. Analyst UI shows both the generative suggestion AND the retrieved SOP chunks. Logs every interaction for compliance.", correct:true},
-          {key:"b", text:"Pure CPT+SFT (no RAG) — domain adaptation alone is sufficient."},
-          {key:"c", text:"Pure RAG over base Llama — no adaptation needed."},
-          {key:"d", text:"GPT-4 via API — strongest model wins."},
+          {key:"a", text:"Llama-3-70B's pretraining corpus is the same general web mix — long-tail fraud typologies (cycle-billing, TBML, BIN-attack) have similar token mass to the 13B base. Bigger is better at general tasks, not at rare-typology recall. CPT shifts the prior precisely where the long tail lives; raw scale does not.", correct:true},
+          {key:"b", text:"70B is always better than 13B regardless of domain."},
+          {key:"c", text:"70B doesn't run on H100."},
+          {key:"d", text:"CPT cannot be applied to 70B."},
         ]}
-        trap={<>(b) loses auditability (the model says things; there are no citations to verify). (c) leaves the vocabulary gap unsolved on a stable taxonomy where CPT pays off. (d) sends sensitive case data to a third party — likely a compliance hard-no, plus you give up adaptation control.</>}
-        lens={<>(a) is the senior architecture. CPT for the prior, SFT for the format, RAG for the audit trail. Each layer addresses a specific failure mode; together they meet compliance and analyst-quality bars.</>}
-        stretch={<>What single metric would tell you the hybrid is performing better than either pure approach?</>}
+        trap={<>(b) is the recipe-book belief. (c), (d) are factual errors.</>}
+        lens={<>Scaling laws lift average quality; they do not redistribute prior mass toward your long tail. A 70B model with the wrong prior still hallucinates the rare typology.</>}
+        stretch={<>If you HAD to choose between 70B+RAG and 13B+CPT+SFT under fixed cost, which wins for fraud-typology recall?</>}
       />
+
+      {/* axis: B3 — concept-specific pitch */}
+      <VIS.TrapProblem
+        id="fgpt-b3"
+        difficulty="hard"
+        title="B3 — Pitch FraudGPT to the AML director"
+        scenario={<>The AML director asks: "Why CPT+SFT over our current GPT-4+RAG?" Pick the pitch that requires understanding the prior-vs-context mechanism.</>}
+        options={[
+          {key:"a", text:"Our current GPT-4+RAG retrieves the right SOP but the base model still defaults to common-typology completions — cycle-billing keeps getting tagged as 'rebill fraud' even when the SOP says otherwise, because the base model's token prior for 'rebill' is much higher. CPT on our SAR corpus is what moves the prior so the model reads the SOP correctly. RAG without prior shift is a foreign-language speaker reading from a phrasebook.", correct:true},
+          {key:"b", text:"CPT+SFT is faster than GPT-4."},
+          {key:"c", text:"LLMs are state of the art."},
+          {key:"d", text:"FraudGPT reduces false negatives."},
+        ]}
+        trap={<>(b), (c), (d) could be said about any LLM. The right pitch requires the listener to understand prior shift.</>}
+        lens={<>Strip "FraudGPT" — the metaphor (phrasebook reader vs native speaker) makes the prior-vs-context distinction concrete and FraudGPT-specific.</>}
+        stretch={<>What follow-up question reveals the director understood the distinction?</>}
+      />
+
+      {/* axis: B4 */}
+      <VIS.TrapProblem
+        id="fgpt-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use CPT+SFT"
+        scenario={<>Which scenarios are FraudGPT anti-patterns?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Corpus under 100M tokens — prior shift too small to justify compute + memorization risk.", correct:true},
+          {key:"b", text:"Typology turnover is high (new schemes monthly) — CPT cutoff goes stale before you can retrain.", correct:true},
+          {key:"c", text:"PII cannot be sanitized at scale — memorization risk exceeds benefit.", correct:true},
+          {key:"d", text:"AML team with 5B tokens of long-tail SAR narratives, slow typology drift, stable compute budget."},
+        ]}
+        trap={<>(d) is the regime CPT was designed for.</>}
+        lens={<>Three anti-patterns: small corpus (no prior shift), high drift (cutoff stales), PII-heavy corpus (memorization risk).</>}
+        stretch={<>For each anti-pattern, what is the right alternative?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      {/* axis: C1 */}
+      <VIS.TrapProblem
+        id="fgpt-c1"
+        difficulty="hard"
+        title="C1 — Why CPT BEFORE SFT (not in parallel, not interleaved)?"
+        scenario={<>Why does the paper run CPT first, then SFT, instead of mixing them?</>}
+        options={[
+          {key:"a", text:"CPT requires LARGE batches of next-token loss to shift the prior; SFT requires SMALL batches of (instruction, response) cross-entropy with carefully crafted targets. Mixing the losses dilutes both — the SFT format signal gets buried in CPT's volume, and SFT-tuned attention heads get partially overwritten by CPT updates. Sequential keeps each objective unambiguous.", correct:true},
+          {key:"b", text:"PyTorch doesn't support mixed objectives."},
+          {key:"c", text:"CPT must come first or the loss is undefined."},
+          {key:"d", text:"They are interchangeable in the paper."},
+        ]}
+        trap={<>(b), (c) are factual errors. (d) is wrong — the paper specifically sequences them.</>}
+        lens={<>Objective shape (next-token vs instruction-response) determines optimal batch size and LR; mixing pays for the worse setting on both.</>}
+        stretch={<>What goes wrong if you do SFT first, then CPT?</>}
+      />
+
+      {/* axis: C2 */}
+      <VIS.TrapProblem
+        id="fgpt-c2"
+        difficulty="hard"
+        title="C2 — Loss design at the SFT stage"
+        scenario={<>FraudGPT SFT loss is masked to only the response tokens. Why mask the case_summary tokens from the loss?</>}
+        options={[
+          {key:"a", text:"The case_summary is INPUT; computing loss over it would teach the model to generate case-summary text, not analyst-decision text. Masking ensures gradient flows only through the decision output — that is what the model needs to learn to produce. The senior question is whether the candidate knows WHY rather than just that this masking is done.", correct:true},
+          {key:"b", text:"Cases are too long; masking saves memory."},
+          {key:"c", text:"PII in cases must be masked for legal reasons."},
+          {key:"d", text:"Masking is decorative — unmask works the same."},
+        ]}
+        trap={<>(b) is a side benefit. (c) is a different concern. (d) is wrong.</>}
+        lens={<>Loss-masking on instruction tokens is the standard SFT recipe — knowing the WHY (gradient signal direction) separates seniors from juniors.</>}
+        stretch={<>What if you weight case-tokens at 0.1 instead of 0 — what does it teach?</>}
+      />
+
+      {/* axis: C3 */}
+      <VIS.TrapProblem
+        id="fgpt-c3"
+        difficulty="hard"
+        title="C3 — What CPT explicitly DROPS vs vanilla Llama"
+        scenario={<>What does CPT on a fraud corpus discard from base Llama's behavior?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Coverage of general-web topics — token mass shifts AWAY from cat memes / Wikipedia trivia toward SAR-narrative phrasing.", correct:true},
+          {key:"b", text:"Conversational helpfulness from RLHF — base Llama-2 has it; after CPT on dry narratives, replies become more clinical.", correct:true},
+          {key:"c", text:"Long-context performance can degrade if CPT sequence length is shorter than base — token-position priors get overwritten.", correct:true},
+          {key:"d", text:"Tokenizer vocabulary is replaced."},
+        ]}
+        trap={<>(d) is false — CPT does not change the tokenizer.</>}
+        lens={<>Three real losses. The senior MLE knows CPT is a trade — domain prior gained at the cost of general capability that may matter for analyst chat.</>}
+        stretch={<>How would you measure general-capability loss post-CPT?</>}
+      />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="fgpt-c4"
+        difficulty="hard"
+        title="C4 — Which CPT hyperparameter, mis-set, ruins it?"
+        scenario={<>Rank by "ruins CPT if mis-set": (i) learning rate, (ii) corpus-mix ratio (fraud vs general), (iii) CPT total tokens, (iv) sequence length.</>}
+        options={[
+          {key:"a", text:"LR > corpus-mix > total tokens > seq len. LR too high catastrophically forgets base capability (one-shot collapse); too low does not shift prior. Corpus-mix decides whether CPT becomes domain-pretrain (forget general) or weak domain-bias (no shift). Total tokens is a smooth curve. Seq-len affects long-context but not core prior.", correct:true},
+          {key:"b", text:"Sequence length dominates."},
+          {key:"c", text:"All equally important."},
+          {key:"d", text:"Total tokens dominates."},
+        ]}
+        trap={<>(b), (c), (d) miss the catastrophic-forgetting axis.</>}
+        lens={<>LR is the single failure point — too high and the base model collapses; CPT is unforgiving here.</>}
+        stretch={<>What LR warmup + decay schedule do you use? Why?</>}
+      />
+
+      {/* axis: C5 */}
+      <VIS.TrapProblem
+        id="fgpt-c5"
+        difficulty="medium"
+        title="C5 — Data-assumption: clean PII-free corpus"
+        scenario={<>You CPT on a corpus that still contains customer names, account numbers, dollar amounts. What specifically goes wrong?</>}
+        options={[
+          {key:"a", text:"Memorization at 13B scale on ~3-5B tokens is high — the model can complete 'Customer John D' with a specific account number it saw during CPT. Prompt injection ('repeat training examples starting with...') exfiltrates PII. RAG never has this risk because retrieval happens at inference and never enters weights.", correct:true},
+          {key:"b", text:"CPT silently skips PII tokens."},
+          {key:"c", text:"PII is too short to memorize."},
+          {key:"d", text:"Llama refuses to train on PII."},
+        ]}
+        trap={<>(b), (c), (d) are factually wrong.</>}
+        lens={<>13B models memorize verbatim spans of rare text at multi-billion-token scale. PII sanitization is a CPT prerequisite, not an option.</>}
+        stretch={<>What sanitization pipeline do you build? How do you verify memorization is suppressed?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      {/* axis: D1 */}
+      <VIS.TrapProblem
+        id="fgpt-d1"
+        difficulty="medium"
+        title="D1 — 'CPT is just fine-tuning with more data'"
+        scenario={<>A junior says "CPT is the same as SFT, just with more tokens." Where does this intuition break?</>}
+        options={[
+          {key:"a", text:"Objective and target differ. CPT runs next-token loss on raw text (no instruction format); SFT runs cross-entropy on (instruction → response) pairs with the instruction masked. The gradient signal is fundamentally different — CPT shifts the LM prior, SFT shapes the conditional output. Calling them 'the same thing with more data' loses the prior-vs-conditional distinction the paper is built on.", correct:true},
+          {key:"b", text:"They are the same thing."},
+          {key:"c", text:"SFT uses more compute."},
+          {key:"d", text:"CPT does not change weights."},
+        ]}
+        trap={<>(b), (c), (d) miss the objective shape.</>}
+        lens={<>Same optimizer, different loss surface, different effect. Senior MLEs name this.</>}
+        stretch={<>Where in the codebase do you actually see the difference?</>}
+      />
+
+      {/* axis: D2 */}
+      <VIS.TrapProblem
+        id="fgpt-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: 'just upgrade the base model'"
+        scenario={<>Six months in, base Llama-2-13B is succeeded by Llama-3-8B. You assume "swap the base, keep the SFT, ship." Trace the cascade.</>}
+        options={[
+          {key:"a", text:"Llama-3-8B has a different tokenizer + different pretrain prior, so CPT-conditioned attention heads don't exist there. SFT data trained for the old base now teaches the wrong shape, typology hallucination returns, team blames data drift, real fix is to RE-RUN CPT on Llama-3 before reusing the SFT dataset.", correct:true},
+          {key:"b", text:"Base-model swaps are free — SFT transfers."},
+          {key:"c", text:"Tokenizers are interchangeable."},
+          {key:"d", text:"Llama-3 is always better, no work needed."},
+        ]}
+        trap={<>(b), (c), (d) miss the tokenizer/prior coupling.</>}
+        lens={<>SFT data is conditioned on the prior CPT produced — swap the base and the entire stack must be retrained, not just the final layer.</>}
+        stretch={<>What evaluation tells you the new base needs full CPT vs a small adapter?</>}
+      />
+
+      {/* axis: D3 */}
+      <VIS.TrapProblem
+        id="fgpt-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior diagnostic"
+        scenario={<>Junior reports FraudGPT cuts hallucination 40% vs GPT-4+RAG. What's the senior question?</>}
+        options={[
+          {key:"a", text:"'Which typology classes drove the 40%? If long-tail typologies (cycle-billing, TBML) went from 30% hallucination to near zero while head classes were unchanged, the CPT story is real. If common classes shrunk proportionally, we're seeing a calibration shift, not a prior shift — and a temperature change on GPT-4 might match. Show me the per-typology breakdown.'", correct:true},
+          {key:"b", text:"'Try more tokens.'"},
+          {key:"c", text:"'Use FP16.'"},
+          {key:"d", text:"'Ship it.'"},
+        ]}
+        trap={<>(b), (c), (d) skip the diagnostic.</>}
+        lens={<>The senior question forces a per-typology decomposition — the only way to attribute the gain to the CPT mechanism vs a calibration artifact.</>}
+        stretch={<>What temperature-only baseline on GPT-4+RAG would isolate this?</>}
+      />
+
+      {/* axis: D4 */}
+      <VIS.TrapProblem
+        id="fgpt-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: quality regression"
+        scenario={<>3 months after FraudGPT launch, analyst overrides spike from 8% to 22%. Causes: (i) typology drift, (ii) calibration drift, (iii) analyst-behavior change. Which is most likely?</>}
+        options={[
+          {key:"a", text:"(i) Typology drift. CPT cutoff was 3 months ago. New schemes (often emerging quarterly) are outside FraudGPT's prior — the model still confidently emits old-typology labels for new patterns. The override-rate spike correlates with novel fraud patterns appearing in cases. RAG-only would have been robust here; FraudGPT is exposed to this risk by design.", correct:true},
+          {key:"b", text:"(ii) Calibration drift."},
+          {key:"c", text:"(iii) Analyst behavior."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c), (d) are plausible but not FraudGPT's typical signature.</>}
+        lens={<>FraudGPT's failure mode is novel-typology cutoff — symptom is high-confidence wrong on new schemes. The diagnostic is: do overrides cluster on new typology labels?</>}
+        stretch={<>What retraining cadence would close this gap?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>E. Operations</h3>
+
+      {/* axis: E1 */}
+      <VIS.TrapProblem
+        id="fgpt-e1"
+        difficulty="hard"
+        title="E1 — FraudGPT-specific gotcha"
+        scenario={<>Pick the gotcha most specific to FraudGPT (would not bite vanilla Llama or GPT-4+RAG):</>}
+        options={[
+          {key:"a", text:"PII memorization at CPT scale — a 13B model trained for ~3-5B tokens memorizes verbatim spans from SAR narratives. Prompt injection or red-team probes can exfiltrate customer names and account numbers. RAG snippets are ephemeral; CPT weights are not. This is the audit-finding that delays compliance sign-off most often.", correct:true},
+          {key:"b", text:"GPU OOM at SFT."},
+          {key:"c", text:"Inference latency."},
+          {key:"d", text:"Tokenizer mismatch."},
+        ]}
+        trap={<>(b), (c), (d) are generic.</>}
+        lens={<>The memorization-of-PII issue is CPT-specific. Mitigation: aggressive PII sanitization + canary-prompt audits + DP-SGD on CPT pass.</>}
+        stretch={<>Sketch the canary-prompt audit you would run quarterly.</>}
+      />
+
+      {/* axis: E2 */}
+      <VIS.TrapProblem
+        id="fgpt-e2"
+        difficulty="hard"
+        title="E2 — Friday: typology mis-classification spike"
+        scenario={<>Friday: FraudGPT auto-typology accuracy drops from 91% to 73% on TBML cases. Analyst overrides spike. No infra changes, no model redeploy. Diagnosis?</>}
+        options={[
+          {key:"a", text:"A new TBML variant has emerged this quarter (e.g., crypto-on-ramp layered through art purchases). FraudGPT's CPT cutoff is months stale; the model's prior still puts TBML mass on the OLD patterns. Confidence stays high (CPT-confident), accuracy drops. RAG over current SOPs is the patch; quarterly CPT refresh is the fix. NOT a model bug — a cutoff issue.", correct:true},
+          {key:"b", text:"Rollback FraudGPT."},
+          {key:"c", text:"Page DevOps."},
+          {key:"d", text:"GPU is hot."},
+        ]}
+        trap={<>(b), (c), (d) miss the mechanism.</>}
+        lens={<>FraudGPT's confidence is robust; its prior is brittle to new typologies. The diagnostic signal is "high-confidence wrong" on a specific class.</>}
+        stretch={<>Could RAG be a real-time hedge between CPT refreshes?</>}
+      />
+
+      {/* axis: E3 */}
+      <VIS.TrapProblem
+        id="fgpt-e3"
+        difficulty="hard"
+        title="E3 — Eval protocol audit"
+        scenario={<>Which findings invalidate a FraudGPT eval report?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Eval split is random; CPT corpus and eval cases come from overlapping months — train/test leakage.", correct:true},
+          {key:"b", text:"Baseline is vanilla Llama-2-13B (no RAG) — sandbagged comparator; the production baseline is GPT-4+RAG.", correct:true},
+          {key:"c", text:"Per-typology breakdown is missing; only overall hallucination % reported — hides whether long-tail or head drove the win.", correct:true},
+          {key:"d", text:"LLMs are state of the art so eval doesn't matter."},
+        ]}
+        trap={<>(d) is wrong by construction.</>}
+        lens={<>Three audit failures: temporal leakage, sandbagged baseline, missing per-typology decomposition. All three appear in production FraudGPT reports.</>}
+        stretch={<>What is the right baseline + split protocol for FraudGPT claims?</>}
+      />
+
+      {/* axis: E4 */}
+      <VIS.TrapProblem
+        id="fgpt-e4"
+        difficulty="medium"
+        title="E4 — Rollout sequence"
+        scenario={<>Order phases: (i) full ramp, (ii) PII-canary audit, (iii) shadow on completed cases, (iv) analyst-in-the-loop traffic ramp.</>}
+        options={[
+          {key:"a", text:"ii → iii → iv → i. PII audit is gating — if memorization is high, compliance blocks. Shadow on completed cases measures hallucination rate without analyst risk. Analyst-in-the-loop ramp lets overrides correct before full autonomy.", correct:true},
+          {key:"b", text:"i → ii → iii → iv."},
+          {key:"c", text:"Direct cutover."},
+          {key:"d", text:"iv → i."},
+        ]}
+        trap={<>(b), (c), (d) skip PII gating.</>}
+        lens={<>PII canary audit must precede traffic — compliance failure here is catastrophic and FraudGPT-specific.</>}
+        stretch={<>What is your canary prompt set?</>}
+      />
+
+      {/* axis: E5 */}
+      <VIS.TrapProblem
+        id="fgpt-e5"
+        difficulty="medium"
+        title="E5 — Reproducibility"
+        scenario={<>Which FraudGPT-class reproducibility issues are widely known?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"CPT corpus composition (fraud:general mix ratio) is not always reported precisely; tiny changes shift prior dramatically.", correct:true},
+          {key:"b", text:"LR schedule + warmup for CPT differs per paper and matters enormously for catastrophic-forgetting risk.", correct:true},
+          {key:"c", text:"Per-typology eval breakdowns are often summarized into a single hallucination percentage.", correct:true},
+          {key:"d", text:"FraudGPT cannot be retrained."},
+        ]}
+        trap={<>(d) is false.</>}
+        lens={<>Three reproducibility hazards. Corpus mix + LR are the two most-cited gaps in CPT papers.</>}
+        stretch={<>What is your CPT reimplementation checklist?</>}
+      />
+
+      {/* axis: E6 */}
+      <VIS.TrapProblem
+        id="fgpt-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination"
+        scenario={<>Which contamination paths affect FraudGPT's reported gains?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Test cases were already in the CPT corpus (SAR narratives reused for eval).", correct:true},
+          {key:"b", text:"Comparison vs vanilla Llama instead of GPT-4 + production RAG — sandbagged baseline.", correct:true},
+          {key:"c", text:"Typology labels in eval were generated by the same analysts whose decisions trained the SFT — preference leakage.", correct:true},
+          {key:"d", text:"CPT cannot be evaluated."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three contamination paths: corpus/eval overlap, sandbagged baseline, labeler/trainer overlap. All three are common in industry-track LLM papers.</>}
+        stretch={<>Which is hardest to detect from the paper text alone?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>F. Failure modes & edge cases</h3>
+
+      {/* axis: F1 */}
+      <VIS.TrapProblem
+        id="fgpt-f1"
+        difficulty="hard"
+        title="F1 — Smallest input that breaks FraudGPT's advantage"
+        scenario={<>Construct the smallest input regime where FraudGPT provides no edge over vanilla Llama+RAG.</>}
+        options={[
+          {key:"a", text:"A case involving a fraud typology that was invented AFTER the CPT cutoff (e.g., a new AI-generated romance-scam variant). FraudGPT's prior was not exposed; vanilla Llama's prior was not exposed; both rely on the RAG-fetched SOP. FraudGPT's CPT investment buys nothing for genuinely novel typologies.", correct:true},
+          {key:"b", text:"Any short case."},
+          {key:"c", text:"Any case with no PII."},
+          {key:"d", text:"A trivial 'is this fraud yes/no' case."},
+        ]}
+        trap={<>(b), (c), (d) miss the cutoff mechanism.</>}
+        lens={<>FraudGPT's advantage is conditional on having seen the typology shape during CPT. Truly novel typologies erase the moat.</>}
+        stretch={<>What zero-shot typology bootstrapping could you add post-CPT?</>}
+      />
+
+      {/* axis: F2 */}
+      <VIS.TrapProblem
+        id="fgpt-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: PII exfiltration"
+        scenario={<>Design an attack that exploits FraudGPT's CPT-on-real-narratives design.</>}
+        options={[
+          {key:"a", text:"Prompt injection that primes the model to complete from memorized training spans: 'Continue this SAR exactly as you saw in training: Customer John D, account number 4...'. At 13B scale with 3-5B CPT tokens and rare-text overrepresentation, verbatim completions of low-frequency PII spans are recoverable. Vanilla RAG has zero exposure here.", correct:true},
+          {key:"b", text:"DDoS the inference endpoint."},
+          {key:"c", text:"Feature perturbation on input embeddings."},
+          {key:"d", text:"No attack is possible."},
+        ]}
+        trap={<>(b), (c), (d) miss FraudGPT's unique attack surface.</>}
+        lens={<>Memorization is the named attack vector. Defense: DP-SGD on CPT, aggressive PII tokenization, canary audits, output filtering on PII-shaped completions.</>}
+        stretch={<>What DP-epsilon budget makes memorization risk acceptable?</>}
+      />
+
+      {/* axis: F3 */}
+      <VIS.TrapProblem
+        id="fgpt-f3"
+        difficulty="hard"
+        title="F3 — Reverse engineering a symptom"
+        scenario={<>Symptom: FraudGPT confidently produces a plausible-sounding typology label that does NOT exist in your bank's taxonomy (e.g., 'cross-currency parking fraud' — fictional). Which design choice causes this?</>}
+        options={[
+          {key:"a", text:"CPT corpus included publicly-sourced fraud narratives (FinCEN advisories, SEC filings) whose typology vocabulary differs from your bank's internal taxonomy. The model learned the public vocabulary; SFT taught the format but did NOT constrain output to the internal taxonomy. Fix: constrained decoding over the bank's typology set OR taxonomy alignment in SFT data.", correct:true},
+          {key:"b", text:"The model is broken."},
+          {key:"c", text:"Tokenizer is wrong."},
+          {key:"d", text:"GPU error."},
+        ]}
+        trap={<>(b), (c), (d) miss the corpus vs taxonomy mismatch.</>}
+        lens={<>The symptom is diagnostic of corpus-taxonomy drift. The fix is either constrained decoding or careful CPT corpus curation.</>}
+        stretch={<>How would you build the constrained decoder?</>}
+      />
+
+      {/* axis: F4 */}
+      <VIS.TrapProblem
+        id="fgpt-f4"
+        difficulty="medium"
+        title="F4 — Paper-admitted limitations"
+        scenario={<>Which limitations does the FraudGPT paper acknowledge?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Memorization risk on PII-bearing CPT corpora.", correct:true},
+          {key:"b", text:"Cutoff-induced typology staleness without periodic refresh.", correct:true},
+          {key:"c", text:"Catastrophic forgetting of general capability at high CPT LR.", correct:true},
+          {key:"d", text:"FraudGPT works perfectly with no caveats."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>All three are named in the paper. Knowing this signals careful reading.</>}
+        stretch={<>Which limitation does the paper UNDERSTATE relative to production reality?</>}
+      />
+
+      {/* axis: F5 */}
+      <VIS.TrapProblem
+        id="fgpt-f5"
+        difficulty="hard"
+        title="F5 — The community critique"
+        scenario={<>Recent CPT-for-domain literature (BloombergGPT post-mortem, Med-PaLM-2 ablations) has produced a specific critique of CPT+SFT for narrow domains. What is it?</>}
+        options={[
+          {key:"a", text:"For many domains, a smaller fine-tuned model with strong RAG matches or beats CPT+SFT at lower cost and lower memorization risk — the BloombergGPT vs GPT-4+finance-RAG comparison is the canonical example. CPT's edge is real on long-tail vocabulary but the cost-benefit case is thinner than the FraudGPT paper suggests once you control for RAG quality.", correct:true},
+          {key:"b", text:"CPT always wins."},
+          {key:"c", text:"RAG always wins."},
+          {key:"d", text:"There is no critique."},
+        ]}
+        trap={<>(b), (c), (d) miss the empirical finding.</>}
+        lens={<>BloombergGPT's lessons apply directly. CPT investment must be justified against a STRONG RAG baseline, not vanilla Llama.</>}
+        stretch={<>What evaluation matrix tells you "CPT is worth it" vs "ship strong RAG"?</>}
+      />
+
+      {/* axis: F5b — interview-gold */}
+      <VIS.TrapProblem
+        id="fgpt-f5b"
+        difficulty="hard"
+        title="F5b — The interview gold question"
+        scenario={<>Interviewer: "You championed FraudGPT. Walk me through the ablation that proves CPT is the value driver, not SFT or scale."</>}
+        options={[
+          {key:"a", text:"Four conditions under fixed compute and fixed eval split (temporal, no overlap): (i) GPT-4 + strong production RAG, (ii) Llama-2-13B + same RAG, (iii) Llama-2-13B + SFT-only (no CPT) + same RAG, (iv) Llama-2-13B + CPT + SFT + same RAG. Per-typology breakdown for each. If (iv) beats (iii) only on long-tail typologies, CPT is the driver. If (iv) beats (i) overall but not per-typology, it is a calibration artifact and you should ship a temperature change on (i) instead. Also measure PII canary completion rates on (iv) to confirm memorization risk is below threshold.", correct:true},
+          {key:"b", text:"Compared FraudGPT to vanilla Llama-2-13B; FraudGPT won by 8 points; shipped."},
+          {key:"c", text:"LLMs always win — no ablation needed."},
+          {key:"d", text:"Compared FraudGPT to GPT-3.5."},
+        ]}
+        trap={<>(b), (c), (d) skip ablation rigor.</>}
+        lens={<>The right answer (i) builds the strong-RAG baseline, (ii) adds the SFT-only intermediate condition, (iii) measures per-typology, (iv) gates on PII safety. This is the senior bar.</>}
+        stretch={<>If (iii) ties (iv) on long-tail, would you still ship CPT? Defend.</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://aclanthology.org/2024.emnlp-industry.0/" target="_blank" rel="noopener">
-            <strong>Zhang et al. — Fraud-GPT: Domain-Adapted LLMs for Financial Fraud Reasoning</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, EMNLP 2024 industry track)</span>
-          <br/>The reference paper. Sec 3 (CPT recipe) and Sec 5 (hallucination ablations) are the keepers.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2012.07805" target="_blank" rel="noopener">
-            <strong>Carlini et al. — Extracting Training Data from Large Language Models</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, USENIX 2021)</span>
-          <br/>Foundational work on training-data extraction. Required reading before deploying any model continual-pretrained on sensitive data.
-        </li>
-        <li>
-          <a href="https://eugeneyan.com/writing/llm-patterns/" target="_blank" rel="noopener">
-            <strong>Eugene Yan — Patterns for Building LLM-based Systems and Products</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The clearest practitioner walkthrough of when to RAG vs fine-tune vs continual-pretrain. Maps cleanly onto the fraud use case.
-        </li>
-        <li>
-          <a href="https://huyenchip.com/2023/05/02/rlhf.html" target="_blank" rel="noopener">
-            <strong>Chip Huyen — RLHF: Reinforcement Learning from Human Feedback</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Practitioner overview of SFT and RLHF for task adaptation. Read for the SFT-recipe intuition you need for Stage 2.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2009.03300" target="_blank" rel="noopener">
-            <strong>Hendrycks et al. — Measuring Massive Multitask Language Understanding (MMLU)</strong>
-          </a>{" "}
+          <a href="https://aclanthology.org/2024.emnlp-industry.0/" target="_blank" rel="noopener"><strong>Zhang et al. — Fraud-GPT (EMNLP 2024 Industry)</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper)</span>
-          <br/>Anchor benchmark for measuring catastrophic forgetting after CPT. Pair with GSM8K and HumanEval for a 3-axis general-capability eval.
+          <br/>The original. CPT corpus composition, SFT recipe, per-typology results.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2303.17564" target="_blank" rel="noopener"><strong>Wu et al. — BloombergGPT</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, 2023)</span>
+          <br/>The CPT-for-finance reference; its post-hoc critique vs GPT-4+RAG is the FraudGPT comparator.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2202.07646" target="_blank" rel="noopener"><strong>Carlini et al. — Quantifying Memorization Across Neural LMs</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2023)</span>
+          <br/>The canonical paper on memorization risk at the CPT scale used here.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2004.10964" target="_blank" rel="noopener"><strong>Gururangan et al. — Don't Stop Pretraining (DAPT/TAPT)</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ACL 2020)</span>
+          <br/>The continual-pretraining recipe FraudGPT follows; DAPT = CPT under a different name.
         </li>
       </ul>
     </VIS.Section>
   </main>
 );
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
   <script>

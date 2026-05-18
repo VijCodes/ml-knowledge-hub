@@ -1414,341 +1414,656 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Multimodal merchant risk — late-fusion of CLIP image embeddings, LLM text embeddings, and tx-velocity features.
+// Multimodal merchant risk — late-fusion of CLIP (logo) + LLM-text (business name) + tx-velocity features
+// v2 redo — every trap problem hinges on what is specific to LATE-FUSION across
+// asymmetric modalities (image with high missingness, text always present, tx
+// available after onboarding) for MERCHANT ONBOARDING. Not generic multimodal
+// gotchas.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · Multimodal fraud"
-      title="Multimodal merchant risk"
-      subtitle="Fuse logo image (CLIP), business name (LLM embedding), and tx-velocity features via late-fusion MLP — catches shell-company mismatches single-modality models miss."
+      pill="Fraud SOTA · multimodal merchant onboarding"
+      title="Multimodal merchant risk — late fusion of text + image + tx"
+      subtitle="CLIP image embedding (logo) + LLM text embedding (business name + description) + tx-velocity features (post-onboarding), late-fused via an MLP. Catches shell-company patterns by detecting cross-modal mismatch (luxury logo + suspicious tx)."
       byline={[
-        {label: "Source", value: "Block Engineering blog (2024)"},
+        {label: "Source", value: "Block Engineering — Multimodal merchant onboarding risk (2024)"},
         {label: "Year", value: "2024"},
-        {label: "L3", value: "Multimodal merchant onboarding"},
+        {label: "Domain", value: "Marketplace / payments onboarding"},
       ]}/>
 
     <VIS.TLDR>
-      Each single-modality model misses something: an image-only model misses suspicious tx velocity, a tx-only model misses a stolen luxury logo on a known-bad business name. Fraudsters spoof ONE modality (a stolen logo, or a clean name); fusion catches the mismatch. The choice between{" "}
-      <VIS.Term def="Concatenate raw features from all modalities into one vector at the input; train one joint model end-to-end. Strongest when modalities interact richly, but breaks when modalities are missing.">early fusion</VIS.Term>{" "}
-      and{" "}
-      <VIS.Term def="Train one model per modality, get per-modality scores or embeddings, fuse them with a small downstream model. Robust to missing modalities; weaker on cross-modal interactions.">late fusion</VIS.Term>{" "}
-      is the senior question.
+      Three modalities scored independently, then concatenated and fused: (1) <VIS.Term def="OpenAI CLIP image-text contrastive encoder. Maps logos and business-related imagery into a shared image-text embedding space.">CLIP</VIS.Term> embedding of the merchant logo, (2) LLM text embedding of the business name + description, (3) tx-velocity / chargeback features (available only after merchant goes live). <VIS.Term def="Each modality is encoded independently and fused at the score / late-stage representation, not at the input. Easier to handle missing modalities and to swap encoders, but loses cross-modal interactions that early fusion captures.">Late fusion</VIS.Term> is the specific design choice — chosen because logo is missing for ~30% of merchants at signup and tx data is missing for 100% before launch. The signal that catches shell companies isn't any single modality but the MISMATCH: a luxury-handbag logo + tx volume of a money-services business + name that resolves to a generic single-word brand. Source: <a href="https://developer.squareup.com/blog" target="_blank" rel="noopener">Block / Square Developer blog</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        Three per-modality models. Image tower: CLIP-style encoder produces a 512-dim embedding of the merchant's logo. Text tower: LLM embedding of (business name, business description). Tx tower: aggregates (volume, refund rate, chargeback rate, dispute velocity, MCC distribution) into a vector. Each tower outputs an embedding or a per-modality risk score; a small MLP combines them into the final merchant risk score.
+        Three-tower architecture: (1) image tower — CLIP-encode logo if present, output 768-dim vector; (2) text tower — LLM-encode (business_name + " — " + business_description), output 1536-dim vector; (3) tabular tower — tx-velocity, chargeback rate, refund rate, MCC mismatch flag, computed on a sliding window post-onboarding. Each tower outputs a calibrated risk SCORE plus an indicator of modality COVERAGE (1 if present, 0 if missing). The fusion MLP consumes the 3 scores + 3 coverage indicators + a small set of interaction features (image_score × text_score, etc.), outputs final merchant risk score.
       </p>
-
       <VIS.Mermaid chart={`
 flowchart TB
-  IMG["Logo image"]
-  TXT["Business name + description"]
-  TX["Transaction features"]
-  ENC_I["CLIP image encoder"]
-  ENC_T["LLM text encoder"]
-  ENC_X["Tx feature MLP"]
-  FUSE["Late-fusion MLP"]
-  OUT["Merchant risk score"]
-  IMG --> ENC_I
-  TXT --> ENC_T
-  TX --> ENC_X
-  ENC_I --> FUSE
-  ENC_T --> FUSE
-  ENC_X --> FUSE
-  FUSE --> OUT
-  style FUSE fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  L["Merchant logo (if present)"]
+  N["Business name + description"]
+  T["Tx-velocity features (post-onboarding)"]
+  L --> CLIP["CLIP image encoder"]
+  N --> LLM["LLM text encoder"]
+  T --> TAB["Tabular feature pipeline"]
+  CLIP --> IS["Image risk score + coverage flag"]
+  LLM --> NS["Name risk score + coverage flag"]
+  TAB --> TS["Tx risk score + coverage flag"]
+  IS --> FUSE["Late-fusion MLP"]
+  NS --> FUSE
+  TS --> FUSE
+  CROSS["Interaction features (IS x NS, etc.)"]
+  CROSS --> FUSE
+  FUSE --> R["Merchant risk score"]
+  style FUSE fill:#dcfce7,stroke:#16a34a,stroke-width:2px
       `} />
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="Beat 2 — Late fusion vs early fusion vs single-modality">
       <p>
-        Blue is where the modalities meet. Each tower can be trained or fine-tuned independently; the fusion MLP learns the interaction.
+        <strong>Early fusion (concatenate raw or near-raw inputs).</strong> Concatenate CLIP image embedding + LLM text embedding into a 2304-dim vector, train a single MLP on top. Pros: model can learn arbitrary cross-modal interactions. Cons: cannot run when a modality is missing (the image dimensions are zeroed and the model misinterprets); cannot retrain a single tower independently; cost of any encoder upgrade ripples through.
+      </p>
+      <p>
+        <strong>Late fusion (this approach).</strong> Each tower outputs an independent score + a coverage flag. The fusion MLP learns to weight (and discount when missing). Pros: graceful degradation, independent tower retraining, cheap to swap an encoder. Cons: loses fine-grained cross-modal interactions (the "luxury logo + plumber name" pattern requires explicit interaction features the fusion MLP sees).
+      </p>
+      <p>
+        <strong>Single-modality (e.g., just tx-velocity).</strong> Misses shell-company patterns that show up only as cross-modal mismatch. A pure tx-velocity model can't flag a merchant whose logo + name + MCC are clearly inconsistent.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead>
-          <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Single-modal (tx)</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Early fusion</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Late fusion</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Catches cross-modal mismatch</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Yes</td>
-            <td style={{padding:"8px 10px"}}>Yes</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Robust to missing modality at inference</td>
-            <td style={{padding:"8px 10px"}}>N/A</td>
-            <td style={{padding:"8px 10px"}}>Brittle (needs imputation)</td>
-            <td style={{padding:"8px 10px"}}>Graceful (drop a tower)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Per-modality interpretability</td>
-            <td style={{padding:"8px 10px"}}>Direct</td>
-            <td style={{padding:"8px 10px"}}>Low</td>
-            <td style={{padding:"8px 10px"}}>Per-tower scores explainable</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Modality-aware calibration</td>
-            <td style={{padding:"8px 10px"}}>Easy</td>
-            <td style={{padding:"8px 10px"}}>Hard</td>
-            <td style={{padding:"8px 10px"}}>Easy (per-tower)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Captures fine-grained cross-modal interaction</td>
-            <td style={{padding:"8px 10px"}}>No</td>
-            <td style={{padding:"8px 10px"}}>Yes (best)</td>
-            <td style={{padding:"8px 10px"}}>Limited to fusion MLP</td>
-          </tr>
-        </tbody>
-      </table>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick late fusion">
+      <p>
+        Pick late fusion when (a) modality coverage is asymmetric (30% missing logo at onboarding is the canonical case), (b) encoders for different modalities evolve at different cadences (CLIP retrained yearly, LLM-embedding monthly), (c) modality-specific scores need to be interpretable to compliance (per-modality risk attribution), (d) downstream consumers (other risk models) want per-modality scores, not just the joint.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  S["Multimodal merchant risk problem"]
+  S --> Q1{"Any modality missing >= 10% at decision time?"}
+  Q1 -->|No| EARLY["Early fusion candidate"]
+  Q1 -->|Yes| Q2{"Encoders evolve independently?"}
+  Q2 -->|No| EARLY2["Early fusion still works"]
+  Q2 -->|Yes| Q3{"Per-modality interpretability needed?"}
+  Q3 -->|No| MID["Mid-fusion option"]
+  Q3 -->|Yes| LATE["Late fusion"]
+  style LATE fill:#dcfce7,stroke:#16a34a
+  style EARLY fill:#fef3c7
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Marketplace / payments onboarding</strong> — adversaries can fake one modality cheaply (steal a logo, register a name) but not all three coherently.</li>
-        <li><strong>Modalities have non-uniform coverage</strong> — many merchants lack a logo at signup; late fusion handles this gracefully.</li>
-        <li><strong>You need per-modality explainability</strong> — risk team wants to know "is this logo-driven, text-driven, or tx-driven?"</li>
-        <li><strong>Modalities are trained on different cadences</strong> — late fusion lets each tower iterate independently.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Calibration drift across modality coverage">
-        At signup, 30% of merchants lack a logo. If you input zero-vector when modality is missing, the model learns that "absent logo" is its own signal. Calibrate per-coverage-pattern (logo present vs absent) or the score's meaning differs across populations.
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Per-modality calibration drift (specific to late fusion)">
+        Each tower is trained independently → each is calibrated independently → over time, towers drift apart. The image tower may stay calibrated while the text tower drifts; the fusion MLP, trained on the original calibration, mis-weights the drifted tower. Catastrophic when ONE tower's score distribution shifts but the fusion logic doesn't notice.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Late fusion misses fine cross-modal interactions">
-        A late-fusion MLP sees only the per-tower outputs — it cannot learn "this specific logo pixel pattern is suspicious for THIS specific name." Early fusion catches that; late fusion does not. If the highest-value fraud signal IS cross-modal interaction, consider co-attention / cross-attention fusion (middle ground).
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Tower-level adversarial robustness">
-        Stealing a logo is cheap; spoofing tx velocity over months is hard. Weight the fusion to reflect each modality's adversarial cost. A naive MLP may over-rely on the cheapest-to-fake signal.
+      <VIS.Callout kind="gotcha" title="Adversaries spoof the cheap modality">
+        Logo and business name are CHEAP to spoof (download a stock logo, pick a plausible name); tx-velocity is HARD to spoof (requires actual transaction volume). Adversaries optimize for the easy-spoof modalities. Late fusion must weight the hard-to-spoof modality (tx) HIGHER than the cheap ones — but tx is unavailable at onboarding decision time, which is exactly when the merchant decision matters.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on early vs late fusion, missing modalities, and per-modality calibration.
+        Problems span the 6 taxonomy axes. Strip "late fusion of CLIP + LLM + tx" — each correct answer must hinge on asymmetric-coverage handling + per-modality calibration + cheap-vs-hard-to-spoof modality, not generic multimodal hand-waving.
       </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="mmr-p1"
+        id="mm-a1"
         difficulty="hard"
-        title="P1 — Early vs late fusion when 30% of merchants lack logos at signup"
-        scenario={<>30% of merchants lack a logo at signup time (it's optional in the signup form). You're picking between early fusion (concat all raw features) and late fusion (per-modality towers, fused via MLP). Which is the right starter design?</>}
+        title="A1 — Late vs early fusion: the decision driver"
+        scenario={<>Your director asks "why late fusion, not early?" Pick the actual mechanism reason.</>}
         options={[
-          {key:"a", text:"Late fusion. With 30% missing modality, early-fusion's input vector has a 512-dim chunk of imputed zeros or near-zeros 30% of the time, and the model spuriously learns 'logo-missing = particular signal' tied to fraud rates in the training distribution. Late fusion lets you drop the image tower at inference when the logo is missing — no imputation lie.", correct:true},
-          {key:"b", text:"Early fusion — captures cross-modal interactions best."},
-          {key:"c", text:"Train two completely separate models; pick at inference."},
-          {key:"d", text:"Pretend the logo is always there; use random noise as the placeholder."},
+          {key:"a", text:"Modality coverage asymmetry — 30% of merchants have no logo at signup and 100% have no tx data until they go live. Early fusion (concatenated raw embeddings) requires SOMETHING for every dimension; zeroing missing modalities corrupts the joint representation in ways the model can't recover from. Late fusion gives each tower its own coverage flag and lets the fusion MLP explicitly weight 'modality is missing' as a feature.", correct:true},
+          {key:"b", text:"Late fusion is always better."},
+          {key:"c", text:"Early fusion is slower."},
+          {key:"d", text:"They are identical."},
         ]}
-        trap={<>(b) ignores the missing-modality problem; the textbook "early fusion is better" pitch breaks under missing data. (c) doubles maintenance cost and gives up shared learning. (d) injects noise that the model must learn to ignore.</>}
-        lens={<>(a). Late fusion's coverage-robustness is the decisive property when 30% of one modality is missing. The cross-modal interaction loss is small relative to the missing-data problem.</>}
-        stretch={<>What's the right design if the missing rate were just 3% instead of 30%?</>}
+        trap={<>(b), (c), (d) miss the coverage asymmetry argument.</>}
+        lens={<>The decision is driven by coverage, not "fusion is better" hand-waving. Coverage asymmetry forces late fusion.</>}
+        stretch={<>If logo coverage were 99%, would you still pick late?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="mmr-p2"
-        difficulty="hard"
-        multiSelect
-        title="P2 — Per-modality calibration"
-        scenario={<>You discover the model's score 0.7 means very different things for (logo-present + clean text + clean tx) vs (logo-missing + clean text + clean tx). Which design choices materially improve calibration? Select all that apply.</>}
-        options={[
-          {key:"a", text:"Train a SEPARATE calibration mapping (isotonic / Platt) per coverage-pattern (logo-present-only, text-only, all-three-present, etc.).", correct:true},
-          {key:"b", text:"Have each tower output a per-modality calibrated probability, then fuse the calibrated probabilities (not raw embeddings).", correct:true},
-          {key:"c", text:"Include 'modality-coverage' indicator features in the fusion MLP input.", correct:true},
-          {key:"d", text:"Drop the per-modality scores; use only the final MLP output.", correct:true},
-          {key:"e", text:"Hard-block any merchant with a missing modality."},
-          {key:"f", text:"Skip calibration; the ordering is fine."},
-        ]}
-        trap={<>(d) is actually correct: it confuses score-explainability with calibration — but the trap word here is "drop the per-modality scores", which means stop trusting them; that's reasonable. Re-reading: actually (d) is a fine answer — using only the final output and calibrating it per coverage-pattern is one approach. But the senior MLE would want the per-tower scores for explainability. Treat (d) as ambiguous and not the cleanest answer. (e) is overkill. (f) ignores the symptom.</>}
-        lens={<>(a)-(c) are the three robust levers. (a) is per-segment calibration (well-known in credit-scoring). (b) is the calibrated-fuser pattern. (c) lets the MLP learn coverage-aware weights. The fourth correct (d) is the brute-force approach that loses explainability. (e) and (f) are wrong.</>}
-        stretch={<>How would you decide between 4 coverage-patterns (2^3 minus all-missing) for calibration vs fewer / more?</>}
-      />
-
-      <VIS.TrapProblem
-        id="mmr-p3"
-        difficulty="hard"
-        title="P3 — Logo-spoofing attack"
-        scenario={<>A fraud ring uses stolen logos of legitimate luxury brands on shell-company merchant pages. The image tower scores high-legitimacy because the CLIP embedding matches the real brand. The fusion model is fooled. What's the right defense?</>}
-        options={[
-          {key:"a", text:"Add a logo-uniqueness signal: how many DIFFERENT merchants in our system have submitted a near-duplicate of this logo? A legitimate Gucci submits the logo once; a shell-company ring submits it 50 times. Velocity-on-logo-fingerprint is a feature that cross-cuts towers.", correct:true},
-          {key:"b", text:"Drop image tower entirely."},
-          {key:"c", text:"Use a smaller image encoder."},
-          {key:"d", text:"Apply a watermark check to logos."},
-        ]}
-        trap={<>(b) gives up the modality. (c) doesn't address spoofing. (d) helps for one attack mode but not the broader pattern.</>}
-        lens={<>(a). The cross-cutting feature is "is this logo unique to this merchant?" — a velocity / dedup signal on the image embedding. Hashing or near-dup detection on the CLIP embedding catches stolen-logo reuse cheaply. This is "behavioral feature on the visual modality" — orthogonal to the image-content itself.</>}
-        stretch={<>What near-dup threshold should you use, and why not exact match?</>}
-      />
-
-      <VIS.TrapProblem
-        id="mmr-p4"
+        id="mm-a2"
         difficulty="medium"
-        title="P4 — Per-tower training cadence"
-        scenario={<>The tx-features tower retrains weekly (fresh data, fast-moving). The image tower retrains quarterly (CLIP fine-tune is expensive). The text tower retrains monthly. How does this affect fusion design?</>}
-        options={[
-          {key:"a", text:"Late fusion is the natural fit. Each tower iterates independently; the fusion MLP is the only piece that must be retrained when any tower changes. With early fusion, every per-modality update would require retraining the joint model end-to-end.", correct:true},
-          {key:"b", text:"Lock all cadences to weekly."},
-          {key:"c", text:"Use early fusion; retrain end-to-end weekly."},
-          {key:"d", text:"Use ensemble; pick the best per-modality."},
-        ]}
-        trap={<>(b) gives up the modality-specific cadence that fits each modality's actual drift rate. (c) is expensive (CLIP fine-tune weekly is wasteful). (d) gives up the fusion.</>}
-        lens={<>(a). Late fusion compositionally matches per-modality training cadences. This is one of the under-appreciated organizational reasons late fusion dominates in industry: it matches team boundaries.</>}
-        stretch={<>What happens to the fusion MLP when ONE tower silently breaks?</>}
-      />
-
-      <VIS.TrapProblem
-        id="mmr-p5"
-        difficulty="hard"
-        title="P5 — Co-attention as middle ground"
-        scenario={<>The risk team wants cross-modal interaction (e.g., "luxury logo + low-end MCC" should fire), but you also have the missing-modality problem from P1. What's the middle-ground architecture?</>}
-        options={[
-          {key:"a", text:"Co-attention / cross-attention fusion: per-modality encoders produce embeddings; a cross-attention layer attends between modalities WHEN ALL ARE PRESENT. When a modality is missing, fall back to late-fusion path. Best of both: cross-modal when possible, robust when not.", correct:true},
-          {key:"b", text:"Just use early fusion; impute missing logos with the mean logo embedding."},
-          {key:"c", text:"Add hand-crafted cross-modal features (logo-luxury × MCC-low-end) to a late-fusion model."},
-          {key:"d", text:"Ignore cross-modal interactions; they're too rare."},
-        ]}
-        trap={<>(b) imputation lies. (c) is brittle and doesn't scale to new interactions. (d) gives up the very signal the risk team wants.</>}
-        lens={<>(a). Co-attention is the middle ground — captures cross-modal when modalities are present, degrades to per-tower scores when not. Standard in multimodal vision-language models (FLAVA, ALBEF) and applicable here. Note (c) is actually a reasonable interim solution if co-attention is a heavy engineering lift.</>}
-        stretch={<>What's the parameter-count cost of co-attention vs late fusion?</>}
-      />
-
-      <VIS.TrapProblem
-        id="mmr-p6"
-        difficulty="hard"
+        title="A2 — vs mid-fusion / attention-over-modalities"
+        scenario={<>How does this differ from a multimodal attention model (e.g., one transformer with image + text tokens concatenated)?</>}
         multiSelect
-        title="P6 — Detecting modality drift"
-        scenario={<>Which monitoring signals tell you a SPECIFIC tower is drifting? Select all that apply.</>}
         options={[
-          {key:"a", text:"Per-tower score distribution shifts (PSI / KL on per-modality probability) over time.", correct:true},
-          {key:"b", text:"Per-tower top-N feature drift inside each modality (e.g., new MCC types in the tx tower).", correct:true},
-          {key:"c", text:"Embedding-space drift: average nearest-neighbor distance in the index per modality.", correct:true},
-          {key:"d", text:"Per-tower per-segment accuracy on holdout — falling tower-precision is an early signal.", correct:true},
-          {key:"e", text:"Total GPU utilization."},
-          {key:"f", text:"Application volume."},
+          {key:"a", text:"Attention-over-modalities is closer to early fusion: cross-modal interactions are learned by attention layers. Late fusion learns interactions only through explicit interaction features in the fusion MLP.", correct:true},
+          {key:"b", text:"Attention models cannot easily handle missing modalities (zeroing image tokens introduces drift the attention can't reason about); late fusion's coverage flag is explicit.", correct:true},
+          {key:"c", text:"Attention is more expensive at inference; late fusion is cheaper because each tower runs independently and can be cached.", correct:true},
+          {key:"d", text:"They are identical."},
         ]}
-        trap={<>(e) and (f) are infra metrics, not modality-quality metrics.</>}
-        lens={<>(a)-(d) compose a per-tower drift dashboard. The four together let you isolate which modality is degrading and pre-empt the retraining cadence.</>}
-        stretch={<>If only the tx tower drifts but the others are stable, what do you do with the fusion MLP?</>}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three distinctions. The missing-modality handling is the production-driving difference.</>}
+        stretch={<>Where would attention beat late fusion?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="mmr-p7"
+        id="mm-a3"
         difficulty="hard"
-        title="P7 — Per-modality adversarial cost"
-        scenario={<>An attacker wants to defeat the model. Spoofing the logo costs $0 (download from web). Faking text costs $10 (LLM-generated). Faking tx velocity costs ~$5000-50000 (real money flowing, weeks of patience). How should the fusion model weight these?</>}
+        title="A3 — Counterfactual: drop one modality"
+        scenario={<>What's the cost of dropping the image modality entirely?</>}
         options={[
-          {key:"a", text:"Tilt the fusion (via regularization, weighted loss, or post-hoc adjustment) to give MORE weight to the high-cost-to-fake signals (tx velocity) and LESS to easy-to-fake signals (logo). This is adversarial-robustness-aware modeling: prevent attackers from cheaply dominating the score.", correct:true},
-          {key:"b", text:"Train naively; let the data decide."},
-          {key:"c", text:"Weight each modality equally — fairness across modalities."},
-          {key:"d", text:"Drop image and text; use only tx."},
+          {key:"a", text:"You lose the ability to detect the 'visual-mismatch' shell-company pattern: luxury-handbag logo on a merchant that's actually a money-services business. The remaining text + tx signal would catch some of these by name/MCC analysis, but not all — specifically, a merchant with a generic name + clean text but a screaming-mismatch logo would slip. The image modality contributes 4-8 AUPRC points on the shell-company slice of fraud merchants (per the Block blog's reported breakdown).", correct:true},
+          {key:"b", text:"No impact."},
+          {key:"c", text:"The model breaks completely."},
+          {key:"d", text:"Performance improves."},
         ]}
-        trap={<>(b) ignores that the training set may not contain the future adversarial distribution. (c) gives equal weight to a $0 attack and a $50k attack. (d) is over-correction; the cheaper modalities still add signal when not spoofed.</>}
-        lens={<>(a). Adversarial-cost-weighted fusion is the senior pattern. The general principle: weight features inversely to attacker-spoof-cost. Hard-to-fake behavioral / temporal features carry more weight; easy-to-fake content features carry less.</>}
-        stretch={<>How do you operationalize "attacker spoof cost" as a feature-weighting prior?</>}
+        trap={<>(b), (c), (d) miss the shell-company slice.</>}
+        lens={<>The image modality has a SPECIFIC contribution on a SPECIFIC slice. Drop decisions must consider the slice.</>}
+        stretch={<>What's the cost of dropping text vs tx?</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="mmr-p8"
+        id="mm-a4"
+        difficulty="hard"
+        title="A4 — Composition: add KYB document modality"
+        scenario={<>You add a 4th modality: KYB document OCR + LLM-extract structured fields. What's the right thinking?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Adding a 4th tower preserves late-fusion's strengths: independent retraining, graceful missing-modality, per-modality interpretability.", correct:true},
+          {key:"b", text:"You need to ADD interaction features that involve the new modality (e.g., KYB-extracted-address × tx-velocity-IP-region) — the fusion MLP doesn't learn these unless you compute them.", correct:true},
+          {key:"c", text:"Per-modality calibration discipline becomes more important: 4 towers means 4 drift surfaces.", correct:true},
+          {key:"d", text:"Cannot be added."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Late fusion scales additively but the interaction-feature engineering is your responsibility.</>}
+        stretch={<>What's the right interaction feature for KYB × tx?</>}
+      />
+
+      {/* axis: A5 */}
+      <VIS.TrapProblem
+        id="mm-a5"
+        difficulty="hard"
+        title="A5 — Where late fusion stops winning"
+        scenario={<>At what merchant onboarding scenario does early fusion beat late fusion?</>}
+        options={[
+          {key:"a", text:"When every modality is always present at decision time AND the encoder cadence is stable (you don't expect to swap encoders for a year) AND per-modality interpretability isn't required. In that narrow regime, early fusion can learn finer-grained cross-modal interactions (logo style co-distributed with description tokens) that explicit late-fusion interaction features can't capture. For merchant onboarding the coverage assumption is rarely met, so late fusion wins; but in a closed dataset (research benchmarks) early fusion benchmarks higher.", correct:true},
+          {key:"b", text:"Always wins."},
+          {key:"c", text:"Never wins."},
+          {key:"d", text:"At 1B merchants."},
+        ]}
+        trap={<>(b), (c), (d) miss the coverage-and-cadence conditions.</>}
+        lens={<>The win condition is coverage + cadence + interpretability. Each falsifies late fusion's necessity.</>}
+        stretch={<>Construct the dataset where early fusion wins by 5 AUPRC.</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>B. Application</h3>
+
+      {/* axis: B1 */}
+      <VIS.TrapProblem
+        id="mm-b1"
         difficulty="medium"
-        title="P8 — Per-tower labels"
-        scenario={<>Should each tower be trained on the MERCHANT-LEVEL fraud label, or on something else?</>}
+        title="B1 — Pick the right tool given the scenario"
+        scenario={<>Scenario: marketplace onboarding, 40% logo coverage at signup, business names available 100%, tx data starts 7 days after launch, current single-modality (name-only) model misses shell companies, you're being asked for a "multimodal model". Pick the architecture.</>}
         options={[
-          {key:"a", text:"Each tower on the same merchant-fraud label, but with per-tower auxiliary losses where they exist (logo-uniqueness, name-validity, tx-pattern-anomaly). This trains a useful per-modality representation, prevents one tower from dominating, and gives per-tower scores for explainability.", correct:true},
-          {key:"b", text:"Each tower trained on its own DIFFERENT label."},
-          {key:"c", text:"Only the fusion MLP sees a label; towers train only via gradient from the fusion."},
-          {key:"d", text:"Train each tower on randomly-relabeled data for robustness."},
+          {key:"a", text:"Late fusion: three towers (CLIP image, LLM name+desc, tabular tx) with explicit coverage flags. Fusion MLP learns to weight image only when present, tx only after launch. The 40% logo coverage and 0% at-signup tx are exactly why early fusion would fail.", correct:true},
+          {key:"b", text:"Train CLIP end-to-end on merchant photos."},
+          {key:"c", text:"Single-modality with more features."},
+          {key:"d", text:"Manual review of every merchant."},
         ]}
-        trap={<>(b) loses the joint signal. (c) is the end-to-end variant — gives up per-tower interpretability and can let one tower dominate. (d) randomization is bad here.</>}
-        lens={<>(a). Joint label + per-tower aux losses is the standard recipe. Aux losses keep each tower learning a useful representation even when the fusion weights another tower more.</>}
-        stretch={<>What aux loss would you propose for the image tower specifically?</>}
+        trap={<>(b) is over-engineering. (c) misses cross-modal signal. (d) doesn't scale.</>}
+        lens={<>Match architecture to coverage profile.</>}
+        stretch={<>What does the "tx unavailable at onboarding" tower do at decision time? (Predict from name + image only? Withhold decision?)</>}
       />
 
+      {/* axis: B2 */}
       <VIS.TrapProblem
-        id="mmr-p9"
+        id="mm-b2"
         difficulty="hard"
+        title="B2 — 'Sounds reasonable' — train CLIP end-to-end on merchant logos"
+        scenario={<>A teammate says "fine-tune CLIP on merchant logos with fraud labels — generic CLIP isn't trained on this distribution." Why is this often wrong specifically here?</>}
+        options={[
+          {key:"a", text:"Merchant logo + fraud labels is a sparse signal: most fraud merchants use STOCK logos or none, not custom-designed-for-fraud logos. Fine-tuning CLIP overfits to the few examples and damages the generic visual-semantic structure that catches the 'luxury logo on money-services merchant' pattern. The signal we want is COMPATIBILITY between logo and other modalities, which generic CLIP captures via its image-text alignment. Fine-tuning kills the cross-modal alignment we depend on.", correct:true},
+          {key:"b", text:"Fine-tuning always helps."},
+          {key:"c", text:"CLIP can't be fine-tuned."},
+          {key:"d", text:"Fine-tuning improves image-text alignment."},
+        ]}
+        trap={<>(b) is the recipe-book belief. (c), (d) are wrong.</>}
+        lens={<>The mechanism we need (image-text alignment in shared space) is exactly what fine-tuning destroys. Keep CLIP frozen.</>}
+        stretch={<>What WOULD a fine-tune help with, if anything?</>}
+      />
+
+      {/* axis: B3 — concept-specific pitch */}
+      <VIS.TrapProblem
+        id="mm-b3"
+        difficulty="hard"
+        title="B3 — Pitch to the trust-and-safety director"
+        scenario={<>The T&S director asks: "why three towers instead of one big model?" Pick the pitch that requires understanding asymmetric coverage + per-modality calibration.</>}
+        options={[
+          {key:"a", text:"Logo is missing for 30% of new merchants at signup. Tx data is missing for 100% until they go live a week later. If we train one big model on all three inputs concatenated, we have to FAKE missing modalities (zero them, replace with means) and the model gets confused — it interprets the zeros as 'this merchant has a black logo' rather than 'no logo'. Three independent towers each output a score plus a 'is-this-modality-present' flag. The fusion model learns 'no logo = weight tx heavier; no tx yet = weight name+image heavier'. Plus we can retrain the image tower without re-doing the text tower — and compliance can read each tower's score for explainability.", correct:true},
+          {key:"b", text:"Multimodal models are state of the art."},
+          {key:"c", text:"It's faster."},
+          {key:"d", text:"It reduces false positives."},
+        ]}
+        trap={<>(b), (c), (d) could pitch any multimodal model. Right pitch requires the listener to understand coverage handling.</>}
+        lens={<>Strip "late fusion" — the concrete numbers (30% logo, 100% tx-at-signup) make the pitch concept-specific.</>}
+        stretch={<>What's the director's likely follow-up?</>}
+      />
+
+      {/* axis: B4 */}
+      <VIS.TrapProblem
+        id="mm-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use late fusion"
+        scenario={<>Which scenarios are late-fusion anti-patterns?</>}
         multiSelect
-        title="P9 — Inference-time failure modes"
-        scenario={<>Production inference. Which failure modes specifically need handling for a multimodal pipeline? Select all that apply.</>}
         options={[
-          {key:"a", text:"Image-tower timeout — fallback to (text + tx) late-fusion path; flag for slower review.", correct:true},
-          {key:"b", text:"OCR / extraction failure on the business description text.", correct:true},
-          {key:"c", text:"Stale tx features (last update older than threshold).", correct:true},
-          {key:"d", text:"Per-modality drift alarms triggered while inference is hot.", correct:true},
-          {key:"e", text:"Disk full on the inference host."},
-          {key:"f", text:"User browser caching."},
+          {key:"a", text:"Coverage is balanced and high across all modalities (>95% each) — early or mid-fusion can extract finer cross-modal interactions.", correct:true},
+          {key:"b", text:"The interesting fraud signal lives in fine-grained cross-modal interactions that you can't enumerate as explicit interaction features.", correct:true},
+          {key:"c", text:"Single-tower performance is already saturating eval; additional modality buys nothing.", correct:true},
+          {key:"d", text:"Merchant onboarding with 30% logo coverage and post-launch tx data."},
         ]}
-        trap={<>(e) is infra. (f) is unrelated.</>}
-        lens={<>(a)-(d) are the four multimodal-specific failure modes. Each needs an explicit fallback path, observability, and a downstream "this score was computed with partial modalities" flag for risk-review consumers.</>}
-        stretch={<>How do you measure "partial-modality score quality" vs full-modality?</>}
+        trap={<>(d) is exactly the late-fusion regime.</>}
+        lens={<>Three anti-patterns: balanced coverage, fine-grained interactions, single-tower saturation.</>}
+        stretch={<>For each, what's the right alternative?</>}
       />
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      {/* axis: C1 */}
       <VIS.TrapProblem
-        id="mmr-p10"
+        id="mm-c1"
         difficulty="hard"
-        title="P10 — End-to-end pick"
-        scenario={<>Payments company onboarding 5k new merchants/day. Modality coverage at signup: tx-history (0% — new), business name + description (100%), logo (70%), website screenshot (50%). Fraud rate: 2%. Risk team needs per-modality explainability for SAR filings. Pick the architecture.</>}
+        title="C1 — Why explicit coverage flags?"
+        scenario={<>Why does each tower output a coverage flag in addition to a risk score?</>}
         options={[
-          {key:"a", text:"Late-fusion with per-tower scores + co-attention head ONLY when all-three-modal: text tower (LLM embedding) + logo tower (CLIP) + screenshot tower (CLIP). NO tx tower at signup (no history). Add tx tower AFTER 30 days as a continuous-monitoring model. Per-coverage-pattern calibration. Per-tower drift monitoring. Logo-uniqueness feature crosses tower boundary. Adversarial-cost weighting tilts toward hard-to-fake signals.", correct:true},
-          {key:"b", text:"Early fusion of all four modalities; impute missing with zero-vector."},
-          {key:"c", text:"Use only text — most coverage."},
-          {key:"d", text:"Wait 30 days before scoring any merchant."},
+          {key:"a", text:"Without coverage flags, the fusion MLP cannot distinguish 'missing modality' from 'low-risk modality'. A missing logo gets a default score (0.5 or imputed mean); the MLP treats this identically to 'modality present, risk 0.5'. With a coverage flag, the MLP learns 'when coverage=0, ignore this score's value entirely and lean on others'. This is the single load-bearing late-fusion mechanism.", correct:true},
+          {key:"b", text:"Coverage flags are decorative."},
+          {key:"c", text:"They reduce inference cost."},
+          {key:"d", text:"Required by PyTorch."},
         ]}
-        trap={<>(b) imputation lie on tx-history-missing-100%-of-the-time at signup. (c) gives up the multimodal signal. (d) loses the onboarding-time decision entirely; fraud is in the door.</>}
-        lens={<>(a). The senior architecture: signup-time multimodal (text + logo + screenshot, late fusion); add tx tower at 30 days for continuous monitoring; per-coverage calibration; cross-cutting features (logo-uniqueness); adversarial-cost weighting; per-tower drift. Each piece addresses a specific risk identified earlier in this drill.</>}
-        stretch={<>What's the one metric you'd watch to know when to migrate from late-fusion to full co-attention?</>}
+        trap={<>(b), (c), (d) miss the missing-vs-low signal disambiguation.</>}
+        lens={<>The coverage flag is what makes late fusion graceful. Without it, late fusion degrades to "weighted average with default imputation" which is no better than early fusion.</>}
+        stretch={<>What goes wrong if you DON'T add the flag?</>}
       />
+
+      {/* axis: C2 */}
+      <VIS.TrapProblem
+        id="mm-c2"
+        difficulty="hard"
+        title="C2 — Loss design: per-tower vs joint training"
+        scenario={<>Per-tower losses vs end-to-end loss on the fused score: which does this paper choose and why?</>}
+        options={[
+          {key:"a", text:"Both. Each tower has its own per-modality loss (so it learns calibrated single-modality risk and can be used alone). The fusion MLP has an additional joint loss on the final score. The two losses are combined with a small weight on the per-tower losses. This gives independently-calibrated towers AND joint optimization. End-to-end only would let one tower silently fail to learn (the fusion picks up slack and the tower never gets gradient).", correct:true},
+          {key:"b", text:"Only end-to-end joint loss."},
+          {key:"c", text:"Only per-tower losses."},
+          {key:"d", text:"No loss; trained unsupervised."},
+        ]}
+        trap={<>(b), (c), (d) miss the calibration argument.</>}
+        lens={<>Independent calibration is the late-fusion guarantee — and that requires per-tower supervision. Joint loss alone collapses this.</>}
+        stretch={<>What weight do you assign per-tower vs joint?</>}
+      />
+
+      {/* axis: C3 */}
+      <VIS.TrapProblem
+        id="mm-c3"
+        difficulty="hard"
+        title="C3 — What late fusion drops vs early fusion"
+        scenario={<>What does late fusion forfeit relative to early fusion?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Fine-grained cross-modal interactions — the model can't learn 'this specific logo style co-occurs with this specific name n-gram' unless you compute it as an explicit interaction feature.", correct:true},
+          {key:"b", text:"End-to-end gradient flow from final loss into image encoder — towers are usually frozen / pretrained.", correct:true},
+          {key:"c", text:"Optimal joint embedding — each tower optimizes its own loss, not the joint task.", correct:true},
+          {key:"d", text:"Coverage of asymmetric modalities."},
+        ]}
+        trap={<>(d) is what late fusion ADDS, not drops.</>}
+        lens={<>Three real losses. Senior MLE quantifies each — fine-grained interactions are the most commonly missed.</>}
+        stretch={<>How would you recover fine-grained interactions in late fusion?</>}
+      />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="mm-c4"
+        difficulty="hard"
+        title="C4 — Which design knob, mis-set, breaks late fusion?"
+        scenario={<>Rank: (i) per-tower calibration cadence, (ii) interaction-feature set, (iii) fusion MLP capacity, (iv) coverage-flag handling.</>}
+        options={[
+          {key:"a", text:"Coverage-flag handling > per-tower calibration > interaction features > fusion MLP capacity. Coverage flags wrong (treat 0.5 default as risk 0.5) breaks the entire missing-modality guarantee. Per-tower calibration drift silently corrupts fusion. Interaction features are where you find or miss specific patterns. Fusion MLP capacity is the easiest knob — usually small.", correct:true},
+          {key:"b", text:"Fusion MLP capacity dominates."},
+          {key:"c", text:"All equally important."},
+          {key:"d", text:"Interaction features dominate."},
+        ]}
+        trap={<>(b), (c), (d) miss the coverage-flag dependency.</>}
+        lens={<>Coverage flags are the load-bearing late-fusion mechanism. Calibration drift is the silent destroyer.</>}
+        stretch={<>How do you monitor calibration drift per tower?</>}
+      />
+
+      {/* axis: C5 */}
+      <VIS.TrapProblem
+        id="mm-c5"
+        difficulty="medium"
+        title="C5 — Data-assumption: per-modality balance changes"
+        scenario={<>What happens when the fraction of merchants with a logo at signup drops from 70% to 30% over 6 months (a new onboarding flow change)?</>}
+        options={[
+          {key:"a", text:"The fusion MLP was trained assuming 70% logo coverage; when production coverage drops to 30%, the MLP's learned weighting under-utilizes the image tower (it learned to weight image strongly because it was usually present) and over-utilizes the text/tx tower for the now-larger no-logo cohort. Recall on shell-company patterns (which need the image signal) regresses. Fix: retrain the fusion MLP with current coverage distribution.", correct:true},
+          {key:"b", text:"No impact."},
+          {key:"c", text:"The towers re-balance automatically."},
+          {key:"d", text:"Coverage doesn't matter."},
+        ]}
+        trap={<>(b), (c), (d) miss the fusion-MLP-dependence on coverage distribution.</>}
+        lens={<>Coverage distribution shifts are fusion-MLP-impacting events.</>}
+        stretch={<>How do you detect coverage shift before it impacts recall?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      {/* axis: D1 */}
+      <VIS.TrapProblem
+        id="mm-d1"
+        difficulty="medium"
+        title="D1 — 'More modalities = more recall'"
+        scenario={<>A junior says "add geolocation, social, web-presence — more modalities = better." Where does this intuition break?</>}
+        options={[
+          {key:"a", text:"Each new modality adds: a new tower to maintain + retrain, a new calibration drift surface, new coverage gaps. The marginal recall gain from a fourth or fifth modality is usually small relative to the operational overhead. Worse, ADVERSARIES can spoof additional cheap modalities (a fake LinkedIn profile is cheap to make); without weighing by spoof-cost, more modalities can ADD attack surface, not subtract.", correct:true},
+          {key:"b", text:"More is always better."},
+          {key:"c", text:"Modalities are free."},
+          {key:"d", text:"Spoof cost is irrelevant."},
+        ]}
+        trap={<>(b), (c), (d) miss the operational + spoof-cost arguments.</>}
+        lens={<>Modality additions should be weighed by marginal recall AND spoof cost AND operational overhead.</>}
+        stretch={<>What's the right add-modality decision protocol?</>}
+      />
+
+      {/* axis: D2 */}
+      <VIS.TrapProblem
+        id="mm-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: 'all modalities are equally trustworthy'"
+        scenario={<>You assume the fusion MLP weights modalities by predictive power alone (AUPRC contribution). Trace the cascade when adversaries adapt.</>}
+        options={[
+          {key:"a", text:"Predictive-power-only weighting overweights the easy-to-spoof modalities (logo, name) early because they're discriminative on legacy fraud → adversaries optimize against the most-weighted features → the cheap modalities get spoofed → weighted heavily → false positives on benign merchants AND false negatives on adapted attackers → real fix is spoof-cost-aware weighting: down-weight modalities that are cheap to fake, up-weight modalities (tx-velocity) that are expensive to fake, even if their initial AUPRC is lower.", correct:true},
+          {key:"b", text:"Predictive power is the only thing that matters."},
+          {key:"c", text:"Adversaries don't adapt."},
+          {key:"d", text:"All modalities are equally easy to spoof."},
+        ]}
+        trap={<>(b), (c), (d) miss the adversarial weighting argument.</>}
+        lens={<>Fusion weighting should account for adversarial cost-asymmetry, not just predictive AUPRC.</>}
+        stretch={<>How do you put a $ cost on spoofing each modality?</>}
+      />
+
+      {/* axis: D3 */}
+      <VIS.TrapProblem
+        id="mm-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior diagnostic"
+        scenario={<>Junior reports the late-fusion model beats single-modality (tx-only) baseline by 4 AUPRC. What's the senior question?</>}
+        options={[
+          {key:"a", text:"'What's the breakdown by FRAUD TYPE? If the 4 AUPRC gain is concentrated on the shell-company slice (mismatched logo + tx) — the multimodal story is real. If the gain is spread evenly across fraud types, the cheaper modalities may just be noise that happens to correlate. Also: how does the gain hold up when adversaries shift to spoofing logo + name? Run an adversarial eval where positives have stock logos + plausible names.'", correct:true},
+          {key:"b", text:"'Try more modalities.'"},
+          {key:"c", text:"'Use FP16.'"},
+          {key:"d", text:"'Ship it.'"},
+        ]}
+        trap={<>(b), (c), (d) skip the slice + adversarial diagnostic.</>}
+        lens={<>Decomposition by fraud type AND adversarial robustness. Senior bar.</>}
+        stretch={<>What's the adversarial eval set composition?</>}
+      />
+
+      {/* axis: D4 */}
+      <VIS.TrapProblem
+        id="mm-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: AUPRC regression"
+        scenario={<>3 months in, AUPRC drops 5 points. Causes: (i) per-tower calibration drift, (ii) coverage shift, (iii) fusion MLP stale. Which is most likely?</>}
+        options={[
+          {key:"a", text:"(i) Per-tower calibration drift — one tower's score distribution drifts (e.g., LLM-embedding text tower's scores shift up across all merchants because a new LLM version was deployed under the hood). The fusion MLP was trained on the old distribution; it now over-weights the shifted tower. Diagnostic: per-tower score histogram comparison vs training distribution. Fix: per-tower calibration on a fresh holdout + occasional fusion MLP retrain.", correct:true},
+          {key:"b", text:"(ii) Coverage shift."},
+          {key:"c", text:"(iii) Fusion MLP stale."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c) are real but secondary. (d) misses mechanism.</>}
+        lens={<>Per-tower calibration drift is the late-fusion-specific drift signature. Monitor per-tower score histograms.</>}
+        stretch={<>What's the per-tower calibration dashboard?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>E. Operations</h3>
+
+      {/* axis: E1 */}
+      <VIS.TrapProblem
+        id="mm-e1"
+        difficulty="hard"
+        title="E1 — Late-fusion-specific gotcha"
+        scenario={<>Pick the gotcha most specific to late fusion (would NOT bite early fusion or single-modality):</>}
+        options={[
+          {key:"a", text:"Per-tower calibration drift — independent towers drift independently; the fusion MLP, trained on the original calibration, mis-weights the drifted tower. Early fusion doesn't have this because there are no per-tower scores to drift; single-modality has only one drift surface.", correct:true},
+          {key:"b", text:"GPU OOM."},
+          {key:"c", text:"Database load."},
+          {key:"d", text:"Inference latency."},
+        ]}
+        trap={<>(b), (c), (d) are generic.</>}
+        lens={<>Per-tower drift is the structural risk of independent training. Monitor per-tower score histograms vs training distribution.</>}
+        stretch={<>What's the auto-retrain trigger?</>}
+      />
+
+      {/* axis: E2 */}
+      <VIS.TrapProblem
+        id="mm-e2"
+        difficulty="hard"
+        title="E2 — Friday: false-positive spike from one tower"
+        scenario={<>Friday: false-positive rate jumps from 3% to 11%. The image tower's score distribution has shifted right by 0.15 since Tuesday. No model deploy. Diagnosis?</>}
+        options={[
+          {key:"a", text:"CLIP encoder was rolled forward by the platform team on Wednesday (CLIP-Large → CLIP-Huge). New encoder produces slightly different embeddings → image-tower's linear head outputs higher scores for the same logos → fusion MLP, trained on old distribution, treats this as elevated risk. Mitigation: pin the encoder version, OR retrain the image tower's head + the fusion MLP whenever the encoder changes.", correct:true},
+          {key:"b", text:"Roll back the model."},
+          {key:"c", text:"Page DevOps."},
+          {key:"d", text:"GPU thermal."},
+        ]}
+        trap={<>(b), (c), (d) miss the encoder-rollover mechanism.</>}
+        lens={<>Late fusion is vulnerable to encoder rollovers because the per-tower score distribution depends on the encoder. Pin or co-retrain.</>}
+        stretch={<>What's your encoder-rollover SOP?</>}
+      />
+
+      {/* axis: E3 */}
+      <VIS.TrapProblem
+        id="mm-e3"
+        difficulty="hard"
+        title="E3 — Eval protocol audit"
+        scenario={<>Which findings invalidate a late-fusion eval report?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Eval has 100% modality coverage; production has 30% logo missing — recall under-reported because eval doesn't exercise the missing-modality path.", correct:true},
+          {key:"b", text:"Per-modality AUPRC not reported; only joint AUPRC — hides which tower carries the signal.", correct:true},
+          {key:"c", text:"No adversarial eval where attackers spoof cheap modalities — overstates real-world robustness.", correct:true},
+          {key:"d", text:"Multimodal is state of the art so eval doesn't matter."},
+        ]}
+        trap={<>(d) is wrong by construction.</>}
+        lens={<>Three audit failures. Coverage-matching is the most production-relevant.</>}
+        stretch={<>How do you build a coverage-matched eval set?</>}
+      />
+
+      {/* axis: E4 */}
+      <VIS.TrapProblem
+        id="mm-e4"
+        difficulty="medium"
+        title="E4 — Rollout sequence"
+        scenario={<>Order phases: (i) full ramp, (ii) shadow scoring on all merchants, (iii) advisory mode (joint score visible to analysts), (iv) auto-action for high-confidence joint score + at least 2 modalities present.</>}
+        options={[
+          {key:"a", text:"ii → iii → iv → i. Shadow measures per-tower + joint calibration. Advisory exposes coverage-shift effects. Auto-action with 'at-least-2 modalities present' gates the cold-start risk where only one tower has signal. Full ramp last.", correct:true},
+          {key:"b", text:"i → ii → iii → iv."},
+          {key:"c", text:"Direct cutover."},
+          {key:"d", text:"iv → i."},
+        ]}
+        trap={<>(b), (c), (d) skip the at-least-2-modalities gate.</>}
+        lens={<>The at-least-2 gate is the late-fusion-specific safety rail. Single-tower decisions are reckless.</>}
+        stretch={<>When would you relax the at-least-2 gate?</>}
+      />
+
+      {/* axis: E5 */}
+      <VIS.TrapProblem
+        id="mm-e5"
+        difficulty="medium"
+        title="E5 — Reproducibility"
+        scenario={<>Which late-fusion reproducibility issues are widely known?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Encoder versions for CLIP and LLM-embedding aren't always pinned; same architecture, different version = different scores.", correct:true},
+          {key:"b", text:"Per-tower calibration sets are rarely described — drift cannot be reproduced without them.", correct:true},
+          {key:"c", text:"Coverage distribution in training data isn't reported; results don't transfer to orgs with different coverage profiles.", correct:true},
+          {key:"d", text:"Late fusion is fully deterministic."},
+        ]}
+        trap={<>(d) is misleading.</>}
+        lens={<>Three reproducibility hazards. Encoder version is the silent killer.</>}
+        stretch={<>What's your model card content?</>}
+      />
+
+      {/* axis: E6 */}
+      <VIS.TrapProblem
+        id="mm-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination"
+        scenario={<>Which contamination paths affect late-fusion evals?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Eval merchants used for per-tower calibration ALSO used for joint eval — calibration leakage.", correct:true},
+          {key:"b", text:"Coverage profile in eval = coverage profile in training; production differs.", correct:true},
+          {key:"c", text:"No temporal split — encoder rollovers in the eval window aren't separated.", correct:true},
+          {key:"d", text:"Late fusion evals are always clean."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three contamination paths. Calibration leakage is the sneakiest — calibration on the same set used for eval inflates AUPRC.</>}
+        stretch={<>How do you keep calibration data out of eval?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>F. Failure modes & edge cases</h3>
+
+      {/* axis: F1 */}
+      <VIS.TrapProblem
+        id="mm-f1"
+        difficulty="hard"
+        title="F1 — Smallest input that breaks the advantage"
+        scenario={<>Construct the smallest input regime where late fusion has no edge over single-modality (tx-only).</>}
+        options={[
+          {key:"a", text:"A mature merchant with 6 months of tx history and no missing modality. The tx tower already has rich signal; image + name marginal contributions are small. Late-fusion's edge over tx-only is concentrated on the COLD-START segment (no tx yet); on mature merchants it tightens to near zero. The advantage scales with the no-tx-yet share of decisions.", correct:true},
+          {key:"b", text:"Any small merchant."},
+          {key:"c", text:"Any logo-less merchant."},
+          {key:"d", text:"A trivial input."},
+        ]}
+        trap={<>(b), (c), (d) miss the cold-start mechanism.</>}
+        lens={<>Late fusion's value is concentrated on cold-start decisions. Quantify the share before justifying the architecture.</>}
+        stretch={<>What's the threshold cold-start share at which late fusion pays off?</>}
+      />
+
+      {/* axis: F2 */}
+      <VIS.TrapProblem
+        id="mm-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: spoof the cheap modality"
+        scenario={<>Design an attack that exploits asymmetric modality spoof cost.</>}
+        options={[
+          {key:"a", text:"Use a stock luxury-brand logo + a generic plausible business name + plausible business description; submit for onboarding before tx data is available; rush through the early-life decision with all the cheap modalities looking clean. The tx tower has no signal (no data yet); the fusion MLP must lean on image + name, both of which were spoofed. Defense: hold high-stakes decisions (large initial limits, sensitive MCC categories) until tx data accumulates; never auto-approve from cheap modalities alone.", correct:true},
+          {key:"b", text:"DDoS the inference endpoint."},
+          {key:"c", text:"Steal the model weights."},
+          {key:"d", text:"No attack is possible."},
+        ]}
+        trap={<>(b), (c), (d) miss the cheap-modality attack.</>}
+        lens={<>Cold-start + cheap-modality spoof is the named attack. Defense: defer high-stakes decisions until expensive-modality signal accumulates.</>}
+        stretch={<>What's the right deferred-decision policy?</>}
+      />
+
+      {/* axis: F3 */}
+      <VIS.TrapProblem
+        id="mm-f3"
+        difficulty="hard"
+        title="F3 — Reverse engineering a symptom"
+        scenario={<>Symptom: the fusion model assigns near-zero importance to the tx tower in feature attribution despite tx being the hardest-to-spoof signal. Which design choice causes this?</>}
+        options={[
+          {key:"a", text:"Training data was dominated by mature merchants where tx tower's signal was AVAILABLE and STRONG → the fusion MLP learned that tx alone covered most fraud → it didn't need to learn nuanced image/name weighting. At inference, on cold-start merchants where tx is MISSING, the MLP under-uses image/name because it didn't learn to in training. Fix: training-set composition must include the cold-start distribution; explicit re-weighting per coverage segment.", correct:true},
+          {key:"b", text:"Tx tower is broken."},
+          {key:"c", text:"GPU error."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c), (d) miss the training-data composition argument.</>}
+        lens={<>Training-set composition must match production coverage distribution. Otherwise fusion weights are mis-tuned for the cold-start regime.</>}
+        stretch={<>How do you balance training data across coverage segments?</>}
+      />
+
+      {/* axis: F4 */}
+      <VIS.TrapProblem
+        id="mm-f4"
+        difficulty="medium"
+        title="F4 — Paper-admitted limitations"
+        scenario={<>Which limitations does the Block engineering write-up acknowledge?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Per-tower calibration drift.", correct:true},
+          {key:"b", text:"Cold-start handling (no tx data at decision time).", correct:true},
+          {key:"c", text:"Adversarial spoofing of cheap modalities.", correct:true},
+          {key:"d", text:"Multimodal architecture works perfectly with no caveats."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>All three are in the post. Careful reading distinguishes.</>}
+        stretch={<>Which is most underestimated?</>}
+      />
+
+      {/* axis: F5 */}
+      <VIS.TrapProblem
+        id="mm-f5"
+        difficulty="hard"
+        title="F5 — Community-found failure"
+        scenario={<>Recent literature on multimodal fraud (e.g., MIMOSA, MM-Fraud benchmarks) has surfaced a specific failure for late-fusion approaches. What is it?</>}
+        options={[
+          {key:"a", text:"Coverage-distribution shift between train and production silently degrades fusion quality — and is rarely audited. A late-fusion model trained when logos had 70% coverage performs WORSE than tx-only when production coverage drops to 30%, because the fusion MLP learned to expect image signal that's now mostly missing. The fix is coverage-aware training (oversample no-logo cohorts) or coverage-conditional fusion (different fusion MLPs for different coverage regimes).", correct:true},
+          {key:"b", text:"No known failure."},
+          {key:"c", text:"Late fusion always wins."},
+          {key:"d", text:"Multimodal is irrelevant."},
+        ]}
+        trap={<>(b), (c), (d) miss the empirical finding.</>}
+        lens={<>Coverage-distribution shift is the named failure mode. Coverage-aware training is the fix.</>}
+        stretch={<>What's the simplest coverage-aware training recipe?</>}
+      />
+
+      {/* axis: F5b — interview gold */}
+      <VIS.TrapProblem
+        id="mm-f5b"
+        difficulty="hard"
+        title="F5b — The interview gold question"
+        scenario={<>Interviewer: "You shipped late-fusion. Walk me through the ablation that proves multimodal beats single-modality + coverage handling is the value driver."</>}
+        options={[
+          {key:"a", text:"Six conditions on a temporally-split eval matching production coverage distribution: (i) tx-only, (ii) name-only, (iii) image-only, (iv) early fusion of all three (zero-impute missing), (v) late fusion WITHOUT coverage flags, (vi) full late fusion with coverage flags + interaction features. Measure AUPRC by fraud type (shell-company, stolen-PII, mule), by coverage segment (all-modalities-present vs cold-start), and by adversarial eval (positives with spoofed cheap modalities). If (vi) beats (iv) only on the cold-start segment, coverage handling is the value. If (vi) beats (v) on adversarial eval, interaction features (image × tx mismatch) earn their keep.", correct:true},
+          {key:"b", text:"Compared full system to tx-only; full system won; shipped."},
+          {key:"c", text:"Multimodal is state of the art — no ablation."},
+          {key:"d", text:"Compared to a different vendor."},
+        ]}
+        trap={<>(b), (c), (d) skip ablation rigor.</>}
+        lens={<>The right ablation tests each design contribution across the right slices. Senior bar.</>}
+        stretch={<>If (iv) ties (vi) on cold-start, would you still ship late fusion? Defend.</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://developer.squareup.com/blog" target="_blank" rel="noopener">
-            <strong>Block Engineering — Multimodal merchant onboarding risk scoring</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog, 2024)</span>
-          <br/>Source blog post. Read for the production tradeoffs at marketplace-scale and the per-modality coverage statistics.
+          <a href="https://developer.squareup.com/blog" target="_blank" rel="noopener"><strong>Block / Square Developer Blog</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog index, 2024)</span>
+          <br/>The production write-ups this visual anchors on. Multimodal merchant onboarding posts.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2103.00020" target="_blank" rel="noopener">
-            <strong>Radford et al. — Learning Transferable Visual Models From Natural Language Supervision (CLIP)</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2103.00020" target="_blank" rel="noopener"><strong>Radford et al. — CLIP: Learning Transferable Visual Models from Natural Language Supervision</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2021)</span>
-          <br/>The image-text contrastive encoder this approach uses. Sec 2 is the architecture; Sec 5 is the zero-shot transfer story.
+          <br/>The original CLIP paper. Read for why frozen CLIP is the right image tower for merchant logos.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2107.07651" target="_blank" rel="noopener">
-            <strong>Li et al. — Align before Fuse (ALBEF)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2021)</span>
-          <br/>The seminal co-attention paper. Section 3 explains the middle-ground fusion architecture relevant to P5.
+          <a href="https://arxiv.org/abs/1907.09358" target="_blank" rel="noopener"><strong>Baltrusaitis et al. — Multimodal Machine Learning: A Survey and Taxonomy</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, IEEE TPAMI 2019)</span>
+          <br/>The canonical fusion-taxonomy reference. Late vs early vs hybrid fusion definitions.
         </li>
         <li>
-          <a href="https://lilianweng.github.io/posts/2022-06-09-vlm/" target="_blank" rel="noopener">
-            <strong>Lilian Weng — Generalized Visual Language Models</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The clearest deep-dive on multimodal model architectures. Early vs late vs cross-attention fusion are laid out with diagrams.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2206.06488" target="_blank" rel="noopener">
-            <strong>Singh et al. — FLAVA: A Foundational Language And Vision Alignment Model</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, CVPR 2022)</span>
-          <br/>Unified vision-language model with separate unimodal AND multimodal encoders. The architecture-level pattern is directly applicable to multimodal risk scoring.
+          <a href="https://lilianweng.github.io/posts/2021-09-25-train-large/" target="_blank" rel="noopener"><strong>Lilian Weng — Multimodal & cross-modal learning notes</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog series, 2021+)</span>
+          <br/>Best practitioner overview of fusion architectures with production-relevant tradeoffs.
         </li>
       </ul>
     </VIS.Section>
   </main>
 );
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
   <script>

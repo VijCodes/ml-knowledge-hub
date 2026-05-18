@@ -1414,337 +1414,656 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Phishing email detection — LLM embeddings + RAG over known templates.
+// Phishing email detection — LLM embeddings + RAG over known phishing templates
+// v2 redo — every trap problem hinges on what is distinctive about LLM-embedding
+// + RAG-template-matching (vs URL-feature classifiers, vs end-to-end LLM
+// classification, vs BERT email classifier), not generic "embedding similarity"
+// gotchas.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · LLM-based fraud"
-      title="Phishing detection with LLM embeddings + RAG"
-      subtitle="Embed the email body with a frontier LLM encoder, retrieve nearest known phishing templates, and classify on cosine + URL/header metadata — catches GenAI-paraphrased attacks BERT misses."
+      pill="Fraud SOTA · phishing detection via embeddings + RAG"
+      title="LLM embeddings + RAG over phishing templates"
+      subtitle="Embed the email body with an LLM encoder; cosine-retrieve the nearest known phishing templates; feed (email, retrieved_templates, sender/URL metadata) into a classifier head. Designed to catch GenAI-paraphrased attacks that BERT/URL classifiers miss."
       byline={[
-        {label: "Source", value: "Microsoft Defender Research blog (2025)"},
+        {label: "Source", value: "Microsoft Defender Research — LLM-driven phishing detection at scale (2025)"},
         {label: "Year", value: "2025"},
-        {label: "L3", value: "Adversarial phishing detection"},
+        {label: "Domain", value: "Adversarial phishing under GenAI paraphrasing"},
       ]}/>
 
     <VIS.TLDR>
-      Old URL/BERT classifiers used surface features (suspicious TLDs, lookalike domains, fixed phrasing). Attackers now paraphrase known phishing templates with ChatGPT, breaking those features while preserving the semantic intent. The fix: LLM embeddings capture meaning across paraphrase, and{" "}
-      <VIS.Term def="Retrieval-Augmented Generation. Here used in its retrieval-only flavor: at inference, fetch the top-k semantically similar items from a vector index and feed them (or their similarity scores) to the downstream model.">RAG</VIS.Term>{" "}
-      over a known-template index lets you score "how close is this to a known scam?" — robust to wording change. Senior question: how do you keep this honest as attackers adapt?
+      Adversaries use ChatGPT/Claude to paraphrase known phishing templates ("urgent invoice" → "your invoice requires immediate attention"). Surface features (URL, sender domain, brand mentions) are preserved; lexical fingerprints (exact phrases) are gone. <VIS.Term def="The vector representation of the email produced by a large language model encoder (e.g., text-embedding-3, e5-mistral). Captures semantic content; near-paraphrases land near each other in vector space even when no token overlaps.">LLM embedding</VIS.Term> + <VIS.Term def="Retrieval-Augmented Generation/Classification — embed the input, retrieve the nearest known-phishing templates, feed retrieved templates into the classifier as additional context.">RAG retrieval</VIS.Term> over a known-template index catches them: paraphrases map to high cosine with the original template, the classifier sees both signals. The structural risk: the retrieval is only as good as the template index — novel campaigns (no template) fall back to the base classifier; index staleness is the silent failure mode. Source: <a href="https://www.microsoft.com/en-us/security/blog/" target="_blank" rel="noopener">MSR Defender blog 2025</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        At ingest, embed the email body with an LLM encoder (e.g., GTE-large, E5-mistral, OpenAI text-embedding-3). Index the embedding in a vector store. At classification time, retrieve the top-k nearest known-phishing templates and known-benign emails. Feed (cosine to top-k phish, cosine to top-k benign, URL features, header features, sender reputation) to a lightweight gradient-boosted classifier.
+        Pipeline: (1) Embed email body with an LLM encoder (text-embedding-3 or e5-mistral, 1536-3072 dim). (2) ANN-retrieve top-K nearest neighbors from a known-phishing-template index (FAISS / HNSW). (3) Compute features: max cosine, mean cosine of top-K, retrieved-template metadata (campaign tag, age, hit rate). (4) Concatenate with sender/URL features (DKIM/SPF, domain age, URL shorteners, brand-in-display-name). (5) Feed into a gradient-boosted classifier head with calibrated probability output. (6) Update the template index nightly with confirmed phishing from analyst feedback.
       </p>
-
       <VIS.Mermaid chart={`
 flowchart TB
-  EMAIL["Incoming email body"]
-  EMB["LLM encoder → embedding"]
-  IDX["Vector index of phish templates + benign"]
-  RET["Top-k retrieval"]
-  META["URL + header + sender features"]
-  CLF["GBDT classifier"]
-  OUT["Phish score"]
-  EMAIL --> EMB
-  EMB --> RET
-  IDX --> RET
-  RET --> CLF
-  META --> CLF
-  EMAIL --> META
-  CLF --> OUT
-  style EMB fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style RET fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  E["Email body"]
+  E --> Emb["LLM encoder (text-embedding-3)"]
+  Emb --> ANN["ANN retrieval (FAISS)"]
+  T["Known phishing template index"]
+  T --> ANN
+  ANN --> F1["Top-K cosines + template metadata"]
+  E --> F2["URL + sender features (DKIM, domain age)"]
+  F1 --> CLF["Calibrated classifier (LightGBM)"]
+  F2 --> CLF
+  CLF --> P["Phishing score"]
+  style Emb fill:#dbeafe
+  style ANN fill:#dbeafe
+  style CLF fill:#dcfce7
       `} />
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from URL classifiers, BERT email classifiers, end-to-end LLM classification">
       <p>
-        Blue = semantic capture. Yellow = lookup against known patterns. The classifier fuses semantic similarity with deterministic features the SOC team understands.
+        <strong>URL-feature classifier (the legacy baseline).</strong> GBDT on URL features (domain age, redirect chain, brand-in-subdomain) + sender features (DKIM/SPF, display-name spoof). Robust to body paraphrasing because it ignores the body. Fails when attackers also rotate URLs faster than the URL features can adapt.
+      </p>
+      <p>
+        <strong>BERT email classifier (the supervised-NLP baseline).</strong> Fine-tunes BERT on (email, label). Catches lexical fingerprints — exact phrases like "urgent action required" — but degrades sharply on GenAI paraphrases because the lexical surface changes. Recall collapses on the specific failure mode this paper targets.
+      </p>
+      <p>
+        <strong>End-to-end LLM classification.</strong> Ask GPT-4 "is this phishing?". Works but expensive ($0.01-0.05 per email at inbox scale), high-latency, and the model's prior on phishing is noisy at the long tail (brand-specific phishing, voice-message phishing, etc.).
+      </p>
+      <p>
+        <strong>LLM embeddings + RAG (this).</strong> The embedding catches paraphrases (semantic-similarity-preserving), the RAG index provides per-campaign grounding (template-match metadata, hit rate), and the classifier head fuses with URL/sender features. Cost is dominated by embedding ($0.00002 per email) — orders of magnitude cheaper than end-to-end LLM. Latency is ANN retrieval (~3-5ms p95).
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead>
-          <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>URL features only</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>BERT classifier</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>LLM-embedding + RAG</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Recall on paraphrased attacks</td>
-            <td style={{padding:"8px 10px"}}>OK (if URL same)</td>
-            <td style={{padding:"8px 10px"}}>Poor (lex shift)</td>
-            <td style={{padding:"8px 10px"}}>Good (semantic match)</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>New-template onboarding</td>
-            <td style={{padding:"8px 10px"}}>Regex update</td>
-            <td style={{padding:"8px 10px"}}>Retrain (slow)</td>
-            <td style={{padding:"8px 10px"}}>Add to index (instant)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Latency per email</td>
-            <td style={{padding:"8px 10px"}}>~1 ms</td>
-            <td style={{padding:"8px 10px"}}>~20 ms</td>
-            <td style={{padding:"8px 10px"}}>50-200 ms</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Inference cost</td>
-            <td style={{padding:"8px 10px"}}>Very low</td>
-            <td style={{padding:"8px 10px"}}>Low</td>
-            <td style={{padding:"8px 10px"}}>Medium (encoder + ANN search)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Auditability</td>
-            <td style={{padding:"8px 10px"}}>High (rule fired)</td>
-            <td style={{padding:"8px 10px"}}>Low (black box)</td>
-            <td style={{padding:"8px 10px"}}>High (cite nearest template)</td>
-          </tr>
-        </tbody>
-      </table>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
+      <p>
+        Pick LLM-embedding + RAG when (a) attackers are actively paraphrasing templates (measured: BERT email-classifier recall has dropped on body features while URL features are stable), (b) you can maintain a template index (analyst feedback loop > 100 confirmed phishing per week), (c) embedding cost is acceptable at inbox scale, (d) you can tolerate a 1-2 day lag between new campaign emergence and template indexing.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  S["Phishing landscape"]
+  S --> Q1{"BERT body recall dropping while URL features stable?"}
+  Q1 -->|No| BERT["Keep BERT"]
+  Q1 -->|Yes| Q2{"Analyst feedback >= 100 phish/week?"}
+  Q2 -->|No| BUILD["Build feedback loop first"]
+  Q2 -->|Yes| Q3{"Inbox-scale embedding budget?"}
+  Q3 -->|No| HYBRID["BERT + selective embedding"]
+  Q3 -->|Yes| EMB["LLM embedding + RAG"]
+  style EMB fill:#dcfce7,stroke:#16a34a
+  style BERT fill:#fef3c7
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Attackers paraphrase known templates</strong> — text-feature recall has been dropping while URL features still work; semantic signal is the gap.</li>
-        <li><strong>Template library exists</strong> — you have curated known-phish exemplars (from SOC, threat intel, user reports).</li>
-        <li><strong>Latency budget allows 50-200 ms</strong> — inbox scanning, not real-time SMTP gate.</li>
-        <li><strong>You want auditability</strong> — citing the nearest known template explains the flag to the SOC analyst.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Encoder choice dominates quality">
-        Not all LLM encoders are equal. Decoder-only LLM "embeddings" (mean-pool over hidden states) often underperform purpose-built dual-encoders (E5, GTE, BGE). Benchmark on your phishing test set before committing.
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Index staleness — silent failure">
+        New phishing campaigns (novel templates, no analyst feedback yet) have no nearest neighbor in the template index. The system falls back to URL/sender features only. Recall on the first 24-48 hours of a new campaign is the recall of the legacy system. The system's "value-add" appears AFTER the campaign is templated — exactly when the damage is already done.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Index drift">
-        As attackers iterate, today's "known templates" become stale. Schedule weekly index refresh from confirmed-phish reports; track recall over time as a drift metric.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Latency budget for inbox scan is tight">
-        50-200 ms is OK for inbox scanning, but if you also have to scan SMTP-time, the encoder forward pass + ANN search may not fit. Consider a two-stage gate: fast rule layer first, embedding layer only for borderline cases.
+      <VIS.Callout kind="gotcha" title="Adversaries embed-attack the encoder">
+        Once attackers know LLM embeddings are used, they craft paraphrases that maximize cosine to BENIGN emails (transactional, support, marketing) and minimize cosine to phishing templates. The defense's encoder becomes the attacker's optimization target. Mitigation: encoder rotation, ensemble of encoders with diverse priors, adversarial training on attacker-style paraphrases.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on debugging the recall regression, retrieval design, and adversarial drift.
+        Problems span the 6 taxonomy axes. Strip "LLM embedding + RAG over templates" — each correct answer must hinge on semantic-similarity-via-encoder PLUS template-index retrieval, not generic "embeddings catch paraphrases" claims.
       </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="phi-p1"
+        id="ph-a1"
         difficulty="hard"
-        title="P1 — Diagnose the recall regression"
-        scenario={<>Your BERT-based phishing classifier was 92% recall last quarter. This quarter it's 71%. URL features are still firing at the same rate. SOC reports indicate users are seeing more phishing emails. What changed?</>}
+        title="A1 — Embedding-only vs embedding + RAG"
+        scenario={<>Why is RAG over a TEMPLATE INDEX necessary, vs just feeding the LLM embedding directly into the classifier?</>}
         options={[
-          {key:"a", text:"Attackers are using GenAI (ChatGPT, Claude) to paraphrase known templates. URL infrastructure (where they're cheap on the attacker side) is unchanged, so URL features still match. BERT learned lexical patterns from the old corpus; the paraphrased text shifts surface features and breaks classifier recall while preserving semantic intent.", correct:true},
-          {key:"b", text:"BERT model degraded due to weight decay over time."},
-          {key:"c", text:"Inbox volume grew, denominator changed."},
-          {key:"d", text:"Annotation quality dropped."},
+          {key:"a", text:"Embedding-only loses per-campaign metadata. The retrieved template tells the classifier 'this looks like campaign #4521 which was active 3 days ago and has hit 8000 inboxes'. That signal is not in the email's embedding alone — it requires LINKING the email to a specific known campaign. The classifier head consumes both the embedding (semantic) and the retrieved metadata (campaign-level evidence).", correct:true},
+          {key:"b", text:"Embedding-only is faster."},
+          {key:"c", text:"RAG is decorative."},
+          {key:"d", text:"They are identical."},
         ]}
-        trap={<>(b) BERT weights are static; they don't decay. (c) recall is a ratio over confirmed positives, not affected by volume. (d) is possible but you'd see precision drop too; the question specifies recall.</>}
-        lens={<>(a). The mechanism is concept drift on the input distribution (the language attackers use) WITHOUT drift on the output concept (still phishing). BERT memorized lexical patterns; LLM-paraphrased text is the textbook adversarial drift.</>}
-        stretch={<>What single feature do you ship FIRST to recover recall while you wait for an embedding-based rebuild?</>}
+        trap={<>(b), (c), (d) miss the per-campaign metadata.</>}
+        lens={<>RAG is what links a single email to a multi-email campaign. Embedding alone gives you semantic similarity but not campaign membership.</>}
+        stretch={<>What additional metadata do you cache per template?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="phi-p2"
-        difficulty="hard"
-        multiSelect
-        title="P2 — Encoder selection"
-        scenario={<>You're picking the embedding model. Candidates: (i) text-embedding-3-large (OpenAI API), (ii) E5-mistral-7b (open weights), (iii) BGE-large (open weights), (iv) hidden-states from your Llama-7B mean-pooled, (v) sentence-BERT (legacy). Which considerations dominate the pick? Select all that apply.</>}
-        options={[
-          {key:"a", text:"Empirical performance on YOUR phishing test set — MTEB rankings are not a substitute; phishing language is its own distribution.", correct:true},
-          {key:"b", text:"Whether the encoder can be self-hosted (vendor lock-in, data residency, cost at scale).", correct:true},
-          {key:"c", text:"Embedding dimension (affects index size and ANN search latency).", correct:true},
-          {key:"d", text:"Whether it was trained with a contrastive objective on semantic-similarity data (decoder-only LLMs mean-pooled often underperform).", correct:true},
-          {key:"e", text:"Model parameter count — bigger is always better."},
-          {key:"f", text:"Whether the model has a chat interface."},
-        ]}
-        trap={<>(e) is the size-fetish fallacy; 7B mean-pooled often loses to 300M-param contrastive encoders for retrieval. (f) is irrelevant for embeddings.</>}
-        lens={<>(a)-(d) are the four real considerations. (d) is the under-known one: contrastive training objective is the property that makes an "encoder" good for retrieval; mean-pooling hidden states from a decoder-only LLM is a known under-performer.</>}
-        stretch={<>If your test set is 100 emails, can you still pick reliably?</>}
-      />
-
-      <VIS.TrapProblem
-        id="phi-p3"
-        difficulty="hard"
-        title="P3 — Retrieval index design"
-        scenario={<>You're building the vector index for known phish and benign templates. Which design choice most affects classifier quality?</>}
-        options={[
-          {key:"a", text:"Curate the BENIGN exemplars to match operational distribution (newsletters, internal IT mail, transactional). A poor benign set makes EVERY email look 'closer to phish than to benign' and inflates false positives.", correct:true},
-          {key:"b", text:"Use the largest possible k in top-k retrieval."},
-          {key:"c", text:"Use cosine similarity instead of Euclidean."},
-          {key:"d", text:"Use HNSW instead of IVF for the ANN index."},
-        ]}
-        trap={<>(b) past k=20 or so, similarity scores plateau and noise increases. (c) and (d) are choices that affect latency / recall@k marginally but not classifier quality at this stage.</>}
-        lens={<>(a). Benign curation is the under-loved lever. Cosine-to-nearest-phish is only meaningful relative to cosine-to-nearest-benign. If your benign set under-represents legitimate transactional mail, every transactional email scores high-phish.</>}
-        stretch={<>How would you detect benign-set staleness in production?</>}
-      />
-
-      <VIS.TrapProblem
-        id="phi-p4"
-        difficulty="hard"
-        title="P4 — Latency budget"
-        scenario={<>Inbox scan SLA is 200ms p99 per email. Your candidate pipeline: LLM encoder (90ms p99) + ANN search top-50 (40ms) + GBDT (5ms) + tx feature fetch (60ms). That's 195ms p99 IF NOTHING goes wrong. What's the right design move?</>}
-        options={[
-          {key:"a", text:"Two-stage gate: fast rule + URL classifier in under 10ms catches obvious phish/benign (~85% of mail). Only borderline 15% goes through the embedding pipeline. Effective p99 stays well under budget; cost drops 6×.", correct:true},
-          {key:"b", text:"Ship it — 195ms is under 200ms, technically passes."},
-          {key:"c", text:"Drop the GBDT and use cosine threshold alone."},
-          {key:"d", text:"Switch to a 1B-param encoder."},
-        ]}
-        trap={<>(b) ignores p99 jitter — any one of the four stages spiking will blow the budget; no headroom is unsafe in production. (c) loses the metadata signal. (d) larger encoder = MORE latency, not less.</>}
-        lens={<>(a). Two-stage is the cost-and-latency lever. The pattern: cheap-and-fast handles the easy majority; expensive-and-smart handles the borderline tail. Same pattern as candidate-gen + ranking in search/recs.</>}
-        stretch={<>How would you decide the borderline threshold for stage-1 → stage-2 routing?</>}
-      />
-
-      <VIS.TrapProblem
-        id="phi-p5"
+        id="ph-a2"
         difficulty="medium"
-        title="P5 — Class imbalance in phishing"
-        scenario={<>Phish prior in inbox traffic is ~0.5%. Your GBDT classifier achieves 0.97 AUROC on a balanced eval. Production precision-at-recall-0.9 is 12%. Why?</>}
-        options={[
-          {key:"a", text:"AUROC on a balanced eval is misleading on a 0.5%-positive production distribution. Re-evaluate with PR-AUC on the real prior; tune threshold for an operating point that the SOC team can actually triage.", correct:true},
-          {key:"b", text:"Classifier is broken; retrain."},
-          {key:"c", text:"Encoder is mis-tuned."},
-          {key:"d", text:"More data needed."},
-        ]}
-        trap={<>(b)-(d) all jump to fixes without diagnosing. The math is precise: at 0.5% positives, precision @ recall=0.9 is dominated by the false-positive rate among the 99.5% benign.</>}
-        lens={<>(a). AUROC overstates performance on rare-positive distributions. PR-AUC and operating-point precision are the metrics that matter to the SOC team. This is THE class-imbalance trap reapplied to phishing.</>}
-        stretch={<>Given SOC can review 200 alerts/day and inbox volume is 1M/day, what precision-recall trade do you target?</>}
-      />
-
-      <VIS.TrapProblem
-        id="phi-p6"
-        difficulty="hard"
+        title="A2 — vs BERT email classifier"
+        scenario={<>Which distinguishes LLM-embedding + RAG from a fine-tuned BERT email classifier?</>}
         multiSelect
-        title="P6 — Adversarial robustness"
-        scenario={<>Attackers will iterate. Which defenses degrade gracefully under continued adversarial pressure? Select all that apply.</>}
         options={[
-          {key:"a", text:"Continuously refresh the known-template index from confirmed-phish reports — semantic match degrades gracefully because attackers must drift FURTHER each cycle.", correct:true},
-          {key:"b", text:"Track recall-over-time on a held-out adversarial canary set; alert if recall drops.", correct:true},
-          {key:"c", text:"Add behavioral features (sender reputation, send velocity, link reputation) that attackers cannot trivially paraphrase away.", correct:true},
-          {key:"d", text:"Use a static ruleset; lock features; never retrain."},
-          {key:"e", text:"Train an adversarial classifier on a fixed once-and-done attack set."},
+          {key:"a", text:"BERT learns lexical features (token n-grams); LLM embedding captures semantics — paraphrases land near each other even with zero token overlap.", correct:true},
+          {key:"b", text:"BERT must be retrained for new campaigns; LLM-embedding + RAG only needs the template index updated (no model retrain).", correct:true},
+          {key:"c", text:"LLM-embedding + RAG can cite WHICH template was matched (audit trail); BERT's output is a single score with no per-campaign attribution.", correct:true},
+          {key:"d", text:"BERT is the same as LLM embedding."},
         ]}
-        trap={<>(d) is the textbook ossification failure — attackers iterate weekly; you must too. (e) overfits the classifier to a single attack distribution; new attacks bypass it.</>}
-        lens={<>(a)-(c) are the three layered defenses. (a) leverages the system's structure — semantic retrieval generalizes across paraphrase. (b) makes drift observable. (c) shifts the cost back to the attacker side (behavioral features are expensive to fake).</>}
-        stretch={<>What's the right canary set design to detect drift early?</>}
+        trap={<>(d) collapses two distinct things.</>}
+        lens={<>Three distinctions: semantic vs lexical, index update vs retrain, citable match vs opaque score. Each maps to a real production tradeoff.</>}
+        stretch={<>When would BERT still win?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="phi-p7"
+        id="ph-a3"
         difficulty="hard"
-        title="P7 — Why decoder-only LLM mean-pool can underperform"
-        scenario={<>An MLE on your team proposes "let's just mean-pool the last hidden states from our Llama-7B and use that as the embedding." Why is this often worse than a smaller purpose-built dual-encoder?</>}
+        title="A3 — Counterfactual: no embedding step"
+        scenario={<>Without LLM embeddings, what's the realistic fallback for the GenAI-paraphrasing problem?</>}
         options={[
-          {key:"a", text:"Decoder-only LLMs are pretrained with a next-token objective that optimizes per-token representations, not sentence-level similarity. Mean-pooling doesn't fix that — semantic-similarity emerges only with contrastive training. Smaller dual-encoders (E5, GTE, BGE) trained with contrastive objectives on similarity pairs typically beat 7B mean-pooled embeddings on retrieval.", correct:true},
-          {key:"b", text:"The 7B model is too large; embedding dimension is too high."},
-          {key:"c", text:"Decoder-only LLMs lack positional encoding for long sentences."},
-          {key:"d", text:"Mean-pooling itself is the bug; use max-pool."},
+          {key:"a", text:"Two options: (i) SimHash / MinHash over n-grams — fast lexical-fingerprint similarity that catches near-duplicate paraphrases but fails on full rewrites; (ii) sentence-BERT (smaller pretrained encoder) — cheaper than LLM embeddings, less semantic but still beats n-gram on rewrites. Both lose some recall vs LLM embeddings on aggressive paraphrasing.", correct:true},
+          {key:"b", text:"Phishing cannot be detected without LLM embeddings."},
+          {key:"c", text:"Train a new BERT on phishing data."},
+          {key:"d", text:"Block all email."},
         ]}
-        trap={<>(b) confuses model size with quality; the issue is objective, not size. (c) is wrong (they have positional encoding). (d) is a knob without changing the underlying objective mismatch.</>}
-        lens={<>(a). This is a known result. See Wang et al. (E5) and the MTEB benchmark — contrastive-trained encoders dominate the retrieval leaderboard despite being 5-50× smaller than decoder-only LLMs. Recent decoder-only LLMs (NV-Embed, LLM2Vec) close the gap only after additional contrastive post-training.</>}
-        stretch={<>What's the cheapest way to make a decoder-only LLM produce competitive embeddings?</>}
+        trap={<>(b), (c), (d) miss realistic alternatives.</>}
+        lens={<>Honest fallbacks exist. The LLM-embedding moat is real but bounded — quantify it before committing.</>}
+        stretch={<>At what paraphrase aggressiveness does sentence-BERT match LLM embedding?</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="phi-p8"
+        id="ph-a4"
+        difficulty="hard"
+        title="A4 — Composition with URL features"
+        scenario={<>How do LLM-embedding-RAG + URL-feature classifiers compose?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"They are complementary signals: embedding catches body paraphrasing (which URL features ignore); URL features catch URL/sender rotation (which embedding ignores). Joint classifier is strictly better than either alone.", correct:true},
+          {key:"b", text:"They cover different attacker strategies: paraphrasing (body-rewrite, URL-stable) vs URL-rotation (body-stable, URL-rotate) — both must be defended.", correct:true},
+          {key:"c", text:"The classifier head learns which signal to weight per email — high embedding cosine + dodgy URL = high score; embedding miss + clean URL = low.", correct:true},
+          {key:"d", text:"They are redundant."},
+        ]}
+        trap={<>(d) misses the orthogonality.</>}
+        lens={<>Signals are designed orthogonal. The right architecture is feature-fusion, not pick-one.</>}
+        stretch={<>What attack defeats BOTH signals?</>}
+      />
+
+      {/* axis: A5 */}
+      <VIS.TrapProblem
+        id="ph-a5"
+        difficulty="hard"
+        title="A5 — Where this approach stops winning"
+        scenario={<>At what attacker behavior does LLM-embedding + RAG's edge over BERT collapse?</>}
+        options={[
+          {key:"a", text:"Fully novel phishing campaigns: no prior template exists, retrieval returns either no match or low-cosine matches to weakly-related templates. The classifier falls back to URL/sender features (where BERT-baseline also operates). The advantage of LLM-embedding evaporates for the FIRST instance of a new campaign — recovers only after analyst feedback templatizes it.", correct:true},
+          {key:"b", text:"Always wins."},
+          {key:"c", text:"At 1B emails per day."},
+          {key:"d", text:"Never wins."},
+        ]}
+        trap={<>(b), (c), (d) miss the cold-start.</>}
+        lens={<>The advantage is conditional on the template index. Cold-start campaigns close the gap.</>}
+        stretch={<>What signal predicts "this is a novel campaign" before analyst feedback arrives?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>B. Application</h3>
+
+      {/* axis: B1 */}
+      <VIS.TrapProblem
+        id="ph-b1"
         difficulty="medium"
-        title="P8 — Calibration for SOC triage"
-        scenario={<>Your classifier outputs a phish-probability in [0,1]. SOC team triages alerts above 0.7. They report: "Many 0.85 alerts are obvious benign; many 0.65 alerts are real phish." What's happening?</>}
+        title="B1 — Pick the right tool given the scenario"
+        scenario={<>Scenario: enterprise inbox of 5M users, BERT-based detector recall on body features dropped from 88% to 71% over 3 months while URL-feature recall stayed at 82%, analyst team confirms ~500 phish per week. Pick the next investment.</>}
         options={[
-          {key:"a", text:"Predicted probabilities are uncalibrated — the threshold-able ordering is roughly right but the absolute probabilities don't match empirical phish rates. Apply isotonic regression or Platt scaling against a held-out validation set.", correct:true},
-          {key:"b", text:"Model is broken; retrain."},
-          {key:"c", text:"Lower the threshold to 0.5."},
-          {key:"d", text:"Use a different ANN index."},
+          {key:"a", text:"LLM embedding + RAG. The signature (body-feature recall drop, URL-feature stable, healthy analyst feedback volume) maps directly to GenAI-paraphrase attack + sufficient labels to maintain a template index. The intervention fits the data shape.", correct:true},
+          {key:"b", text:"Retrain BERT — it's lexical drift."},
+          {key:"c", text:"Block all email from new domains."},
+          {key:"d", text:"Switch to a different vendor's URL blocklist."},
         ]}
-        trap={<>(b) ignores that the AUROC is fine (ordering is right). (c) is a knob without diagnosis — same calibration problem at a different threshold. (d) is unrelated.</>}
-        lens={<>(a). Calibration vs ranking are separable. GBDT and embedding-based scores often have good AUROC but poor calibration. Post-hoc calibration (isotonic / Platt) keeps the ranking and aligns probabilities to empirical rates.</>}
-        stretch={<>What's the difference between isotonic regression and Platt scaling, and when does each fail?</>}
+        trap={<>(b) won't fix paraphrases. (c) is catastrophic. (d) doesn't address body.</>}
+        lens={<>The signature is diagnostic. The fix is targeted.</>}
+        stretch={<>What additional measurement confirms paraphrasing is the cause?</>}
       />
 
+      {/* axis: B2 */}
       <VIS.TrapProblem
-        id="phi-p9"
+        id="ph-b2"
         difficulty="hard"
+        title="B2 — 'Sounds reasonable' — use bigger embedding"
+        scenario={<>A teammate says "use 3072-dim text-embedding-3-large instead of 1536-dim text-embedding-3-small — better embeddings catch more paraphrases." Why is this often wrong for this specific pipeline?</>}
+        options={[
+          {key:"a", text:"At inbox scale (5M+ emails/day), the embedding cost and ANN-index storage double. The marginal recall gain on aggressive paraphrases is usually small (1-2 pts on the body-feature dimension). The classifier head fuses embedding-similarity with URL/sender features — the bottleneck is usually NOT semantic resolution but template-index coverage and URL feature staleness. Spend the budget on faster template-index updates instead.", correct:true},
+          {key:"b", text:"Bigger is always better."},
+          {key:"c", text:"3072-dim breaks FAISS."},
+          {key:"d", text:"text-embedding-3-large is slower."},
+        ]}
+        trap={<>(b) is the recipe-book belief. (c), (d) are facts but not the point.</>}
+        lens={<>The bottleneck is usually elsewhere (index freshness, URL features). Identify before scaling embedding size.</>}
+        stretch={<>What measurement tells you bigger embedding actually helps?</>}
+      />
+
+      {/* axis: B3 — concept-specific pitch */}
+      <VIS.TrapProblem
+        id="ph-b3"
+        difficulty="hard"
+        title="B3 — Pitch this to the security director"
+        scenario={<>The security director asks: "why LLM-embedding + RAG over our BERT detector?" Pick the pitch that requires understanding why semantic embedding + template-match metadata jointly matter.</>}
+        options={[
+          {key:"a", text:"Attackers used ChatGPT to rewrite 'urgent invoice — pay $5000' as 'your invoice requires immediate attention and a $5000 settlement' — same scam, zero word overlap. Our BERT learned the OLD phrase as a feature and now misses the rewrite. LLM embedding maps both phrases to nearly the same vector — paraphrases collide. Plus, retrieval lets us SAY 'this matches campaign #4521, which hit 8000 inboxes last week' — the analyst sees the campaign tag, not just a score. BERT can't link an email to a specific campaign.", correct:true},
+          {key:"b", text:"LLM embeddings are state of the art."},
+          {key:"c", text:"It's faster than BERT."},
+          {key:"d", text:"It reduces false positives."},
+        ]}
+        trap={<>(b), (c), (d) could pitch any embedding model. Right pitch requires the listener to understand the paraphrase-collision + campaign-link mechanism.</>}
+        lens={<>Strip "LLM embedding" — the concrete example (zero-word-overlap paraphrase + campaign tag) makes this concept-specific.</>}
+        stretch={<>What's the director's likely follow-up?</>}
+      />
+
+      {/* axis: B4 */}
+      <VIS.TrapProblem
+        id="ph-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use LLM-embedding + RAG"
+        scenario={<>Which scenarios are anti-patterns?</>}
         multiSelect
-        title="P9 — When the encoder itself is the attack surface"
-        scenario={<>An attacker embeds invisible Unicode characters (zero-width joiners, RTL overrides) into the phishing email body. The encoder normalizes them away in tokenization, but URL parsers in your features see different strings. Which defenses help? Select all that apply.</>}
         options={[
-          {key:"a", text:"Normalize aggressively at input (NFKC normalization, strip zero-width / RTL overrides) BEFORE both the encoder and the URL parser.", correct:true},
-          {key:"b", text:"Use the rendered text (what the user sees) as the input to BOTH layers, not the raw bytes.", correct:true},
-          {key:"c", text:"Add a feature that COUNTS invisible Unicode characters; high count is itself a phish signal.", correct:true},
-          {key:"d", text:"Replace LLM encoder with character-level CNN."},
-          {key:"e", text:"Reject any email with non-ASCII characters."},
+          {key:"a", text:"Domains with no analyst feedback loop (e.g., consumer email at small ISP) — template index goes stale, system silently degrades.", correct:true},
+          {key:"b", text:"Highly novel phishing where every campaign is one-shot — no template to retrieve against; embedding-only with no RAG gives no edge.", correct:true},
+          {key:"c", text:"Cost-constrained inbox where $0.00002/email × 10M emails/day is meaningful relative to budget.", correct:true},
+          {key:"d", text:"Enterprise inbox with measured BERT recall drop on body features."},
         ]}
-        trap={<>(d) abandons the semantic capability without solving the Unicode issue. (e) is overbroad — legitimate multilingual mail is non-ASCII.</>}
-        lens={<>(a)-(c) compose. (a) is preprocessing; (b) is rendering-faithful input; (c) makes the obfuscation itself a feature. Each is cheap; together they shift the attacker cost.</>}
-        stretch={<>Why does using rendered text avoid most of these attacks for free?</>}
+        trap={<>(d) is the regime it was designed for.</>}
+        lens={<>Three anti-patterns: no feedback loop, one-shot campaigns, cost-constrained.</>}
+        stretch={<>For each, what's the right alternative?</>}
       />
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      {/* axis: C1 */}
       <VIS.TrapProblem
-        id="phi-p10"
+        id="ph-c1"
         difficulty="hard"
-        title="P10 — End-to-end pick"
-        scenario={<>Setup: enterprise email gateway scanning 50M emails/day, SOC team of 30, current BERT classifier at 71% recall (dropped from 92% last year), GenAI-paraphrased attacks suspected, latency budget 200ms p99, must give SOC an explanation. Pick the architecture.</>}
+        title="C1 — Why retrieve top-K, not just top-1?"
+        scenario={<>The pipeline retrieves top-K (typically K=5-10) nearest templates, not just the single nearest. Why?</>}
         options={[
-          {key:"a", text:"Two-stage: (1) fast URL + sender + behavioral rules handle obvious phish + obvious benign in under 10ms (covers ~85% of traffic). (2) Borderline 15% goes through the LLM-embedding + RAG pipeline: encoder → ANN over weekly-refreshed phish + benign index → GBDT fusion with metadata → calibrated probability → SOC alert with the nearest-template citation.", correct:true},
-          {key:"b", text:"Retrain BERT on more data."},
-          {key:"c", text:"Buy GPT-4 API per-email scan; let the LLM decide."},
-          {key:"d", text:"Drop the classifier; rely on user-report feedback only."},
+          {key:"a", text:"Top-1 cosine is fragile: an email at the boundary between two campaigns (e.g., generic-invoice-phishing applicable to multiple template clusters) snaps to one arbitrary template. Top-K + mean-cosine + max-cosine features give the classifier a calibrated similarity profile — 'high mean-cosine across 5 invoice templates' is stronger evidence than 'high max-cosine against one'.", correct:true},
+          {key:"b", text:"Top-1 is too slow."},
+          {key:"c", text:"K must be exactly 5."},
+          {key:"d", text:"Top-K is decorative."},
         ]}
-        trap={<>(b) misses the root cause (paraphrase drift). (c) is unaffordable at 50M emails/day and provides no audit trail. (d) is the no-classifier baseline that fails the use case.</>}
-        lens={<>(a). The two-stage gate is the cost-and-latency-aware design. Weekly index refresh handles drift. Nearest-template citation gives SOC the explanation. Calibrated probability gives them a meaningful threshold. This is the senior-MLE architecture.</>}
-        stretch={<>What's the kill-switch metric that would fall back to stage-1 only if stage-2 misbehaves?</>}
+        trap={<>(b), (c), (d) miss the calibration argument.</>}
+        lens={<>Top-K gives a stable, calibratable similarity profile; top-1 is noisy. The classifier head consumes the profile, not the rank.</>}
+        stretch={<>What goes wrong at K = 50?</>}
       />
+
+      {/* axis: C2 */}
+      <VIS.TrapProblem
+        id="ph-c2"
+        difficulty="hard"
+        title="C2 — Why a separate classifier head on top of cosines?"
+        scenario={<>Why not just threshold cosine (cosine > 0.85 → phishing)?</>}
+        options={[
+          {key:"a", text:"Cosine isn't calibrated — a legitimate company newsletter can have cosine 0.83 to a phishing template if both share generic vocabulary. The classifier head learns the threshold conditionally on (URL features, sender features, retrieved-template campaign metadata). 'cosine 0.85 + clean DKIM + Fortune-500 sender' → benign; 'cosine 0.7 + brand-spoof display name + new domain' → phishing. The head fuses signals; raw cosine cannot.", correct:true},
+          {key:"b", text:"Cosine is not implementable."},
+          {key:"c", text:"A classifier is decorative."},
+          {key:"d", text:"GPUs require classifiers."},
+        ]}
+        trap={<>(b), (c), (d) miss the signal-fusion argument.</>}
+        lens={<>The classifier turns multiple noisy signals into a calibrated probability. Threshold-on-cosine is the recipe-book mistake.</>}
+        stretch={<>What loss do you train the head with for calibration?</>}
+      />
+
+      {/* axis: C3 */}
+      <VIS.TrapProblem
+        id="ph-c3"
+        difficulty="hard"
+        title="C3 — What does this approach drop vs BERT?"
+        scenario={<>What does LLM-embedding + RAG forfeit relative to a fine-tuned BERT email classifier?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"End-to-end gradient flow — BERT is fine-tuned for the task; LLM encoder is frozen and may not be optimal for phishing-specific features.", correct:true},
+          {key:"b", text:"Per-token attention patterns — BERT can highlight WHICH words drove the score; embedding-cosine cannot point to specific tokens.", correct:true},
+          {key:"c", text:"Inference simplicity — BERT is one forward pass; embedding + RAG is (encode + ANN-query + classifier).", correct:true},
+          {key:"d", text:"Coverage of GenAI paraphrases."},
+        ]}
+        trap={<>(d) is exactly what it ADDS.</>}
+        lens={<>Three losses. The senior MLE quantifies each — token attribution loss may matter for analyst explainability.</>}
+        stretch={<>How would you recover token attribution post-embedding?</>}
+      />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="ph-c4"
+        difficulty="hard"
+        title="C4 — Which hyperparameter, mis-set, breaks it?"
+        scenario={<>Rank: (i) ANN recall@K, (ii) template index update cadence, (iii) classifier threshold, (iv) embedding dim.</>}
+        options={[
+          {key:"a", text:"Template index update cadence > ANN recall > classifier threshold > embedding dim. If the index is updated weekly while campaigns last 2 days, the system silently degrades — the most critical lever. ANN recall@K controls retrieval fidelity. Threshold tunes precision/recall but doesn't fix the index. Embedding dim is secondary.", correct:true},
+          {key:"b", text:"Embedding dim dominates."},
+          {key:"c", text:"All equally important."},
+          {key:"d", text:"Threshold dominates."},
+        ]}
+        trap={<>(b), (c), (d) miss the index-freshness mechanism.</>}
+        lens={<>Index update cadence is the load-bearing operational knob. Inverts intuition about model hyperparameters.</>}
+        stretch={<>What cadence do you target? Daily? Hourly?</>}
+      />
+
+      {/* axis: C5 */}
+      <VIS.TrapProblem
+        id="ph-c5"
+        difficulty="medium"
+        title="C5 — Data-assumption: enough analyst feedback to template"
+        scenario={<>What happens at a small org with only 10 confirmed phish per week?</>}
+        options={[
+          {key:"a", text:"Template index is sparse; ANN retrieval returns weakly-related templates (low cosines, high variance). The classifier head learns to ignore the embedding signal and rely on URL features only — the LLM-embedding investment provides little. Fix: subscribe to a shared template feed (vendor or industry-shared), or fall back to a smaller-encoder + URL-feature stack.", correct:true},
+          {key:"b", text:"System works the same."},
+          {key:"c", text:"More analyst hours fix it."},
+          {key:"d", text:"Embedding cannot work at small scale."},
+        ]}
+        trap={<>(b), (d) are oversimplified; (c) is partial.</>}
+        lens={<>The system has a feedback-volume floor below which the template index can't power the retrieval signal.</>}
+        stretch={<>What's the minimum confirmed-phish-per-week to make this pay off?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      {/* axis: D1 */}
+      <VIS.TrapProblem
+        id="ph-d1"
+        difficulty="medium"
+        title="D1 — 'High cosine = phishing'"
+        scenario={<>A junior says "cosine ≥ 0.85 to a phishing template means it IS phishing." Where does this intuition break?</>}
+        options={[
+          {key:"a", text:"Legitimate business emails often share semantic structure with phishing — invoice notifications, password resets, account alerts. A real Microsoft account-alert email has cosine ~0.8 to many phishing-invoice templates because both discuss account status, urgency, and action items. Threshold-on-cosine would flag every legitimate alert. The classifier head uses cosine as ONE feature among many, conditional on URL/sender features.", correct:true},
+          {key:"b", text:"Cosine is always exact."},
+          {key:"c", text:"There is no false positive."},
+          {key:"d", text:"Cosine doesn't apply."},
+        ]}
+        trap={<>(b), (c), (d) miss the semantic-overlap-with-benign.</>}
+        lens={<>Embedding similarity is necessary but not sufficient. Senior MLEs add conditioning.</>}
+        stretch={<>What's the false-positive rate of a pure-cosine threshold at 0.85 on legitimate alerts?</>}
+      />
+
+      {/* axis: D2 */}
+      <VIS.TrapProblem
+        id="ph-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: 'good embeddings = no false positives'"
+        scenario={<>You assume "switching to a better encoder eliminates legitimate-alert false positives." Trace the cascade.</>}
+        options={[
+          {key:"a", text:"Better encoder → tighter semantic clusters → MORE legitimate alerts land near phishing templates (because semantic similarity is the actual property — alerts and alert-phishing ARE semantically similar) → false-positive rate goes UP, not down → team blames the encoder → real fix is conditioning on URL/sender features, not encoder quality.", correct:true},
+          {key:"b", text:"Better encoder always reduces false positives."},
+          {key:"c", text:"Encoder quality is independent of false positives."},
+          {key:"d", text:"False positives cannot be reduced."},
+        ]}
+        trap={<>(b) is the recipe-book belief. (c), (d) miss the mechanism.</>}
+        lens={<>The encoder is the SIGNAL, not the DECISION. Decision lives in the classifier with conditioning features.</>}
+        stretch={<>What's the right experiment to verify this?</>}
+      />
+
+      {/* axis: D3 */}
+      <VIS.TrapProblem
+        id="ph-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior diagnostic"
+        scenario={<>Junior reports the embedding-RAG system catches 30% more phishing than the BERT baseline. What's the senior question?</>}
+        options={[
+          {key:"a", text:"'Show me the breakdown: how much of the 30% gain is on FIRST-OCCURRENCE templates (where embedding semantic-similarity is doing the work) vs REPEAT campaigns the BERT model should have caught? If most of the gain is on repeats, BERT was just stale — retraining BERT might match. If the gain is concentrated on first-occurrence paraphrases of known templates, the embedding-RAG story is real. Also: what's the false-positive rate change on legitimate alerts?'", correct:true},
+          {key:"b", text:"'Try a bigger embedding.'"},
+          {key:"c", text:"'Use FP16.'"},
+          {key:"d", text:"'Ship it.'"},
+        ]}
+        trap={<>(b), (c), (d) skip the diagnostic.</>}
+        lens={<>Decomposition by attack-type forces attribution. Senior bar.</>}
+        stretch={<>What experiment isolates first-occurrence paraphrases?</>}
+      />
+
+      {/* axis: D4 */}
+      <VIS.TrapProblem
+        id="ph-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: recall regression"
+        scenario={<>3 months after launch, body-feature recall slips from 91% to 79%. Causes: (i) encoder drift, (ii) template index staleness, (iii) attacker adapting. Which is most likely?</>}
+        options={[
+          {key:"a", text:"(ii) Template index staleness — analyst feedback queue backed up, new campaigns aren't being templated within 24 hours. The system has no nearest-neighbor for fresh paraphrases. Diagnostic: cosine distribution for misses — if misses cluster at LOW cosines to ALL templates, the campaigns aren't represented; if at HIGH cosines but to BENIGN templates, encoder is drifting.", correct:true},
+          {key:"b", text:"(i) Encoder drift."},
+          {key:"c", text:"(iii) Attacker adapting."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c), (d) are plausible but index-staleness is the most common signature.</>}
+        lens={<>Index staleness is the structural risk and the most common drift signature. Diagnostic via cosine distribution of misses.</>}
+        stretch={<>What dashboard would alert you to this?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>E. Operations</h3>
+
+      {/* axis: E1 */}
+      <VIS.TrapProblem
+        id="ph-e1"
+        difficulty="hard"
+        title="E1 — System-specific gotcha"
+        scenario={<>Pick the gotcha most specific to embedding-RAG-over-templates (would NOT bite BERT or URL-classifier):</>}
+        options={[
+          {key:"a", text:"Template index staleness — the system silently degrades to URL-feature baseline when campaigns aren't templated within their active window. BERT degrades on lexical drift but doesn't have this specific staleness mode; URL-classifier doesn't depend on a template index at all.", correct:true},
+          {key:"b", text:"GPU OOM."},
+          {key:"c", text:"Inbox latency."},
+          {key:"d", text:"Tokenizer mismatch."},
+        ]}
+        trap={<>(b), (c), (d) are generic.</>}
+        lens={<>The dependency on a freshly-curated index is system-specific. Mitigation: feedback-loop SLAs, vendor template feeds, cold-start signal heuristics.</>}
+        stretch={<>What's the SLA on template-index update latency you commit to?</>}
+      />
+
+      {/* axis: E2 */}
+      <VIS.TrapProblem
+        id="ph-e2"
+        difficulty="hard"
+        title="E2 — Friday: precision collapse"
+        scenario={<>Friday: precision drops from 96% to 81% over 2 hours. False-positive quarantines surge. No deploy, no encoder change. Diagnosis?</>}
+        options={[
+          {key:"a", text:"A legitimate large-scale email blast (say a quarterly newsletter from a major vendor) is being mis-templated as phishing — the embedding of the new vendor email lands near a phishing template (semantic similarity of 'urgent action required' phrasing). Without per-template metadata (sender domain whitelist for the matched template), the false-positive cascades. Mitigation: per-template benign-sender allowlist; quick-revert path for analyst-confirmed false positives.", correct:true},
+          {key:"b", text:"Roll back."},
+          {key:"c", text:"Page DevOps."},
+          {key:"d", text:"GPU is hot."},
+        ]}
+        trap={<>(b), (c), (d) miss the mechanism.</>}
+        lens={<>Embedding-RAG's false-positive failure mode is "legitimate bulk email collides with phishing template." Mitigation is per-template sender-allowlists.</>}
+        stretch={<>How do you build the allowlist without an exhaustive vendor inventory?</>}
+      />
+
+      {/* axis: E3 */}
+      <VIS.TrapProblem
+        id="ph-e3"
+        difficulty="hard"
+        title="E3 — Eval protocol audit"
+        scenario={<>Which findings invalidate an embedding-RAG eval report?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Eval phishing samples are paraphrases of templates ALREADY in the index — measures retrieval-quality, not real-world cold-start recall.", correct:true},
+          {key:"b", text:"Baseline is BERT trained on stale data — sandbagged comparator.", correct:true},
+          {key:"c", text:"False-positive rate measured only against random benign emails, not against legitimate alerts/newsletters that share semantic structure with phishing.", correct:true},
+          {key:"d", text:"LLM embeddings are state of the art so eval doesn't matter."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three audit failures. Adversarial false-positive set is often missing — the legitimate-alert collision case is the production-killer.</>}
+        stretch={<>How do you construct the adversarial false-positive set?</>}
+      />
+
+      {/* axis: E4 */}
+      <VIS.TrapProblem
+        id="ph-e4"
+        difficulty="medium"
+        title="E4 — Rollout sequence"
+        scenario={<>Order phases: (i) full ramp, (ii) shadow mode (score in parallel, don't act), (iii) advisory mode (analyst sees score, decides), (iv) auto-quarantine for high-confidence with allowlist.</>}
+        options={[
+          {key:"a", text:"ii → iii → iv → i. Shadow measures precision/recall against ground truth; advisory builds analyst trust and surfaces the legitimate-alert false-positive class; auto-quarantine with allowlist contains the false-positive risk; full ramp last.", correct:true},
+          {key:"b", text:"i → ii → iii → iv."},
+          {key:"c", text:"Direct cutover."},
+          {key:"d", text:"iv → i."},
+        ]}
+        trap={<>(b), (c), (d) skip the legitimate-alert mining step.</>}
+        lens={<>The legitimate-alert false-positive class only surfaces with advisory traffic. Skip advisory and you'll discover it the hard way in production.</>}
+        stretch={<>What's the advisory-mode duration target?</>}
+      />
+
+      {/* axis: E5 */}
+      <VIS.TrapProblem
+        id="ph-e5"
+        difficulty="medium"
+        title="E5 — Reproducibility"
+        scenario={<>Which reproducibility issues are widely known?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Embedding model version (text-embedding-3 vs ada-002 vs e5-mistral) drives non-trivial cosine distribution shifts; cosines aren't comparable across versions.", correct:true},
+          {key:"b", text:"Template index composition is rarely reported precisely; results don't generalize to other orgs.", correct:true},
+          {key:"c", text:"ANN library + parameters (FAISS HNSW M, efSearch) affect recall@K and aren't always stated.", correct:true},
+          {key:"d", text:"This pipeline cannot be reimplemented."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three reproducibility hazards. The encoder-version one is the silent killer — same code, different encoder, different cosines.</>}
+        stretch={<>What's your encoder-versioning policy?</>}
+      />
+
+      {/* axis: E6 */}
+      <VIS.TrapProblem
+        id="ph-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination"
+        scenario={<>Which contamination paths affect embedding-RAG evals?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Eval phishing samples were the templates' source emails — retrieval trivially returns the seed.", correct:true},
+          {key:"b", text:"Benign eval set sampled randomly from inboxes — under-represents legitimate alerts/newsletters that semantically resemble phishing.", correct:true},
+          {key:"c", text:"Classifier head was tuned on the eval set's false-positive distribution — leakage.", correct:true},
+          {key:"d", text:"Embeddings cannot be contaminated."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three contamination paths. The benign-eval undersampling is the most common — and the most damaging because it overstates production precision.</>}
+        stretch={<>What's the right benign sampling strategy?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>F. Failure modes & edge cases</h3>
+
+      {/* axis: F1 */}
+      <VIS.TrapProblem
+        id="ph-f1"
+        difficulty="hard"
+        title="F1 — Smallest input that breaks the advantage"
+        scenario={<>Construct the smallest input regime where this approach has no edge over BERT.</>}
+        options={[
+          {key:"a", text:"A phishing campaign whose template was indexed yesterday from analyst feedback, and the current incoming email is NOT paraphrased — it is verbatim the template. BERT trained on yesterday's data also recognizes it. Both score it as phishing. The embedding advantage emerges ONLY when the email's lexical surface diverges from the template surface (i.e., GenAI paraphrasing has been applied).", correct:true},
+          {key:"b", text:"Any email under 100 words."},
+          {key:"c", text:"Any email with no URL."},
+          {key:"d", text:"A trivial email."},
+        ]}
+        trap={<>(b), (c), (d) miss the lexical-divergence mechanism.</>}
+        lens={<>Embedding advantage is conditional on paraphrasing. On verbatim repeats, BERT keeps up.</>}
+        stretch={<>What's the paraphrase-aggressiveness threshold at which the advantage starts?</>}
+      />
+
+      {/* axis: F2 */}
+      <VIS.TrapProblem
+        id="ph-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: target the encoder"
+        scenario={<>Design an attack that exploits the LLM-embedding step.</>}
+        options={[
+          {key:"a", text:"Adversarial-prompt the LLM encoder: craft a phishing email that semantically resembles a benign transactional email by maximizing cosine to known-benign embeddings (e.g., 'invoice notification' style without action language). The phishing payload (URL, brand-spoof) stays; the BODY is engineered to land far from phishing templates and near benign ones. The encoder is a public model — the attacker can locally compute embeddings and iterate.", correct:true},
+          {key:"b", text:"DDoS the inference endpoint."},
+          {key:"c", text:"Steal the classifier weights."},
+          {key:"d", text:"No attack is possible."},
+        ]}
+        trap={<>(b), (c), (d) miss the encoder-as-target attack.</>}
+        lens={<>The encoder is the optimization target. Defense: encoder rotation, ensemble of encoders, adversarial training on attacker-style paraphrases, weight URL/sender features more heavily.</>}
+        stretch={<>What's the right encoder-rotation cadence?</>}
+      />
+
+      {/* axis: F3 */}
+      <VIS.TrapProblem
+        id="ph-f3"
+        difficulty="hard"
+        title="F3 — Reverse engineering a symptom"
+        scenario={<>Symptom: recall on the 'invoice fraud' campaign category drops 25 points overnight while recall on other categories is stable. Which design choice causes this?</>}
+        options={[
+          {key:"a", text:"The 'invoice fraud' template in the index has been overwritten or removed (or its representative example was mis-labeled and pruned). The system can no longer retrieve a nearest neighbor for invoice paraphrases. Other categories' templates are intact, so their recall is preserved. Fix: per-category index health monitoring + template-deletion audit log.", correct:true},
+          {key:"b", text:"Encoder broke."},
+          {key:"c", text:"GPU error."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c), (d) miss the per-category index health.</>}
+        lens={<>Category-specific recall drops point to template-index integrity issues. Monitor per-category retrieval coverage.</>}
+        stretch={<>What's the per-category dashboard alert?</>}
+      />
+
+      {/* axis: F4 */}
+      <VIS.TrapProblem
+        id="ph-f4"
+        difficulty="medium"
+        title="F4 — Paper-admitted limitations"
+        scenario={<>Which limitations does the MSR Defender post acknowledge?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Cold-start campaigns where no template exists.", correct:true},
+          {key:"b", text:"Inference cost at inbox scale.", correct:true},
+          {key:"c", text:"Adversarial encoder-targeting risk.", correct:true},
+          {key:"d", text:"This approach works perfectly with no caveats."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>All three are documented. Knowing this signals careful reading vs hype.</>}
+        stretch={<>Which is most underestimated in production?</>}
+      />
+
+      {/* axis: F5 */}
+      <VIS.TrapProblem
+        id="ph-f5"
+        difficulty="hard"
+        title="F5 — Community-found failure"
+        scenario={<>Recent literature (NDSS/USENIX phishing detection benchmarks) has surfaced a specific failure mode for embedding-similarity defenses. What is it?</>}
+        options={[
+          {key:"a", text:"Brand-impersonation attacks where the attacker emails a generic 'Microsoft account alert' body that semantically resembles many legitimate Microsoft emails. Embedding-similarity to phishing templates is low; embedding-similarity to LEGITIMATE Microsoft emails is HIGH; URL features may be the only discriminator. Embedding-RAG provides little signal when the attacker mimics benign brand voice.", correct:true},
+          {key:"b", text:"No known failure."},
+          {key:"c", text:"Embeddings always fail."},
+          {key:"d", text:"Brand impersonation doesn't exist."},
+        ]}
+        trap={<>(b), (c), (d) miss the empirical finding.</>}
+        lens={<>Brand-voice mimicry is the named gap. Embedding-RAG must lean on URL/sender features here.</>}
+        stretch={<>What URL feature catches brand-impersonation?</>}
+      />
+
+      {/* axis: F5b — interview gold */}
+      <VIS.TrapProblem
+        id="ph-f5b"
+        difficulty="hard"
+        title="F5b — The interview gold question"
+        scenario={<>Interviewer: "You shipped LLM-embedding + RAG over the BERT baseline. Walk me through the ablation that proves the RAG step is the value driver."</>}
+        options={[
+          {key:"a", text:"Four conditions on a held-out temporal split: (i) BERT classifier on body, (ii) LLM-embedding alone (no RAG, just feed embedding to classifier), (iii) LLM-embedding + RAG to template index, (iv) LLM-embedding + RAG + URL/sender features. Measured precision/recall on three slices: known-template repeats, GenAI paraphrases of known templates, fully novel campaigns. If (iii) beats (ii) on paraphrases (template metadata is the driver) and (iv) beats (iii) on novel campaigns (URL features cover cold start), the design choices are each justified. If (ii) ties (iii) on paraphrases, RAG is decorative and embedding alone suffices.", correct:true},
+          {key:"b", text:"Compared full system to BERT; full system won; shipped."},
+          {key:"c", text:"Embedding is state of the art — no ablation needed."},
+          {key:"d", text:"Compared to a different vendor."},
+        ]}
+        trap={<>(b), (c), (d) skip ablation rigor.</>}
+        lens={<>The right ablation isolates each design choice on the relevant slice. Senior bar.</>}
+        stretch={<>If (ii) ties (iii), would you still ship RAG? Defend.</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://www.microsoft.com/en-us/security/blog/" target="_blank" rel="noopener">
-            <strong>Microsoft Defender Research — LLM-driven phishing detection at scale</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog, 2025)</span>
-          <br/>Source post for this concept. Read for the production-scale tradeoffs (latency budget, refresh cadence, SOC integration).
+          <a href="https://www.microsoft.com/en-us/security/blog/" target="_blank" rel="noopener"><strong>Microsoft Defender Research blog</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(blog index, 2025)</span>
+          <br/>The production-side write-ups this visual anchors on. Search for the LLM-driven phishing detection posts.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2212.03533" target="_blank" rel="noopener">
-            <strong>Wang et al. — Text Embeddings by Weakly-Supervised Contrastive Pre-training (E5)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper)</span>
-          <br/>Why contrastive-trained dual-encoders dominate retrieval. Sections 3-4 explain the objective; Sec 5 has the benchmarks.
+          <a href="https://arxiv.org/abs/2305.14918" target="_blank" rel="noopener"><strong>Wang et al. — Text Embeddings by Weakly-Supervised Contrastive Pretraining (E5)</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, 2023)</span>
+          <br/>The E5 family used as alternative to OpenAI embeddings in production.
         </li>
         <li>
-          <a href="https://huggingface.co/blog/mteb" target="_blank" rel="noopener">
-            <strong>HuggingFace — MTEB: Massive Text Embedding Benchmark</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The standard leaderboard for embedding models. Use as a starting point, but evaluate on your phishing test set before committing.
+          <a href="https://www.pinecone.io/learn/series/faiss/" target="_blank" rel="noopener"><strong>Pinecone — FAISS deep-dive series</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(tutorial)</span>
+          <br/>The practical reference for ANN-index parameters that affect this pipeline.
         </li>
         <li>
-          <a href="https://eugeneyan.com/writing/llm-patterns/" target="_blank" rel="noopener">
-            <strong>Eugene Yan — Patterns for Building LLM-based Systems</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The RAG section is the clearest practitioner guide to retrieval-augmented classification — directly applicable to the template-lookup pattern.
-        </li>
-        <li>
-          <a href="https://krebsonsecurity.com/" target="_blank" rel="noopener">
-            <strong>Krebs on Security</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog, ongoing)</span>
-          <br/>Field reporting on actual phishing campaigns. Read to calibrate which attacker tactics matter for your threat model — not all paraphrase attacks are equally common.
+          <a href="https://arxiv.org/abs/1908.10084" target="_blank" rel="noopener"><strong>Reimers & Gurevych — Sentence-BERT</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, EMNLP 2019)</span>
+          <br/>The pre-LLM-embedding baseline; useful for the "is the LLM upgrade worth it" decision.
         </li>
       </ul>
     </VIS.Section>
   </main>
 );
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
   <script>
