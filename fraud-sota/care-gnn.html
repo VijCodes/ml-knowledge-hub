@@ -1414,337 +1414,659 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// CARE-GNN — Fraud SOTA · GNN-based fraud detection
-// Camouflage-Resistant GNN with RL-learned neighbor selection.
+// CARE-GNN — Camouflage-Resistant GNN for fraud (Dou et al., CIKM 2020)
+// v2 redo — trap problems span A-F axes; every problem hinges on CARE-GNN's
+// specific mechanism (per-relation RL-tuned similarity filter) and threads
+// the GADBench-tuned-GBDT gotcha where applicable.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · GNN-based fraud detection"
-      title="CARE-GNN"
-      subtitle="RL-tuned neighbor filtering + label-aware similarity to beat fraudster camouflage on review graphs."
+      pill="Fraud SOTA · GNN-based fraud detection (camouflage defense)"
+      title="CARE-GNN — Camouflage-Aware Reinforced GNN"
+      subtitle="Per-relation RL-learned similarity threshold filters out camouflaged neighbors before message passing on heterogeneous review-fraud graphs."
       byline={[
         {label: "Paper", value: "Dou et al., CIKM 2020"},
         {label: "Year", value: "2020"},
-        {label: "L3", value: "GNN fraud detector"},
+        {label: "Domain", value: "GNN fraud detection"},
       ]}/>
 
     <VIS.TLDR>
-      Vanilla{" "}
-      <VIS.Term def="A standard graph neural network that updates each node by averaging features of its neighbors. Treats every neighbor as equally informative.">GraphSAGE</VIS.Term>{" "}
-      averages over all neighbors, so a fraudster wired to many benign accounts is mathematically pulled toward "benign." CARE-GNN learns a per-relation similarity threshold via reinforcement learning, drops dissimilar (camouflage) neighbors before aggregation, and re-weights the rest by label-aware similarity. Net effect: bigger margin on{" "}
-      <VIS.Term def="A fraud-detection benchmark built from Yelp review records, with relations between users, reviews, and products. Models classify reviews as spam vs benign.">YelpChi</VIS.Term> / Amazon than plain GNN baselines — but at the cost of a delicate RL inner loop and an answer-key gotcha: GADBench (2024) later shows a well-tuned GBDT on structural features matches it.
+      Vanilla <VIS.Term def="An MPNN that samples a fixed neighborhood per node and aggregates features uniformly. Fraudsters defeat this by camouflaging — surrounding themselves with benign neighbors so aggregation dilutes the fraud signal.">GraphSAGE</VIS.Term> collapses on Yelp/Amazon fraud graphs because fraudsters camouflage. CARE-GNN adds a per-relation <VIS.Term def="An MLP-cosine similarity score between center node and a candidate neighbor used to decide whether to keep the edge during message passing.">label-aware similarity</VIS.Term> filter and an <VIS.Term def="Bernoulli-rewarded reinforcement learner that picks the top-p% similar neighbors per relation each epoch, where p is tuned online by whether the prior epoch's val-loss improved.">RL agent</VIS.Term> that tunes the keep-fraction per relation. Headline gains on YelpChi/Amazon used a random split — under GADBench's temporal split plus AUPRC plus tuned-GBDT baseline, the win collapses to less than one point on most graphs. Source: <a href="https://arxiv.org/abs/2008.08692" target="_blank" rel="noopener">arXiv:2008.08692</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        Fraud graphs are heterogeneous (users, reviews, products) and multi-relational (R-U-R = "reviews by the same user," R-S-R = "reviews with the same star rating," R-T-R = "reviews posted in the same month"). Fraudsters defeat plain GNNs through{" "}
-        <VIS.Term def="The fraudster strategy of connecting to many benign nodes (or behaving like benign ones in some features) so that neighborhood-averaging models predict 'benign' for them.">camouflage</VIS.Term>:
-        a spam review is linked to many benign reviews, so any model that averages neighbor features predicts "benign."
-      </p>
-      <p>
-        CARE-GNN bolts three modules onto a standard message-passing backbone:
+        CARE-GNN is a GraphSAGE-family <VIS.Term def="A neural network that operates on graph-structured data by aggregating features from each node's neighbors layer by layer.">GNN</VIS.Term> for heterogeneous fraud graphs (e.g. Yelp reviews: review-user-review, review-product-review, review-time-review relations) augmented with three modules:
       </p>
       <ol>
-        <li><strong>Label-aware similarity</strong> — a 1-layer MLP scores how similar each neighbor's hidden state is to the center node, supervised by their fraud-label agreement.</li>
-        <li><strong>RL neighbor selector</strong> — per relation, a Bernoulli-bandit learns the top-p% threshold: keep only the most similar neighbors, drop the rest as camouflage.</li>
-        <li><strong>Relation-aware aggregation</strong> — the filtered, weighted neighbor sets from each relation are combined with learnable per-relation weights.</li>
+        <li><strong>Label-aware similarity</strong> sigma(v, u) — an MLP-cosine score predicting whether u is the same class as v.</li>
+        <li><strong>Per-relation neighbor selector</strong> — keep only the top-p fraction of neighbors per relation by sigma.</li>
+        <li><strong>RL agent</strong> — tunes p per relation each epoch using Bernoulli reward (did val-loss improve?).</li>
       </ol>
-
       <VIS.Mermaid chart={`
 flowchart TB
-  N["Center node (review)"]
-  N --> R1["Relation R-U-R"]
-  N --> R2["Relation R-S-R"]
-  N --> R3["Relation R-T-R"]
-  R1 --> S1["Score neighbors"]
-  R2 --> S2["Score neighbors"]
-  R3 --> S3["Score neighbors"]
-  S1 --> F1["RL filter top-p"]
-  S2 --> F2["RL filter top-p"]
-  S3 --> F3["RL filter top-p"]
-  F1 --> AGG["Weighted aggregation"]
-  F2 --> AGG
-  F3 --> AGG
-  AGG --> Z["Updated node"]
-  style F1 fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style F2 fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style F3 fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+  C["Center node v (review)"]
+  C --> R1["Relation R-U-R (same user)"]
+  C --> R2["Relation R-S-R (same product star)"]
+  C --> R3["Relation R-T-R (same time bucket)"]
+  R1 --> S["Score sigma(v,u) per neighbor"]
+  R2 --> S
+  R3 --> S
+  S --> F["Keep top-p per relation (RL-tuned)"]
+  F --> A["Aggregate kept neighbors"]
+  A --> O["v's representation"]
+  style F fill:#dbeafe,stroke:#1e40af,stroke-width:2px
       `} />
-      <p>The red boxes are the CARE-GNN-specific filtering step; everything else is vanilla heterogeneous GNN.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead>
-          <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Step</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>GraphSAGE / GAT</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>CARE-GNN</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Neighbor set</td>
-            <td style={{padding:"8px 10px"}}>All neighbors per relation</td>
-            <td style={{padding:"8px 10px"}}>Top-p by learned similarity (p set by RL)</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Aggregation weights</td>
-            <td style={{padding:"8px 10px"}}>Uniform (SAGE) or attention (GAT)</td>
-            <td style={{padding:"8px 10px"}}>Label-aware similarity score</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Relation fusion</td>
-            <td style={{padding:"8px 10px"}}>Concat or sum</td>
-            <td style={{padding:"8px 10px"}}>Learnable per-relation weight</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Training signal</td>
-            <td style={{padding:"8px 10px"}}>Cross-entropy only</td>
-            <td style={{padding:"8px 10px"}}>CE + similarity loss + RL reward on threshold</td>
-          </tr>
-        </tbody>
-      </table>
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from GraphSAGE, PC-GNN, GAGA">
+      <p>
+        <strong>GraphSAGE.</strong> Aggregates ALL sampled neighbors uniformly. Fraudsters exploit this by surrounding themselves with benign neighbors — the fraud signal averages away.
+      </p>
+      <p>
+        <strong>PC-GNN (sibling).</strong> Attacks <em>class imbalance</em>, not camouflage. PC-GNN's sampler over-samples minority-class neighbors regardless of similarity; CARE-GNN's filter drops camouflaged neighbors regardless of class. Orthogonal fraud problems.
+      </p>
+      <p>
+        <strong>GAGA (sibling).</strong> CARE-GNN assumes mostly-homophilic relations with camouflage exceptions. GAGA assumes the opposite — fraudsters predominantly connect to benign nodes (mule networks) and homophily is the exception. Filtering low-similarity neighbors (CARE-GNN) destroys the very signal GAGA wants to model.
+      </p>
+      <p>
+        <strong>GADBench-tuned GBDT.</strong> A LightGBM with degree, k-hop fraud-neighbor counts, and triangle counts captures most of CARE-GNN's signal. Under GADBench's temporal-split AUPRC protocol, the original paper's edge over a tuned tree shrinks dramatically. <em>Every claim about CARE-GNN in production must be ablated against this baseline.</em>
+      </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Multi-relation fraud graphs</strong> (reviews / users / products) where fraudsters connect to many benign nodes to dilute the signal.</li>
-        <li><strong>Moderate scale</strong> — YelpChi (~45k nodes), Amazon (~11k). Per-relation RL filter scales O(E) per epoch but RL inner loop adds wallclock.</li>
-        <li><strong>Partially labeled</strong> data with enough fraud examples to drive the similarity loss (≥5% positives works in practice; below 1% the RL signal gets noisy).</li>
-      </ul>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it / where it wins">
+      <p>
+        Pick CARE-GNN when (a) heterogeneous relations exist, (b) fraud rate is moderate (5 to 20 percent) — high enough that camouflage is a profitable fraudster strategy, low enough that imbalance isn't dominant, (c) node features carry enough signal for the similarity MLP to learn, and (d) you have already established a tuned-GBDT baseline and CARE-GNN beats it on a temporal split.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  D["Fraud surface"]
+  D --> Q1{"Multiple relation types?"}
+  Q1 -->|No| GBDT["GBDT + structural features"]
+  Q1 -->|Yes| Q2{"Homophilic with camouflage?"}
+  Q2 -->|No, low homophily| GAGA["GAGA"]
+  Q2 -->|Yes| Q3{"Beats tuned GBDT on temporal split?"}
+  Q3 -->|No| GBDT2["Ship GBDT"]
+  Q3 -->|Yes| CARE["CARE-GNN"]
+  style CARE fill:#dcfce7,stroke:#16a34a
+  style GBDT fill:#fef3c7,stroke:#d97706
+  style GBDT2 fill:#fef3c7,stroke:#d97706
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations & gotchas">
-      <VIS.Callout kind="gotcha" title="GADBench (NeurIPS 2024): are you actually beating GBDT?">
-        Tang et al. re-ran CARE-GNN, PC-GNN, GAGA, etc. on a fair benchmark with leakage-free splits. A{" "}
-        <VIS.Term def="Gradient Boosted Decision Trees (XGBoost / LightGBM / CatBoost). The default tabular baseline for fraud detection at most companies — fast, calibrated, well-tuned.">GBDT</VIS.Term>{" "}
-        with hand-engineered structural features (degree per relation, neighbor-label distribution, ego-net density) <strong>matches or beats CARE-GNN on YelpChi and Amazon</strong>. Always run that baseline first — if you can't beat it, the GNN infra is not worth it.
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="The RL-threshold instability">
+        The Bernoulli-rewarded RL agent oscillates: a bad epoch's noisy reward swings p, the next epoch's signal is weaker, p swings again. In practice you must freeze p after warm-up — but then it is no longer "RL-tuned," it is a static hyperparameter and the framing collapses to "GraphSAGE with per-relation top-p filter."
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="RL threshold is unstable">
-        The per-relation Bernoulli bandit needs careful learning rate, warmup, and reward smoothing. Training variance across seeds is high; expect 1-2 point F1 swings.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Densely connected fraud rings break the filter">
-        If fraudsters cluster (mule networks), neighbors ARE similar, so the filter does nothing — and you've lost the camouflage assumption. GAGA's heterophily framing is a better lens here.
+      <VIS.Callout kind="gotcha" title="The GADBench reckoning">
+        CARE-GNN's headline F1 on YelpChi was reported on a <em>random</em> train/test split. The graph's temporal structure means random splits let the GNN see future neighbors during training. Under GADBench's temporal split, CARE-GNN drops 15-20 F1 points and a tuned LightGBM with degree + neighbor-purity features closes most of the remaining gap.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on CARE-GNN and the broader question "is your fraud-GNN actually better than a tuned GBDT?"
+        Problems span the 6 taxonomy axes. Every option must pass the redaction litmus — strip "CARE-GNN" and the question must no longer be answerable from generic ML knowledge.
       </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="care-p1"
+        id="care-a1"
         difficulty="hard"
-        title="P1 — A new fraud-GNN paper beats GraphSAGE by 4 F1. Ship?"
-        scenario={<>You're evaluating CARE-GNN for a payments fraud detector. The paper reports +4 F1 over GraphSAGE on YelpChi. Your current production model is a LightGBM with 320 hand-built features (transaction counts per window, merchant entropy, device-fingerprint clusters). Fraud rate is 0.7%. The data scientist proposes: "Replace LightGBM with CARE-GNN since it beats GNN baselines." What's the right next move?</>}
+        title="A1 — CARE-GNN vs PC-GNN: same family, different fraud problem"
+        scenario={<>Your tech lead says "CARE-GNN and PC-GNN are both fraud GNNs — pick one for our 0.3% fraud transaction graph." You have to articulate which fraud problem each one solves. Which is the actual discriminator?</>}
         options={[
-          {key:"a", text:"Re-run LightGBM with structural graph features (per-relation degree, neighbor-label distribution, ego-net density) under the same split CARE-GNN uses, before deciding."},
-          {key:"b", text:"Ship CARE-GNN; paper has peer review."},
-          {key:"c", text:"Replace LightGBM with vanilla GraphSAGE first to isolate the 'is GNN even helping' question."},
-          {key:"d", text:"Train both, A/B test in production for 4 weeks."},
+          {key:"a", text:"CARE-GNN targets camouflage via a per-relation similarity filter; PC-GNN targets class imbalance via a label-aware neighbor sampler. With 0.3% fraud, imbalance dominates, so PC-GNN.", correct:true},
+          {key:"b", text:"They are the same model; pick either."},
+          {key:"c", text:"CARE-GNN is for transaction graphs; PC-GNN is for review graphs."},
+          {key:"d", text:"CARE-GNN handles imbalance; PC-GNN handles camouflage."},
         ]}
-        trap={<>(b) is the textbook trap — "paper says +4 F1, ship it." But the baseline in the paper is plain GraphSAGE, not your tuned LightGBM. (c) buys you nothing — you're still comparing GNN vs GNN, not GBDT vs GNN. (d) burns 4 weeks of prod traffic to test something a 1-day offline experiment answers.</>}
-        lens={<>(a) is the GADBench answer. Tang et al. (NeurIPS 2024) showed that GBDT + structural graph features matches CARE-GNN on the same benchmarks. Always run the strong tabular baseline ON THE GNN'S TURF before adopting graph infra — it's a 1-day experiment that has killed many graph-ML deployments.</>}
-        stretch={<>Which 3 structural features would you add to LightGBM first?</>}
+        trap={<>(d) inverts the truth — exactly the confusion the question targets. (c) is over-specific. (b) is wrong.</>}
+        lens={<>The two papers attack orthogonal fraud problems. CARE-GNN filters whom to message-pass with (camouflage defense); PC-GNN reweights who gets sampled into batches (imbalance defense). At 0.3% fraud, the dominant issue is imbalance — the GraphSAGE representation is dominated by benign neighbors regardless of camouflage.</>}
+        stretch={<>Could you stack PC-GNN's sampler with CARE-GNN's filter? What conflicts arise?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="care-p2"
-        difficulty="hard"
-        title="P2 — Why does plain GraphSAGE collapse on YelpChi?"
-        scenario={<>You run vanilla GraphSAGE on YelpChi. It achieves train F1 = 0.85 but test F1 = 0.41 on the spam class. Investigating the model output, you find spam reviews get predictions near 0.5 — nearly random. The fraud rate is 14% (relatively balanced for fraud). What's the primary mechanism?</>}
-        options={[
-          {key:"a", text:"Class imbalance — 14% positives is still too low; the model defaults to predicting benign."},
-          {key:"b", text:"Camouflage — spam reviews connect to many benign reviews via R-U-R and R-S-R relations; mean aggregation pulls spam embeddings toward the benign cluster.", correct:true},
-          {key:"c", text:"Over-smoothing — 2-layer GraphSAGE smooths all embeddings toward a global mean."},
-          {key:"d", text:"Train/test leakage."},
-        ]}
-        trap={<>(a) misreads the imbalance — 14% positives is fine for cross-entropy; this isn't a 0.1% fraud problem. (c) over-smoothing happens at 4+ layers, not 2. (d) is the lazy "must be leakage" reflex when train ≫ test.</>}
-        lens={<>(b) is the camouflage mechanism CARE-GNN is built to defeat. Spam reviewers deliberately post benign-looking content and target popular products, so their graph neighborhoods are mostly benign — averaging neighbors pulls the prediction toward 0.5. CARE-GNN's filter drops dissimilar neighbors BEFORE aggregation, so spam embeddings stay distinct.</>}
-        stretch={<>If you set the RL filter threshold to keep 100% of neighbors, does CARE-GNN reduce to GraphSAGE?</>}
-      />
-
-      <VIS.TrapProblem
-        id="care-p3"
+        id="care-a2"
         difficulty="medium"
+        title="A2 — 'CARE-GNN is adversarial training for GNNs'"
+        scenario={<>A reviewer dismisses CARE-GNN as "adversarial training applied to GNNs." Which statements about CARE-GNN's mechanism are true?</>}
         multiSelect
-        title="P3 — CARE-GNN runs but RL threshold won't converge. Which fixes apply?"
-        scenario={<>You train CARE-GNN on a corporate transaction graph (2M nodes, 8 relations). Training loss decreases but the per-relation RL thresholds oscillate between 0.1 and 0.9 across epochs. F1 swings 5 points seed-to-seed. Which interventions plausibly stabilize training?</>}
         options={[
-          {key:"a", text:"Add EMA smoothing on the RL reward (decay 0.9).", correct:true},
-          {key:"b", text:"Warm up the GNN backbone for 20 epochs with all neighbors before turning on the RL filter.", correct:true},
-          {key:"c", text:"Replace the RL bandit with a fixed top-50% threshold and tune it as a hyperparameter.", correct:true},
-          {key:"d", text:"Switch from GraphSAGE backbone to GAT."},
-          {key:"e", text:"Increase learning rate to escape oscillation faster."},
+          {key:"a", text:"CARE-GNN's filter operates on neighbor selection, not on input feature perturbation — adversarial training perturbs inputs, which is a different mechanism.", correct:true},
+          {key:"b", text:"Camouflage in the CARE-GNN sense is a benign-by-construction strategy (fraudsters surround themselves with real benign neighbors), not an adversarial perturbation of node features.", correct:true},
+          {key:"c", text:"The RL agent in CARE-GNN tunes which neighbors to KEEP, not which to perturb.", correct:true},
+          {key:"d", text:"CARE-GNN uses FGSM-style perturbations during training."},
         ]}
-        trap={<>(d) is unrelated; the instability is in the bandit, not the backbone. (e) actively worsens RL convergence — high LR amplifies reward variance. The trap is the candidate who blames the GNN side when the issue is the RL inner loop.</>}
-        lens={<>Three stabilizers: (a) reward EMA reduces gradient noise; (b) warmup gives the similarity scorer time to be meaningful before filtering on it; (c) collapsing RL to a hyperparameter is what most production teams actually do — and yes, it almost recovers full CARE-GNN performance.</>}
-        stretch={<>If a fixed threshold recovers 95% of the F1, is the RL component worth keeping in production?</>}
+        trap={<>(d) is what adversarial training does — CARE-GNN does not. The reviewer's framing is a category error.</>}
+        lens={<>Camouflage is a structural attack on the graph topology, not a feature-space adversarial attack. The defense lives at the neighbor-selection layer, not at feature perturbation. Calling it "adversarial training" misroutes the mental model to FGSM/PGD, which would not help against camouflage.</>}
+        stretch={<>Could adversarial training on node features ever address camouflage indirectly? Argue both ways.</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="care-p4"
+        id="care-a3"
         difficulty="hard"
-        title="P4 — Densely connected fraud ring breaks CARE-GNN. Why?"
-        scenario={<>CARE-GNN is deployed on a money-laundering graph. The fraud detector misses an entire ring of 40 accounts that transact only with each other. The model scores them all 0.45-0.55. Standard CARE-GNN assumption: filter out dissimilar neighbors. What went wrong?</>}
+        title="A3 — Counterfactual: CARE-GNN never existed"
+        scenario={<>Counterfactual: CARE-GNN was never published. You have a Yelp-style review-fraud problem with camouflage. What is your actual fallback, and what does it cost you?</>}
         options={[
-          {key:"a", text:"The ring's accounts have HIGH similarity to each other, so the filter keeps all of them; aggregation reinforces 'fraud-like' embedding but never crosses the decision boundary because the ring has no labeled fraud anchors.", correct:true},
-          {key:"b", text:"Bug in the RL filter — too aggressive."},
-          {key:"c", text:"Should switch to FraudGT — transformers don't have this problem."},
-          {key:"d", text:"Class imbalance — there aren't enough fraud labels."},
+          {key:"a", text:"A tuned LightGBM with degree, neighbor-class-purity, and triangle-count features captures most of CARE-GNN's signal under temporal-split AUPRC; the cost is interpretability gain rather than performance loss.", correct:true},
+          {key:"b", text:"You would have nothing — fraud detection on graphs would be impossible."},
+          {key:"c", text:"You would use vanilla GraphSAGE and accept the loss."},
+          {key:"d", text:"You would build a transformer over node features."},
         ]}
-        trap={<>(b) and (d) blame the wrong knob. (c) is a real candidate fix but ignores that the root cause is the LABEL propagation assumption, which would also limit FraudGT. CARE-GNN assumes fraudsters camouflage AS BENIGN; a tight ring has NO camouflage — it's an ER-fraud-dense subgraph the model has never been told to look for.</>}
-        lens={<>(a) is the limitation Dou et al. acknowledge. CARE-GNN's filter is built for the "fraud-amid-benign" camouflage case. When fraudsters cluster (mule networks, dense rings), filtered neighbors are STILL fraud-like, but the model has no labeled fraud in the receptive field to anchor the prediction. PC-GNN (label-aware sampling) and GAGA (heterophily-aware) attack this case differently.</>}
-        stretch={<>How would you augment training to make CARE-GNN flag dense fraud rings?</>}
+        trap={<>(b), (c), (d) all miss actual industrial practice. (c) accepts the camouflage hit; (d) ignores graph structure entirely.</>}
+        lens={<>The honest fallback is not "GraphSAGE minus the filter" but "a tuned tree with structural features." GADBench showed this baseline beats CARE-GNN's original claim on temporal-split AUPRC for most public graphs.</>}
+        stretch={<>Name two regimes where CARE-GNN clearly beats the GBDT baseline.</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="care-p5"
+        id="care-a4"
         difficulty="hard"
+        title="A4 — Stack CARE-GNN + PC-GNN sampler"
+        scenario={<>You want to combine PC-GNN's class-balanced sampler with CARE-GNN's similarity filter on a 0.5% fraud review graph. Which interactions are real concerns?</>}
         multiSelect
-        title="P5 — GADBench replication: which of these would falsify CARE-GNN's gain?"
-        scenario={<>You're replicating CARE-GNN on the public YelpChi benchmark and want to know if its reported +5 F1 over GraphSAGE is real or a benchmark artifact. Which experimental controls are necessary for a fair comparison? Select all that apply.</>}
         options={[
-          {key:"a", text:"Use the GADBench fixed splits, not the original paper's random splits.", correct:true},
-          {key:"b", text:"Tune GraphSAGE's hyperparameters with the same Optuna budget as CARE-GNN.", correct:true},
-          {key:"c", text:"Add a GBDT (XGBoost/LightGBM) baseline with structural graph features (degree, neighbor-label dist, ego-net density).", correct:true},
-          {key:"d", text:"Average over 10+ random seeds; CARE-GNN's RL has high seed variance.", correct:true},
-          {key:"e", text:"Use only the relation that gives CARE-GNN its best score."},
+          {key:"a", text:"PC-GNN over-samples fraud nodes; if those fraud nodes are camouflaged, CARE-GNN's filter then drops most of their (benign) neighbors — leaving the fraud nodes with empty neighborhoods to aggregate over.", correct:true},
+          {key:"b", text:"The RL agent's reward signal becomes noisier because PC-GNN's sampling already shifts the validation distribution; the agent attributes reward changes to its threshold when they actually come from the sampler.", correct:true},
+          {key:"c", text:"You must choose ONE — they cannot be combined."},
+          {key:"d", text:"The combined model has more parameters."},
         ]}
-        trap={<>(e) cherry-picks — that's how leaky baselines get inflated in the first place. The other four are exactly the controls GADBench enforces.</>}
-        lens={<>All four controls together collapse most fraud-GNN papers' reported gains. The discriminating fact is (c) — GBDT + structural features as a peer baseline. If CARE-GNN can't beat that under controls (a)-(d), the paper's claim is benchmark-fragile.</>}
-        stretch={<>Why does seed variance hit RL-based models harder than vanilla GNNs?</>}
+        trap={<>(c) is too strong — combining is possible, just non-trivial. (d) is parameters-not-the-issue.</>}
+        lens={<>The two mechanisms operate on different axes (which nodes to batch vs which neighbors to keep) but they interact through the RL agent's reward attribution. In practice you freeze the RL agent and ship a deterministic similarity threshold; then PC-GNN composes cleanly.</>}
+        stretch={<>If you froze p first, would you still want PC-GNN's sampler? Justify.</>}
       />
 
+      {/* axis: A5 */}
       <VIS.TrapProblem
-        id="care-p6"
+        id="care-a5"
+        difficulty="hard"
+        title="A5 — Where CARE-GNN stops winning"
+        scenario={<>At what fraud rate does CARE-GNN's camouflage premise stop holding? Pick the answer with the strongest architectural justification.</>}
+        options={[
+          {key:"a", text:"Above approximately 25% fraud rate: when fraudsters dominate the graph, they have no incentive to camouflage among benign neighbors — they are the majority. CARE-GNN's filter has no camouflaged neighbors to remove and reduces to GraphSAGE.", correct:true},
+          {key:"b", text:"Below 0.1% fraud: imbalance dominates."},
+          {key:"c", text:"At exactly 50% fraud."},
+          {key:"d", text:"There is no boundary — CARE-GNN works at any fraud rate."},
+        ]}
+        trap={<>(b) is the imbalance-dominant regime (PC-GNN's territory), not the upper bound on CARE-GNN. (c), (d) miss the mechanism.</>}
+        lens={<>Camouflage is a strategy fraudsters adopt because they are a minority. As the minority shrinks the camouflage incentive grows; as the minority approaches the majority the camouflage incentive vanishes. The paper notes this regime explicitly.</>}
+        stretch={<>What is the optimal fraud-rate regime for CARE-GNN to outperform a tuned GBDT?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>B. Application</h3>
+
+      {/* axis: B1 */}
+      <VIS.TrapProblem
+        id="care-b1"
         difficulty="medium"
-        title="P6 — Label-aware similarity loss needs labeled neighbors. What if 95% are unlabeled?"
-        scenario={<>You apply CARE-GNN to a graph where only 5% of nodes are labeled (semi-supervised). The label-aware similarity loss requires neighbor labels to supervise the similarity scorer. What's the cleanest workaround?</>}
+        title="B1 — Pick the right tool given the scenario"
+        scenario={<>Scenario: review fraud on a marketplace; 8% fraud rate; three heterogeneous relations (R-U-R, R-S-R, R-T-R); rich node features (review text length, user history length, rating distribution); a tuned LightGBM baseline gets 0.72 AUPRC on temporal split. You have 1 month and 2 engineers. Which is the right next investment?</>}
         options={[
-          {key:"a", text:"Use pseudo-labels from a teacher model trained on the labeled subset to supervise similarity loss; refresh teacher periodically.", correct:true},
-          {key:"b", text:"Skip the similarity loss; use CARE-GNN with RL filter only."},
-          {key:"c", text:"Switch to GAGA — handles low labels better."},
-          {key:"d", text:"Throw out unlabeled nodes from the graph entirely."},
+          {key:"a", text:"Train CARE-GNN with rich features and shadow-score against the LightGBM on temporal-split AUPRC. If CARE-GNN beats 0.72 AUPRC by at least 2 points, ship; otherwise stay on GBDT.", correct:true},
+          {key:"b", text:"Train GAGA immediately because transformers are state of the art."},
+          {key:"c", text:"Train PC-GNN — imbalance is the issue at 8% fraud."},
+          {key:"d", text:"Build a federated learning pipeline."},
         ]}
-        trap={<>(b) defeats the point — similarity is what makes filtering meaningful. (c) is a valid downstream pivot but doesn't answer THIS question. (d) discards structural information that's the whole reason you have a graph.</>}
-        lens={<>(a) — teacher-student / pseudo-label is the standard semi-supervised extension. Train teacher on 5% labels, generate soft labels for unlabeled neighbors, use those in the similarity loss. Refresh teacher every N epochs to avoid confirmation bias.</>}
-        stretch={<>What's the failure mode if teacher confidence is too low?</>}
+        trap={<>(b) is the "transformer = better" reflex; GAGA targets heterophily, not the scenario. (c) misreads imbalance — 8% is moderate, not extreme. (d) is off-topic.</>}
+        lens={<>The scenario matches CARE-GNN's design assumptions (heterogeneous relations, moderate fraud, features). The shadow-comparison clause is the senior part — CARE-GNN's headline lift has been overturned on several benchmarks under GADBench fair eval; you owe yourself the actual measurement.</>}
+        stretch={<>If CARE-GNN beats LightGBM by 0.5 AUPRC, do you ship it? What is your maintenance-cost tradeoff?</>}
       />
 
+      {/* axis: B2 */}
       <VIS.TrapProblem
-        id="care-p7"
+        id="care-b2"
         difficulty="hard"
-        title="P7 — Inference latency: CARE-GNN vs LightGBM on 100k QPS"
-        scenario={<>Payments fraud needs p99 &lt; 30ms per transaction at 100k QPS. CARE-GNN scoring requires (a) fetching 2-hop neighbors per relation from a graph store, (b) running the similarity scorer per neighbor, (c) running RL-filtered aggregation. LightGBM scoring is a single table lookup + tree traversal (~0.5ms p99). What's the right architecture?</>}
+        title="B2 — 'Sounds reasonable' — more relations = better"
+        scenario={<>A teammate suggests "we have 12 relations; let us add all of them to CARE-GNN to maximize signal." Why is this wrong specifically for CARE-GNN?</>}
         options={[
-          {key:"a", text:"Score CARE-GNN offline in a daily/hourly batch into a feature store; serve LightGBM online with the GNN embedding as one of its features.", correct:true},
-          {key:"b", text:"Migrate to a graph database (Neo4j, TigerGraph) and run CARE-GNN online — modern graph DBs hit 5ms p99."},
-          {key:"c", text:"Replace LightGBM entirely with CARE-GNN; latency budget can be raised to 100ms."},
-          {key:"d", text:"Drop CARE-GNN; latency makes it infeasible."},
+          {key:"a", text:"Each relation has its own RL agent and similarity MLP; 12 RL agents create reward-noise correlation, the agents fight each other (one's threshold change shifts another's reward), and convergence breaks. CARE-GNN's mechanism does not scale to many relations.", correct:true},
+          {key:"b", text:"GPUs cannot hold 12 relations."},
+          {key:"c", text:"Adding relations is always better — the teammate is correct."},
+          {key:"d", text:"More relations cause label leakage."},
         ]}
-        trap={<>(b) is over-optimistic — even fast graph DBs degrade past 50k QPS with multi-relation 2-hop fetches. (c) ignores SLA reality. (d) throws away potentially useful signal.</>}
-        lens={<>(a) is the production pattern at most fintechs. Compute GNN embeddings offline (or in micro-batches every 5-15min), persist as a feature, serve the fast tabular model online. You keep most of the GNN signal without the online latency hit.</>}
-        stretch={<>What's the freshness vs latency tradeoff for choosing batch interval?</>}
+        trap={<>(b) is a memory complaint, not a mechanism issue. (c) is the naive belief. (d) is unrelated.</>}
+        lens={<>Each agent's reward is the global val-loss delta, which is shared — so all agents see the same noisy reward signal and credit-assignment between agents is impossible. In practice CARE-GNN uses 3-5 relations; beyond that the RL story breaks. A GBDT with relation-typed neighbor features has no such ceiling.</>}
+        stretch={<>What architectural change would let CARE-GNN scale to 50 relations?</>}
       />
 
+      {/* axis: B3 — CRITICAL concept-specific pitch */}
       <VIS.TrapProblem
-        id="care-p8"
-        difficulty="medium"
-        title="P8 — Camouflage definitions: feature vs relation"
-        scenario={<>The CARE-GNN paper distinguishes two types of fraudster camouflage. Match the type to the example.</>}
-        options={[
-          {key:"a", text:"Feature camouflage = spam review has writing style similar to benign reviews (hard to detect from text features alone). Relation camouflage = spam reviewer connects to many benign products/reviews (hard to detect by aggregating neighbors).", correct:true},
-          {key:"b", text:"Feature camouflage = obfuscated user IDs. Relation camouflage = bot networks."},
-          {key:"c", text:"Feature camouflage and relation camouflage are the same thing in different vocabulary."},
-          {key:"d", text:"Both terms refer to adversarial perturbations of input features."},
-        ]}
-        trap={<>(d) misreads as adversarial robustness. (c) flattens an important distinction. CARE-GNN attacks RELATION camouflage specifically; feature camouflage is a separate problem (text embeddings, fingerprinting).</>}
-        lens={<>(a) is the paper's definition. CARE-GNN's RL filter targets relation camouflage — drop neighbors that don't match the center node in the embedding space. Feature camouflage requires better feature engineering or a different model class.</>}
-        stretch={<>Which type of camouflage does GBDT+structural features catch?</>}
-      />
-
-      <VIS.TrapProblem
-        id="care-p9"
+        id="care-b3"
         difficulty="hard"
+        title="B3 — Pitch CARE-GNN to the Risk team"
+        scenario={<>Your Risk-team lead asks "Why CARE-GNN over our existing GBDT? Give me one sentence I can take to the VP." Pick the pitch that requires the listener to understand CARE-GNN's specific mechanism — not a generic GNN sales pitch.</>}
+        options={[
+          {key:"a", text:"CARE-GNN explicitly identifies and drops camouflaged neighbors per relation (e.g. fraudulent reviews surrounded by real reviews from the same product) before message passing, so the aggregation step sees the actual fraud topology — a defense that lives at neighbor selection, not at the loss, and that the GBDT cannot replicate without per-relation pairwise-similarity features.", correct:true},
+          {key:"b", text:"CARE-GNN lowers false-negative rate and improves regulatory explainability."},
+          {key:"c", text:"GNNs use the graph; our GBDT does not."},
+          {key:"d", text:"CARE-GNN is state of the art."},
+        ]}
+        trap={<>(b) is the generic "lower FN, more explainable" pitch — it fails redaction (could be said about any model). (c) is false: a GBDT with degree and neighbor-purity features uses the graph. (d) is empty.</>}
+        lens={<>The concept-specific pitch names <em>per-relation camouflage filtering</em> and the <em>neighbor-selection-vs-loss</em> distinction. A listener who does not understand that camouflage is a structural attack defeated at neighbor selection cannot evaluate this claim. Replace "CARE-GNN" with "Model X" — (a) still names the mechanism, so the listener needs to know what camouflage filtering is to judge it.</>}
+        stretch={<>Write a 3-sentence VP follow-up that addresses the GADBench tuned-GBDT counter.</>}
+      />
+
+      {/* axis: B4 */}
+      <VIS.TrapProblem
+        id="care-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use CARE-GNN"
+        scenario={<>Which scenarios are CARE-GNN's anti-patterns?</>}
         multiSelect
-        title="P9 — Cold-start: new merchant with no graph neighborhood"
-        scenario={<>A new merchant onboards with 0 transactions and 0 graph neighbors. CARE-GNN scores it 0.5 (no signal). Production needs SOME score. Which approaches are valid fallbacks? Select all that apply.</>}
         options={[
-          {key:"a", text:"Fall back to a rules engine for the first N transactions until graph signal exists.", correct:true},
-          {key:"b", text:"Use a tabular model trained on merchant-only features (industry code, registration age, KYC signals) as fallback.", correct:true},
-          {key:"c", text:"Build a 'similar merchant' k-NN over registration features and borrow the nearest neighbor's CARE-GNN score.", correct:true},
-          {key:"d", text:"Set score to 1.0 (block) for all new merchants until graph signal exists."},
-          {key:"e", text:"Set score to 0.0 (approve) for all new merchants — innocent until proven guilty."},
+          {key:"a", text:"Heterophilic graph (fraudsters predominantly connect to benign neighbors — money mule pattern). CARE-GNN's filter drops the heterophilic signal as if it were camouflage.", correct:true},
+          {key:"b", text:"Very low fraud rate (under 0.5%) where class imbalance dominates the gradient and the RL agent's reward is dominated by majority-class accuracy.", correct:true},
+          {key:"c", text:"Cold-start nodes with no features — the similarity MLP has nothing to learn from.", correct:true},
+          {key:"d", text:"Dense homophilic graphs with moderate fraud rate."},
         ]}
-        trap={<>(d) and (e) are both wrong defaults — they hardcode a precision-recall tradeoff with no calibration. (d) kills onboarding; (e) is open-season for fraudsters who know to use fresh merchants.</>}
-        lens={<>(a), (b), (c) are all valid hybrid approaches. Production fraud stacks always have a fallback model for cold-start because graph-based models are by construction starved of signal at t=0. This is also where GBDT-on-features keeps winning — it doesn't need a graph.</>}
-        stretch={<>How long is the cold-start period typically before graph signal stabilizes?</>}
+        trap={<>(d) is the regime CARE-GNN was designed for — not an anti-pattern.</>}
+        lens={<>CARE-GNN's three failure modes line up: heterophily (filter destroys signal), extreme imbalance (PC-GNN's regime), and feature-poverty (similarity MLP cannot discriminate). Each maps to a sibling technique that does better.</>}
+        stretch={<>Which sibling addresses each anti-pattern? Match them.</>}
       />
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      {/* axis: C1 */}
       <VIS.TrapProblem
-        id="care-p10"
+        id="care-c1"
         difficulty="hard"
-        title="P10 — Reproducibility: paper reports F1=0.78, you get F1=0.71"
-        scenario={<>You faithfully implement CARE-GNN from the paper. On YelpChi, the paper reports F1=0.78 (spam class). Your implementation gets 0.71 across 5 seeds. Hyperparameters match. Which is the single MOST likely cause?</>}
+        title="C1 — Why per-relation filter (not global)?"
+        scenario={<>Why does CARE-GNN learn a separate similarity threshold p per relation, instead of a single global threshold?</>}
         options={[
-          {key:"a", text:"The paper's random splits are different from the canonical GADBench splits; their splits leak time-correlated reviews into both train and test, inflating reported F1.", correct:true},
-          {key:"b", text:"Bug in your similarity scorer — re-check the cosine vs dot-product convention."},
-          {key:"c", text:"GPU non-determinism."},
-          {key:"d", text:"Your PyTorch version is too new."},
+          {key:"a", text:"Different relations carry different homophily levels (R-U-R may be highly homophilic — same user's reviews tend to share class; R-T-R may be near-random — same time bucket is weak). A global threshold either over-filters the weak relation or under-filters the strong one.", correct:true},
+          {key:"b", text:"Per-relation thresholds reduce model parameters."},
+          {key:"c", text:"GPU memory constraint."},
+          {key:"d", text:"Per-relation thresholds make the model invariant to relation permutation."},
         ]}
-        trap={<>(b)-(d) are common but minor. (c) accounts for &lt;0.5 F1 typically. (d) is a generic excuse. The systematic 7-point gap is too big to be a code-level bug or framework drift.</>}
-        lens={<>(a) is the GADBench finding for CARE-GNN specifically. The original paper's splits inflated reported numbers via temporal/structural leakage. GADBench's controlled splits drop CARE-GNN's F1 by ~5-7 points — closer to your replication. ALWAYS check the split methodology before blaming your code.</>}
-        stretch={<>How would you design a leakage-free temporal split for fraud?</>}
+        trap={<>(b) is the opposite of true. (c), (d) miss the mechanism.</>}
+        lens={<>The per-relation design assumes each relation has its own homophily statistics; a global filter cannot respect the heterogeneity. CARE-GNN's gains concentrate on graphs with diverse relations (YelpChi has 3 relations with quite different homophily); on a single-relation graph CARE-GNN reduces to GraphSAGE-plus-threshold.</>}
+        stretch={<>Sketch the homophily measure you would compute per relation to set p without RL.</>}
       />
+
+      {/* axis: C2 */}
+      <VIS.TrapProblem
+        id="care-c2"
+        difficulty="medium"
+        title="C2 — Loss / similarity regularizer interaction"
+        scenario={<>CARE-GNN adds a similarity-loss regularizer that pulls same-class node features together. What does this regularizer specifically do for the rest of the training?</>}
+        options={[
+          {key:"a", text:"It stabilizes the similarity MLP early in training, when classification CE alone is too weak to give the MLP a useful gradient — without the regularizer, sigma is near-random and the neighbor-selection step is noise, which makes the RL reward signal also noise.", correct:true},
+          {key:"b", text:"It reduces overfitting only."},
+          {key:"c", text:"It is a hyperparameter knob with no architectural role."},
+          {key:"d", text:"It replaces the classification loss."},
+        ]}
+        trap={<>(d) is wrong — both losses are used. (b) is true but trivial.</>}
+        lens={<>The similarity regularizer is a bootstrap mechanism: it makes sigma meaningful before the RL agent has data to work with. Without it, training is a cold-start RL problem (no signal → no reward → no threshold update → no signal). With it, the agent finds non-trivial thresholds within a few epochs.</>}
+        stretch={<>What would happen if you raised the regularizer weight too high?</>}
+      />
+
+      {/* axis: C3 */}
+      <VIS.TrapProblem
+        id="care-c3"
+        difficulty="hard"
+        title="C3 — What CARE-GNN drops vs GraphSAGE"
+        scenario={<>What does CARE-GNN explicitly drop relative to vanilla GraphSAGE?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Uniform aggregation over all sampled neighbors — replaced by top-p selection by similarity.", correct:true},
+          {key:"b", text:"Single global aggregation function across relations — replaced by per-relation aggregation.", correct:true},
+          {key:"c", text:"Node-ID / feature embeddings."},
+          {key:"d", text:"Inductive sampling at unseen nodes — both GraphSAGE and CARE-GNN remain inductive."},
+        ]}
+        trap={<>(c) is wrong: CARE-GNN keeps node embeddings. (d) is a fact about both, not a drop.</>}
+        lens={<>Two drops: uniform aggregation (now top-p) and single global aggregator (now per-relation). Two retentions: inductive structure, node-feature embeddings. The retentions are what let CARE-GNN behave like a drop-in replacement for GraphSAGE at serving time.</>}
+        stretch={<>Of the two drops, which contributes more to the headline F1 gain on YelpChi? Defend.</>}
+      />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="care-c4"
+        difficulty="hard"
+        title="C4 — Which knob, mis-set, breaks CARE-GNN?"
+        scenario={<>Rank these hyperparameters by "production breakage severity if mis-set": (i) RL threshold p initialization, (ii) similarity-loss regularizer weight, (iii) number of GNN layers, (iv) batch size.</>}
+        options={[
+          {key:"a", text:"RL threshold p init > similarity-loss weight > number of layers > batch size. A bad p init makes the RL agent oscillate (most reproducible failure); the regularizer controls bootstrap; layers cause over-smoothing if greater than 2; batch size is least sensitive.", correct:true},
+          {key:"b", text:"Batch size > p init > layers > regularizer."},
+          {key:"c", text:"All are equally critical."},
+          {key:"d", text:"Number of layers is the only critical one."},
+        ]}
+        trap={<>(b) puts batch size first. (c), (d) miss the RL agent's instability.</>}
+        lens={<>The RL agent is the most fragile component. A common production failure is "we re-trained and CARE-GNN regressed 5 F1" — the new run's RL agent settled at a different p because random init pushed it into a different reward basin. Fix: freeze p after warm-up.</>}
+        stretch={<>What is your initialization heuristic for p per relation?</>}
+      />
+
+      {/* axis: C5 */}
+      <VIS.TrapProblem
+        id="care-c5"
+        difficulty="medium"
+        title="C5 — Data-assumption violation: cold-start nodes"
+        scenario={<>You deploy CARE-GNN on a marketplace where 30% of users are brand-new (no review history, only a username and timestamp). What happens to CARE-GNN's behavior on these cold-start nodes?</>}
+        options={[
+          {key:"a", text:"The similarity MLP cannot discriminate cold-start nodes (no informative features), so sigma is near-random; the per-relation filter degenerates to random subsampling; CARE-GNN reduces to GraphSAGE with random neighbor dropout — losing its camouflage-defense premise on exactly the nodes where camouflage is most likely.", correct:true},
+          {key:"b", text:"CARE-GNN handles cold-start transparently because it is a GNN."},
+          {key:"c", text:"Cold-start nodes are aggregated using their neighbors' features only — no impact on CARE-GNN."},
+          {key:"d", text:"CARE-GNN raises an error on cold-start nodes."},
+        ]}
+        trap={<>(b) is the GNN-is-magic intuition. (c) misses that the center node's similarity score is also random.</>}
+        lens={<>CARE-GNN's mechanism depends on a meaningful sigma — which depends on features. Cold-start breaks the assumption. Mitigation: a default sigma threshold (skip RL filter) for new nodes, or hybrid with a content/embedding-based feature inducer.</>}
+        stretch={<>What pre-filter would you add to detect cold-start nodes before they hit CARE-GNN?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      {/* axis: D1 */}
+      <VIS.TrapProblem
+        id="care-d1"
+        difficulty="medium"
+        title="D1 — 'Deeper CARE-GNN catches deeper camouflage'"
+        scenario={<>Intuition: if 2-layer CARE-GNN handles 1-hop camouflage, then 5-layer CARE-GNN should handle 5-hop camouflage. Where does this intuition break?</>}
+        options={[
+          {key:"a", text:"At depth greater than 2, MPNN over-smoothing dominates: representations converge across the graph and the similarity MLP can no longer discriminate same-class from different-class neighbors. Deeper CARE-GNN is strictly worse than 2-layer — depth amplifies rather than solves the camouflage problem.", correct:true},
+          {key:"b", text:"Deeper is always better — the intuition is correct."},
+          {key:"c", text:"Deeper costs more GPU but is otherwise identical."},
+          {key:"d", text:"Deeper breaks the loss function."},
+        ]}
+        trap={<>(b) is the naive read. (c) misses the over-smoothing mechanism.</>}
+        lens={<>Over-smoothing is intrinsic to MPNN depth — every additional layer mixes more of the graph's nodes into each representation. CARE-GNN's filter cannot defeat over-smoothing; it only defeats camouflage at the depth it operates. Catching deeper laundering rings is FraudGT's territory (single-shot attention over k-hop subgraph), not CARE-GNN's.</>}
+        stretch={<>How would you detect over-smoothing in your CARE-GNN run? Name a measurable diagnostic.</>}
+      />
+
+      {/* axis: D1b */}
+      <VIS.TrapProblem
+        id="care-d1b"
+        difficulty="hard"
+        title="D1b — 'RL agent gives me distribution-shift robustness'"
+        scenario={<>A junior says "the RL agent makes CARE-GNN robust to distribution shift — it will re-tune p automatically." Why is this wrong?</>}
+        options={[
+          {key:"a", text:"The RL agent's reward is the validation-loss delta on a fixed val set drawn from the training distribution. Under distribution shift the agent receives no signal about the new distribution and re-tunes p to optimize a stale objective.", correct:true},
+          {key:"b", text:"The RL agent does help with distribution shift."},
+          {key:"c", text:"The agent freezes at deploy time anyway."},
+          {key:"d", text:"RL agents are always brittle."},
+        ]}
+        trap={<>(c) is true in some setups but does not address the junior's claim. (d) is too broad.</>}
+        lens={<>RL "robustness" requires reward feedback from the shifted distribution. CARE-GNN's RL loop is in-distribution. For real distribution-shift robustness you need an online evaluation channel (delayed chargeback labels) feeding a continually-updated val set — which CARE-GNN does not provide.</>}
+        stretch={<>How would you wire delayed chargeback signal into the RL reward?</>}
+      />
+
+      {/* axis: D2 */}
+      <VIS.TrapProblem
+        id="care-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade"
+        scenario={<>You assume "CARE-GNN handles imbalance because it filters camouflage, and camouflage and imbalance are related." Trace the cascade — what concretely breaks?</>}
+        options={[
+          {key:"a", text:"Assumption 1: 'camouflage covers imbalance' → no class reweighting → at 0.5% fraud rate the gradient is dominated by benign loss → similarity MLP learns benign-vs-benign discrimination and sigma is high for benigns but useless for fraud → RL agent finds p that keeps benign-similar neighbors → fraud signal vanishes from the aggregation → AUPRC collapses.", correct:true},
+          {key:"b", text:"Nothing breaks — the assumption is fine."},
+          {key:"c", text:"Memory usage doubles."},
+          {key:"d", text:"Latency increases."},
+        ]}
+        trap={<>(b), (c), (d) miss the cascade.</>}
+        lens={<>Camouflage and imbalance are orthogonal problems. CARE-GNN's filter, applied without class reweighting at low fraud rate, optimizes the wrong objective end-to-end. Fix: combine PC-GNN-style sampler (or class-weighted loss) with CARE-GNN's filter, after freezing the RL agent.</>}
+        stretch={<>Diagnose the cascade in metrics: what does the AUPRC curve look like, and at what point?</>}
+      />
+
+      {/* axis: D3 */}
+      <VIS.TrapProblem
+        id="care-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior diagnostic"
+        scenario={<>A junior runs CARE-GNN, gets 0.78 AUROC on YelpChi random split, declares victory. What is the senior question that overturns the win?</>}
+        options={[
+          {key:"a", text:"'Show me the temporal-split AUPRC and the tuned-LightGBM baseline with degree + neighbor-purity features under the same temporal split. The published gains on YelpChi were inflated by the random-split protocol.'", correct:true},
+          {key:"b", text:"'How many GPUs did you use?'"},
+          {key:"c", text:"'Try more layers.'"},
+          {key:"d", text:"'AUROC is fine, ship it.'"},
+        ]}
+        trap={<>(b), (c), (d) miss the GADBench protocol issue.</>}
+        lens={<>The senior question forces the junior to confront (i) AUROC vs AUPRC at low prevalence, (ii) random-split label leakage on temporal graphs, (iii) the GBDT baseline that GADBench established. This is the most reliable filter at the senior bar for fraud GNN claims.</>}
+        stretch={<>Sketch the LightGBM feature list you would build for the baseline.</>}
+      />
+
+      {/* axis: D4 */}
+      <VIS.TrapProblem
+        id="care-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: score drop after deploy"
+        scenario={<>CARE-GNN production AUPRC drops from 0.62 to 0.51 over two weeks. Three plausible causes: (i) camouflage distribution shift, (ii) class imbalance shift, (iii) RL agent oscillation across retrainings. Which is most likely?</>}
+        options={[
+          {key:"a", text:"(iii) RL agent oscillation. If the agent was not frozen, each retraining can converge to a different p; (i) and (ii) would cause smaller, distribution-driven drifts. The discontinuous drop magnitude (11 AUPRC points over 2 weeks across 1 retraining) is the fingerprint of a different operating point, not a slow distribution drift.", correct:true},
+          {key:"b", text:"(i) Camouflage distribution shift."},
+          {key:"c", text:"(ii) Class imbalance shift."},
+          {key:"d", text:"Random noise."},
+        ]}
+        trap={<>(b), (c) are plausible but distribution-driven drops are gradual. (d) ignores the magnitude.</>}
+        lens={<>The signature of RL-agent oscillation is "trained-model variance" not "test-distribution variance." Diagnose by re-running training with frozen p and checking whether the regression replicates.</>}
+        stretch={<>Design a continuous monitor that detects RL-agent oscillation between retrainings.</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>E. Operations</h3>
+
+      {/* axis: E1 */}
+      <VIS.TrapProblem
+        id="care-e1"
+        difficulty="hard"
+        title="E1 — Production gotcha specific to CARE-GNN"
+        scenario={<>Pick the production gotcha most specific to CARE-GNN (i.e. would not bite other fraud GNNs):</>}
+        options={[
+          {key:"a", text:"The RL agent's stochastic threshold means two consecutive retrainings with identical data and seeds can produce different deployed thresholds; shadow-mode comparisons against a prior model are non-deterministic unless the RL agent is frozen post warm-up.", correct:true},
+          {key:"b", text:"Inference latency increases with graph size."},
+          {key:"c", text:"Embedding tables consume memory."},
+          {key:"d", text:"Training is GPU-bound."},
+        ]}
+        trap={<>(b), (c), (d) are generic GNN concerns — not CARE-GNN-specific.</>}
+        lens={<>The CARE-GNN-specific issue is RL-induced non-determinism at the threshold layer. Every other GNN has deterministic post-training. Mitigation: freeze p after warm-up, log it, version it as a config artifact.</>}
+        stretch={<>What changes in your model-versioning system to handle per-relation p as a versioned config?</>}
+      />
+
+      {/* axis: E2 */}
+      <VIS.TrapProblem
+        id="care-e2"
+        difficulty="hard"
+        title="E2 — Friday: val-loss spikes"
+        scenario={<>It is Friday. Overnight retraining: CARE-GNN val-loss jumps from 0.18 to 0.31. Logs show p for relation R-U-R bounced between 0.4 and 0.7 across the last 4 epochs. Three teams converge with different diagnoses: (i) fraud rate dropped, (ii) feature pipeline regression, (iii) RL agent oscillation. What is the right first move?</>}
+        options={[
+          {key:"a", text:"Pin p at its pre-spike value, retrain with the RL agent frozen, and check whether val-loss recovers. If it does, the cause is RL oscillation; if not, the cause is upstream. This isolates the failure mode in one experiment.", correct:true},
+          {key:"b", text:"Roll back the model."},
+          {key:"c", text:"Page the data team."},
+          {key:"d", text:"Add more layers."},
+        ]}
+        trap={<>(b) skips diagnosis. (c) escalates without evidence. (d) is unrelated.</>}
+        lens={<>The "p bouncing across epochs" log signature is unique to CARE-GNN. Pinning p is the cheapest diagnostic and immediately partitions the hypothesis space.</>}
+        stretch={<>What metric (besides p) would you add to your training dashboard to detect this early?</>}
+      />
+
+      {/* axis: E3 */}
+      <VIS.TrapProblem
+        id="care-e3"
+        difficulty="hard"
+        title="E3 — Eval-protocol audit (GADBench lesson)"
+        scenario={<>Your team's CARE-GNN report card shows 0.81 F1 on YelpChi, citing the original paper. Which audit findings invalidate the report card?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Original eval used a random train/test split on a temporally-ordered graph — neighbors in the train graph included nodes that appear in the test set, leaking future structural information.", correct:true},
+          {key:"b", text:"Original eval reported F1 at the threshold that maximized F1 on the test set itself (post-hoc threshold) rather than on a held-out validation set.", correct:true},
+          {key:"c", text:"The LightGBM baseline used by the paper was untuned (default hyperparameters), while CARE-GNN was tuned.", correct:true},
+          {key:"d", text:"YelpChi is a public benchmark, so all evaluations are trustworthy."},
+        ]}
+        trap={<>(d) is wrong by construction.</>}
+        lens={<>GADBench's three structural fixes: temporal split, prevent post-hoc threshold tuning, equal hyperparameter budget for baselines. Each of (a)(b)(c) corresponds to one fix. Production-aligned eval requires all three.</>}
+        stretch={<>Write the eval-protocol checklist your team will apply before accepting any new fraud-detection model.</>}
+      />
+
+      {/* axis: E4 */}
+      <VIS.TrapProblem
+        id="care-e4"
+        difficulty="medium"
+        title="E4 — Migration sequence: GBDT to CARE-GNN"
+        scenario={<>Order the rollout phases to migrate from a tuned LightGBM to CARE-GNN with minimum risk: (i) full ramp, (ii) shadow scoring at 0% traffic, (iii) hybrid ensemble (average of both), (iv) traffic ramp 1, 5, 25, 100%.</>}
+        options={[
+          {key:"a", text:"ii → iii → iv → i. Shadow first to compare offline; then hybrid to absorb cases where CARE-GNN disagrees with GBDT (the hybrid is a safety net); then ramp; full only after the ramp completes without metric regressions.", correct:true},
+          {key:"b", text:"i → ii → iii → iv."},
+          {key:"c", text:"iv → ii → iii → i."},
+          {key:"d", text:"Direct cutover."},
+        ]}
+        trap={<>(b), (c), (d) miss the safety value of starting with shadow + hybrid.</>}
+        lens={<>The hybrid step is CARE-GNN-specific: CARE-GNN's per-relation filter can be over-aggressive (drops too many neighbors), causing high-variance scores on dense-graph nodes. The hybrid with the GBDT bounds this variance during ramp.</>}
+        stretch={<>What is the offline diagnostic that tells you the hybrid is no longer needed?</>}
+      />
+
+      {/* axis: E5 */}
+      <VIS.TrapProblem
+        id="care-e5"
+        difficulty="medium"
+        title="E5 — Reproducibility: original CARE-GNN repo"
+        scenario={<>You clone the original CARE-GNN repo to reproduce the YelpChi result. What two reproducibility issues are widely known about the public code?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"The default eval script uses the same set as both validation and test (issue tracker #14).", correct:true},
+          {key:"b", text:"The RNG seed is not fully controlled across the RL agent's actions — runs with identical seeds can diverge.", correct:true},
+          {key:"c", text:"The repo includes the test-set labels in the training loader."},
+          {key:"d", text:"The repo does not run on GPUs."},
+        ]}
+        trap={<>(c) is a stronger claim than the public record supports; (d) is false.</>}
+        lens={<>Both reproducibility gaps inflate the headline number. GADBench provides a sanitized re-implementation; cite that, not the original repo's number.</>}
+        stretch={<>If the GADBench number disagrees with the paper's number by 8 F1, what do you tell your VP?</>}
+      />
+
+      {/* axis: E6 */}
+      <VIS.TrapProblem
+        id="care-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination on YelpChi"
+        scenario={<>Which YelpChi-specific properties most contaminate CARE-GNN's reported gains over a tuned GBDT under random-split eval?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"The graph is temporally ordered; random splits create train/test edges that span the same time window, letting train neighbors include test-period nodes.", correct:true},
+          {key:"b", text:"Reviewer identities repeat — the same user contributes multiple reviews across the train and test split, causing user-level label leakage.", correct:true},
+          {key:"c", text:"The R-T-R (same time bucket) relation directly encodes the time the split was supposed to respect.", correct:true},
+          {key:"d", text:"YelpChi is too small to evaluate any model on."},
+        ]}
+        trap={<>(d) overstates — the graph is small but evaluable; the issue is protocol.</>}
+        lens={<>All three contamination paths (a)(b)(c) are graph-structural and unique to YelpChi-style temporal review graphs. Temporal splits address (a) and (c); user-level holdouts address (b).</>}
+        stretch={<>Sketch the train/test split policy you would use in production.</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>F. Failure modes &amp; edge cases</h3>
+
+      {/* axis: F1 */}
+      <VIS.TrapProblem
+        id="care-f1"
+        difficulty="hard"
+        title="F1 — Smallest input that breaks CARE-GNN"
+        scenario={<>Construct the smallest graph where CARE-GNN provably reduces to GraphSAGE (no advantage).</>}
+        options={[
+          {key:"a", text:"A graph with a single relation and uniform pairwise similarity: sigma is constant across neighbors, so the RL agent receives a flat reward signal, p does not move, and the top-p selection becomes equivalent to random subsampling. CARE-GNN equals GraphSAGE-with-dropout.", correct:true},
+          {key:"b", text:"Any 1-node graph."},
+          {key:"c", text:"Any graph with fewer than 100 nodes."},
+          {key:"d", text:"A bipartite graph."},
+        ]}
+        trap={<>(b) is degenerate. (c), (d) miss the mechanism.</>}
+        lens={<>The mechanism breaks at "uniform sigma" or "single relation" — that is when both of CARE-GNN's contributions become inert.</>}
+        stretch={<>Construct an adversarial dataset where CARE-GNN is provably worse than GraphSAGE.</>}
+      />
+
+      {/* axis: F2 */}
+      <VIS.TrapProblem
+        id="care-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: fraud ring with intra-similarity"
+        scenario={<>Design an attack that exploits CARE-GNN's similarity-based filter to evade detection.</>}
+        options={[
+          {key:"a", text:"Form a dense fraud ring where all fraud nodes share similar features (similar review-text length, rating, posting time). Sigma is high among ring members; CARE-GNN's filter KEEPS them as 'high-similarity neighbors' assuming same-class — and since they are, the aggregation produces a high-fraud representation. Because the filter is class-agnostic, it can keep tight fraud clusters as if they were homophilic benign neighborhoods.", correct:true},
+          {key:"b", text:"Add random noise to fraud node features."},
+          {key:"c", text:"Increase fraud count to 50%."},
+          {key:"d", text:"There is no attack."},
+        ]}
+        trap={<>(b) is feature-perturbation (defended by adversarial training). (c) flips the regime to majority-fraud. (d) is wrong by construction.</>}
+        lens={<>CARE-GNN's similarity signal is class-symmetric: high sigma between two nodes means "same class" without saying which class. Tight fraud rings exploit this directly. The defense would require an asymmetric similarity that penalizes mutual-fraud similarity — which the paper does not provide.</>}
+        stretch={<>How would you change the similarity loss to make it class-asymmetric?</>}
+      />
+
+      {/* axis: F4 */}
+      <VIS.TrapProblem
+        id="care-f4"
+        difficulty="medium"
+        title="F4 — What the paper itself admits"
+        scenario={<>Which failure mode does the original CARE-GNN paper explicitly call out as a regime where CARE-GNN does not help?</>}
+        options={[
+          {key:"a", text:"When the fraud rate is high enough that fraudsters dominate the neighborhood — they have no incentive to camouflage, so there is nothing for the filter to remove.", correct:true},
+          {key:"b", text:"CARE-GNN works perfectly in all regimes."},
+          {key:"c", text:"GPU memory bottlenecks."},
+          {key:"d", text:"FP16 precision."},
+        ]}
+        trap={<>(b), (c), (d) are not paper-cited limitations.</>}
+        lens={<>The paper is explicit about this regime boundary. Knowing it signals that the candidate read the paper rather than the blog.</>}
+        stretch={<>What did the paper NOT predict that GADBench exposed?</>}
+      />
+
+      {/* axis: F5 */}
+      <VIS.TrapProblem
+        id="care-f5"
+        difficulty="hard"
+        title="F5 — The GADBench critique"
+        scenario={<>GADBench (NeurIPS 2024) re-evaluated CARE-GNN under temporal split + AUPRC + a tuned-LightGBM baseline with structural features. What did it find?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"On most public benchmarks (YelpChi, Amazon), the CARE-GNN vs tuned-LightGBM gap collapses to less than 2 AUPRC points under temporal split.", correct:true},
+          {key:"b", text:"On dense heterogeneous graphs (Amazon with rich features), CARE-GNN retains a small edge — its per-relation mechanism is hardest for structural features to replicate.", correct:true},
+          {key:"c", text:"AUROC reported under random splits inflated CARE-GNN's apparent gain by 3-6 points on YelpChi.", correct:true},
+          {key:"d", text:"CARE-GNN dominates the tuned GBDT by more than 10 points on every benchmark."},
+        ]}
+        trap={<>(d) is the popular pre-GADBench belief that the benchmark overturned.</>}
+        lens={<>The GADBench finding is regime-specific: GNNs retain a real edge on rich heterogeneous multi-relation graphs but lose published headline gains elsewhere. Senior MLEs internalize this nuance.</>}
+        stretch={<>For a brand-new fraud surface with no GBDT baseline, what is your honest first 90 days?</>}
+      />
+
+      {/* axis: F5b — interview gold */}
+      <VIS.TrapProblem
+        id="care-f5b"
+        difficulty="hard"
+        title="F5b — The interview gold question"
+        scenario={<>Interviewer: "You championed CARE-GNN at your last company. Walk me through the experiment you ran to confirm CARE-GNN actually beats a tuned GBDT with structural features under fair evaluation." Pick the answer that demonstrates senior judgment.</>}
+        options={[
+          {key:"a", text:"Built a LightGBM baseline with degree, in/out-degree per relation, k-hop fraud-neighbor counts, triangle counts, and node-feature summary statistics; tuned both models with equal hyperparameter budget; reported AUPRC on temporal split; CARE-GNN won by 1.4 AUPRC on the heterogeneous graph, lost by 0.2 AUPRC on the homogeneous transaction graph. Shipped CARE-GNN only on the former.", correct:true},
+          {key:"b", text:"Ran the original paper's eval; CARE-GNN beat the baseline by 4 F1; shipped."},
+          {key:"c", text:"CARE-GNN is SOTA, so we shipped without a baseline."},
+          {key:"d", text:"We compared CARE-GNN to GraphSAGE only."},
+        ]}
+        trap={<>(b), (c), (d) all skip the GADBench-style fair comparison and are wrong at the senior bar.</>}
+        lens={<>The right answer surfaces the GADBench protocol AND a regime-specific deployment decision. This is the question that separates "read the paper" from "knows when to ignore the paper."</>}
+        stretch={<>What is the one feature you would add to the LightGBM baseline that most reduces the CARE-GNN gap?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/2008.08692" target="_blank" rel="noopener">
-            <strong>Dou et al. — Enhancing GNN-based Fraud Detectors against Camouflaged Fraudsters</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2008.08692" target="_blank" rel="noopener"><strong>Dou et al. — CARE-GNN</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, CIKM 2020)</span>
-          <br/>The original CARE-GNN paper. Read Sec 3 (model) and Sec 4.4 (ablations) — skip the related-work section, it's dated.
+          <br/>The original. Section 3 (label-aware similarity), Section 4 (RL module), Section 5 (per-relation aggregation).
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2306.12251" target="_blank" rel="noopener">
-            <strong>Tang et al. — GADBench: Revisiting Supervised Graph Anomaly Detection</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2306.12251" target="_blank" rel="noopener"><strong>Tang et al. — GADBench</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2024)</span>
-          <br/>The "are you actually beating GBDT?" paper. Table 3 has the head-to-head. <strong>Mandatory reading before adopting any fraud-GNN in production.</strong>
+          <br/>The fair-eval re-audit. Read for the temporal-split + AUPRC + tuned-GBDT-baseline protocol; cite this instead of the CARE-GNN paper's numbers.
         </li>
         <li>
-          <a href="https://github.com/YingtongDou/CARE-GNN" target="_blank" rel="noopener">
-            <strong>Official CARE-GNN PyTorch repo</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(code)</span>
-          <br/>Reference implementation. <code>model.py</code> has the per-relation RL filter — that's where the magic (and the instability) lives.
+          <a href="https://arxiv.org/abs/2105.06624" target="_blank" rel="noopener"><strong>Liu et al. — PC-GNN</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, WWW 2021)</span>
+          <br/>The orthogonal-axis sibling (imbalance, not camouflage).
         </li>
         <li>
-          <a href="https://towardsdatascience.com/graph-neural-networks-for-fraud-detection-fa3a18b29b54" target="_blank" rel="noopener">
-            <strong>TDS — GNNs for Fraud Detection: a practitioner's lens</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Walks through the camouflage problem with a worked example. Better intuition than the paper for first-pass reading.
-        </li>
-        <li>
-          <a href="https://github.com/safe-graph/DGFraud" target="_blank" rel="noopener">
-            <strong>safe-graph / DGFraud benchmark</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(repo)</span>
-          <br/>Aggregator repo with CARE-GNN, PC-GNN, GAGA, and friends implemented under a common API. Use this to replicate before trusting any single paper's numbers.
+          <a href="https://arxiv.org/abs/2302.10407" target="_blank" rel="noopener"><strong>Wang et al. — GAGA</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, WWW 2023)</span>
+          <br/>The heterophily-aware sibling — relevant where CARE-GNN's similarity filter is the wrong defense.
         </li>
       </ul>
     </VIS.Section>
   </main>
 );
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
   <script>

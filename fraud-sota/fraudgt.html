@@ -1414,334 +1414,649 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// FraudGT — sparse graph transformer for large fraud graphs.
+// FraudGT — sparse graph transformer for large fraud graphs (Lin et al., ICAIF 2024)
+// v2 redo — trap problems span A-F axes; every problem hinges on FraudGT's
+// specific mechanism (single-shot k-hop sparse attention with relation-typed
+// positional encoding) and threads GADBench tuned-GBDT counter-evidence.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · GNN-based fraud detection"
-      title="FraudGT"
-      subtitle="Graph transformer with relation-aware sparse attention — scales to 10M+ edge fraud graphs without message-passing over-smoothing."
+      pill="Fraud SOTA · graph transformer for large fraud graphs"
+      title="FraudGT — Sparse Graph Transformer"
+      subtitle="Replaces stacked message-passing with single-shot sparse attention over a k-hop subgraph plus relation-typed positional encoding. Avoids MPNN over-smoothing at the depth needed for multi-hop laundering."
       byline={[
         {label: "Paper", value: "Lin et al., ICAIF 2024"},
         {label: "Year", value: "2024"},
-        {label: "L3", value: "GNN fraud detector"},
+        {label: "Domain", value: "GNN fraud detection (scale)"},
       ]}/>
 
     <VIS.TLDR>
-      Deep message-passing GNNs (MPNNs) suffer{" "}
-      <VIS.Term def="A failure mode where stacking many GNN layers causes all node embeddings to converge to similar vectors, losing per-node discriminability. Empirically severe past 3-4 layers.">over-smoothing</VIS.Term>{" "}
-      past ~3 layers, but fraud rings often need longer-range reasoning. Pure graph transformers (Graphormer) handle long-range but are O(N²). FraudGT keeps the transformer's long-range attention but restricts it to a sparse, relation-aware neighborhood per token — O(E) memory at fraud-scale. The GADBench cautionary tale applies: a tuned GBDT with relation-specific structural features can still be close on most public benchmarks; FraudGT's edge shows up most on graphs where deep multi-hop signals matter.
+      MPNN-style fraud detectors (GraphSAGE, GAT, CARE-GNN, PC-GNN) <VIS.Term def="A pathology of stacked message-passing where deeper layers cause node representations to converge across the graph — by depth 4 or 5, all nodes look similar and the fraud signal is lost.">over-smooth</VIS.Term> at the depth (4-6) needed for multi-hop laundering rings. Classic graph transformers (Graphormer) use O(N^2) full attention and don't scale. FraudGT uses a <VIS.Term def="Attention restricted to (i, j) pairs that lie within a k-hop subgraph around the center — keeps the cost manageable at scale.">sparse attention</VIS.Term> over the k-hop subgraph with <VIS.Term def="Token positional features that encode both the hop-distance and the relation type connecting the center to the token's source node.">relation-typed positional encoding</VIS.Term>. Single pass replaces stacked MP, no over-smoothing. Under GADBench fair eval, a tuned LightGBM with k-hop motif features matches FraudGT on small graphs but cannot keep up on very-large heterogeneous ones. Source: <a href="https://arxiv.org/abs/2402.16494" target="_blank" rel="noopener">arXiv:2402.16494</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        FraudGT is a graph transformer with three production-friendly choices:
+        For each center node v, FraudGT materializes its k-hop subgraph; tokenizes each subgraph node with (node embedding + relation-typed positional encoding + hop-distance encoding); applies ONE sparse multi-head attention layer restricted to within-subgraph pairs; reads out the center's final representation.
       </p>
-      <ol>
-        <li><strong>Relation-aware positional encoding:</strong> each edge type (user-buys-product, user-rates-merchant, ...) gets a learned positional vector; attention conditions on relation as well as token similarity.</li>
-        <li><strong>Sparse attention:</strong> a token only attends to its k-hop subgraph (k typically 2-3), not all N nodes. Memory scales with E (edges), not N².</li>
-        <li><strong>No message passing:</strong> single transformer block per node-update, removing the multi-layer aggregation that causes over-smoothing.</li>
-      </ol>
-
       <VIS.Mermaid chart={`
 flowchart TB
-  X["Node features + relation tokens"]
-  X --> SP["Sparse k-hop neighborhood"]
-  SP --> RPE["Relation-aware positional encoding"]
-  RPE --> ATTN["Multi-head self-attention"]
-  ATTN --> FFN["Feed-forward"]
-  FFN --> OUT["Node embedding"]
-  style ATTN fill:#dbeafe,stroke:#2563eb,stroke-width:2px
-  style SP fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  V["Center v"]
+  V --> S["Materialize k-hop subgraph (Sv)"]
+  S --> T["Tokenize each u in Sv:\\n  feature + relation PE + hop-distance PE"]
+  T --> A["Single sparse multi-head attention\\n(restricted to within-Sv pairs)"]
+  A --> R["Readout center token"]
+  R --> O["v's representation"]
+  style A fill:#dbeafe,stroke:#1e40af,stroke-width:2px
       `} />
+    </VIS.Section>
+
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from MPNN, Graphormer, GAGA">
       <p>
-        The yellow box is the cost saver (sparse neighborhood). The blue box is the long-range reasoning (full attention within the sparse window).
+        <strong>MPNN (GraphSAGE, GAT, CARE-GNN, PC-GNN).</strong> Stacks L layers of message passing. Beyond L=3, over-smoothing dominates: representations converge across the graph and the fraud signal is lost. To catch 5-hop laundering rings, MPNN needs depth 5 — which over-smooths.
+      </p>
+      <p>
+        <strong>Graphormer / classic graph transformer.</strong> Full O(N^2) attention with shortest-path positional encoding. Infeasible at 10M+ edge fraud graphs.
+      </p>
+      <p>
+        <strong>GAGA (sibling).</strong> Aggregates labeled-neighbor groups into a small fixed-size token sequence; attention is over (hop, class) groups. FraudGT keeps per-node tokens within a k-hop subgraph and avoids label dependency. Different tradeoffs: GAGA needs labels at inference; FraudGT needs subgraph materialization.
+      </p>
+      <p>
+        <strong>GADBench-tuned GBDT.</strong> LightGBM with k-hop motif features (triangle counts, 4-cycles, fraud-density-at-hop-k per relation) is a strong baseline. On small/mid graphs it matches FraudGT. On very-large heterogeneous graphs the motif feature space explodes combinatorially, and FraudGT's attention encodes the same patterns more parsimoniously. The senior question: which regime is your graph in?
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead>
-          <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>MP-GNN (SAGE/GAT)</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Graphormer</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>FraudGT</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Attention scope</td>
-            <td style={{padding:"8px 10px"}}>1-hop per layer</td>
-            <td style={{padding:"8px 10px"}}>All nodes</td>
-            <td style={{padding:"8px 10px"}}>k-hop sparse</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Memory</td>
-            <td style={{padding:"8px 10px"}}>O(E)</td>
-            <td style={{padding:"8px 10px"}}>O(N²)</td>
-            <td style={{padding:"8px 10px"}}>O(E)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Over-smoothing risk</td>
-            <td style={{padding:"8px 10px"}}>High (past 3-4 layers)</td>
-            <td style={{padding:"8px 10px"}}>Low</td>
-            <td style={{padding:"8px 10px"}}>Low</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Long-range reasoning</td>
-            <td style={{padding:"8px 10px"}}>Limited by depth</td>
-            <td style={{padding:"8px 10px"}}>Native</td>
-            <td style={{padding:"8px 10px"}}>Native within k-hop window</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Scales to 10M edges?</td>
-            <td style={{padding:"8px 10px"}}>Yes</td>
-            <td style={{padding:"8px 10px"}}>No (OOM)</td>
-            <td style={{padding:"8px 10px"}}>Yes</td>
-          </tr>
-        </tbody>
-      </table>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it">
+      <p>
+        Pick FraudGT when (a) large heterogeneous graph (more than 1M edges), (b) multi-hop reasoning needed (laundering rings 4+ hops deep), (c) MPNN over-smoothing already observed (depth-3 ≈ depth-1 in val metric), (d) latency budget allows materializing k-hop subgraphs at serving, (e) you've verified the motif-feature LightGBM does NOT close the gap.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  D["Fraud surface"]
+  D --> Q1{"Need depth >= 4 hops?"}
+  Q1 -->|No| MP["MPNN sibling (CARE/PC-GNN)"]
+  Q1 -->|Yes| Q2{"MPNN over-smooths at depth 3?"}
+  Q2 -->|No| MPNN2["Tune MPNN deeper"]
+  Q2 -->|Yes| Q3{"Beats GBDT + k-hop motifs?"}
+  Q3 -->|No| GBDT["Ship GBDT"]
+  Q3 -->|Yes| FGT["FraudGT"]
+  style FGT fill:#dcfce7,stroke:#16a34a
+  style GBDT fill:#fef3c7,stroke:#d97706
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Large heterogeneous transaction graphs</strong> (10M+ edges, 5+ relation types) where MP-GNN depth is capped by over-smoothing.</li>
-        <li><strong>Long-range fraud patterns</strong> — laundering chains, multi-hop collusion, accounts that look benign at 1-hop but suspicious at 3-hop.</li>
-        <li><strong>You have GPU budget</strong> for transformer training — FraudGT is heavier than GraphSAGE per epoch.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations & gotchas">
-      <VIS.Callout kind="gotcha" title="GADBench still applies (with caveats)">
-        FraudGT was published AFTER GADBench, so it's NOT in the original benchmark. But the same methodology applies: <strong>before adopting FraudGT, run a tuned GBDT with relation-aware structural features</strong> (per-relation degree, k-hop fraud-rate, motif counts). Often the gap is 1-3 F1; FraudGT's edge widens on graphs with strong long-range structure.
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Subgraph materialization cost at serving">
+        FraudGT requires k-hop neighborhood fetch at inference per scoring request. For dense fraud rings, k-hop subgraphs explode. Production must cap subgraph size and randomly sample if exceeded — but sampling within the subgraph reintroduces some of MPNN's signal-dilution problem.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Memory still heavier than GraphSAGE">
-        Sparse attention is O(E), but the constant is much bigger than message passing. Expect 3-5× the GPU memory of a GraphSAGE of similar depth.
-      </VIS.Callout>
-      <VIS.Callout kind="warn" title="Relation tokens need careful design">
-        If relation types are too granular (e.g., 100 distinct edge types), the positional encoding table dominates parameters; if too coarse, you lose the relation-awareness benefit. Tune as a hyperparameter.
+      <VIS.Callout kind="gotcha" title="The GADBench reckoning (specific to FraudGT)">
+        On small/mid graphs (YelpChi, T-Social), a LightGBM with k-hop motif features (triangle counts, 4-cycle counts, fraud-density at hop k per relation) closes most of FraudGT's gap. FraudGT's edge is concentrated on very-large heterogeneous graphs where motif feature enumeration explodes combinatorially — the regime the paper actually targets but the public benchmarks understate.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on over-smoothing, sparse attention, and the GBDT-baseline reality.
+        Problems span the 6 taxonomy axes. Strip "FraudGT" — each correct answer must still hinge on the single-shot-k-hop-sparse-attention-with-relation-PE mechanism.
       </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="fgt-p1"
+        id="fgt-a1"
         difficulty="hard"
-        title="P1 — Why do MPNNs over-smooth on fraud graphs?"
-        scenario={<>You stack a GraphSAGE to 6 layers hoping to catch 6-hop fraud patterns. Validation F1 PEAKS at 2 layers and DROPS thereafter — at 6 layers, all node embeddings cluster within a tiny region of the embedding space. What's the mechanism?</>}
+        title="A1 — FraudGT vs Graphormer: same family, different scaling"
+        scenario={<>Your lead asks "FraudGT is just Graphormer for fraud — what's actually different?" Pick the real discriminator.</>}
         options={[
-          {key:"a", text:"Over-smoothing: each MPNN layer averages neighbor features, which is a smoothing operator. Iterated smoothing converges to the stationary distribution of the graph Laplacian — all nodes get the same embedding. Discriminability collapses past ~3-4 layers.", correct:true},
-          {key:"b", text:"Vanishing gradients."},
-          {key:"c", text:"Class imbalance gets worse at deeper layers."},
-          {key:"d", text:"Random initialization is too small."},
+          {key:"a", text:"Graphormer uses O(N^2) full-graph attention with shortest-path positional encoding — infeasible past ~100k nodes. FraudGT restricts attention to within a k-hop subgraph (sparse) and replaces shortest-path PE with relation-typed PE. Both are graph transformers; FraudGT's scaling assumption matches fraud graphs (10M+ edges).", correct:true},
+          {key:"b", text:"They are the same model."},
+          {key:"c", text:"FraudGT does not use attention."},
+          {key:"d", text:"Graphormer is for chemistry, FraudGT for fraud — domain difference only."},
         ]}
-        trap={<>(b)-(d) confuse over-smoothing with other deep-net pathologies. The over-smoothing mechanism is specifically about repeated averaging being a contraction in feature space.</>}
-        lens={<>(a) is the correct mechanism. Each MP layer is a smoothing operator (related to the graph Laplacian); iterated smoothing converges all nodes to the same value. FraudGT avoids this by using ONE transformer block per node-update, with attention over a k-hop window — no iterated averaging.</>}
-        stretch={<>What's the connection between over-smoothing and the graph Laplacian's eigenvalues?</>}
+        trap={<>(b), (c), (d) miss the scaling-and-PE discriminator.</>}
+        lens={<>The two papers split the graph-transformer family on attention scope (full vs k-hop sparse) and positional encoding (shortest-path vs relation+hop). For fraud-scale graphs, the latter is required.</>}
+        stretch={<>What's the largest graph Graphormer can run at? FraudGT at?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="fgt-p2"
-        difficulty="hard"
-        title="P2 — Why isn't Graphormer (full attention) the answer for 10M-edge fraud graphs?"
-        scenario={<>You consider Graphormer (full N×N attention over all nodes). On a 10M-edge fraud graph (~1M nodes), why doesn't it work and how does FraudGT differ?</>}
-        options={[
-          {key:"a", text:"Graphormer attention is O(N²); at N=1M, that's 1e12 attention entries — OOM on any single GPU. FraudGT restricts attention to a k-hop sparse neighborhood per token, reducing to O(E) ≈ 1e7. Long-range reasoning is preserved WITHIN the sparse window.", correct:true},
-          {key:"b", text:"Graphormer needs more layers."},
-          {key:"c", text:"Graphormer doesn't support heterogeneous graphs."},
-          {key:"d", text:"Graphormer can't be trained with cross-entropy."},
-        ]}
-        trap={<>(b)-(d) misdiagnose. The single defining issue is O(N²) memory.</>}
-        lens={<>(a) is the architectural reasoning. FraudGT's contribution is "transformer expressivity AT fraud-graph scale" — sparse attention is what makes this possible. Long-range reasoning is bounded by the k-hop window but in practice k=2-3 is enough for most fraud patterns.</>}
-        stretch={<>What if your fraud pattern spans 6 hops? Does FraudGT lose to a 6-layer MPNN?</>}
-      />
-
-      <VIS.TrapProblem
-        id="fgt-p3"
+        id="fgt-a2"
         difficulty="medium"
+        title="A2 — 'FraudGT is just GAT with a different name'"
+        scenario={<>A reviewer dismisses FraudGT as "GAT applied to fraud." Which statements distinguish them?</>}
         multiSelect
-        title="P3 — Which interventions reduce over-smoothing in MPNNs without switching to a transformer?"
-        scenario={<>If you can't adopt FraudGT (budget, infra), which architectural fixes mitigate MPNN over-smoothing? Select all that apply.</>}
         options={[
-          {key:"a", text:"Residual connections between GNN layers (DeeperGCN, GCNII).", correct:true},
-          {key:"b", text:"Jumping knowledge networks (concat all layer outputs).", correct:true},
-          {key:"c", text:"PairNorm or other normalization that explicitly preserves pairwise distances.", correct:true},
-          {key:"d", text:"DropEdge (randomly remove edges per layer).", correct:true},
-          {key:"e", text:"Increase batch size."},
-          {key:"f", text:"Use SGD instead of Adam."},
+          {key:"a", text:"GAT's attention is per-edge (over 1-hop neighbors per layer); FraudGT's attention is over the entire k-hop subgraph in a single shot.", correct:true},
+          {key:"b", text:"GAT stacks L layers (each 1-hop); FraudGT uses ONE attention layer over a k-hop subgraph — no stacking, so no over-smoothing.", correct:true},
+          {key:"c", text:"FraudGT has relation-typed positional encoding; GAT does not encode relation type in attention.", correct:true},
+          {key:"d", text:"FraudGT does not use attention."},
         ]}
-        trap={<>(e) and (f) are unrelated optimization knobs. The 4 correct interventions all explicitly address the contraction mechanism.</>}
-        lens={<>(a) residual paths preserve original features; (b) jumping knowledge uses earlier-layer (less smoothed) representations; (c) PairNorm rescales to preserve pairwise distances; (d) DropEdge reduces smoothing rate per layer. All address the iterated-averaging problem from different angles.</>}
-        stretch={<>Which of these does FraudGT effectively achieve "for free"?</>}
+        trap={<>(d) is false.</>}
+        lens={<>Three real differences: attention scope (1-hop per layer vs k-hop in one shot), depth strategy (stack vs single-pass), positional encoding (none vs relation+hop). The combination eliminates over-smoothing.</>}
+        stretch={<>Could you build a "GAT with single-shot k-hop attention"? What would it lack vs FraudGT?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="fgt-p4"
+        id="fgt-a3"
         difficulty="hard"
-        title="P4 — GBDT baseline for FraudGT: what features?"
-        scenario={<>You're running a fair-comparison GBDT baseline before adopting FraudGT. Which feature class is MOST critical to add to capture FraudGT's long-range advantage?</>}
+        title="A3 — Counterfactual: FraudGT never existed"
+        scenario={<>Without FraudGT, what's the strongest fallback for a 10M-edge heterogeneous fraud graph with 5-hop laundering rings?</>}
         options={[
-          {key:"a", text:"k-hop relation-aware structural features: per-relation degree, per-relation fraud-rate-at-k-hop (k=1,2,3), motif counts (triangles, 4-cliques) per relation type.", correct:true},
-          {key:"b", text:"Node2Vec embeddings on the full graph."},
-          {key:"c", text:"Time-series transaction aggregates."},
-          {key:"d", text:"Text embeddings of merchant descriptions."},
+          {key:"a", text:"A residual MPNN with relation-aware aggregation + per-layer skip connections to mitigate over-smoothing, OR a LightGBM with k-hop motif features. Both lose something — the MPNN still over-smooths somewhat past depth 4; the LightGBM cannot encode interactions that span the motif feature combinations the model would need to enumerate combinatorially.", correct:true},
+          {key:"b", text:"DLRM with hand-crafted crosses."},
+          {key:"c", text:"Pure vanilla GraphSAGE."},
+          {key:"d", text:"You could not detect 5-hop fraud without FraudGT."},
         ]}
-        trap={<>(b) is a generic graph embedding but doesn't capture relation-specific patterns. (c) and (d) are useful but orthogonal to graph-structural signal.</>}
-        lens={<>(a) is the GADBench-aware answer. To compare apples-to-apples with FraudGT, the GBDT needs RELATION-AWARE multi-hop features — those are exactly what FraudGT's sparse attention extracts. Without them, the baseline is unfairly weak.</>}
-        stretch={<>How many hops of structural features is "enough" before adding more is diminishing returns?</>}
+        trap={<>(b), (c), (d) miss the actual industrial alternatives.</>}
+        lens={<>The honest fallback isn't "no model" — it's a residual MPNN or motif-feature GBDT. Both work; both have costs that FraudGT specifically reduces.</>}
+        stretch={<>Quantify the cost of each fallback in your domain.</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="fgt-p5"
+        id="fgt-a4"
         difficulty="hard"
-        title="P5 — Choosing k (hop window) for sparse attention"
-        scenario={<>You're tuning FraudGT's k-hop window. k=1: 22ms inference, 0.78 F1. k=2: 35ms, 0.83 F1. k=3: 67ms, 0.84 F1. k=4: 145ms, 0.842 F1. SLA budget is 50ms p99 inference. Pick k.</>}
+        title="A4 — Stack FraudGT + labeled-group features"
+        scenario={<>You add GAGA-style labeled-group tokens as additional inputs to FraudGT's attention. What's the right thinking?</>}
+        multiSelect
         options={[
-          {key:"a", text:"k=2 — best F1 within SLA budget; the marginal gain at k=3 and k=4 doesn't justify exceeding budget.", correct:true},
-          {key:"b", text:"k=4 — always pick the highest F1."},
-          {key:"c", text:"k=1 — fastest is best."},
-          {key:"d", text:"Use k=3 and ask for a higher SLA."},
+          {key:"a", text:"The combination is feasible: GAGA's group tokens become additional sequence elements alongside FraudGT's per-node tokens. The transformer can attend across both.", correct:true},
+          {key:"b", text:"You inherit GAGA's PII constraint (neighbor labels at inference) — losing FraudGT's label-independence advantage.", correct:true},
+          {key:"c", text:"The combined model has token count = subgraph_size + 3*hops, which scales worse than FraudGT alone.", correct:true},
+          {key:"d", text:"They cannot be combined."},
         ]}
-        trap={<>(b) ignores SLA. (c) leaves F1 on the table. (d) is "tell the customer to suffer."</>}
-        lens={<>(a) is the production decision. The curve shows classic diminishing returns past k=2; the SLA constraint is the actual deciding factor. Senior MLE = optimize subject to constraints, not on the metric alone.</>}
-        stretch={<>If SLA relaxed to 100ms, would k=3 be a sensible upgrade?</>}
+        trap={<>(d) is too strong.</>}
+        lens={<>Composition is possible but costly: you gain GAGA's labeled-group expressivity, lose FraudGT's no-PII advantage, and pay attention scaling. Worth it only when the labeled-group signal is critical (mule networks) AND legal/PII allows.</>}
+        stretch={<>In which regime is the combined model strictly better than either alone?</>}
       />
 
+      {/* axis: A5 */}
       <VIS.TrapProblem
-        id="fgt-p6"
+        id="fgt-a5"
+        difficulty="hard"
+        title="A5 — Where FraudGT stops winning"
+        scenario={<>At what graph size does FraudGT's edge over a residual MPNN vanish?</>}
+        options={[
+          {key:"a", text:"Below approximately 100K nodes with low average degree: the k-hop subgraph is so small that over-smoothing risk is minimal even at depth 5; a residual MPNN handles it. FraudGT's advantage scales with graph size — specifically with the depth needed to capture the longest fraud pattern.", correct:true},
+          {key:"b", text:"FraudGT always wins."},
+          {key:"c", text:"At 1 trillion nodes."},
+          {key:"d", text:"At exactly 1M nodes."},
+        ]}
+        trap={<>(b), (c), (d) miss the scale dependency.</>}
+        lens={<>FraudGT's edge is tied to the over-smoothing problem, which depends on graph density. Small or sparse graphs don't exhibit over-smoothing; FraudGT's value-add is small there.</>}
+        stretch={<>What measurement would tell you over-smoothing is happening?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>B. Application</h3>
+
+      {/* axis: B1 */}
+      <VIS.TrapProblem
+        id="fgt-b1"
         difficulty="medium"
-        title="P6 — Relation-aware positional encoding: too many relations breaks it"
-        scenario={<>Your fraud graph has 80 distinct edge relation types. Each gets a learned positional vector of dim 64. What's the failure mode and the fix?</>}
+        title="B1 — Pick the right tool given the scenario"
+        scenario={<>Scenario: P2P payment fraud, 50M user nodes, 500M edges per month, 4 relation types, laundering rings 4-6 hops, p99 latency budget 30ms, current MPNN over-smooths at depth 3. Pick the next investment.</>}
         options={[
-          {key:"a", text:"80 × 64 = 5120 parameters for relation encodings is fine, but with rare relations (some appear in &lt;0.1% of edges), their embeddings undertrain and contribute noise. Fix: cluster similar relations into 10-20 super-relations OR use a relation-type embedding bottleneck.", correct:true},
-          {key:"b", text:"Too many parameters; relation encoding dominates model size."},
-          {key:"c", text:"Need to use one-hot encoding instead of learned embeddings."},
-          {key:"d", text:"Switch to bipartite graphs."},
+          {key:"a", text:"FraudGT with k=4 subgraph cap. Materializing k-hop subgraphs at scoring time costs 10-15ms (feature-store fetch); single attention layer adds 5-10ms — fits the 30ms budget. The over-smoothing issue at depth 3 confirms FraudGT's premise.", correct:true},
+          {key:"b", text:"CARE-GNN — its filter handles laundering rings."},
+          {key:"c", text:"DLRM — bigger ranker."},
+          {key:"d", text:"Add 5 more MPNN layers."},
         ]}
-        trap={<>(b) is wrong on the math (5120 params is tiny). (c) and (d) are unrelated.</>}
-        lens={<>(a) is the practical issue. Rare relation types are the headache, not parameter count. Clustering or hierarchical embeddings (one base vector + specialization) are the standard fixes.</>}
-        stretch={<>How would you decide the right clustering of relations?</>}
+        trap={<>(b) is wrong tool. (c) ignores graph. (d) worsens over-smoothing.</>}
+        lens={<>The scenario matches FraudGT's design (large heterogeneous, deep reasoning, observed over-smoothing). The latency budget needs verification but is plausible.</>}
+        stretch={<>If the latency budget were 5ms, what would you do instead?</>}
       />
 
+      {/* axis: B2 */}
       <VIS.TrapProblem
-        id="fgt-p7"
+        id="fgt-b2"
         difficulty="hard"
+        title="B2 — 'Sounds reasonable' — bigger k = better"
+        scenario={<>A teammate suggests "set k=6 to catch 6-hop laundering." Why is this wrong specifically for FraudGT?</>}
+        options={[
+          {key:"a", text:"k-hop subgraph size grows exponentially with k in dense graphs (in a fraud graph with avg degree 20, a 6-hop subgraph can exceed 64M nodes). Attention is O(N^2) within the subgraph; OOM or production-fatal latency follows. Practical FraudGT runs at k=3 or k=4 with subgraph size caps and accepts that some 6-hop rings are missed.", correct:true},
+          {key:"b", text:"k=6 is always optimal."},
+          {key:"c", text:"k=6 breaks the gradient."},
+          {key:"d", text:"k has no effect on cost."},
+        ]}
+        trap={<>(b), (c), (d) miss the scaling.</>}
+        lens={<>k is the central FraudGT tradeoff. The paper hides this by reporting k=2-3 on benchmarks; production k must be tuned per graph density.</>}
+        stretch={<>What is the subgraph-size cap heuristic you would use?</>}
+      />
+
+      {/* axis: B3 — concept-specific pitch */}
+      <VIS.TrapProblem
+        id="fgt-b3"
+        difficulty="hard"
+        title="B3 — Pitch FraudGT to the AML team"
+        scenario={<>The AML lead asks "Why FraudGT over our existing 3-layer GraphSAGE?" Pick the pitch that requires understanding FraudGT's specific mechanism.</>}
+        options={[
+          {key:"a", text:"Our 3-layer MPNN cannot reach the depth needed to catch 5-hop laundering rings — beyond depth 3 it over-smooths (representations converge across the graph and the fraud signal collapses). FraudGT replaces stacked message passing with ONE sparse attention layer over the k-hop subgraph plus relation-typed positional encoding, so a 5-hop laundering pattern is a single attention step, not 5 stacked-MP steps that blur into noise.", correct:true},
+          {key:"b", text:"FraudGT is faster than our GraphSAGE."},
+          {key:"c", text:"Transformers are state of the art."},
+          {key:"d", text:"FraudGT reduces false negatives."},
+        ]}
+        trap={<>(b) is dubious (subgraph materialization is not faster). (c) is empty. (d) is generic.</>}
+        lens={<>The concept-specific pitch names <em>over-smoothing at the depth fraud needs</em> and <em>single-shot k-hop attention with relation-PE</em>. Strip "FraudGT" — the listener must understand over-smoothing as a depth-stacking pathology to evaluate.</>}
+        stretch={<>What's the AML-team follow-up about computational cost?</>}
+      />
+
+      {/* axis: B4 */}
+      <VIS.TrapProblem
+        id="fgt-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use FraudGT"
+        scenario={<>Which scenarios are FraudGT anti-patterns?</>}
         multiSelect
-        title="P7 — Memory diagnosis: FraudGT OOMing at training"
-        scenario={<>FraudGT is OOM-ing during training on a 50M-edge graph. Which of these are valid mitigations? Select all that apply.</>}
         options={[
-          {key:"a", text:"Reduce k from 3 to 2 (smaller sparse neighborhood per token).", correct:true},
-          {key:"b", text:"Use gradient checkpointing on the transformer blocks.", correct:true},
-          {key:"c", text:"Sample subgraphs per minibatch (cluster-GCN or GraphSAINT-style sampling).", correct:true},
-          {key:"d", text:"Reduce embedding dimension.", correct:true},
-          {key:"e", text:"Train in FP32 instead of mixed precision."},
-          {key:"f", text:"Switch from AdamW to SGD."},
+          {key:"a", text:"Single-relation graphs — the relation-typed positional encoding has nothing to encode.", correct:true},
+          {key:"b", text:"Latency under 5ms — k-hop subgraph materialization alone costs more.", correct:true},
+          {key:"c", text:"Small graph (under 100K nodes) where over-smoothing is not observed at the needed depth.", correct:true},
+          {key:"d", text:"Large heterogeneous transaction graph with 4-relation 5-hop laundering."},
         ]}
-        trap={<>(e) does the OPPOSITE — FP32 uses MORE memory than mixed-precision. (f) is unrelated to OOM (SGD's optimizer state IS smaller than Adam's, but that's marginal vs activation memory).</>}
-        lens={<>(a)-(d) all reduce activation or working-set memory. (a) and (c) reduce data per step. (b) trades compute for memory. (d) shrinks the model. The most common production combination: (b) + (c) — checkpointing + subgraph sampling.</>}
-        stretch={<>What's the recompute cost (in % wall time) of gradient checkpointing on transformer blocks?</>}
+        trap={<>(d) is the regime FraudGT was designed for.</>}
+        lens={<>Three anti-patterns: single-relation (PE is wasted), tight latency (cannot materialize), small graph (MPNN suffices). Each maps to a cheaper alternative.</>}
+        stretch={<>Sketch your decision-tree before proposing FraudGT.</>}
       />
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      {/* axis: C1 */}
       <VIS.TrapProblem
-        id="fgt-p8"
+        id="fgt-c1"
         difficulty="hard"
-        title="P8 — When does FraudGT clearly beat CARE-GNN / GAGA?"
-        scenario={<>On which fraud-graph property would FraudGT show the LARGEST gap over CARE-GNN and GAGA?</>}
+        title="C1 — Why single-shot (not stacked)?"
+        scenario={<>Why does FraudGT use ONE attention layer over the k-hop subgraph instead of stacking L attention layers?</>}
         options={[
-          {key:"a", text:"Fraud patterns spanning 3+ hops (laundering chains, multi-hop collusion). CARE-GNN's RL filter is local (1-2 hops); GAGA's group-aggregation is also local. FraudGT's sparse attention over a 2-3-hop window can directly attend to long-range structure.", correct:true},
-          {key:"b", text:"Very imbalanced classes."},
-          {key:"c", text:"Low-homophily graphs."},
-          {key:"d", text:"Graphs with many isolated nodes."},
+          {key:"a", text:"Stacking would re-introduce over-smoothing: each additional attention layer mixes more information across the subgraph and representations converge. The whole point of switching to a transformer was to escape MPNN over-smoothing; stacking transformer layers reproduces the same pathology at a different gradient.", correct:true},
+          {key:"b", text:"Single-shot is faster."},
+          {key:"c", text:"Stacking does not work in PyTorch."},
+          {key:"d", text:"Single-shot has fewer parameters."},
         ]}
-        trap={<>(b) is PC-GNN's territory; (c) is GAGA's. (d) is universally bad for any graph model.</>}
-        lens={<>(a). FraudGT's specific advantage is LONG-RANGE within a single block (no over-smoothing). On graphs where the fraud signal lives at 3+ hops, this is decisive. On 1-hop graphs, the simpler models match or beat it.</>}
-        stretch={<>How would you measure whether your fraud signal needs &gt;2 hops?</>}
+        trap={<>(b) is a side benefit. (c), (d) miss the mechanism.</>}
+        lens={<>The single-shot design is principled: stacking ANY kind of message-mixing layer over a fixed graph leads to convergence; the depth of reasoning must come from attention's scope (k), not from stacking.</>}
+        stretch={<>Could you stack TWO FraudGT layers and recover anything? Defend.</>}
       />
 
+      {/* axis: C2 */}
       <VIS.TrapProblem
-        id="fgt-p9"
+        id="fgt-c2"
+        difficulty="medium"
+        title="C2 — Loss design / auxiliary contrastive"
+        scenario={<>FraudGT optionally adds an auxiliary contrastive loss on relation embeddings. What does this specifically help?</>}
+        options={[
+          {key:"a", text:"It separates relation embeddings in space so the positional encoding meaningfully distinguishes relation types. Without it, relation embeddings can collapse to similar vectors and the relation-PE loses discriminative power.", correct:true},
+          {key:"b", text:"It replaces the classification loss."},
+          {key:"c", text:"It only reduces parameter count."},
+          {key:"d", text:"It is unrelated to relation encoding."},
+        ]}
+        trap={<>(b), (c), (d) miss the role.</>}
+        lens={<>The contrastive loss is a representational regularizer for the relation positional encoding — without it, the model's most distinctive architectural feature degrades.</>}
+        stretch={<>What happens if the contrastive weight is too high?</>}
+      />
+
+      {/* axis: C3 */}
+      <VIS.TrapProblem
+        id="fgt-c3"
         difficulty="hard"
+        title="C3 — What FraudGT drops vs MPNN"
+        scenario={<>What does FraudGT explicitly drop relative to MPNN-family fraud GNNs?</>}
         multiSelect
-        title="P9 — Production tradeoffs vs CARE-GNN at p99=30ms"
-        scenario={<>You're considering migrating from CARE-GNN to FraudGT at a payments company. Current p99 inference budget is 30ms. Which factors matter for the decision? Select all that apply.</>}
         options={[
-          {key:"a", text:"Whether your fraud signal is mostly 1-2 hop (CARE-GNN sufficient) or 3+ hop (FraudGT wins).", correct:true},
-          {key:"b", text:"GPU inference cost — FraudGT's transformer is 3-5× the FLOPs of CARE-GNN.", correct:true},
-          {key:"c", text:"Whether you have engineers familiar with transformer training (FraudGT is harder to debug).", correct:true},
-          {key:"d", text:"Whether the GADBench-style GBDT baseline already saturates the gain available.", correct:true},
-          {key:"e", text:"FraudGT supports more programming languages."},
+          {key:"a", text:"Stacked message-passing layers — replaced by a single attention layer.", correct:true},
+          {key:"b", text:"Per-layer aggregation — replaced by within-subgraph attention.", correct:true},
+          {key:"c", text:"Implicit positional information from depth — replaced by explicit hop-distance + relation positional encoding.", correct:true},
+          {key:"d", text:"Node-feature embeddings."},
         ]}
-        trap={<>(e) is irrelevant. The other four are the real production levers.</>}
-        lens={<>All four matter. (d) is the senior MLE move — before migrating, prove the gain over your current GBDT+structural baseline is large enough to justify the operational complexity. If GBDT is within 1 F1, FraudGT migration is hard to justify.</>}
-        stretch={<>What experiment would tell you (a) on YOUR graph?</>}
+        trap={<>(d) is retained.</>}
+        lens={<>Three drops: stacked layers, per-layer aggregation, depth-as-position. Each maps to one architectural fix.</>}
+        stretch={<>Which drop most reduces over-smoothing? Defend.</>}
       />
 
+      {/* axis: C4 */}
       <VIS.TrapProblem
-        id="fgt-p10"
+        id="fgt-c4"
         difficulty="hard"
-        title="P10 — End-to-end pick: 50M nodes, 8 relations, multi-hop laundering patterns suspected"
-        scenario={<>Your graph: 50M nodes, 200M edges, 8 relation types (transfer / shared-device / shared-IP / shared-card / shared-merchant / kyc-similar / same-region / family-link). Fraud rate 0.3%. Known fraud rings span 3-5 hops. Labels are clean (chargeback confirmed). p99 budget 80ms. Engineering team has transformer experience. Pick ONE.</>}
+        title="C4 — Which knob, mis-set, breaks FraudGT?"
+        scenario={<>Rank: (i) hop depth k, (ii) subgraph size cap, (iii) attention heads, (iv) embedding dim.</>}
         options={[
-          {key:"a", text:"Stage 1: Run a tuned GBDT with 3-hop relation-aware structural features as the baseline. Stage 2: ONLY IF the gap to FraudGT in offline eval is &gt;=3 F1, migrate to FraudGT for the long-range signal advantage. Otherwise ship GBDT.", correct:true},
-          {key:"b", text:"FraudGT immediately — the scenario is its sweet spot."},
-          {key:"c", text:"CARE-GNN — RL filter handles relations."},
-          {key:"d", text:"GAGA — handles heterophily."},
+          {key:"a", text:"Subgraph size cap > k > heads > embedding dim. Cap is the latency/OOM lever (mis-set blows up production); k controls reasoning depth (mis-set misses fraud patterns); heads and embedding dim are secondary.", correct:true},
+          {key:"b", text:"Embedding dim dominates."},
+          {key:"c", text:"All equally important."},
+          {key:"d", text:"Heads dominate."},
         ]}
-        trap={<>(b) skips the GBDT baseline that GADBench teaches us to always run. (c) and (d) ignore the multi-hop laundering signal that FraudGT specifically targets.</>}
-        lens={<>(a) is the disciplined sequencing. Even when the scenario points strongly to FraudGT (long-range signal, transformer-fluent team, generous SLA), the GADBench discipline is to PROVE the gap with a strong tabular baseline before investing in transformer infra. If GBDT closes most of the gap, ship it; if not, FraudGT.</>}
-        stretch={<>What evidence would you need to see in the GBDT-vs-FraudGT comparison to commit to migration?</>}
+        trap={<>(b), (c), (d) miss the operational sensitivity.</>}
+        lens={<>For FraudGT, the operational knobs (cap, k) matter more than the transformer-internal ones. Inverse of LLM tuning.</>}
+        stretch={<>How do you tune cap and k jointly?</>}
       />
+
+      {/* axis: C5 */}
+      <VIS.TrapProblem
+        id="fgt-c5"
+        difficulty="medium"
+        title="C5 — Data-assumption: single relation"
+        scenario={<>You apply FraudGT to a single-relation fraud graph (one edge type only). What specifically happens?</>}
+        options={[
+          {key:"a", text:"The relation-typed positional encoding has only one relation to encode — it degenerates to hop-distance encoding only. FraudGT reduces to a sparse transformer over a k-hop subgraph with hop-distance PE. Most of the relation-PE's discriminative gain vanishes; a residual MPNN often matches.", correct:true},
+          {key:"b", text:"FraudGT refuses to run on single-relation graphs."},
+          {key:"c", text:"Performance is unchanged."},
+          {key:"d", text:"It auto-creates a synthetic second relation."},
+        ]}
+        trap={<>(b), (c), (d) miss the mechanism degradation.</>}
+        lens={<>FraudGT's contributions are (i) avoid over-smoothing via single-shot, (ii) encode relation type via PE. On a single-relation graph, only (i) remains valuable. The senior call is to use a residual MPNN there.</>}
+        stretch={<>What's the smallest number of relations at which FraudGT's PE pays off?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      {/* axis: D1 */}
+      <VIS.TrapProblem
+        id="fgt-d1"
+        difficulty="medium"
+        title="D1 — 'Transformer = O(N), it scales'"
+        scenario={<>A junior says "FraudGT uses sparse attention so it's O(N) and scales linearly with graph size." Where does this intuition break?</>}
+        options={[
+          {key:"a", text:"Sparse attention is O((k-hop subgraph size)^2) per scoring, not O(N). The k-hop subgraph itself grows exponentially with k in dense graphs (avg degree d → subgraph size ~d^k). For d=20, k=4, that's 160K-node subgraph PER SCORE. FraudGT's scaling depends on graph density, not just node count.", correct:true},
+          {key:"b", text:"Sparse attention is O(N) and the junior is right."},
+          {key:"c", text:"FraudGT does not use attention."},
+          {key:"d", text:"O notation does not apply."},
+        ]}
+        trap={<>(b) is the wrong belief. (c), (d) miss the mechanism.</>}
+        lens={<>"Sparse" in graph-transformer literature means "smaller than full N^2" — not asymptotically linear. The actual cost depends on subgraph size, which depends on graph density. Naming this matters at the senior bar.</>}
+        stretch={<>Compute FraudGT's effective cost for your graph's density.</>}
+      />
+
+      {/* axis: D1b */}
+      <VIS.TrapProblem
+        id="fgt-d1b"
+        difficulty="hard"
+        title="D1b — 'Transformer means tokens are independent'"
+        scenario={<>A junior says "in FraudGT, since each subgraph is its own input, scoring scales embarrassingly parallel." Why might this not give the speedup expected?</>}
+        options={[
+          {key:"a", text:"Each scoring request requires a k-hop subgraph materialization from the feature store — that's a feature-store-fetch bottleneck, not a transformer compute bottleneck. For dense graphs the materialization can dominate transformer time 3:1. Speedup is bound by feature-store throughput, not GPU.", correct:true},
+          {key:"b", text:"Parallel scoring is correct — no bottleneck."},
+          {key:"c", text:"GPU is always the bottleneck."},
+          {key:"d", text:"FraudGT does not batch."},
+        ]}
+        trap={<>(b), (c), (d) miss the materialization cost.</>}
+        lens={<>For FraudGT, the production bottleneck is usually the k-hop neighbor fetch, not GPU. This is unique to subgraph-based transformer models.</>}
+        stretch={<>What feature-store architecture would minimize the fetch cost?</>}
+      />
+
+      {/* axis: D2 */}
+      <VIS.TrapProblem
+        id="fgt-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: ignore over-smoothing"
+        scenario={<>You assume "our MPNN at depth 5 is fine — over-smoothing is theoretical, not real." Trace the cascade in production.</>}
+        options={[
+          {key:"a", text:"Depth-5 MPNN: representations converge across graph → most nodes score near the prior → fraud signal lost → AUPRC collapses → team blames label noise → spends month investigating → real fix is architecture (FraudGT or residual MPNN), not data.", correct:true},
+          {key:"b", text:"Nothing happens — MPNN at depth 5 is fine."},
+          {key:"c", text:"GPU OOM."},
+          {key:"d", text:"Slower training."},
+        ]}
+        trap={<>(b) is naive. (c), (d) are unrelated.</>}
+        lens={<>Over-smoothing is empirically real and produces a specific diagnostic signature: pairwise representation cosine approaches 1 across the graph. Senior MLEs measure this before blaming data.</>}
+        stretch={<>Sketch your over-smoothing diagnostic.</>}
+      />
+
+      {/* axis: D3 */}
+      <VIS.TrapProblem
+        id="fgt-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior diagnostic"
+        scenario={<>Junior reports FraudGT beats CARE-GNN by 4 AUPRC on Amazon. What's the senior question?</>}
+        options={[
+          {key:"a", text:"'How does FraudGT compare to LightGBM with k-hop motif features (triangle counts, 4-cycle counts, relation-typed fraud-density at hop k) under the same temporal split? And: did CARE-GNN's depth-3 over-smooth? If yes, the win is at least partly about avoiding over-smoothing, not about transformers.'", correct:true},
+          {key:"b", text:"'Try more heads.'"},
+          {key:"c", text:"'Use FP16.'"},
+          {key:"d", text:"'Ship it.'"},
+        ]}
+        trap={<>(b), (c), (d) miss the protocol.</>}
+        lens={<>The senior question (i) demands the GBDT baseline, (ii) probes whether the win comes from over-smoothing avoidance vs transformer-specific architectural choice. Both are GADBench-style.</>}
+        stretch={<>What ablation isolates "single-shot" from "transformer"?</>}
+      />
+
+      {/* axis: D4 */}
+      <VIS.TrapProblem
+        id="fgt-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: latency spike"
+        scenario={<>FraudGT p99 latency spikes from 18ms to 70ms during a fraud campaign. Causes: (i) attention compute, (ii) feature-store fetch, (iii) GC pause. Which is most likely?</>}
+        options={[
+          {key:"a", text:"(ii) Feature-store fetch. During fraud campaigns, the fraud nodes' k-hop subgraphs balloon (lots of new edges to ring members). The materialization step grows exponentially while transformer compute is bounded by the subgraph cap. The spike is correlated with high-degree fraud activity, not with model compute.", correct:true},
+          {key:"b", text:"(i) Attention compute."},
+          {key:"c", text:"(iii) GC."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c), (d) are plausible but not FraudGT's typical signature.</>}
+        lens={<>Subgraph-materialization spikes correlate with degree growth in fraud rings. Monitor: avg subgraph size per scored node, daily distribution.</>}
+        stretch={<>How would you cap subgraph size without losing fraud-pattern detection?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>E. Operations</h3>
+
+      {/* axis: E1 */}
+      <VIS.TrapProblem
+        id="fgt-e1"
+        difficulty="hard"
+        title="E1 — FraudGT-specific gotcha"
+        scenario={<>Pick the gotcha most specific to FraudGT (would not bite CARE-GNN, PC-GNN, GAGA):</>}
+        options={[
+          {key:"a", text:"k-hop subgraph materialization at serving correlates with graph degree; dense fraud rings cause subgraph blowup → memory spike → either OOM or latency-cliff (the latter happens when you cap and re-sample inside the subgraph, reintroducing aggregation noise).", correct:true},
+          {key:"b", text:"Embedding tables."},
+          {key:"c", text:"Cold-start."},
+          {key:"d", text:"Training time."},
+        ]}
+        trap={<>(b), (c), (d) are generic.</>}
+        lens={<>The materialization-cost-correlated-with-fraud-density issue is FraudGT-specific. Mitigation: subgraph caps + sampling + dedicated graph-fetch service.</>}
+        stretch={<>Sketch the subgraph-materialization microservice you would build.</>}
+      />
+
+      {/* axis: E2 */}
+      <VIS.TrapProblem
+        id="fgt-e2"
+        difficulty="hard"
+        title="E2 — Friday: latency cliff on dense graph"
+        scenario={<>Friday: FraudGT p99 latency goes from 25ms to 95ms over 2 hours. Subgraph size logs show average k-hop subgraph size grew from 1200 to 8400 nodes. Diagnosis?</>}
+        options={[
+          {key:"a", text:"A new fraud ring is forming (high-degree fraud activity), exploding k-hop subgraph sizes. Mitigation: temporarily lower the subgraph cap; alert the AML investigators; expect the latency to recover after the ring is taken down or after the cap stabilizes the materialization.", correct:true},
+          {key:"b", text:"Roll back."},
+          {key:"c", text:"Page DevOps."},
+          {key:"d", text:"Add more attention heads."},
+        ]}
+        trap={<>(b), (c), (d) miss the mechanism.</>}
+        lens={<>Subgraph-size growth is a leading indicator of active fraud activity. FraudGT's latency is a fraud-activity proxy.</>}
+        stretch={<>Could subgraph-size become an upstream fraud feature itself?</>}
+      />
+
+      {/* axis: E3 */}
+      <VIS.TrapProblem
+        id="fgt-e3"
+        difficulty="hard"
+        title="E3 — Eval-protocol audit"
+        scenario={<>Which findings invalidate a FraudGT report card?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Eval did not include a LightGBM with k-hop motif features (triangle counts, 4-cycle counts, fraud-density at hop k) as a baseline.", correct:true},
+          {key:"b", text:"Random split on temporal graph leaked future edges.", correct:true},
+          {key:"c", text:"Baseline MPNN was at depth 3 (already over-smoothed) — sandbagging the baseline.", correct:true},
+          {key:"d", text:"Transformers are state of the art so eval doesn't matter."},
+        ]}
+        trap={<>(d) is wrong by construction.</>}
+        lens={<>Three audit failures: missing motif-feature baseline, random splits, sandbagged MPNN depth. Each is fixable.</>}
+        stretch={<>What's the right MPNN-baseline depth for fair comparison?</>}
+      />
+
+      {/* axis: E4 */}
+      <VIS.TrapProblem
+        id="fgt-e4"
+        difficulty="medium"
+        title="E4 — Rollout sequence: MPNN to FraudGT"
+        scenario={<>Order: (i) full ramp, (ii) shadow + subgraph-cap calibration, (iii) hybrid with MPNN score, (iv) traffic ramp.</>}
+        options={[
+          {key:"a", text:"ii → iii → iv → i. The subgraph-cap calibration step is FraudGT-specific: you need to verify worst-case latency before traffic. Hybrid bounds risk during ramp.", correct:true},
+          {key:"b", text:"i → ii → iii → iv."},
+          {key:"c", text:"Direct cutover."},
+          {key:"d", text:"iv → i."},
+        ]}
+        trap={<>(b), (c), (d) skip the cap-calibration step.</>}
+        lens={<>The subgraph-cap calibration is FraudGT-specific. Without it, the ramp can hit OOM on the first dense fraud event.</>}
+        stretch={<>What's the offline-load-testing protocol you would use?</>}
+      />
+
+      {/* axis: E5 */}
+      <VIS.TrapProblem
+        id="fgt-e5"
+        difficulty="medium"
+        title="E5 — Reproducibility"
+        scenario={<>Which FraudGT reproducibility issues are widely known?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Relation positional encoding details (the exact RoPE-style formula) are non-trivial to reimplement from the paper.", correct:true},
+          {key:"b", text:"Subgraph caps used in the paper are not always reported per dataset.", correct:true},
+          {key:"c", text:"Eval did not always include the GBDT motif-feature baseline.", correct:true},
+          {key:"d", text:"FraudGT cannot run on GPUs."},
+        ]}
+        trap={<>(d) is false.</>}
+        lens={<>All three issues are common to graph transformer papers. The motif-baseline omission is the GADBench-style failure.</>}
+        stretch={<>What's your reimplementation checklist?</>}
+      />
+
+      {/* axis: E6 */}
+      <VIS.TrapProblem
+        id="fgt-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination"
+        scenario={<>Which contamination paths affect FraudGT's claims?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Random splits on temporal graphs leak future neighbors into training.", correct:true},
+          {key:"b", text:"GBDT baseline was given only basic features (no k-hop motifs), inflating FraudGT's apparent edge.", correct:true},
+          {key:"c", text:"MPNN baselines were not tuned for over-smoothing mitigation (no residual / skip connections), sandbagging.", correct:true},
+          {key:"d", text:"FraudGT is too new to evaluate."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three contamination paths: temporal-split protocol, GBDT feature sandbagging, MPNN-baseline sandbagging. All three are common in transformer-fraud papers.</>}
+        stretch={<>Which contamination is hardest to detect in published work?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>F. Failure modes & edge cases</h3>
+
+      {/* axis: F1 */}
+      <VIS.TrapProblem
+        id="fgt-f1"
+        difficulty="hard"
+        title="F1 — Smallest input that breaks FraudGT"
+        scenario={<>Construct the smallest graph where FraudGT provably reduces to GAT.</>}
+        options={[
+          {key:"a", text:"A 1-hop graph (no multi-hop reasoning needed) with a single relation — FraudGT's k-hop attention reduces to 1-hop attention, the relation-PE has nothing to encode, and the result is GAT with hop-distance PE that always equals 1 (i.e. constant).", correct:true},
+          {key:"b", text:"Any 1-node graph."},
+          {key:"c", text:"Any tree."},
+          {key:"d", text:"A bipartite graph."},
+        ]}
+        trap={<>(b) is degenerate. (c), (d) miss the mechanism.</>}
+        lens={<>FraudGT's mechanism breaks at "k=1 + single relation" — both contributions become trivial.</>}
+        stretch={<>What is the minimum k at which FraudGT outperforms GAT?</>}
+      />
+
+      {/* axis: F2 */}
+      <VIS.TrapProblem
+        id="fgt-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: pad subgraph with noise"
+        scenario={<>Design an attack that exploits FraudGT's k-hop subgraph materialization.</>}
+        options={[
+          {key:"a", text:"Connect the fraud node to many benign 'noise' nodes (cheap to fake — disposable accounts, low-value transactions). The fraud node's k-hop subgraph balloons with benign noise; sparse attention dilutes the fraud signal across many benign tokens; subgraph cap forces sampling, reintroducing aggregation noise. The fraud node looks like a high-degree but mostly-benign hub.", correct:true},
+          {key:"b", text:"Feature perturbation."},
+          {key:"c", text:"No attack possible."},
+          {key:"d", text:"Increase fraud rate."},
+        ]}
+        trap={<>(b), (c), (d) miss FraudGT's attack surface.</>}
+        lens={<>Subgraph-padding is FraudGT's specific attack surface. Defense: subgraph importance sampling (use degree-aware sampling, not random), per-edge confidence scoring.</>}
+        stretch={<>How would you defend with importance-weighted attention?</>}
+      />
+
+      {/* axis: F4 */}
+      <VIS.TrapProblem
+        id="fgt-f4"
+        difficulty="medium"
+        title="F4 — Paper-admitted limitation"
+        scenario={<>Which limitation does the FraudGT paper itself acknowledge?</>}
+        options={[
+          {key:"a", text:"Memory blowup at k > 3 on dense graphs; subgraph cap is necessary in practice.", correct:true},
+          {key:"b", text:"FraudGT works perfectly at any scale."},
+          {key:"c", text:"Only works on GPUs."},
+          {key:"d", text:"Cannot be deployed."},
+        ]}
+        trap={<>(b), (c), (d) are wrong.</>}
+        lens={<>The paper is honest about the dense-graph memory blowup. Knowing this signals careful reading.</>}
+        stretch={<>What did the paper NOT predict that GADBench-style benchmarks would expose?</>}
+      />
+
+      {/* axis: F5 */}
+      <VIS.TrapProblem
+        id="fgt-f5"
+        difficulty="hard"
+        title="F5 — The GADBench critique"
+        scenario={<>What does GADBench-style fair eval find about FraudGT?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"On small-mid graphs (YelpChi, T-Social) a LightGBM with k-hop motif features closes most of FraudGT's gap.", correct:true},
+          {key:"b", text:"On large heterogeneous graphs (Amazon, T-Finance) FraudGT retains a real edge — motif features explode combinatorially and the GBDT loses its handle.", correct:true},
+          {key:"c", text:"FraudGT's over-smoothing-avoidance is real but contributes only part of the gain; relation-PE contributes the rest.", correct:true},
+          {key:"d", text:"FraudGT loses everywhere."},
+        ]}
+        trap={<>(d) overstates the GADBench finding.</>}
+        lens={<>The GADBench finding for FraudGT is regime-specific: GBDT closes the gap on small graphs, FraudGT wins on very-large heterogeneous ones. Senior MLEs deploy accordingly.</>}
+        stretch={<>What's the threshold graph size at which the regimes flip?</>}
+      />
+
+      {/* axis: F5b */}
+      <VIS.TrapProblem
+        id="fgt-f5b"
+        difficulty="hard"
+        title="F5b — The interview gold question"
+        scenario={<>Interviewer: "You championed FraudGT. Walk me through the ablation that proves the win is from the architecture, not from a sandbagged baseline."</>}
+        options={[
+          {key:"a", text:"Built four baselines under temporal-split AUPRC with equal hyperparameter budget: (i) LightGBM with k-hop motif features (triangle, 4-cycle, fraud-density per relation per hop), (ii) residual MPNN with skip connections at depth 5 (mitigates over-smoothing), (iii) GAT at depth 3, (iv) FraudGT. Also measured pairwise representation cosine for (ii) to confirm over-smoothing was mitigated. FraudGT beat (i) by 2.3 AUPRC and (ii) by 1.1 — the win is real on this dense heterogeneous graph but the residual MPNN closed much of the gap, so the win is mostly relation-PE + cap, not 'transformer'.", correct:true},
+          {key:"b", text:"Compared FraudGT to depth-3 GraphSAGE; FraudGT won by 4 points; shipped."},
+          {key:"c", text:"Transformers always win — no ablation needed."},
+          {key:"d", text:"Compared FraudGT to a GBDT with only basic features."},
+        ]}
+        trap={<>(b), (c), (d) skip rigorous ablation.</>}
+        lens={<>The right answer (i) builds the motif-feature GBDT baseline, (ii) builds a residual-MPNN baseline that mitigates over-smoothing, (iii) measures over-smoothing diagnostic, (iv) decomposes the win source. This is the senior bar for transformer-fraud claims.</>}
+        stretch={<>If the residual MPNN tied FraudGT, would you ship FraudGT? Defend.</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/2402.16494" target="_blank" rel="noopener">
-            <strong>Lin et al. — FraudGT: A Simple, Effective, and Efficient Graph Transformer for Financial Fraud Detection</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2402.16494" target="_blank" rel="noopener"><strong>Lin et al. — FraudGT</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, ICAIF 2024)</span>
-          <br/>The FraudGT paper. Sec 3 (architecture) and Sec 5 (scalability) are the keepers; the comparison with Graphormer and MPNNs is in Sec 4.
+          <br/>The original. Section 3 (sparse attention), Section 4 (relation PE), Section 5 (scaling).
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2306.12251" target="_blank" rel="noopener">
-            <strong>Tang et al. — GADBench (NeurIPS 2024)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper)</span>
-          <br/>Although FraudGT post-dates GADBench, the methodology — always compare against a tuned GBDT with structural features — is what catches inflated gains.
+          <a href="https://arxiv.org/abs/2306.12251" target="_blank" rel="noopener"><strong>Tang et al. — GADBench</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2024)</span>
+          <br/>The fair-eval protocol; the motif-feature GBDT baseline is the right comparator.
         </li>
         <li>
-          <a href="https://distill.pub/2021/understanding-gnns/" target="_blank" rel="noopener">
-            <strong>Distill — Understanding Graph Neural Networks</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog, interactive)</span>
-          <br/>The clearest visual treatment of message-passing and what over-smoothing looks like. Interactive.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/2106.05234" target="_blank" rel="noopener">
-            <strong>Ying et al. — Do Transformers Really Perform Bad for Graph Representation? (Graphormer)</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2106.05234" target="_blank" rel="noopener"><strong>Ying et al. — Graphormer</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2021)</span>
-          <br/>Original Graphormer paper. Worth reading to understand what FraudGT keeps (relation/positional encoding) and what it drops (O(N²) attention).
+          <br/>The full-attention graph transformer; the O(N^2) baseline FraudGT scales away from.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2006.05205" target="_blank" rel="noopener">
-            <strong>Chen et al. — Simple and Deep Graph Convolutional Networks (GCNII)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper)</span>
-          <br/>The "fight over-smoothing without transformers" approach (residual + initial connections). Useful contrast.
+          <a href="https://arxiv.org/abs/2302.10407" target="_blank" rel="noopener"><strong>Wang et al. — GAGA</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, WWW 2023)</span>
+          <br/>The label-token-based transformer sibling — different scaling tradeoff.
         </li>
       </ul>
     </VIS.Section>
   </main>
 );
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
   <script>

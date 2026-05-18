@@ -1414,333 +1414,663 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// GAGA — Group AGgregation transformer for low-homophily fraud graphs.
+// GAGA — Group AGgregation transformer for low-homophily fraud (Wang et al., WWW 2023)
+// v2 redo — trap problems span A-F axes; every problem hinges on GAGA's specific
+// mechanism (labeled-neighbor-group tokens encoded for a transformer to attend
+// across hops on heterophilic fraud graphs) and threads the GADBench-vs-GBDT
+// counter-evidence.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · GNN-based fraud detection"
-      title="GAGA"
-      subtitle="Group neighbors by label, tokenize as 'group embeddings,' then let a transformer attend across hops — built for heterophilic fraud graphs."
+      pill="Fraud SOTA · GNN-based fraud detection (heterophily)"
+      title="GAGA — Group AGgregation transformer"
+      subtitle="Encodes labeled neighbor groups (fraud-hop1, benign-hop1, ...) as transformer tokens — attends across hops on heterophilic fraud graphs where MPNNs fail."
       byline={[
         {label: "Paper", value: "Wang et al., WWW 2023"},
         {label: "Year", value: "2023"},
-        {label: "L3", value: "GNN fraud detector"},
+        {label: "Domain", value: "GNN fraud detection (heterophily)"},
       ]}/>
 
     <VIS.TLDR>
-      Fraud graphs are{" "}
-      <VIS.Term def="A graph property where most connected node pairs have DIFFERENT labels. Fraud graphs are heterophilic — fraudsters mostly connect to benign accounts. Opposite of homophily (connected = similar).">heterophilic</VIS.Term>:
-      fraudsters connect to benign nodes more than to other fraudsters. CARE-GNN's similarity filter assumes homophily ("drop dissimilar neighbors"); on heterophilic graphs the right move is the OPPOSITE — attend MORE to dissimilar neighbors. GAGA reframes the problem: group neighbors by their labels (fraud / benign / unknown), encode each group as a token, and let a transformer attend across the resulting sequence. The GADBench gotcha still applies: GBDT with neighbor-label-distribution features captures most of the same signal.
+      Vanilla MPNNs and CARE-GNN-style filters assume <VIS.Term def="The property that connected nodes tend to share labels — i.e. fraud connects to fraud, benign to benign.">homophily</VIS.Term> with camouflage exceptions. Money-mule fraud is the opposite: fraudsters predominantly connect to benign nodes, so <VIS.Term def="The opposite of homophily — connected nodes tend to have different labels. Money mules and structured-laundering networks are classic examples.">heterophilic</VIS.Term> by design. GAGA encodes each center's neighbors as per-hop <VIS.Term def="Per-(hop, class-label) groups: fraud-group@hop1 aggregates all fraud-labeled hop-1 neighbors, benign-group@hop1 aggregates the benign-labeled ones, unlabeled-group@hop1 aggregates the rest. Each group becomes a transformer token.">labeled-group tokens</VIS.Term> and runs a transformer over the resulting sequence. Requires partial neighbor labels at inference (regulatory caveat). Under GADBench fair eval, a GBDT with per-hop fraud-neighbor count features captures most of the gain. Source: <a href="https://arxiv.org/abs/2302.10407" target="_blank" rel="noopener">arXiv:2302.10407</a>.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="Beat 1 — What it is">
       <p>
-        GAGA's pipeline:
+        For each center node v, GAGA constructs a sequence of group tokens: <code>[fraud@h1, benign@h1, unlabeled@h1, fraud@h2, benign@h2, unlabeled@h2, ...]</code>. Each token aggregates v's neighbors at hop k that share a label (or the unlabeled group). A transformer (multi-head self-attention) attends across these tokens with hop-distance positional encodings.
       </p>
-      <ol>
-        <li><strong>Group:</strong> for each center node, partition its neighbors at each hop by their{" "}
-          <VIS.Term def="The class label assigned to a node — here, 'fraud' (1), 'benign' (0), or 'unknown' (-1, for unlabeled nodes).">label</VIS.Term> into 3 groups (fraud / benign / unknown).</li>
-        <li><strong>Aggregate (per group):</strong> mean-pool feature vectors within each group; the result is a "group embedding" per (hop × label).</li>
-        <li><strong>Tokenize:</strong> stack the group embeddings into a sequence of tokens (e.g., 2 hops × 3 labels = 6 tokens, plus the center node = 7).</li>
-        <li><strong>Transformer:</strong> a standard multi-head self-attention transformer attends across the token sequence. Output the center-token embedding to a classifier head.</li>
-      </ol>
-
       <VIS.Mermaid chart={`
 flowchart TB
-  N["Center node"]
-  N --> H1["Hop-1 neighbors"]
-  N --> H2["Hop-2 neighbors"]
-  H1 --> G1F["Group: fraud"]
-  H1 --> G1B["Group: benign"]
-  H1 --> G1U["Group: unknown"]
-  H2 --> G2F["Group: fraud"]
-  H2 --> G2B["Group: benign"]
-  H2 --> G2U["Group: unknown"]
-  G1F --> T["Transformer attention"]
-  G1B --> T
-  G1U --> T
-  G2F --> T
-  G2B --> T
-  G2U --> T
-  N --> T
-  T --> CLS["Classify center"]
-  style T fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  V["Center node v"]
+  V --> N1["Hop-1 neighbors"]
+  N1 --> F1["fraud@h1 token (mean of fraud neighbors)"]
+  N1 --> B1["benign@h1 token"]
+  N1 --> U1["unlabeled@h1 token"]
+  V --> N2["Hop-2 neighbors"]
+  N2 --> F2["fraud@h2"]
+  N2 --> B2["benign@h2"]
+  N2 --> U2["unlabeled@h2"]
+  F1 --> T["Transformer (multi-head SA)"]
+  B1 --> T
+  U1 --> T
+  F2 --> T
+  B2 --> T
+  U2 --> T
+  T --> O["v's representation"]
+  style T fill:#dbeafe,stroke:#1e40af,stroke-width:2px
       `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
+    <VIS.Section id="sec-diff" title="Beat 2 — How it differs from CARE-GNN, PC-GNN, GAT">
       <p>
-        Three things distinguish GAGA from prior fraud-GNNs:
+        <strong>CARE-GNN (sibling).</strong> Filters low-similarity neighbors assuming homophily-with-camouflage. On a heterophilic graph (money mules), CARE-GNN's filter drops the very neighbors that carry the fraud signal — the cross-class connection IS the signal.
       </p>
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
-        <thead>
-          <tr style={{background:"#1f3a5f", color:"#fff"}}>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>GraphSAGE / CARE-GNN</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>GAGA</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Homophily assumption</td>
-            <td style={{padding:"8px 10px"}}>High (drop dissimilar)</td>
-            <td style={{padding:"8px 10px"}}>None (attention learns)</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Aggregation function</td>
-            <td style={{padding:"8px 10px"}}>Fixed (mean, attention-over-edges)</td>
-            <td style={{padding:"8px 10px"}}>Self-attention over label-grouped tokens</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Use of labels</td>
-            <td style={{padding:"8px 10px"}}>For supervision only (CARE: also similarity)</td>
-            <td style={{padding:"8px 10px"}}>As GROUPING signal at train AND inference</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Cost per node</td>
-            <td style={{padding:"8px 10px"}}>O(|N| · d)</td>
-            <td style={{padding:"8px 10px"}}>O(k² · d) where k = hops × labels (small)</td>
-          </tr>
-        </tbody>
-      </table>
+      <p>
+        <strong>PC-GNN (sibling).</strong> Rebalances class frequencies at the sampling layer. Orthogonal to heterophily — PC-GNN's gain doesn't depend on homophily or heterophily.
+      </p>
+      <p>
+        <strong>GAT.</strong> Learns per-edge attention weights over node features. GAGA goes further: <em>encodes labels into the token sequence itself</em>. The model can attend to "this center has 5 fraud neighbors at hop 1 and 12 benign at hop 1" — a pattern GAT cannot express because GAT's attention is over feature-similarity, not over label-class distributions.
+      </p>
+      <p>
+        <strong>GADBench-tuned GBDT.</strong> A LightGBM with explicit <code>n_fraud_neighbors_at_hop_k</code> features encodes the same labeled-group signal that GAGA's tokens carry. Under fair eval the lift is small on most graphs; GAGA's edge is concentrated on dense heterophilic graphs where the transformer's cross-hop attention captures interactions GBDTs miss.
+      </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Low-homophily graphs</strong> — money mules, account takeovers, where fraudsters mostly link to benign nodes.</li>
-        <li><strong>Partial labels available at inference time</strong> — GAGA's group-by-label trick requires neighbor labels (or pseudo-labels) at scoring time.</li>
-        <li><strong>Mid-scale graphs</strong> — token-based transformer is efficient at the per-node level (k tokens), but the sampling step still touches all neighbors.</li>
-      </ul>
+    <VIS.Section id="sec-when" title="Beat 3 — When to pick it / where it wins">
+      <p>
+        Pick GAGA when (a) homophily is low (fraud-to-benign edges dominate fraud connectivity), (b) partial neighbor labels are available at <em>inference time</em> (this is the critical constraint), (c) labels are legally and privately accessible as a feature (not always true for cross-customer fraud), (d) you have already tried a GBDT with per-hop-per-class neighbor-count features and GAGA beats it on temporal-split AUPRC.
+      </p>
+      <VIS.Mermaid chart={`
+flowchart TB
+  D["Fraud surface"]
+  D --> Q1{"Homophily low (fraud connects to benign)?"}
+  Q1 -->|No| CARE["CARE-GNN / GraphSAGE"]
+  Q1 -->|Yes| Q2{"Labels accessible at inference?"}
+  Q2 -->|No, PII| FRAUDGT["FraudGT (no label tokens)"]
+  Q2 -->|Yes| Q3{"Beats per-hop-class GBDT?"}
+  Q3 -->|No| GBDT["Ship GBDT"]
+  Q3 -->|Yes| GAGA["GAGA"]
+  style GAGA fill:#dcfce7,stroke:#16a34a
+  style GBDT fill:#fef3c7,stroke:#d97706
+      `} />
     </VIS.Section>
 
-    <VIS.Section id="sec-limits" title="Limitations & gotchas">
-      <VIS.Callout kind="gotcha" title="GADBench: GBDT with neighbor-label-distribution features matches GAGA">
-        Once you compute "what fraction of my 1-hop neighbors are fraud" as a tabular feature, you've explicitly fed the GBDT the GROUPING signal GAGA learns implicitly. <strong>GADBench (NeurIPS 2024) shows GBDT+structural+neighbor-label-distribution closes the gap with GAGA to ≤1 F1 on YelpChi/Amazon.</strong> Always run that baseline first.
+    <VIS.Section id="sec-gotchas" title="Beat 4 — Limitations & gotchas">
+      <VIS.Callout kind="gotcha" title="Inference-time label dependency = privacy risk">
+        GAGA requires neighbor LABELS at inference. In many jurisdictions (GDPR, fraud-team labels), one user's fraud label is PII for that user and cannot be used as a feature for scoring another user. Most "regulatory friction" stories with fraud GNNs trace back here.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Privacy: neighbor labels at inference">
-        GAGA needs neighbor labels (or pseudo-labels) at inference. If neighbor labels are PII (e.g., "did this user commit fraud?"), exposing them to the inference pipeline creates a privacy surface. Federated / pseudo-label workarounds are non-trivial.
+      <VIS.Callout kind="gotcha" title="Label-staleness">
+        Production typically has only labels older than the chargeback delay (30-60 days). GAGA's labeled-group tokens at inference are stale relative to training, degrading more than CARE-GNN does under the same staleness because GAGA encodes labels structurally.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Label leakage trap">
-        If your "fraud" group at training time silently includes the CENTER node's own label, you're predicting from the answer. Audit the grouping code carefully.
+      <VIS.Callout kind="gotcha" title="GADBench shrinks the headline">
+        GAGA's reported gains on T-Finance and Amazon shrink under temporal-split AUPRC. The remaining edge is real on dense heterophilic graphs (Amazon) but minimal on near-homophilic ones (T-Finance).
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on heterophily, label leakage, and the GBDT-baseline reality check.
+        Problems span the 6 taxonomy axes. Strip "GAGA" — each correct answer must still require knowing the labeled-group-token mechanism to evaluate.
       </p>
 
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>A. Identity & comparison</h3>
+
+      {/* axis: A1 */}
       <VIS.TrapProblem
-        id="gaga-p1"
+        id="gaga-a1"
         difficulty="hard"
-        title="P1 — What is graph homophily and why do CARE-GNN-style filters fail when it's low?"
-        scenario={<>An interviewer asks: "Define graph homophily. Why does CARE-GNN's filter (drop dissimilar neighbors) fail on low-homophily graphs, and how does GAGA fix it?"</>}
+        title="A1 — GAGA vs CARE-GNN: same family, opposite homophily assumption"
+        scenario={<>Your lead asks "GAGA and CARE-GNN both improve over GraphSAGE — pick one for our money-mule detection problem." What is the actual discriminator?</>}
         options={[
-          {key:"a", text:"Homophily = fraction of edges connecting same-class nodes. Low homophily means fraudsters mostly link to benign — CARE-GNN's similarity filter would drop the very neighbors that are MOST DIAGNOSTIC of fraud (the benign neighbors a fraudster connects to). GAGA replaces the filter with attention, which can attend MORE to dissimilar neighbors when the labels say so.", correct:true},
-          {key:"b", text:"Homophily means the graph is undirected. CARE-GNN assumes directed graphs."},
-          {key:"c", text:"Low homophily means too few labeled nodes. GAGA does semi-supervised."},
-          {key:"d", text:"Homophily refers to feature similarity. GAGA uses transformers instead."},
+          {key:"a", text:"CARE-GNN's similarity filter assumes connected nodes share labels (homophily) with camouflage as the exception; GAGA assumes the opposite — fraudsters connect to benigns by design, so the cross-class edge IS the signal. CARE-GNN's filter would drop the very neighbors GAGA's transformer must attend to. For money mules, GAGA.", correct:true},
+          {key:"b", text:"They are the same model."},
+          {key:"c", text:"CARE-GNN is faster."},
+          {key:"d", text:"GAGA handles imbalance."},
         ]}
-        trap={<>(b)-(d) confuse homophily with other concepts. The trap is candidates who know "homophily" as a buzzword but can't explain the mechanism by which CARE-GNN breaks.</>}
-        lens={<>(a) gets the mechanism. CARE-GNN's filter ASSUMES that similar = same-class. On heterophilic graphs, the most informative neighbors are precisely the DISSIMILAR ones — exactly the ones CARE-GNN drops. GAGA's group-then-attend pattern lets the transformer learn the relationship rather than assume it.</>}
-        stretch={<>What's the analogous failure mode for a vanilla GAT on a heterophilic graph?</>}
+        trap={<>(b), (c), (d) miss the homophily-vs-heterophily distinction.</>}
+        lens={<>The two papers make opposite assumptions about the graph topology. CARE-GNN: homophilic-with-camouflage. GAGA: heterophilic-by-design. Money mules are textbook heterophilic — fraud accounts route money through benign accounts. The mistake of using CARE-GNN here destroys the signal.</>}
+        stretch={<>If you ran GAGA on a homophilic graph by accident, what would happen?</>}
       />
 
+      {/* axis: A2 */}
       <VIS.TrapProblem
-        id="gaga-p2"
-        difficulty="hard"
-        title="P2 — Money mule detection: why is GAGA a better fit than CARE-GNN?"
-        scenario={<>You're detecting money mules — people whose accounts are used by fraudsters to move money but who themselves don't transact with other mules. They primarily interact with normal accounts (the laundering targets). Homophily ≈ 0.1 (very low). Which model and why?</>}
-        options={[
-          {key:"a", text:"GAGA — the heterophilic structure (mule ↔ benign) is exactly what its label-grouped attention is built for. CARE-GNN would drop the diagnostic benign neighbors via the similarity filter.", correct:true},
-          {key:"b", text:"CARE-GNN — the RL filter would learn to keep the right neighbors."},
-          {key:"c", text:"PC-GNN — rebalancing the sampler would help."},
-          {key:"d", text:"GraphSAGE with class-weighted CE — simpler is better."},
-        ]}
-        trap={<>(b) hopes RL can learn anything; but the inductive bias of the model is "drop dissimilar" — the RL just tunes how aggressively. (c) is solving a different problem (imbalance, not heterophily). (d) ignores the structure of the problem.</>}
-        lens={<>(a). The architectural fit matters. CARE-GNN's similarity filter has the WRONG inductive bias for heterophilic graphs. GAGA's group-and-attend leaves the relationship learnable — including "fraudsters connect to benign nodes A LOT."</>}
-        stretch={<>How would you measure homophily on your fraud graph before picking an architecture?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gaga-p3"
-        difficulty="hard"
-        multiSelect
-        title="P3 — Label leakage audit on GAGA"
-        scenario={<>You're auditing a GAGA implementation. Which of these would constitute LABEL LEAKAGE (predicting from the answer)? Select all that apply.</>}
-        options={[
-          {key:"a", text:"At training time, the 'fraud' group includes the CENTER node itself (so the model literally sees its own label in the input).", correct:true},
-          {key:"b", text:"At inference time, neighbor labels are recent ground-truth labels (collected after the inference timestamp).", correct:true},
-          {key:"c", text:"At training time, hop-2 neighbors include nodes whose label was assigned AFTER the center node's label.", correct:true},
-          {key:"d", text:"The transformer uses positional encodings."},
-          {key:"e", text:"Using class-weighted cross-entropy in the loss."},
-        ]}
-        trap={<>(d) and (e) are standard architecture/training choices, not leakage. The 3 leakage modes (a/b/c) are subtle and easy to miss.</>}
-        lens={<>(a) is the most embarrassing leak — center-node self-inclusion in its own grouping. (b) and (c) are temporal leaks: using future information at inference or training time. All three are common and devastating; ALWAYS audit before trusting GAGA numbers.</>}
-        stretch={<>Design a single check that catches (a) automatically.</>}
-      />
-
-      <VIS.TrapProblem
-        id="gaga-p4"
-        difficulty="hard"
-        title="P4 — GADBench: GBDT + which features matches GAGA?"
-        scenario={<>To replicate GAGA's gain with a GBDT baseline (per GADBench's methodology), which feature class is MOST important to add?</>}
-        options={[
-          {key:"a", text:"Per-hop neighbor label distribution: fraction of fraud / benign / unknown among 1-hop neighbors, same for 2-hop. This is the explicit version of what GAGA groups.", correct:true},
-          {key:"b", text:"Neighbor degree statistics."},
-          {key:"c", text:"Triangle counts in the ego network."},
-          {key:"d", text:"Node2vec embeddings."},
-        ]}
-        trap={<>(b)-(d) are useful structural features but don't directly encode the GROUPING-by-label signal GAGA uses. The exact match is per-hop neighbor-label distribution.</>}
-        lens={<>(a) is the GADBench answer. GAGA's grouping is exactly "what fraction of my neighbors at each hop are fraud / benign?" Compute that as a feature and a GBDT learns the same signal — often catching most of GAGA's reported gain.</>}
-        stretch={<>If you can't compute neighbor labels at inference, which baseline gain disappears?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gaga-p5"
+        id="gaga-a2"
         difficulty="medium"
-        title="P5 — Why TOKENIZE neighbors instead of pooling?"
-        scenario={<>A junior engineer asks: "Why does GAGA tokenize neighbors by group before transformer attention? Why not just mean-pool ALL neighbors into one vector and feed that to a transformer?"</>}
-        options={[
-          {key:"a", text:"Mean-pooling all neighbors discards the per-label-group information; the transformer would see a single mixed vector and couldn't differentiate 'attended to fraud group' vs 'attended to benign group.' Tokenizing per group preserves that distinction.", correct:true},
-          {key:"b", text:"Transformers can't accept single-vector inputs."},
-          {key:"c", text:"Tokenization is just a software convention."},
-          {key:"d", text:"To match BERT's input format."},
-        ]}
-        trap={<>(b)-(d) misread the architectural choice. The actual reason is information-preserving: tokens-by-group preserve the structure that the attention layer then weighs.</>}
-        lens={<>(a) is the design rationale. The token-per-group structure is the OBJECT the transformer attends OVER. Mean-pooling first throws away the structure attention is supposed to operate on.</>}
-        stretch={<>What if you tokenized per individual neighbor instead of per group?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gaga-p6"
-        difficulty="hard"
+        title="A2 — 'GAGA is just GAT with extra steps'"
+        scenario={<>A reviewer dismisses GAGA as "GAT with positional encoding." Which statements distinguish GAGA from GAT?</>}
         multiSelect
-        title="P6 — Privacy: neighbor labels at inference create which risks?"
-        scenario={<>GAGA at inference reads neighbor labels (e.g., "is this user fraud?"). In a deployment with privacy/compliance requirements, which risks does this create? Select all that apply.</>}
         options={[
-          {key:"a", text:"Neighbor labels may be PII or otherwise privacy-protected; reading them at inference time may violate data-minimization principles.", correct:true},
-          {key:"b", text:"If the model leaks gradients (membership inference attack), an attacker could probe neighbor labels via crafted queries.", correct:true},
-          {key:"c", text:"Cross-tenant inference may expose labels from one customer's data to another customer's scoring.", correct:true},
-          {key:"d", text:"Inference latency increases with label storage."},
-          {key:"e", text:"Model size grows linearly with label vocabulary."},
+          {key:"a", text:"GAT's attention is over node features; GAGA's attention is over labeled-group aggregates — labels are part of the token, not just features.", correct:true},
+          {key:"b", text:"GAGA can express 'this center has 5 fraud neighbors at hop 1' as a directly-attended token; GAT cannot — GAT operates on feature similarity, which does not encode class-distribution directly.", correct:true},
+          {key:"c", text:"GAGA has hop-distance positional encoding; GAT does not.", correct:true},
+          {key:"d", text:"GAGA does not use attention."},
         ]}
-        trap={<>(d)-(e) are non-issues. The privacy risks (a)-(c) are real and often missed in academic-to-production translations.</>}
-        lens={<>(a), (b), (c) are the privacy attack surfaces. Mitigations: use pseudo-labels from a separately-trained teacher (P7), federated inference, or simply pre-aggregate neighbor-label statistics offline so the online path never sees raw labels.</>}
-        stretch={<>Which of these risks does CARE-GNN avoid that GAGA has?</>}
+        trap={<>(d) is false.</>}
+        lens={<>GAGA's contribution is the labeled-group tokenization, not the transformer per se. A GAT-equivalent without label-encoded tokens cannot capture the heterophilic patterns GAGA targets.</>}
+        stretch={<>Could you mimic GAGA inside GAT by adding label-features? What would you lose?</>}
       />
 
+      {/* axis: A3 */}
       <VIS.TrapProblem
-        id="gaga-p7"
+        id="gaga-a3"
         difficulty="hard"
-        title="P7 — Pseudo-labels at inference: does GAGA degrade?"
-        scenario={<>You deploy GAGA with pseudo-labels (generated by a teacher model) at inference time. The teacher is 92% accurate on benign vs fraud. How much should you expect GAGA's accuracy to degrade vs the train-with-true-labels setting?</>}
+        title="A3 — Counterfactual: GAGA never existed"
+        scenario={<>Counterfactual: GAGA was never published. You face money-mule fraud on a heterophilic graph. Pick the fallback with the strongest cost-benefit profile.</>}
         options={[
-          {key:"a", text:"Small but real degradation (~1-3 F1 points). The 8% pseudo-label noise mostly impacts the grouping, and GAGA's attention can partially compensate.", correct:true},
-          {key:"b", text:"No degradation — pseudo-labels are nearly perfect."},
-          {key:"c", text:"Massive degradation (~20 F1 points) — GAGA is fragile to label noise."},
-          {key:"d", text:"Pseudo-labels can't be used; deployment is impossible."},
+          {key:"a", text:"A tuned LightGBM with per-hop per-class neighbor-count features (n_fraud_h1, n_benign_h1, n_fraud_h2, ...). Under GADBench temporal-split AUPRC this baseline captures most of GAGA's labeled-group signal at a fraction of the compute. The cost is loss of cross-hop transformer attention patterns.", correct:true},
+          {key:"b", text:"Vanilla GAT — would beat GraphSAGE."},
+          {key:"c", text:"CARE-GNN with the filter inverted."},
+          {key:"d", text:"DLRM with hand-crafted crosses."},
         ]}
-        trap={<>(b) is over-optimistic; (c) is over-pessimistic; (d) is wrong (deployment is normal). The reality is in between.</>}
-        lens={<>(a). 8% pseudo-label noise translates to roughly 8% of neighbors landing in the wrong group; the transformer's attention can downweight these but not eliminate the effect. The 1-3 F1 hit is documented in practical GAGA deployments.</>}
-        stretch={<>Could you ensemble multiple teachers to reduce pseudo-label noise?</>}
+        trap={<>(b) doesn't address heterophily. (c) is a clever hack but the paper never claims this works. (d) is off-topic.</>}
+        lens={<>The honest fallback is GBDT-with-labeled-group-features. GADBench's lesson applies most strongly here: GAGA's main contribution is feature-engineering-as-tokens, which a GBDT can replicate at the feature layer.</>}
+        stretch={<>What single feature in the GBDT baseline most reduces the GAGA gap?</>}
       />
 
+      {/* axis: A4 */}
       <VIS.TrapProblem
-        id="gaga-p8"
+        id="gaga-a4"
         difficulty="hard"
-        title="P8 — When does GAGA underperform CARE-GNN?"
-        scenario={<>On which graph property does GAGA underperform CARE-GNN, despite GAGA's theoretical advantage?</>}
+        title="A4 — Stack GAGA + PC-GNN sampler"
+        scenario={<>You want to combine GAGA's labeled-group transformer with PC-GNN's sampler on a 0.5%-fraud heterophilic graph. Where does the composition need care?</>}
+        multiSelect
         options={[
-          {key:"a", text:"On HIGH-homophily graphs where most neighbors share the center's label, CARE-GNN's similarity filter has the right inductive bias and is more sample-efficient. GAGA's attention has to LEARN homophily from data; CARE-GNN ASSUMES it.", correct:true},
-          {key:"b", text:"On very large graphs — GAGA scales worse."},
-          {key:"c", text:"On clean labels — CARE-GNN benefits more from clean data."},
-          {key:"d", text:"GAGA always beats CARE-GNN."},
+          {key:"a", text:"PC-GNN oversamples fraud centers; GAGA's labeled-group tokens at training time then over-represent the fraud@hop_k tokens. The transformer learns to attend disproportionately to fraud tokens, and at inference (natural prior) it under-attends to benign tokens — calibration breaks.", correct:true},
+          {key:"b", text:"The labeled-group token computation must respect the sampler's reweighting — naive token computation uses raw neighbor counts, but PC-GNN-sampled batches have non-natural counts.", correct:true},
+          {key:"c", text:"They cannot be combined."},
+          {key:"d", text:"PC-GNN replaces GAGA's transformer."},
         ]}
-        trap={<>(d) is the overgeneralization trap. (b) is wrong — GAGA actually scales WELL per-node because token count is small. (c) is unsupported.</>}
-        lens={<>(a) is the inductive-bias point. When the true relationship IS "similar neighbors, same class" (homophily), CARE-GNN's hardcoded bias is more sample-efficient than GAGA's learn-it-from-data approach. Measure homophily BEFORE picking the architecture.</>}
-        stretch={<>How would you measure homophily directly?</>}
+        trap={<>(c) is too strong. (d) is false.</>}
+        lens={<>The composition is non-trivial: any sampler-based imbalance fix interacts with the transformer's attention because attention weights are batch-dependent. Practical fix: apply prior correction to GAGA's output AND ensure labeled-group token computation uses natural neighbor counts even when batches are sampler-balanced.</>}
+        stretch={<>How would you compute labeled-group tokens consistently across train and test?</>}
       />
 
+      {/* axis: A5 */}
       <VIS.TrapProblem
-        id="gaga-p9"
+        id="gaga-a5"
+        difficulty="hard"
+        title="A5 — Where GAGA stops winning"
+        scenario={<>At what homophily level does GAGA's premise stop holding? Defend with a mechanism argument.</>}
+        options={[
+          {key:"a", text:"At homophily approximately above 0.8 (most edges connect same-class nodes), GAGA's labeled-group tokens collapse: fraud@h1 is nearly always small for benign centers and large for fraud centers, so the labeled-group signal is redundant with the center's label distribution. CARE-GNN's filter or even a simple GAT does as well, at lower cost.", correct:true},
+          {key:"b", text:"GAGA works at any homophily."},
+          {key:"c", text:"At homophily = 0.5 only."},
+          {key:"d", text:"There is no boundary."},
+        ]}
+        trap={<>(b), (c), (d) miss the mechanism.</>}
+        lens={<>GAGA's expressivity advantage scales inversely with homophily. At high homophily the labeled-group token's information collapses to "neighbor class = center class" which is trivial. GAGA shines specifically where heterophilic mixing makes label-group distributions informative beyond center-label.</>}
+        stretch={<>How would you measure your graph's homophily before picking GAGA?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>B. Application</h3>
+
+      {/* axis: B1 */}
+      <VIS.TrapProblem
+        id="gaga-b1"
         difficulty="medium"
-        multiSelect
-        title="P9 — What's in a 'group' token?"
-        scenario={<>For each (hop × label) group, what does GAGA encode into the group token? Select all that apply.</>}
+        title="B1 — Pick the right tool given the scenario"
+        scenario={<>Scenario: cross-bank wire-fraud detection (each bank's customer labels are PII and cannot be shared); heterophilic by nature (mules straddle banks). Pick the next investment.</>}
         options={[
-          {key:"a", text:"Mean-pooled feature vectors of all neighbors in the group.", correct:true},
-          {key:"b", text:"A learned positional embedding indicating which (hop, label) the group is.", correct:true},
-          {key:"c", text:"Count of neighbors in the group as a numeric feature.", correct:true},
-          {key:"d", text:"The exact list of neighbor IDs."},
-          {key:"e", text:"The label of the center node."},
+          {key:"a", text:"NOT GAGA — labels at inference are unavailable across banks (PII). Use FraudGT (label-free transformer over k-hop subgraph) or a federated approach. GAGA's labeled-group token mechanism cannot be built when labels are not shareable.", correct:true},
+          {key:"b", text:"GAGA — it handles heterophily."},
+          {key:"c", text:"CARE-GNN — its filter handles cross-bank fraud."},
+          {key:"d", text:"Vanilla DLRM."},
         ]}
-        trap={<>(d) doesn't generalize; (e) is leakage (P3a). The actual encoding is (a) features + (b) position + (c) count.</>}
-        lens={<>(a), (b), (c) are the three components of the group token. Position embedding distinguishes "hop-1 fraud" from "hop-2 fraud," and the count gives the transformer a signal about group size (an empty group should attend differently from a 1000-neighbor group).</>}
-        stretch={<>What if a group is empty (no fraud neighbors at hop 1)?</>}
+        trap={<>(b) is the heterophily reflex but ignores the inference-label constraint that is GAGA's hard requirement. (c) is wrong-tool. (d) ignores graph structure.</>}
+        lens={<>GAGA's strength (label-encoded tokens) is its weakness in cross-customer fraud surfaces — labels are PII. The scenario flips the choice to FraudGT or a federated alternative.</>}
+        stretch={<>Could you adapt GAGA to use only YOUR bank's labels at inference?</>}
       />
 
+      {/* axis: B2 */}
       <VIS.TrapProblem
-        id="gaga-p10"
+        id="gaga-b2"
         difficulty="hard"
-        title="P10 — Picking between GAGA, CARE-GNN, PC-GNN, GBDT-baseline"
-        scenario={<>Your fraud graph: homophily ≈ 0.2 (low), fraud rate 0.4%, 5% label noise, 20M nodes, labels are non-PII (transaction confirmations from chargebacks), p99 budget 100ms. Pick ONE.</>}
+        title="B2 — 'Sounds reasonable' — deeper hops always help"
+        scenario={<>A teammate proposes "set GAGA's hop depth to 6 — money laundering networks are 5+ hops deep, so we need that range." Why is this wrong specifically for GAGA?</>}
         options={[
-          {key:"a", text:"GBDT + structural + per-hop neighbor-label-distribution features. Get the GADBench-style baseline number FIRST; if the gap to GAGA is &lt;1 F1 (likely), ship the GBDT for simplicity and SLA.", correct:true},
-          {key:"b", text:"GAGA — heterophily is its strength."},
-          {key:"c", text:"CARE-GNN — RL filter."},
-          {key:"d", text:"PC-GNN — for the imbalance."},
+          {key:"a", text:"At hop 6, the labeled-group tokens aggregate over a large fraction of the graph; the per-class statistics converge to the population fraud rate regardless of the center; tokens become uninformative and the transformer cannot discriminate. Practically GAGA tops out at hop 3-4 where the labeled-group signal is still center-specific.", correct:true},
+          {key:"b", text:"GPU memory."},
+          {key:"c", text:"Deeper is always better."},
+          {key:"d", text:"Hop 6 breaks the loss."},
         ]}
-        trap={<>(b) is the obvious heterophily answer but skips the GBDT baseline. (c) has the wrong inductive bias for heterophily. (d) targets imbalance, not heterophily.</>}
-        lens={<>(a) is the GADBench-aware senior MLE answer. Even when the scenario points toward GAGA's wheelhouse (heterophily), running the GBDT baseline with neighbor-label-distribution features first is the rational sequencing — it's cheap, fast to deploy, and frequently within 1 F1 of GAGA. Only IF the gap is meaningful (≥3 F1) do you invest in GAGA's infra.</>}
-        stretch={<>Under what scenario change would GAGA become the clear pick?</>}
+        trap={<>(b) is the memory complaint, not the mechanism. (c) is naive.</>}
+        lens={<>GAGA's tokens are aggregations — they suffer from a different version of over-smoothing where the per-class token converges to the population class-mean as hop grows. The transformer cannot recover what the tokenization lost.</>}
+        stretch={<>How would you detect that your tokens have collapsed to the population mean?</>}
       />
+
+      {/* axis: B3 — concept-specific pitch */}
+      <VIS.TrapProblem
+        id="gaga-b3"
+        difficulty="hard"
+        title="B3 — Pitch GAGA to the AML team"
+        scenario={<>The AML lead asks "Why GAGA over our existing GAT?" Pick the pitch that requires understanding GAGA's specific mechanism.</>}
+        options={[
+          {key:"a", text:"GAGA encodes neighbor LABELS into the input tokens, not just node features, so the transformer can attend to patterns like 'this account has 5 known-fraud neighbors at hop 1 plus 12 known-benign at hop 2 sharing a single device' — a heterophilic structure (mule routes fraud through benigns) that GAT cannot represent because GAT's attention is over feature similarity, which would smooth across the cross-class boundary.", correct:true},
+          {key:"b", text:"GAGA is more accurate on AML datasets."},
+          {key:"c", text:"Transformers are state of the art."},
+          {key:"d", text:"GAGA is fast at inference."},
+        ]}
+        trap={<>(b) is generic. (c) is empty. (d) is dubious and irrelevant.</>}
+        lens={<>The concept-specific pitch names the <em>labeled-group token</em> mechanism and the <em>heterophilic mule pattern</em> it specifically captures. Strip "GAGA" → the listener must understand label-as-token to evaluate. (b)(c)(d) all survive redaction with "any model X."</>}
+        stretch={<>What's the regulatory follow-up about inference-time labels you must answer?</>}
+      />
+
+      {/* axis: B4 */}
+      <VIS.TrapProblem
+        id="gaga-b4"
+        difficulty="hard"
+        title="B4 — When NOT to use GAGA"
+        scenario={<>Which scenarios are GAGA anti-patterns?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Inference-time labels are PII/regulatorily restricted (cross-customer fraud, GDPR territory).", correct:true},
+          {key:"b", text:"High-homophily graph — labeled-group tokens collapse to trivial center-label-correlated features.", correct:true},
+          {key:"c", text:"Sparse graph with few neighbors per hop — labeled-group tokens are noisy averages over 1-2 nodes.", correct:true},
+          {key:"d", text:"Dense heterophilic graph with available partial labels at inference."},
+        ]}
+        trap={<>(d) is the regime GAGA was designed for.</>}
+        lens={<>Three anti-patterns map to three different alternatives: PII → FraudGT, high-homophily → CARE-GNN, sparse → tabular features only.</>}
+        stretch={<>Sketch the anti-pattern checklist you would apply before proposing GAGA.</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>C. Mechanism</h3>
+
+      {/* axis: C1 */}
+      <VIS.TrapProblem
+        id="gaga-c1"
+        difficulty="hard"
+        title="C1 — Why group tokens (not per-neighbor tokens)?"
+        scenario={<>Why does GAGA aggregate neighbors into per-(hop, class) GROUP tokens, instead of giving each neighbor its own transformer token?</>}
+        options={[
+          {key:"a", text:"Per-neighbor tokens scale linearly with degree — large fraud rings (1000+ neighbors) blow up attention's O(N^2) cost. Per-(hop, class) group tokens give constant token count (3 classes x H hops), making the transformer O(H^2) regardless of graph size. The aggregation loses fine-grained neighbor identity but preserves the class-distribution signal, which is what heterophily depends on.", correct:true},
+          {key:"b", text:"To reduce parameter count."},
+          {key:"c", text:"To match the original transformer paper."},
+          {key:"d", text:"Per-neighbor tokens are impossible."},
+        ]}
+        trap={<>(b), (c) miss the scaling argument. (d) is false.</>}
+        lens={<>The group aggregation is a deliberate scalability/expressivity tradeoff: lose neighbor identity, gain constant-size token sequence. For heterophily detection (class-distribution patterns) the loss is acceptable; for fine-grained patterns (specific suspicious neighbor) it isn't.</>}
+        stretch={<>What architectural change would let GAGA retain some per-neighbor identity?</>}
+      />
+
+      {/* axis: C2 */}
+      <VIS.TrapProblem
+        id="gaga-c2"
+        difficulty="medium"
+        title="C2 — Loss / unlabeled-group handling"
+        scenario={<>How does GAGA's loss treat the unlabeled-group token? Why is this choice load-bearing?</>}
+        options={[
+          {key:"a", text:"The unlabeled-group token is still aggregated and attended to — it carries useful signal (unlabeled-neighbor count alone is informative). The loss is computed only on the labeled center node; unlabeled tokens contribute to the representation but not directly to the gradient. This lets GAGA work with partial labels at training and inference without imputation.", correct:true},
+          {key:"b", text:"The unlabeled-group token is masked out completely."},
+          {key:"c", text:"GAGA requires all labels."},
+          {key:"d", text:"The unlabeled-group token replaces the labeled ones."},
+        ]}
+        trap={<>(b), (c), (d) miss the partial-label handling.</>}
+        lens={<>This is what makes GAGA practically usable: full-label graphs are rare in fraud (chargeback delays, regulatory holds). The unlabeled-group token's design absorbs the missingness gracefully.</>}
+        stretch={<>What happens if more than half of neighbors are unlabeled at inference?</>}
+      />
+
+      {/* axis: C3 */}
+      <VIS.TrapProblem
+        id="gaga-c3"
+        difficulty="hard"
+        title="C3 — What GAGA drops vs MPNN"
+        scenario={<>What does GAGA explicitly drop relative to message-passing GNNs?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Per-neighbor message passing — replaced by per-(hop, class) aggregation into transformer tokens.", correct:true},
+          {key:"b", text:"Fine-grained neighbor identity — aggregated into class groups.", correct:true},
+          {key:"c", text:"Stacked GNN layers — replaced by a single transformer over the labeled-group sequence.", correct:true},
+          {key:"d", text:"Node-feature embeddings."},
+        ]}
+        trap={<>(d) is retained — node features feed the group aggregations.</>}
+        lens={<>Three drops: per-neighbor message passing, neighbor identity, stacked layers. One key retention: node-feature embeddings. The drops collectively eliminate over-smoothing and enable the heterophily expressivity.</>}
+        stretch={<>Which drop contributes most to GAGA's heterophily gain?</>}
+      />
+
+      {/* axis: C4 */}
+      <VIS.TrapProblem
+        id="gaga-c4"
+        difficulty="hard"
+        title="C4 — Which knob, mis-set, breaks GAGA?"
+        scenario={<>Rank by mis-set severity: (i) hop depth, (ii) number of attention heads, (iii) labeled-group aggregator (mean vs max), (iv) embedding dim.</>}
+        options={[
+          {key:"a", text:"Hop depth > group aggregator > attention heads > embedding dim. Hop depth controls the token sequence length — too low (1) loses cross-hop reasoning; too high (6+) collapses tokens to population means. Aggregator choice (mean vs max) changes what each token encodes — max emphasizes outliers, mean captures averages.", correct:true},
+          {key:"b", text:"Embedding dim dominates."},
+          {key:"c", text:"All equally important."},
+          {key:"d", text:"Number of heads dominates."},
+        ]}
+        trap={<>(b), (c), (d) miss the tokenization-knob priority.</>}
+        lens={<>Tokenization-affecting knobs are most critical; transformer-internal knobs are secondary. This is the inverse of LLM tuning priorities and a GAGA-specific signal.</>}
+        stretch={<>What is your hop-depth selection heuristic?</>}
+      />
+
+      {/* axis: C5 */}
+      <VIS.TrapProblem
+        id="gaga-c5"
+        difficulty="medium"
+        title="C5 — Data-assumption: stale labels at inference"
+        scenario={<>Your chargeback delay is 60 days, so at inference time the freshest labeled neighbors are 60+ days old. What specifically degrades?</>}
+        options={[
+          {key:"a", text:"The labeled-group tokens at inference are computed from stale labels — recent fraud (the most actionable to detect) is not yet in any 'fraud@hopK' token, so the transformer attends to a labeled-group distribution that systematically under-represents new fraud. GAGA's fraud-detection power on the most-recent fraud is the lowest by construction.", correct:true},
+          {key:"b", text:"No effect — GAGA handles staleness."},
+          {key:"c", text:"GAGA refuses to run."},
+          {key:"d", text:"Tokens are computed at training only."},
+        ]}
+        trap={<>(b), (c), (d) miss the inference-time issue.</>}
+        lens={<>GAGA degrades on label-stale inference more than CARE-GNN does, because GAGA encodes labels structurally. Mitigation: use pseudo-labels from a fast tabular model to fill recent-window labeled-group tokens; accept the bias and monitor it.</>}
+        stretch={<>How would you measure "stale-label bias" in GAGA's scores?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>D. Intuition traps</h3>
+
+      {/* axis: D1 */}
+      <VIS.TrapProblem
+        id="gaga-d1"
+        difficulty="medium"
+        title="D1 — 'Transformer = always better than MPNN'"
+        scenario={<>Intuition: GAGA wins because transformers are better than MPNNs. Where does this intuition mislead?</>}
+        options={[
+          {key:"a", text:"GAGA's win is NOT from 'transformer vs MPNN' — it's from labeled-group TOKENIZATION. A GBDT with per-hop-per-class neighbor-count features captures the same signal; a vanilla transformer over node features (without labeled-group tokens) does NOT. The architecture is secondary to the tokenization choice.", correct:true},
+          {key:"b", text:"Transformer is always better."},
+          {key:"c", text:"MPNN beats transformer."},
+          {key:"d", text:"It depends only on parameter count."},
+        ]}
+        trap={<>(b), (c), (d) miss the tokenization-vs-architecture decomposition.</>}
+        lens={<>The mechanism-vs-architecture decomposition is a senior-MLE move: which part of the model is doing the work? For GAGA, it's the tokenization. This is also why GADBench shows GBDT with the right features closes most of the gap.</>}
+        stretch={<>Build the GBDT feature list that mirrors GAGA's tokenization.</>}
+      />
+
+      {/* axis: D1b */}
+      <VIS.TrapProblem
+        id="gaga-d1b"
+        difficulty="hard"
+        title="D1b — 'More labels = always better'"
+        scenario={<>A junior says "let's label MORE neighbors before training — more labeled-group token signal." Why might this hurt?</>}
+        options={[
+          {key:"a", text:"At inference time you can only label so much (chargeback delay). If training uses near-100% labeled neighbors and inference has 40% labeled, the labeled-group token distribution at inference is systematically different from training (unlabeled-group token is much larger). The transformer was trained on a distribution that does not match what it sees at inference. Counter-intuitively, downsampling training labels to match inference labeled-fraction helps.", correct:true},
+          {key:"b", text:"More labels is always strictly better."},
+          {key:"c", text:"More labels triggers overfitting."},
+          {key:"d", text:"Labels affect only the loss."},
+        ]}
+        trap={<>(b) is the naive belief. (c) is general; (d) ignores GAGA's tokenization.</>}
+        lens={<>The train-test distribution match issue is GAGA-specific. The labeled-fraction is a structural parameter of the input distribution, not a regularizer.</>}
+        stretch={<>Sketch your label-fraction matching protocol.</>}
+      />
+
+      {/* axis: D2 */}
+      <VIS.TrapProblem
+        id="gaga-d2"
+        difficulty="hard"
+        title="D2 — Wrong-assumption cascade: ignore PII"
+        scenario={<>You assume "we have labels in the data warehouse, so we have labels at inference" and skip the legal/PII review. Trace the cascade.</>}
+        options={[
+          {key:"a", text:"Build GAGA → ship → legal flags neighbor-label features as PII (label of one user is sensitive info about that user used to score another user) → recall the model → re-architect to FraudGT or remove label tokens → 3 months wasted → team morale damaged.", correct:true},
+          {key:"b", text:"No cascade — labels in DW are fine to use."},
+          {key:"c", text:"GPU OOM."},
+          {key:"d", text:"Latency increases."},
+        ]}
+        trap={<>(b), (c), (d) miss the regulatory issue.</>}
+        lens={<>The PII issue is the #1 GAGA-specific production failure. Always validate the legal-feature-use review before commit.</>}
+        stretch={<>Write the 1-paragraph note you would send legal to clear GAGA's label features.</>}
+      />
+
+      {/* axis: D3 */}
+      <VIS.TrapProblem
+        id="gaga-d3"
+        difficulty="hard"
+        title="D3 — Junior vs senior diagnostic"
+        scenario={<>Junior reports GAGA beats GAT by 3 AUPRC on T-Finance. What's the senior question that probes whether the win is real?</>}
+        options={[
+          {key:"a", text:"'How does GAGA compare to a LightGBM with per-hop per-class neighbor count features under the same temporal split? T-Finance is closer to homophilic than heterophilic, so labeled-group tokens may not add much over the explicit features. Also: was T-Finance random-split or temporal-split?'", correct:true},
+          {key:"b", text:"'Did you use enough heads?'"},
+          {key:"c", text:"'Try a bigger model.'"},
+          {key:"d", text:"'GAGA is SOTA, ship it.'"},
+        ]}
+        trap={<>(b), (c), (d) miss the eval-protocol issue.</>}
+        lens={<>The senior question forces (i) GBDT-with-equivalent-features baseline, (ii) temporal-split protocol, (iii) homophily-fit check. All three are the GADBench template applied to a transformer-fraud paper.</>}
+        stretch={<>How would you measure T-Finance's homophily? What number would change your mind?</>}
+      />
+
+      {/* axis: D4 */}
+      <VIS.TrapProblem
+        id="gaga-d4"
+        difficulty="hard"
+        title="D4 — Plausible misattribution: GAGA degrades over time"
+        scenario={<>GAGA's production AUPRC degrades 2 points per week over 6 weeks. Candidates: (i) fraud-network topology shift, (ii) labeled-fraction at inference dropping (label staleness growing), (iii) transformer drift. Which is most likely?</>}
+        options={[
+          {key:"a", text:"(ii) Labeled-fraction drift. Production label pipelines often degrade silently (chargeback delays creep up, label-batch jobs slip). GAGA's labeled-group tokens become noisier and the transformer's attention shifts to the unlabeled-group token, which is less informative. The 2-pt/week linear degradation is the fingerprint of a slow upstream pipeline issue.", correct:true},
+          {key:"b", text:"(i) Topology shift."},
+          {key:"c", text:"(iii) Transformer drift."},
+          {key:"d", text:"Random."},
+        ]}
+        trap={<>(b), (c) are plausible but would manifest with different cadence. (d) ignores the linearity.</>}
+        lens={<>Linear-degradation signature = upstream pipeline drift. For GAGA, the labeled-fraction is the most fragile upstream variable.</>}
+        stretch={<>What labeled-fraction monitor would alert before AUPRC degrades?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>E. Operations</h3>
+
+      {/* axis: E1 */}
+      <VIS.TrapProblem
+        id="gaga-e1"
+        difficulty="hard"
+        title="E1 — Production gotcha specific to GAGA"
+        scenario={<>Pick the gotcha most specific to GAGA (would not bite CARE-GNN, PC-GNN, FraudGT).</>}
+        options={[
+          {key:"a", text:"Inference-time labeled-fraction MUST match training-time labeled-fraction or the labeled-group token distribution shifts. Most fraud orgs lack tooling to enforce this constraint, so the bug is silent.", correct:true},
+          {key:"b", text:"GPU OOM."},
+          {key:"c", text:"Embedding sharding."},
+          {key:"d", text:"Cold-start."},
+        ]}
+        trap={<>(b), (c), (d) are generic.</>}
+        lens={<>The label-fraction match is GAGA's unique production constraint. Solution: at training, downsample neighbor labels to match expected inference availability; at inference, monitor the labeled-fraction.</>}
+        stretch={<>What dashboard tile would you add to your model monitor for this?</>}
+      />
+
+      {/* axis: E2 */}
+      <VIS.TrapProblem
+        id="gaga-e2"
+        difficulty="hard"
+        title="E2 — Friday: GAGA score distribution shifts"
+        scenario={<>Friday: GAGA scores at p95 jump from 0.6 to 0.85 over one day. Fraud queue overflows. Logs show no fraud-rate change and no code deploy. What's the prime suspect?</>}
+        options={[
+          {key:"a", text:"Check the labeled-group token statistics over the last 24h vs the prior week. A label-batch job slipping or a label-source dropping out causes a sudden drop in labeled fraction; the transformer falls back to the unlabeled-group token, which it has learned to score conservatively (i.e. higher fraud probability when uncertain). This is GAGA-specific behavior.", correct:true},
+          {key:"b", text:"Roll back."},
+          {key:"c", text:"Page the data team."},
+          {key:"d", text:"Add more layers."},
+        ]}
+        trap={<>(b), (c), (d) skip diagnosis.</>}
+        lens={<>The labeled-fraction is the most fragile upstream variable. Always check it first when GAGA's score distribution shifts without an apparent fraud-rate or code change.</>}
+        stretch={<>Write the SQL/metric query that detects this.</>}
+      />
+
+      {/* axis: E3 */}
+      <VIS.TrapProblem
+        id="gaga-e3"
+        difficulty="hard"
+        title="E3 — Eval-protocol audit"
+        scenario={<>Which audit findings invalidate a GAGA report card?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Eval used full-label graphs (every neighbor labeled), unrealistic relative to production where labels are 40% or less of neighbors.", correct:true},
+          {key:"b", text:"Random splits on temporal graphs leak.", correct:true},
+          {key:"c", text:"GBDT baseline used was not given per-hop-per-class neighbor-count features (i.e. baseline was sandbagged).", correct:true},
+          {key:"d", text:"Transformers are inherently trustworthy."},
+        ]}
+        trap={<>(d) is wrong by construction.</>}
+        lens={<>Three audit failures: unrealistic labeled-fraction, random splits, sandbagged baseline. Each is fixable; each invalidates the report card if uncorrected.</>}
+        stretch={<>Write the GAGA-specific eval checklist for your team.</>}
+      />
+
+      {/* axis: E4 */}
+      <VIS.TrapProblem
+        id="gaga-e4"
+        difficulty="medium"
+        title="E4 — Rollout sequence: GAT to GAGA"
+        scenario={<>Order: (i) full ramp, (ii) shadow + legal/PII review, (iii) hybrid with GAT score, (iv) traffic ramp.</>}
+        options={[
+          {key:"a", text:"ii → iii → iv → i. The legal/PII review is mandatory before any traffic; shadow validates score distribution; hybrid bounds variance during ramp.", correct:true},
+          {key:"b", text:"i → ii → iii → iv."},
+          {key:"c", text:"Direct cutover."},
+          {key:"d", text:"iv → i."},
+        ]}
+        trap={<>(b), (c), (d) skip the legal review.</>}
+        lens={<>GAGA's legal/PII review must precede any user-facing traffic. This is a GAGA-specific step.</>}
+        stretch={<>What is the legal team's acceptance criterion?</>}
+      />
+
+      {/* axis: E5 */}
+      <VIS.TrapProblem
+        id="gaga-e5"
+        difficulty="medium"
+        title="E5 — Reproducibility issues"
+        scenario={<>Which GAGA reproducibility issues are widely known?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Hop depth + group-aggregator choice are sensitive to dataset; paper's defaults don't always transfer.", correct:true},
+          {key:"b", text:"Public eval assumed full-label graphs at inference, inflating apparent gains relative to production-realistic labeled-fraction.", correct:true},
+          {key:"c", text:"Original code used random splits on temporal datasets.", correct:true},
+          {key:"d", text:"GAGA cannot be reimplemented in PyTorch."},
+        ]}
+        trap={<>(d) is false.</>}
+        lens={<>The three reproducibility issues are protocol issues that GADBench's protocol addresses.</>}
+        stretch={<>What's your reimplementation checklist for GAGA?</>}
+      />
+
+      {/* axis: E6 */}
+      <VIS.TrapProblem
+        id="gaga-e6"
+        difficulty="hard"
+        title="E6 — Eval contamination on T-Finance / Amazon"
+        scenario={<>Which contamination paths most affect GAGA's claims on T-Finance / Amazon?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"Random splits + temporally ordered transaction edges → train neighborhoods overlap test-period nodes.", correct:true},
+          {key:"b", text:"Full-label eval — inference assumes ALL neighbor labels visible, which is not production-realistic.", correct:true},
+          {key:"c", text:"T-Finance is closer to homophilic than heterophilic, but GAGA's premise is heterophily — the headline gain on T-Finance understates the regime-fit issue.", correct:true},
+          {key:"d", text:"Amazon and T-Finance are too small to evaluate."},
+        ]}
+        trap={<>(d) overstates.</>}
+        lens={<>Three contamination paths: split protocol, label-fraction unrealism, regime-fit. All three are addressable; cumulatively they explain most of the GAGA-vs-GBDT shrinkage under GADBench.</>}
+        stretch={<>Which contamination path is hardest to fix in practice?</>}
+      />
+
+      <h3 style={{marginTop:24, color:"#1f3a5f"}}>F. Failure modes & edge cases</h3>
+
+      {/* axis: F1 */}
+      <VIS.TrapProblem
+        id="gaga-f1"
+        difficulty="hard"
+        title="F1 — Smallest input that breaks GAGA"
+        scenario={<>Construct the smallest graph where GAGA provably reduces to a hop-aware transformer over node features (no labeled-group benefit).</>}
+        options={[
+          {key:"a", text:"A graph with ZERO labeled neighbors at inference — the fraud and benign group tokens collapse to the empty token; only the unlabeled-group token carries information; GAGA reduces to a hop-aware transformer over feature aggregates with no class-distribution signal.", correct:true},
+          {key:"b", text:"Any 1-node graph."},
+          {key:"c", text:"Any tree."},
+          {key:"d", text:"A bipartite graph."},
+        ]}
+        trap={<>(b) is trivial. (c), (d) miss the mechanism.</>}
+        lens={<>GAGA's mechanism collapses when there are no labeled neighbors — exactly mirroring CARE-GNN's collapse on uniform similarity.</>}
+        stretch={<>What is the minimum labeled-fraction at which GAGA recovers measurable lift over GAT?</>}
+      />
+
+      {/* axis: F2 */}
+      <VIS.TrapProblem
+        id="gaga-f2"
+        difficulty="hard"
+        title="F2 — Adversarial: label poisoning a benign neighbor"
+        scenario={<>Design an attack that exploits GAGA's reliance on neighbor labels.</>}
+        options={[
+          {key:"a", text:"Poison the labels of a few benign neighbors to 'fraud' (or vice versa). GAGA's labeled-group tokens shift, the transformer attends differently, and the center's score moves in a controllable direction. Because GAGA encodes labels into the model's input, label tampering directly shifts inference — more impactful than feature tampering would be on a feature-only GNN.", correct:true},
+          {key:"b", text:"Add random noise to features."},
+          {key:"c", text:"There is no attack."},
+          {key:"d", text:"Add new edges."},
+        ]}
+        trap={<>(b), (c), (d) miss GAGA's label-dependency attack surface.</>}
+        lens={<>Label tampering is GAGA's unique attack surface — most GNNs are feature/edge-attackable, but GAGA adds label-attackability because labels are inputs. Defense: integrity-protected labels, label-source provenance tracking.</>}
+        stretch={<>How few label flips are needed to flip a single decision?</>}
+      />
+
+      {/* axis: F4 */}
+      <VIS.TrapProblem
+        id="gaga-f4"
+        difficulty="medium"
+        title="F4 — Paper-admitted limitation"
+        scenario={<>Which limitation does the GAGA paper itself call out?</>}
+        options={[
+          {key:"a", text:"Degradation under inference-time label staleness; sensitivity to hop depth.", correct:true},
+          {key:"b", text:"GAGA is bug-free."},
+          {key:"c", text:"GPU memory limitations only."},
+          {key:"d", text:"Training time."},
+        ]}
+        trap={<>(b), (c), (d) miss the specific paper-named limitations.</>}
+        lens={<>The paper is honest about label staleness — which is a soft signal of regime-fit. Knowing it signals careful reading.</>}
+        stretch={<>What did the paper NOT predict that GADBench exposed?</>}
+      />
+
+      {/* axis: F5 */}
+      <VIS.TrapProblem
+        id="gaga-f5"
+        difficulty="hard"
+        title="F5 — The GADBench critique"
+        scenario={<>What did GADBench find about GAGA?</>}
+        multiSelect
+        options={[
+          {key:"a", text:"On most public benchmarks GAGA's lift over a LightGBM with per-hop-per-class neighbor-count features collapses to less than 2 AUPRC under temporal split.", correct:true},
+          {key:"b", text:"On dense heterophilic graphs (Amazon) GAGA retains a small but real edge — the transformer's cross-hop attention captures interactions the GBDT cannot.", correct:true},
+          {key:"c", text:"Full-label eval used in the paper inflated apparent gains relative to production-realistic labeled-fraction.", correct:true},
+          {key:"d", text:"GAGA dominates every benchmark by 10+ AUPRC."},
+        ]}
+        trap={<>(d) is wrong.</>}
+        lens={<>Three findings: small gap on most benchmarks, real edge on dense heterophilic, label-fraction-inflated paper numbers. Senior MLEs hold all three at once.</>}
+        stretch={<>What is the one feature you add to the GBDT baseline that most reduces the gap?</>}
+      />
+
+      {/* axis: F5b */}
+      <VIS.TrapProblem
+        id="gaga-f5b"
+        difficulty="hard"
+        title="F5b — The interview gold question"
+        scenario={<>Interviewer: "You championed GAGA at your last role. Walk me through the experiment that proves the labeled-group tokens are doing work beyond what a GBDT-with-equivalent-features captures."</>}
+        options={[
+          {key:"a", text:"Built three baselines under temporal-split AUPRC with equal hyperparameter budget: (i) class-weighted LightGBM with per-hop-per-class neighbor count features, (ii) vanilla GAT, (iii) GAGA. Also matched the labeled-fraction at training to inference-time labeled-fraction (40%) to avoid distribution mismatch. GAGA beat (i) by 1.6 AUPRC on dense heterophilic Amazon and by 0.3 on near-homophilic T-Finance; we shipped on Amazon only.", correct:true},
+          {key:"b", text:"Ran the original paper's eval; GAGA beat GAT by 3 points; shipped."},
+          {key:"c", text:"GAGA is transformer-based, so it's better; no ablation."},
+          {key:"d", text:"We compared GAGA only to vanilla GraphSAGE."},
+        ]}
+        trap={<>(b), (c), (d) skip the GADBench-style ablation.</>}
+        lens={<>The right answer (i) builds the right GBDT baseline (with the same labeled-group information), (ii) matches the labeled-fraction, (iii) reports regime-specific deployment. This is the senior signal.</>}
+        stretch={<>What is the one regime where you would default to GAGA without an ablation?</>}
+      />
+
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/2302.10407" target="_blank" rel="noopener">
-            <strong>Wang et al. — Label Information Enhanced Fraud Detection against Low Homophily in Graphs</strong>
-          </a>{" "}
+          <a href="https://arxiv.org/abs/2302.10407" target="_blank" rel="noopener"><strong>Wang et al. — GAGA</strong></a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, WWW 2023)</span>
-          <br/>The GAGA paper. Sec 3 (group aggregation) and Sec 4.4 (homophily analysis) are the keepers.
+          <br/>The original. Section 3 (labeled-group tokens), Section 4 (transformer), Section 5 (ablation).
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2306.12251" target="_blank" rel="noopener">
-            <strong>Tang et al. — GADBench (NeurIPS 2024)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper)</span>
-          <br/>The benchmark that closes the GAGA-vs-GBDT gap with neighbor-label-distribution features. Mandatory.
+          <a href="https://arxiv.org/abs/2306.12251" target="_blank" rel="noopener"><strong>Tang et al. — GADBench</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2024)</span>
+          <br/>The fair-eval protocol that re-benchmarks GAGA against feature-engineered GBDTs.
         </li>
         <li>
-          <a href="https://towardsdatascience.com/heterophily-and-gnns-fb1f7c50e8d4" target="_blank" rel="noopener">
-            <strong>TDS — Heterophily and GNNs: when neighbors don't share your class</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>Best plain-English intro to the homophily/heterophily distinction. Read before the GAGA paper.
+          <a href="https://arxiv.org/abs/2008.08692" target="_blank" rel="noopener"><strong>Dou et al. — CARE-GNN</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, CIKM 2020)</span>
+          <br/>The opposite-homophily-assumption sibling. Read alongside to map your graph's regime.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2006.11468" target="_blank" rel="noopener">
-            <strong>Zhu et al. — Beyond Homophily in Graph Neural Networks (H2GCN)</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2020)</span>
-          <br/>The canonical "GNNs for heterophilic graphs" paper that pre-dates GAGA. Useful framing of why standard GNNs fail.
-        </li>
-        <li>
-          <a href="https://github.com/Orion-wyc/GAGA" target="_blank" rel="noopener">
-            <strong>Official GAGA repo</strong>
-          </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(code)</span>
-          <br/>Reference PyTorch implementation. The label-grouping logic is in <code>data.py</code> — audit it for the P3 leakage modes.
+          <a href="https://arxiv.org/abs/2402.16494" target="_blank" rel="noopener"><strong>Lin et al. — FraudGT</strong></a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICAIF 2024)</span>
+          <br/>The label-free transformer alternative — pick when neighbor labels are PII.
         </li>
       </ul>
     </VIS.Section>
   </main>
 );
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
 </script>
   <script>
