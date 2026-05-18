@@ -1414,286 +1414,561 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// DyGFormer — Fraud SOTA · Real-time / streaming graph fraud
-// Transformer on temporal neighbor sequences; SOTA on dynamic-graph benchmarks.
+// DyGFormer — dynamic graph TRANSFORMER over patches of temporal neighbor sequences.
+// Concept-specific anchors (must survive redaction):
+//   (1) TRANSFORMER backbone (NOT RNN memory like TGN) — stateless between scoring calls
+//   (2) NEIGHBOR-CO-OCCURRENCE encoding: each token is tagged with how often the
+//       node appears in BOTH endpoints' histories — the model's distinctive lever
+//   (3) PATCHING of long neighbor sequences into fixed-size patches for long-context
+// Strip "transformer over neighbor patches + co-occurrence encoding" and answers should fail.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · Real-time / streaming graph fraud"
+      pill="Fraud SOTA · Dynamic graph transformer"
       title="DyGFormer"
-      subtitle="Transformer attention over each node's temporal neighbor sequence — skips memory compression and beats TGN on benchmarks with rich histories."
+      subtitle="Transformer over patches of each node's temporal neighbor sequence, with a neighbor co-occurrence encoding. Stateless per-call; no RNN memory."
       byline={[
-        {label: "Paper", value: "Yu et al., NeurIPS 2023"},
-        {label: "Year", value: "2023"},
-        {label: "L3", value: "Transformer GNN"},
+        {label: "Source", value: "Yu et al. — Towards Better Dynamic Graph Learning: New Architecture and Unified Library (NeurIPS 2023)"},
+        {label: "L3", value: "Transformer over neighbor patches + co-occurrence encoding"},
+        {label: "Anchor", value: "Token = (neighbor, time, co-occurrence count); attention does the work"},
       ]}/>
 
     <VIS.TLDR>
-      TGN compresses each node's history into a small{" "}
-      <VIS.Term def="A small per-node hidden state vector in TGN. The compressed summary of the node's interaction history, updated by every new edge event.">memory vector</VIS.Term>{" "}
-      that gets updated by a GRU on every edge event. That works when history is short, but when fraud signal requires attending over hundreds of past events the memory bottlenecks out. DyGFormer keeps the raw temporal neighbor sequence and runs transformer attention over it (with patching for long sequences and a node-co-occurrence encoding). Higher compute and memory bandwidth in exchange for SOTA on TGB-style benchmarks where rich history matters.
+      Where{" "}
+      <VIS.Term def="Temporal Graph Network — a dynamic-graph model that keeps a per-node RNN-style memory vector, updated by a GRU each time the node participates in an event.">TGN</VIS.Term>{" "}
+      gives every node an RNN-style memory updated event-by-event,{" "}
+      <VIS.Term def="Dynamic Graph Transformer — a 2023 architecture that scores a link by running a transformer over the recent neighbor sequences of the two endpoints, tagged with a neighbor co-occurrence count.">DyGFormer</VIS.Term>{" "}
+      takes the opposite design: NO per-node state between calls. At scoring time, gather each endpoint's recent neighbor sequence, tag every token with how often that neighbor appears in BOTH endpoints' histories (the <strong>co-occurrence encoding</strong>), chunk into fixed-size patches, and run a transformer over the patches. The co-occurrence count is the architectural lever — vanilla transformers can't see that node X appears in both U's AND V's history; DyGFormer makes that signal a first-class input. Long sequences are handled by patching (like a vision-transformer patch), not by RNN compression.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — transformer + co-occurrence encoding + patching">
       <p>
-        Imagine a fraud account that committed a small obvious fraud 9 months ago and has acted normally since. TGN's memory vector has been overwritten by hundreds of normal events; the old fraud signal is gone. DyGFormer keeps the raw neighbor list and lets attention decide which past events matter for the current decision.
+        Imagine you are scoring whether user U sending to merchant V is fraud. Pull U's last 200 neighbor interactions and V's last 200 neighbor interactions. Make every interaction a token: (neighbor_id, time_delta, edge_features). Then count, for every neighbor that appears in U's sequence, how many times it ALSO appears in V's sequence (and vice versa) — that integer is appended to the token. Now chop each 200-token sequence into 8 patches of 25 tokens each, concatenate, and feed to a vanilla transformer. The transformer's attention learns when a high co-occurrence count is bad news (a shared mule), when it is good news (a routine vendor), and when stale tokens (high dt) should be down-weighted.
       </p>
-      <p>
-        Three architectural choices:
-      </p>
+
       <ol>
-        <li><strong>Temporal neighbor sequence</strong> — for each node, materialize the chronological list of its past interactions: which neighbor, at what time, with what edge feature.</li>
-        <li><strong>Patching</strong> — group consecutive events into patches of K events each so the transformer attends over a manageable number of tokens. Like ViT for images, but along the time axis.</li>
-        <li><strong>Node co-occurrence encoding</strong> — explicitly count, for the pair of nodes whose interaction we're scoring, how often they have co-appeared in each other's recent neighbor lists. This adds an inductive bias that pure attention struggles to learn.</li>
+        <li><strong>Token = (neighbor_id_embedding, dt-encoding, edge_features).</strong> Standard dynamic-graph token, similar to TGAT.</li>
+        <li><strong>Neighbor co-occurrence encoding (the headline contribution):</strong> for each token in U's sequence, append c_u = count of that neighbor in U's sequence and c_v = count in V's sequence. Same for V's tokens. This makes "Node X appears 7 times in U's history AND 3 times in V's history" a single learnable feature the transformer can attend to.</li>
+        <li><strong>Patching:</strong> instead of feeding 1 token per neighbor (long sequences blow O(N^2) attention), pack P consecutive tokens into one patch token by linear projection (vision-transformer style). 200 tokens at patch size 25 = 8 patch-tokens per endpoint = 16 patch-tokens total per call.</li>
+        <li><strong>Backbone:</strong> a standard transformer (2-4 layers, d=128-200). NO causal mask is needed within a single scoring call — all neighbor events are in the past, so self-attention is bidirectional over the patches.</li>
+        <li><strong>Head:</strong> mean-pool patches into a single vector per endpoint; concat U and V vectors; MLP to a link-prediction logit.</li>
+        <li><strong>Stateless between calls:</strong> nothing is remembered across scoring calls. Each call gathers its own neighbor windows from a feature store and runs the whole forward pass. This is the opposite of TGN's per-node memory.</li>
       </ol>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  N["Score edge u-v at time t"]
-  N --> SU["u's temporal neighbor list"]
-  N --> SV["v's temporal neighbor list"]
-  SU --> P1["Patchify into K-event chunks"]
-  SV --> P2["Patchify into K-event chunks"]
-  P1 --> A["Transformer attention"]
-  P2 --> A
-  A --> CO["Co-occurrence encoding"]
-  CO --> SCR["Fraud score"]
-  style A fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style CO fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-      `} />
-      <p>Red boxes are DyGFormer's distinguishing components versus a generic temporal GNN.</p>
-
-      <VIS.Equation display tex={`h_u(t) = \\text{Transformer}\\Big(\\text{Patch}\\big(\\{(v_i, t_i, e_i) : t_i < t\\}\\big)\\Big)`} />
-      <p>Each node's hidden state at time t is a transformer over its patched chronological neighbor list. No memory state survives between scoring calls; attention re-reads history each time.</p>
+  U["Endpoint U recent neighbors"]
+  V["Endpoint V recent neighbors"]
+  U --> CO["Co-occurrence count tagger"]
+  V --> CO
+  CO --> TU["U tokens with c_u and c_v"]
+  CO --> TV["V tokens with c_u and c_v"]
+  TU --> PA["Patching (25 tokens per patch)"]
+  TV --> PA
+  PA --> TF["Transformer (2-4 layers)"]
+  TF --> H["Concat plus MLP"]
+  H --> S["Link score"]
+  style CO fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style PA fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style TF fill:#dcfce7,stroke:#16a34a,stroke-width:2px
+      `}/>
+      <p>Yellow = neighbor co-occurrence encoding (the architectural lever). Blue = patching (long-sequence trick). Green = transformer backbone (stateless). No per-node memory anywhere.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from TGN">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-why" title="Why neighbor co-occurrence + patching beats TGN-style memory on the long-range link benchmarks">
+      <p>
+        On the TGB (Temporal Graph Benchmark) and DGL dynamic-graph benchmarks, DyGFormer outperforms TGN, JODIE, and TGAT on link-prediction MRR by 5-15% on the long-range tasks. The headline reason is the co-occurrence encoding: TGN's memory of a node compresses ITS OWN history; DyGFormer can see "this neighbor is shared between U and V" as a token-level feature that attention immediately picks up. TGN must HOPE that two GRU updates and two attention layers, run independently for U and V, somehow line up the shared neighbor — DyGFormer hands the model the answer.
+      </p>
+      <p>
+        The patching trick is the second lever. Without patching, attending to 200 tokens per endpoint costs 400^2 attention ops. With 25-token patches, 16^2 = 256 ops — 600x cheaper. The cost is that within-patch detail is averaged, but the co-occurrence encoding is added BEFORE patching so the signal survives.
+      </p>
+
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>TGN</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>TGN (RNN memory)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>TGAT (attention, no memory)</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>DyGFormer</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>History representation</td>
-            <td style={{padding:"8px 10px"}}>Compressed memory vector</td>
-            <td style={{padding:"8px 10px"}}>Raw chronological neighbor list</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Update on new event</td>
-            <td style={{padding:"8px 10px"}}>GRU update on two memories</td>
-            <td style={{padding:"8px 10px"}}>Append to neighbor list (no learned state update)</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Inference latency</td>
-            <td style={{padding:"8px 10px"}}>~1-5 ms</td>
-            <td style={{padding:"8px 10px"}}>~15-60 ms (depends on sequence length)</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Long-history signal</td>
-            <td style={{padding:"8px 10px"}}>Bottlenecked by memory dim</td>
-            <td style={{padding:"8px 10px"}}>Captured by attention</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Co-occurrence inductive bias</td>
-            <td style={{padding:"8px 10px"}}>Implicit only</td>
-            <td style={{padding:"8px 10px"}}>Explicit encoding</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Per-node state</td><td style={{padding:"6px 10px"}}>RNN memory s_n(t)</td><td style={{padding:"6px 10px"}}>None</td><td style={{padding:"6px 10px"}}>None — stateless per call</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Shared-neighbor signal</td><td style={{padding:"6px 10px"}}>Indirect via memory</td><td style={{padding:"6px 10px"}}>Indirect via attention</td><td style={{padding:"6px 10px"}}>Direct: co-occurrence count per token</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Long-sequence cost</td><td style={{padding:"6px 10px"}}>O(K) attention</td><td style={{padding:"6px 10px"}}>O(K^2)</td><td style={{padding:"6px 10px"}}>O((K/P)^2) with patch size P</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Long-history coverage</td><td style={{padding:"6px 10px"}}>All history in memory</td><td style={{padding:"6px 10px"}}>K-neighbor window</td><td style={{padding:"6px 10px"}}>Much larger window via patching</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Inference complexity</td><td style={{padding:"6px 10px"}}>O(2-node GRU + K attn)</td><td style={{padding:"6px 10px"}}>O(K^2)</td><td style={{padding:"6px 10px"}}>O(patches^2) — bigger per call than TGN but no state lookup</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Rich-history fraud signal</strong> — when patterns depend on events from weeks or months ago that TGN's memory cannot retain.</li>
-        <li><strong>Offline / forensic scoring</strong> where latency budget is 50-100ms instead of 5ms.</li>
-        <li><strong>Re-scoring known accounts</strong> for periodic risk review — DyGFormer's full attention exposes signals TGN smooths over.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Latency does not fit sub-10ms budgets">
-        Each scoring call re-attends over both endpoints' neighbor lists. Even with patching this is 15-60ms per pair. For real-time payments rails you need TGN; DyGFormer fits batch / forensics workloads.
+    <VIS.Section id="sec-limits" title="Limits and gotchas — the transformer-over-patches specific ones">
+      <VIS.Callout kind="gotcha" title="No state between calls — fresh feature-store reads every time">
+        Unlike TGN, DyGFormer carries no state. Each scoring call must read the latest K neighbors for BOTH endpoints from the feature store. If the feature store is stale, the model is stale — and there is no in-memory cache to bridge the gap.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="GPU memory scales with sequence length">
-        Long-tail accounts with 10K+ events blow the attention budget. Truncate to the most recent N events or use sliding-window attention.
+      <VIS.Callout kind="warn" title="Patching loses within-patch order">
+        Aggregating P tokens into one patch token destroys ordering inside the patch. If a fraud signature lives inside a 3-event burst within one patch window, the patch averaging smears it. Defense: smaller patch size for high-velocity windows, OR multi-resolution patching.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Co-occurrence encoding is the secret sauce">
-        Ablations in the paper show that without the explicit co-occurrence encoding DyGFormer barely beats TGN. The transformer alone is not the win; co-occurrence is.
+      <VIS.Callout kind="warn" title="Co-occurrence count is sensitive to neighbor-window length">
+        c_u depends on how long the U neighbor window is. Doubling the window doubles expected co-occurrence counts for stationary neighbors. The model has to learn this conditional on window length, OR you normalize counts by window length before feeding.
+      </VIS.Callout>
+      <VIS.Callout kind="gotcha" title="No causal mask within a scoring call — but careful across calls">
+        Within a single scoring call, all neighbor events are in the past, so self-attention is bidirectional. BUT during training, the labels are at future times — you must ensure the neighbor windows used at training event t do not contain events with t_event &gt; t. This is a data-pipeline rule, not an attention-mask rule.
+      </VIS.Callout>
+      <VIS.Callout kind="warn" title="Cold-pair: no shared neighbors">
+        If U and V have never shared neighbors, c_u = c_v = 0 everywhere and the co-occurrence signal contributes nothing. The model falls back to vanilla neighbor sequences. For very cold pairs (most users x most merchants), this is the dominant regime.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on DyGFormer, the TGN-vs-DyGFormer tradeoff, and what their ablations actually prove.
+        Every problem hinges on something only DyGFormer does: the neighbor co-occurrence encoding, patching of long temporal-neighbor sequences, transformer-over-patches with no per-node memory, and stateless-per-call inference. Strip "co-occurrence encoding + patching + transformer-no-memory" and the answer must no longer work.
       </p>
 
+      {/* B3 — STAKEHOLDER PITCH */}
       <VIS.TrapProblem
         id="dyg-p1"
         difficulty="hard"
-        title="P1 — Memory-based TGN vs attention-based DyGFormer"
-        scenario={<>You're choosing between TGN and DyGFormer for a credit-card fraud detector. Most accounts have hundreds to thousands of lifetime events. Latency SLA is 25ms p99. Which architecture is right?</>}
+        title="P1 — Risk ML lead asks: 'We already have TGN in production. What does DyGFormer give us that TGN can't?'"
+        scenario={<><em>Discriminating insight: TGN's memory compresses each node's OWN history independently; the shared-neighbor signal is at best implicit through attention. DyGFormer's co-occurrence encoding makes "this neighbor appears in BOTH endpoints' histories" a first-class token feature. Strip "co-occurrence encoding" and the pitch is generic transformer-vs-RNN.</em><br/><br/>Pick the pitch that justifies adding DyGFormer.</>}
         options={[
-          {key:"a", text:"Hybrid: DyGFormer offline for batch risk scoring of established accounts; TGN online for real-time edge-by-edge scoring within the latency budget. Production at LinkedIn and others ships exactly this split.", correct:true},
-          {key:"b", text:"DyGFormer everywhere — it dominates on benchmarks."},
-          {key:"c", text:"TGN everywhere — it is faster."},
-          {key:"d", text:"Replace both with GraphSAGE."},
+          {key:"a", text:"DyGFormer is newer and transformers are always better than RNNs."},
+          {key:"b", text:"TGN encodes each node's history into an RNN-style memory vector INDEPENDENTLY — U's memory doesn't know which nodes are in V's history. The shared-neighbor signal (a mule node M appearing in BOTH U's and V's neighborhoods — a classic fraud-ring signature) can only emerge via downstream attention, lossy. DyGFormer's headline contribution is a NEIGHBOR CO-OCCURRENCE encoding: every token in U's neighbor sequence carries a count of how many times that neighbor also appears in V's neighbor sequence (and vice versa). This makes the shared-neighbor signal a first-class learnable feature — the transformer sees it directly. On long-range link-prediction benchmarks (TGB) DyGFormer beats TGN by 5-15% MRR, traceable to this encoding.", correct:true},
+          {key:"c", text:"DyGFormer uses fewer parameters."},
+          {key:"d", text:"DyGFormer doesn't need GPUs."},
         ]}
-        trap={<>(b) ignores latency. (c) trades accuracy for speed unnecessarily on the batch path. (d) discards the whole class of methods.</>}
-        lens={<>(a) — the tradeoff is rarely "one architecture wins." DyGFormer's attention over rich history is best for periodic risk review; TGN's memory updates fit edge-per-second scoring. Production stacks run both and reconcile.</>}
-        stretch={<>How would you reconcile a disagreement between TGN-online and DyGFormer-batch scores?</>}
+        trap={<>(a) is recency bias and architecturally lazy — TGN ALSO has attention. (c)(d) factually false.</>}
+        lens={<>B3 redact-test: strip "co-occurrence encoding" and only (b) collapses. The encoding IS the pitch.</>}
+        stretch={<>For which fraud types is the co-occurrence signal smallest — and so DyGFormer's advantage shrinks?</>}
       />
 
+      {/* A1 — vs TGN */}
       <VIS.TrapProblem
         id="dyg-p2"
         difficulty="hard"
-        multiSelect
-        title="P2 — Why does DyGFormer beat TGN on TGB?"
-        scenario={<>DyGFormer reports SOTA on TGB benchmarks. Which architectural choices account for the gain? Select all that apply.</>}
+        title="P2 — TGN vs DyGFormer: name three irreducible architectural differences."
+        scenario={<><em>Discriminating insight: (1) state (TGN has per-node memory, DyGFormer has none), (2) shared-neighbor signal (DyGFormer encodes it explicitly via co-occurrence count, TGN must learn it through attention), (3) long-sequence handling (TGN compresses via memory, DyGFormer patches).</em><br/><br/>Three differences.</>}
         options={[
-          {key:"a", text:"Raw neighbor list preserves information that memory compression erases.", correct:true},
-          {key:"b", text:"Patching enables longer effective context window than a flat sequence.", correct:true},
-          {key:"c", text:"Explicit node co-occurrence encoding teaches a structural bias the transformer struggles to learn from data alone.", correct:true},
-          {key:"d", text:"Larger model size (more parameters).", correct:false},
-          {key:"e", text:"Bigger batch sizes during training.", correct:false},
+          {key:"a", text:"They're nearly identical."},
+          {key:"b", text:"Three: (1) State: TGN maintains a per-node RNN memory s_n(t) updated by a GRU on every event the node participates in — state persists across scoring calls. DyGFormer is STATELESS per call: it reads each endpoint's recent neighbor window from a feature store and recomputes from scratch each time. (2) Shared-neighbor signal: DyGFormer tags each neighbor token with how many times that neighbor appears in the OTHER endpoint's history (the co-occurrence encoding) — a token-level explicit signal. TGN has no analogous lever; the shared-neighbor pattern has to emerge through attention. (3) Long-sequence handling: TGN compresses history into the fixed-size memory vector and uses K=20-50 neighbor attention. DyGFormer keeps the long sequence visible by patching it (e.g., 200 tokens → 8 patches of 25), so attention runs over patches.", correct:true},
+          {key:"c", text:"TGN is faster."},
+          {key:"d", text:"Only the loss function differs."},
         ]}
-        trap={<>(d) and (e) are common "more is more" excuses. The paper's ablations explicitly isolate (a), (b), (c) as the architectural wins.</>}
-        lens={<>The ablation table in the paper shows: dropping co-occurrence costs the most (1-2 points AUC), dropping patching costs the second most, and memory-less attention provides the baseline win. Bigger model is NOT the contributor; the inductive biases are.</>}
-        stretch={<>If co-occurrence is the biggest win, can you bolt it onto TGN?</>}
+        trap={<>(a)(c)(d) blur or skip the mechanism.</>}
+        lens={<>State, shared-neighbor signal, long-sequence handling — the three architectural axes.</>}
+        stretch={<>Which of the three is most responsible for the empirical MRR gap?</>}
       />
 
+      {/* C1 — co-occurrence mechanics */}
       <VIS.TrapProblem
         id="dyg-p3"
-        difficulty="medium"
-        title="P3 — Patching choice"
-        scenario={<>You set the DyGFormer patch size K. Small K means many tokens; large K means fewer tokens but more information per token. What's the failure mode of each extreme?</>}
+        difficulty="hard"
+        title="P3 — Walk through how the neighbor co-occurrence count is computed for a (U, V) scoring call."
+        scenario={<><em>Discriminating insight: for each token in U's sequence, c_u = count of that neighbor in U's window, c_v = count of that neighbor in V's window. Symmetric for V's tokens. Counts are appended to each token before patching. Window length matters.</em><br/><br/>Compute the co-occurrence encoding.</>}
         options={[
-          {key:"a", text:"K too small: attention is O(seq_len squared) so you blow GPU memory. K too large: per-patch encoding compresses signal away (DyGFormer reduces to TGN). Sweep K in 4-32; the paper recommends 16.", correct:true},
-          {key:"b", text:"K is a fixed constant; do not tune."},
-          {key:"c", text:"K does not affect performance."},
-          {key:"d", text:"Always use K equals 1."},
+          {key:"a", text:"Count total events for U and V."},
+          {key:"b", text:"Step 1: gather U's last N neighbor events (neighbor_id, time, edge_features) and V's last N neighbor events. Step 2: build a multiset of neighbor_ids for each endpoint: M_U = {n1:5, n2:1, n3:2, ...}, M_V = {n2:3, n4:1, n3:7, ...}. Step 3: for each token (neighbor=n_i, time, ef) in U's sequence, append (c_u = M_U[n_i], c_v = M_V[n_i]) to the token. (c_v will be zero if n_i is not in V's window.) Step 4: do the symmetric thing for V's tokens. The pair (c_u, c_v) per token is the new signal — a node that appears in both endpoints' histories now has high c_u AND high c_v.", correct:true},
+          {key:"c", text:"Count distinct merchants."},
+          {key:"d", text:"Use the dot product of node embeddings."},
         ]}
-        trap={<>(b)-(d) are wrong. The trap is candidates who treat patch size as an irrelevant detail.</>}
-        lens={<>(a) — patch size mediates the compression-vs-compute tradeoff. K equals one is a vanilla transformer (memory-blowing); large K becomes a coarse-grained pooling (TGN-like). Sweet spot is 8-32 on most real graphs.</>}
-        stretch={<>How does optimal K relate to the average node degree in your graph?</>}
+        trap={<>(a) loses neighbor-level granularity; (c)(d) miss the encoding.</>}
+        lens={<>Per-token (c_u, c_v) pair is the encoding. Internalize the multiset construction.</>}
+        stretch={<>What's the storage cost of computing this on demand vs precomputing?</>}
       />
 
+      {/* C2 — patching mechanics */}
       <VIS.TrapProblem
         id="dyg-p4"
         difficulty="hard"
-        title="P4 — Account with 50K lifetime events"
-        scenario={<>A high-volume merchant account has 50K lifetime events. Naive DyGFormer attention over all of them blows GPU memory. What's the fix?</>}
+        title="P4 — Patching: 200 tokens, patch size P=25. What does the patch-token look like and what is the attention cost?"
+        scenario={<><em>Discriminating insight: 200 tokens / 25 = 8 patch-tokens per endpoint. Each patch is a linear projection of the concatenation of 25 token embeddings (ViT-style). Attention runs over 16 patch-tokens (8 per endpoint), so cost is 16^2 = 256 vs 400^2 = 160k without patching.</em><br/><br/>Walk through patching.</>}
         options={[
-          {key:"a", text:"Window the attention to the most recent W events (e.g., last 2000), and complement with a longer-horizon summary feature computed offline. Combine with positional encoding so recency is preserved.", correct:true},
-          {key:"b", text:"Drop the account from the model."},
-          {key:"c", text:"Reduce model dimension until it fits."},
-          {key:"d", text:"Use TGN for this one account."},
+          {key:"a", text:"Take the mean of every 25 tokens."},
+          {key:"b", text:"With 200 raw tokens per endpoint and patch size P=25, you get 200/25 = 8 patch tokens per endpoint. Each patch token is a learned LINEAR PROJECTION of the concatenation of the 25 token embeddings (W_patch * [t_1; t_2; ...; t_25]); same trick as ViT. Concatenating both endpoints gives 16 patch tokens. Self-attention runs over those 16 tokens at O(16^2) = 256 ops, versus O(400^2) = 160k without patching. The cost: within-patch order is mixed (the linear projection is permutation-aware but attention can't dis-aggregate). Mean-pool (a) is a strictly weaker pooling — it loses the learnable mixing.", correct:true},
+          {key:"c", text:"Sum every 25 tokens."},
+          {key:"d", text:"Drop every 24 of 25 tokens."},
         ]}
-        trap={<>(b) drops a probably-important node. (c) reduces capacity for all accounts. (d) is operationally messy but actually defensible — see lens.</>}
-        lens={<>(a) is the standard fix: bounded attention window plus offline summaries (rolling features) for the long tail. (d) is also valid as a pragmatic split — high-volume accounts on TGN-style memory, mid-volume on DyGFormer. Many production deployments do exactly this.</>}
-        stretch={<>What summary statistics would you compute for the long-horizon offline complement?</>}
+        trap={<>(a)(c) are weak pooling that lose learnability; (d) discards 96% of signal.</>}
+        lens={<>Patching = learned linear projection of concatenated tokens. ViT trick, applied to temporal-neighbor sequences.</>}
+        stretch={<>What's the optimal patch size — too small loses long-sequence advantage, too large smears bursts.</>}
       />
 
+      {/* C3 — stateless property */}
       <VIS.TrapProblem
         id="dyg-p5"
-        difficulty="medium"
-        multiSelect
-        title="P5 — DyGFormer training stability"
-        scenario={<>Your DyGFormer training loss oscillates. Which interventions help?</>}
+        difficulty="hard"
+        title="P5 — Why is DyGFormer's stateless-per-call design a DELIBERATE choice, not a bug?"
+        scenario={<><em>Discriminating insight: stateless means no train/eval-memory-leak surface, no batch-order non-determinism, no stale-state problem. The cost is per-call inference is heavier — every call re-reads neighbor windows from the feature store.</em><br/><br/>Why deliberate?</>}
         options={[
-          {key:"a", text:"Add warmup + cosine decay learning rate schedule.", correct:true},
-          {key:"b", text:"Clip gradients to norm 1.0.", correct:true},
-          {key:"c", text:"Reduce attention dropout from 0.5 to 0.1.", correct:true},
-          {key:"d", text:"Switch optimizer from Adam to plain SGD.", correct:false},
-          {key:"e", text:"Reduce model dimension to half.", correct:false},
+          {key:"a", text:"It's a bug — stateful would be better."},
+          {key:"b", text:"Stateless brings significant engineering wins: (1) no train/eval memory-leak surface (TGN's classic 10pt gap from memory crossing the boundary cannot happen here), (2) no batch-order non-determinism — same input always gives same output, (3) no stale-state vulnerability — a dormant account doesn't carry an outdated reputation because there's no carried state; the feature-store query returns the actual recent neighbor window. The cost is per-call compute is heavier (must read and re-tokenize windows every time) and you lose long-range history compression — you only see the last N events per endpoint. The trade is intentional: replace state-management complexity with feature-store throughput.", correct:true},
+          {key:"c", text:"It saves GPU memory."},
+          {key:"d", text:"It's just laziness."},
         ]}
-        trap={<>(d) is a step backward — transformers train poorly with vanilla SGD. (e) hurts capacity rather than stability.</>}
-        lens={<>(a)-(c) are the standard transformer stability bag: warmup + cosine schedule, grad clipping, dropout tuning. AdamW with weight decay 0.01 is the default optimizer. Reducing model size is the wrong knob for "loss oscillates."</>}
-        stretch={<>Which of these matters most at small-data scale?</>}
+        trap={<>(a)(c)(d) miss the engineering trade.</>}
+        lens={<>State = power and risk. Stateless = simpler ops, more per-call compute. DyGFormer chose stateless.</>}
+        stretch={<>For which deployment regimes is stateless preferred over TGN's stateful?</>}
       />
 
+      {/* C4 — time encoding */}
       <VIS.TrapProblem
         id="dyg-p6"
-        difficulty="hard"
-        title="P6 — Streaming inference for DyGFormer"
-        scenario={<>You want streaming inference with DyGFormer (one new edge at a time). The naive approach re-attends over both nodes' full histories per call. What's the production pattern?</>}
+        difficulty="medium"
+        title="P6 — DyGFormer still needs to know when each event happened. How does it encode time?"
+        scenario={<><em>Discriminating insight: DyGFormer reuses TGAT's learned Fourier time-encoding phi(dt) for each token, where dt is time-from-now-to-event. NOT positional encoding by integer index — events are irregularly spaced.</em><br/><br/>Time encoding inside DyGFormer.</>}
         options={[
-          {key:"a", text:"Cache the patched neighbor list and patch-level encodings; on new edge, only re-encode the affected patch and incrementally update attention KV cache. Similar to KV-cache tricks in autoregressive LLM inference.", correct:true},
-          {key:"b", text:"DyGFormer cannot do streaming."},
-          {key:"c", text:"Re-attend over full history each call; bear the cost."},
-          {key:"d", text:"Cache the previous score and reuse it."},
+          {key:"a", text:"Standard sinusoidal positional encoding on token index 0..N-1."},
+          {key:"b", text:"Same Fourier-style time encoding as TGAT: phi(dt) = [cos(omega_1 dt), sin(omega_1 dt), ..., cos(omega_d dt), sin(omega_d dt)] with learnable omega, concatenated to each token. dt is the (scoring-time - event-time) gap, NOT integer position. Auth events are irregularly spaced, so a position-index sinusoid would equate '4 seconds ago' with '4 weeks ago' if both are 'position 3.' Fourier-on-dt lets attention learn multi-scale time weighting.", correct:true},
+          {key:"c", text:"Use absolute calendar time as a scalar feature."},
+          {key:"d", text:"No time encoding — patching captures order."},
         ]}
-        trap={<>(b) is wrong. (c) ignores the engineering opportunity. (d) is a coarse approximation that misses the new edge entirely.</>}
-        lens={<>(a) — KV-cache patterns from autoregressive LLMs transfer to DyGFormer. Cache patch-level keys and values; only re-encode the patch containing the new edge. The rest of the attention can reuse cached state. This is what 2024 production deployments do.</>}
-        stretch={<>What invalidates the cache?</>}
+        trap={<>(a) treats irregular spacing as uniform; (c) leaks calendar info and is poor for attention; (d) loses time entirely.</>}
+        lens={<>DyGFormer reuses TGAT's time encoding — phi(dt) per token, learned Fourier basis.</>}
+        stretch={<>What changes if you patch first and then encode time at the patch level — what's lost?</>}
       />
 
+      {/* D1 — wrong intuition */}
       <VIS.TrapProblem
         id="dyg-p7"
         difficulty="hard"
-        title="P7 — Negative sampling for DyGFormer"
-        scenario={<>Same question as for TGN: how do you build hard negatives? Why is the answer the same?</>}
+        title="P7 — 'DyGFormer is just a transformer on neighbor sequences — basically a bigger TGAT.' Where does the intuition break?"
+        scenario={<><em>Discriminating insight: TGAT runs attention over each endpoint's neighbors INDEPENDENTLY then combines at the end. DyGFormer adds (a) the co-occurrence encoding between endpoints and (b) patching. Without those, you have TGAT.</em><br/><br/>Break the intuition.</>}
         options={[
-          {key:"a", text:"Hard-negative mining (frequency-weighted, in-batch from same time window, k-NN by embedding) is architecture-agnostic — TGN and DyGFormer both benefit. The hard-negative concept is about the data distribution, not the model.", correct:true},
-          {key:"b", text:"DyGFormer needs purely random negatives because of attention."},
-          {key:"c", text:"DyGFormer auto-mines hard negatives during training."},
-          {key:"d", text:"Negatives do not matter for DyGFormer."},
+          {key:"a", text:"The intuition is right."},
+          {key:"b", text:"Two specific differences make DyGFormer not 'just bigger TGAT': (1) Co-occurrence encoding — TGAT computes U's neighbor attention and V's neighbor attention INDEPENDENTLY then combines representations at the head. There is no token-level signal of which neighbors are shared. DyGFormer's per-token (c_u, c_v) lets attention immediately see shared structure. (2) Patching enables MUCH longer neighbor sequences (200+ vs TGAT's typical 20-30) within the same compute budget, so DyGFormer benefits from long-range neighbor history that TGAT can't access. Strip co-occurrence and patching and yes, you have a bigger TGAT; with them you have a qualitatively different model.", correct:true},
+          {key:"c", text:"Bigger always means better."},
+          {key:"d", text:"DyGFormer uses different loss."},
         ]}
-        trap={<>(b)-(d) misattribute. Hard-negative mining is independent of the encoder.</>}
-        lens={<>(a) — frequency-weighted (high-degree nodes sampled more often as negatives), in-batch (other positives in the batch are negatives for this pair), or k-NN-by-embedding (nearest non-edges). All composable with both architectures.</>}
-        stretch={<>Which of these three negative-mining strategies is most expensive at scale?</>}
+        trap={<>(a)(c)(d) miss the two architectural levers.</>}
+        lens={<>Co-occurrence + patching are non-trivial mechanism additions, not just scale.</>}
+        stretch={<>Can you build a TGAT variant that adds JUST co-occurrence — and how would it compare?</>}
       />
 
+      {/* D2 — wrong-assumption cascade */}
       <VIS.TrapProblem
         id="dyg-p8"
-        difficulty="medium"
-        title="P8 — Co-occurrence encoding details"
-        scenario={<>For scoring edge u-v, the co-occurrence encoding counts something specific. What?</>}
+        difficulty="hard"
+        title="P8 — Assume 'DyGFormer keeps per-node state like TGN.' Which downstream beliefs follow that are wrong?"
+        scenario={<><em>Discriminating insight: under that assumption you'd expect train/eval memory leakage, batch-order non-determinism, stale-state vulnerability — none of which apply. You'd ALSO wrongly assume long-range history is in memory; it's bounded by the neighbor window.</em><br/><br/>Cascade.</>}
         options={[
-          {key:"a", text:"For each node x in u's recent neighbor list: how many times has x appeared in v's recent neighbor list? Encode that count distribution as part of u's representation, and symmetrically for v. Captures 'do u and v share neighbors?'", correct:true},
-          {key:"b", text:"Total count of edges between u and v."},
-          {key:"c", text:"Count of u-v edges over the last hour."},
-          {key:"d", text:"Random feature."},
+          {key:"a", text:"Nothing follows."},
+          {key:"b", text:"At least 4 beliefs break. (1) 'Train/eval memory leakage applies' — false, no state crosses train/eval, no leakage surface. (2) 'Need batch-frozen memory trick' — false, no memory to freeze. (3) 'Stale-state vulnerability for dormant nodes' — false, no state to be stale; the model reads CURRENT neighbor windows each call. (4) 'Long-range history is captured' — false, capped by neighbor-window length (e.g., last 200 events). Anything older than the window is invisible. Each of these is a different operational implication that flips when you correct the stateful misreading.", correct:true},
+          {key:"c", text:"Only the leakage belief breaks."},
+          {key:"d", text:"Only the cold-start belief breaks."},
         ]}
-        trap={<>(b) and (c) ignore the structural-similarity intent. (d) is wrong.</>}
-        lens={<>(a) — the co-occurrence encoding asks "how much do u's neighbor list and v's neighbor list overlap?" High overlap means shared structural context, which is a powerful predictor of future interaction. The paper shows this single inductive bias is the largest ablation contributor.</>}
-        stretch={<>How is this similar to or different from a Jaccard similarity feature?</>}
+        trap={<>(c)(d) understate cascade.</>}
+        lens={<>State assumption flips operational reasoning. Pin it precisely.</>}
+        stretch={<>Which of the four shows up FIRST in a misconfigured deployment?</>}
       />
 
+      {/* D3 — cold pair */}
       <VIS.TrapProblem
         id="dyg-p9"
-        difficulty="hard"
-        title="P9 — Bolt co-occurrence onto TGN"
-        scenario={<>If co-occurrence is the biggest win, can you add it to TGN as a feature and recover most of the gap?</>}
+        difficulty="medium"
+        title="P9 — Scoring U-V where U and V have ZERO shared neighbors. What does the co-occurrence encoding do?"
+        scenario={<><em>Discriminating insight: c_u and c_v are zero everywhere in both endpoints' tokens. The headline encoding contributes no signal — the model degrades to vanilla neighbor sequences (essentially TGAT). For very cold pairs this is the common regime.</em><br/><br/>Cold-pair behavior.</>}
         options={[
-          {key:"a", text:"Yes — concatenate the co-occurrence encoding to TGN's temporal embedding head input. Recovers a meaningful share of the gap. Verified by independent ablations.", correct:true},
-          {key:"b", text:"No — DyGFormer's win is end-to-end and not transferable."},
-          {key:"c", text:"Only if you also patch."},
-          {key:"d", text:"Only by retraining TGN from scratch."},
+          {key:"a", text:"The model refuses to score."},
+          {key:"b", text:"Co-occurrence counts are zero everywhere, so the encoding contributes no signal. The model degenerates to a vanilla transformer on each endpoint's neighbor sequence — effectively TGAT-with-patching. This is the cold-pair regime (the most common one for user x rare-merchant scoring). DyGFormer's edge over TGAT shrinks in this regime; its edge over TGN stays because patching still extends the neighbor window. Operationally: don't claim 5-15% MRR lift for cold-pair scoring — that gain is concentrated in pairs with non-trivial shared neighbor structure.", correct:true},
+          {key:"c", text:"Model accuracy drops to zero."},
+          {key:"d", text:"Co-occurrence count switches to a different metric."},
         ]}
-        trap={<>(b) is the most common confident-wrong answer. (c) and (d) overcomplicate.</>}
-        lens={<>(a) — the co-occurrence encoding is an architecture-agnostic inductive bias. Several follow-up papers report that TGN + co-occurrence closes most of the gap. The senior take: focus on the inductive bias, not the marketing label of the model.</>}
-        stretch={<>What would you ablate next to find the remaining gap?</>}
+        trap={<>(a)(c) catastrophize; (d) is wishful.</>}
+        lens={<>Co-occurrence is signal where it exists; absent it, the model is TGAT-with-patching.</>}
+        stretch={<>What fraction of real-world scoring pairs are 'cold' in this sense?</>}
       />
 
+      {/* E1 — feature-store SLO */}
       <VIS.TrapProblem
         id="dyg-p10"
         difficulty="hard"
-        title="P10 — Senior framing of TGN vs DyGFormer"
-        scenario={<>You're presenting to a senior staff engineer who is skeptical of new GNN models. Frame TGN vs DyGFormer in one paragraph.</>}
+        title="P10 — Stateless means every call hits the feature store for the latest 200 neighbors for BOTH endpoints. p99 budget?"
+        scenario={<><em>Discriminating insight: feature-store latency is in the critical path. Architectural answers: (a) co-located store with the inference server, (b) bounded-fanout pre-fetch, (c) precomputed materialized neighbor windows refreshed at minute cadence.</em><br/><br/>Plan the feature-store path.</>}
         options={[
-          {key:"a", text:"Both are temporal GNNs; TGN compresses history into a memory vector for sub-5ms online scoring, DyGFormer keeps the raw history and attends over it for richer signal at 15-60ms latency. The architectural insight that matters most is DyGFormer's co-occurrence inductive bias, which is portable across models. Pick TGN online, DyGFormer offline, and steal the co-occurrence feature for both.", correct:true},
-          {key:"b", text:"DyGFormer is better; we should adopt it."},
-          {key:"c", text:"TGN is more practical; ignore DyGFormer."},
-          {key:"d", text:"Use GraphSAGE; both are over-engineered."},
+          {key:"a", text:"Just call the same OLAP store the analytics team uses."},
+          {key:"b", text:"Co-locate a dedicated low-latency feature store (e.g., RocksDB / SSD-backed KV with a memory-resident hot-set) returning each endpoint's last 200 neighbor records in &lt;3ms p99. Fanout: both U and V are fetched in parallel, not serial. Materialize on write — when an auth event arrives, append it to both endpoints' neighbor sequences in the store at write time so reads are O(1) range scans. Caching: hottest endpoints (top merchants) live in RAM with TTL=1s. Without this, the feature-store call dominates p99 and the model's per-call inference latency is moot. Stateless DOES mean the feature-store IS the latency path.", correct:true},
+          {key:"c", text:"Use a SQL database query."},
+          {key:"d", text:"Make the model smaller."},
         ]}
-        trap={<>(b) and (c) lack nuance. (d) ignores the streaming requirement.</>}
-        lens={<>(a) is the senior framing: explain the tradeoff, name the transferable insight (co-occurrence), and propose a composition. This is what staff engineers want to hear.</>}
-        stretch={<>What is the simplest A/B test design to validate the hybrid?</>}
+        trap={<>(a)(c) underspec the latency budget; (d) doesn't address the I/O.</>}
+        lens={<>Stateless models shift state to the feature store. Plan the store, not the model.</>}
+        stretch={<>What's the right cache-eviction policy for the hot-set?</>}
+      />
+
+      {/* E2 — patch size choice */}
+      <VIS.TrapProblem
+        id="dyg-p11"
+        difficulty="medium"
+        title="P11 — Patch size: 1, 25, or 100?"
+        scenario={<><em>Discriminating insight: patch 1 = no patching, O(N^2) attention. Patch 100 = signal smeared. Empirical sweet spot is patch 16-32 for N=200. Match to typical burst length.</em><br/><br/>Pick patch size.</>}
+        options={[
+          {key:"a", text:"1 — no patching, maximum detail."},
+          {key:"b", text:"25 for N=200. Patch 1 means O(N^2) attention — 200^2 per endpoint, 400^2 across both — too expensive for serving. Patch 100 collapses 200 events into 2 patches, smearing burst-length signal (most fraud bursts are 3-30 events). 25 is the empirical sweet spot: 8 patches per endpoint = 16 total = 256 attention ops, while preserving most burst-internal structure inside a patch via the learned linear projection. As a heuristic: choose patch size ~ typical burst length, so a burst fits inside one patch and is summarized faithfully.", correct:true},
+          {key:"c", text:"100 — fewer patches, faster."},
+          {key:"d", text:"Equal to model dim."},
+        ]}
+        trap={<>(a) blows compute; (c) loses signal; (d) is unprincipled.</>}
+        lens={<>Patch size ~ typical burst length. Quadratic compute vs signal granularity trade.</>}
+        stretch={<>How would you learn the patch size end-to-end?</>}
+      />
+
+      {/* E3 — training-time data discipline */}
+      <VIS.TrapProblem
+        id="dyg-p12"
+        difficulty="hard"
+        title="P12 — There's no causal mask in DyGFormer's transformer. Doesn't that leak future info?"
+        scenario={<><em>Discriminating insight: within a scoring call, all neighbor events are in the past relative to the scoring event by data-pipeline construction. The DATA pipeline enforces the time discipline (only events with t_event &lt; t_score in the window), not an attention mask.</em><br/><br/>How is causality enforced?</>}
+        options={[
+          {key:"a", text:"It DOES leak — that's a bug."},
+          {key:"b", text:"Causality is enforced at the DATA layer, not the attention layer. The neighbor windows for U and V are constructed by querying 'last N events with t_event &lt; t_score' — by construction nothing in the window is in the future. Within the window everything IS in the past, so bidirectional attention is fine and useful (later neighbor events ARE in the past at scoring time). At training time, the same rule applies: when training on scoring event at time t_train, the neighbor windows MUST be cut off at t_train. The bug is if the training pipeline uses 'last N events overall' which can leak. So: no attention mask, but a strict data-pipeline rule.", correct:true},
+          {key:"c", text:"Add a causal mask just in case."},
+          {key:"d", text:"DyGFormer can use future info legitimately."},
+        ]}
+        trap={<>(a) misreads where causality lives; (c) is cargo-cult; (d) is wrong.</>}
+        lens={<>Causality enforced in the data pipeline (window cutoff), not the attention mask.</>}
+        stretch={<>What's the cheapest unit test to catch a training-time leak?</>}
+      />
+
+      {/* E4 — co-occurrence at scale */}
+      <VIS.TrapProblem
+        id="dyg-p13"
+        difficulty="hard"
+        title="P13 — Computing c_u, c_v requires intersecting U's and V's neighbor lists per call. Scaling?"
+        scenario={<><em>Discriminating insight: 200 vs 200 intersection at every call is O(N) with hashing or O(N log N) with sort. Across millions of calls per minute, this can dominate. Pre-hash neighbor windows + intersect at inference, or precompute popular-pair counts.</em><br/><br/>Scale the encoding.</>}
+        options={[
+          {key:"a", text:"Drop the co-occurrence encoding."},
+          {key:"b", text:"Per call: build a hash-map of U's window (200 entries) once, then iterate over V's window (200 entries) checking membership — O(N) per call, single-digit microseconds with optimized C++. At millions of calls per minute, the dominant cost is actually the feature-store fetch, not the hash intersection. If even that becomes hot, precompute popular U-V pair counts at write time (when a new event arrives, increment c[U][V] and c[V][U] in a count-min sketch). At extreme scale, approximate counts via MinHash are good enough.", correct:true},
+          {key:"c", text:"Use a database join."},
+          {key:"d", text:"Skip the encoding for hot pairs."},
+        ]}
+        trap={<>(a) gives up the lever; (c) is too slow; (d) is the wrong direction.</>}
+        lens={<>Hash-intersect at call time; precompute at write time if it dominates.</>}
+        stretch={<>How much accuracy loss from MinHash-approximated counts?</>}
+      />
+
+      {/* F1 — when NOT to use */}
+      <VIS.TrapProblem
+        id="dyg-p14"
+        difficulty="medium"
+        title="P14 — Stream of one-shot single-merchant gift card purchases. DyGFormer or TGN or neither?"
+        scenario={<><em>Discriminating insight: one-shot pairs have no shared-neighbor signal AND no per-node history. Both models degenerate; a simple classifier wins.</em><br/><br/>Which model?</>}
+        options={[
+          {key:"a", text:"DyGFormer — newer model."},
+          {key:"b", text:"Neither. With one-shot purchases, neither endpoint accumulates a meaningful history. (1) TGN's memory has only one event to compress — value-free. (2) DyGFormer's co-occurrence encoding requires shared neighbors — none exist. Both models degenerate to roughly 'score from features of this single event'. A GBDT on transaction features (amount, MCC, device, time-of-day) matches at a fraction of the cost. Use temporal graph models where pair-history or shared-neighbor structure exists.", correct:true},
+          {key:"c", text:"TGN, always."},
+          {key:"d", text:"Stack both."},
+        ]}
+        trap={<>(a)(c)(d) over-apply temporal-graph models.</>}
+        lens={<>If no shared-neighbor and no per-node history, fancy graph models are overkill.</>}
+        stretch={<>Roughly what shared-neighbor density makes DyGFormer worth deploying?</>}
+      />
+
+      {/* F2 — adversarial */}
+      <VIS.TrapProblem
+        id="dyg-p15"
+        difficulty="hard"
+        title="P15 — Attacker knows DyGFormer's co-occurrence encoding. How to evade?"
+        scenario={<><em>Discriminating insight: the attacker can suppress the shared-neighbor signal by routing mule transactions through DIFFERENT mule nodes for each victim pair. Defense: detect coordinated routing patterns at the network level upstream of the model.</em><br/><br/>Defend.</>}
+        options={[
+          {key:"a", text:"Co-occurrence cannot be evaded."},
+          {key:"b", text:"Attack: use a DIFFERENT mule node per victim pair so c_u and c_v stay near zero — the co-occurrence signal evaporates. Defenses: (1) upstream network-level detector that catches mule-rotation patterns (a node receiving from many victims in short windows, even if no individual pair shares neighbors), (2) ensemble DyGFormer with a non-graph model whose features (device, IP, amount distribution) the attacker can't simultaneously sanitize, (3) lower the co-occurrence threshold and rely on patterns at near-zero counts, (4) augment co-occurrence with 2-hop shared neighbors — harder to dodge by single-mule rotation.", correct:true},
+          {key:"c", text:"Increase the model size."},
+          {key:"d", text:"Block all small transactions."},
+        ]}
+        trap={<>(a) ignores adversary; (c) doesn't address evasion; (d) is policy hack.</>}
+        lens={<>Architectural levers create predictable evasions. Defense in depth.</>}
+        stretch={<>How does adding 2-hop co-occurrence change the attacker's cost?</>}
+      />
+
+      {/* C5 — directed edges */}
+      <VIS.TrapProblem
+        id="dyg-p16"
+        difficulty="medium"
+        title="P16 — Edges are DIRECTED (sender vs receiver). Does the co-occurrence count care?"
+        scenario={<><em>Discriminating insight: yes — a node appearing as RECEIVER in both U's history and V's history is very different from appearing as SENDER. Track directional co-occurrence: (c_u_in, c_u_out, c_v_in, c_v_out) per token.</em><br/><br/>Direction.</>}
+        options={[
+          {key:"a", text:"No — co-occurrence is direction-agnostic."},
+          {key:"b", text:"Yes, direction matters. A node M that appears as RECEIVER in U's history (U sent money to M) AND RECEIVER in V's history (V sent money to M) is a textbook shared-mule signature. Same node appearing as SENDER in both means U and V are co-victims, not co-perpetrators — totally different signal. The fix is to track FOUR directional counts per token: (c_u_in, c_u_out, c_v_in, c_v_out) and let the transformer learn which directional pattern is fraud-indicative.", correct:true},
+          {key:"c", text:"Sum the two directions."},
+          {key:"d", text:"Direction doesn't matter in practice."},
+        ]}
+        trap={<>(a)(c)(d) collapse directional information.</>}
+        lens={<>Directional co-occurrence is strictly richer than scalar. Use it.</>}
+        stretch={<>What's the cost vs benefit of going from 1 to 4 directional counts?</>}
+      />
+
+      {/* C6 — node features */}
+      <VIS.TrapProblem
+        id="dyg-p17"
+        difficulty="medium"
+        title="P17 — Where do node features (user KYC, merchant MCC) enter DyGFormer?"
+        scenario={<><em>Discriminating insight: node features are concatenated to the neighbor token (the neighbor's features, not the focal node's) or added at the head. The endpoint's OWN features can be passed separately to the head MLP.</em><br/><br/>Where do features go?</>}
+        options={[
+          {key:"a", text:"DyGFormer doesn't use node features."},
+          {key:"b", text:"Two entry points. (1) Each neighbor's features (e.g., for a merchant neighbor: MCC, country, age) get concatenated into the token alongside neighbor_id_embedding + dt-encoding + edge_features + co-occurrence counts. The transformer sees rich tokens. (2) The focal endpoint's OWN features (U's KYC, V's MCC) are NOT in the per-token stream because they'd be redundant across all tokens; they get concatenated to the pooled patch representation before the head MLP. Loss: U's features are concat-ed once at the head, neighbor features are per-token.", correct:true},
+          {key:"c", text:"Only as edge features."},
+          {key:"d", text:"Only as graph-level features."},
+        ]}
+        trap={<>(a) factually wrong; (c)(d) limit feature reach.</>}
+        lens={<>Neighbor features go in tokens; focal features go to the head.</>}
+        stretch={<>What if focal features are themselves dynamic (e.g., risk score updated daily)?</>}
+      />
+
+      {/* E5 — operational monitoring */}
+      <VIS.TrapProblem
+        id="dyg-p18"
+        difficulty="medium"
+        multiSelect
+        title="P18 — DyGFormer production health diagnostics — pick all that matter."
+        scenario={<><em>Discriminating insight: stateless model means monitor feature-store latency, co-occurrence count distribution, neighbor-window completeness, patch-attention entropy.</em><br/><br/>Pick diagnostics.</>}
+        options={[
+          {key:"a", text:"Feature-store p99 fetch latency per endpoint.", correct:true},
+          {key:"b", text:"Distribution of (c_u, c_v) across recent scoring calls (drifting toward zero = signal evaporating).", correct:true},
+          {key:"c", text:"Fraction of scoring calls where neighbor window is &lt; full N (cold endpoints).", correct:true},
+          {key:"d", text:"Memory L2 norm over time."},
+          {key:"e", text:"Patch-level attention entropy (collapsed entropy = model not using all patches).", correct:true},
+          {key:"f", text:"GRU forget-gate activations."},
+        ]}
+        trap={<>(d) is TGN diagnostic, no memory in DyGFormer; (f) ditto.</>}
+        lens={<>State-free model → state-free diagnostics. Don't apply TGN's checklist.</>}
+        stretch={<>Which signal moves first when the co-occurrence advantage is eroding?</>}
+      />
+
+      {/* D4 — interaction with delayed labels */}
+      <VIS.TrapProblem
+        id="dyg-p19"
+        difficulty="hard"
+        title="P19 — Confirmed-fraud labels arrive 30-60 days late. Does stateless DyGFormer make this easier than stateful TGN?"
+        scenario={<><em>Discriminating insight: yes — to recompute the forward pass at training time you only need the neighbor windows AS OF the original scoring time. No memory snapshot needed; just an as-of feature-store query.</em><br/><br/>Delayed-label training.</>}
+        options={[
+          {key:"a", text:"Same difficulty."},
+          {key:"b", text:"Easier. To train on a chargeback that arrives 60 days late, you need the inputs the model saw at the original scoring time. For DyGFormer, those inputs are 'U's last 200 neighbors as of t_score' and 'V's last 200 neighbors as of t_score' — a deterministic, idempotent as-of query against the feature store (or against the raw event log). No memory snapshot, no replay-the-GRU complexity. TGN, by contrast, needs a snapshot of the memory state AS OF t_score per event to reconstruct what the model saw. DyGFormer's stateless design turns delayed-label training from 'store memory snapshots' into 'log scoring time + run an as-of query'.", correct:true},
+          {key:"c", text:"Harder — no memory."},
+          {key:"d", text:"Same as TGN."},
+        ]}
+        trap={<>(a)(c)(d) miss the as-of-query advantage.</>}
+        lens={<>Stateless + as-of-able feature store = clean delayed-label retraining.</>}
+        stretch={<>What's the storage cost — log every scoring call vs snapshot memory?</>}
+      />
+
+      {/* A2 — vs sequence transformer (Transformer-Risk) */}
+      <VIS.TrapProblem
+        id="dyg-p20"
+        difficulty="hard"
+        title="P20 — Mastercard's Transformer-Risk is also a transformer on auth events. How is DyGFormer architecturally different?"
+        scenario={<><em>Discriminating insight: Transformer-Risk runs the transformer over each CARD'S OWN auth tape (tokens are auth events of one card). DyGFormer runs the transformer over each ENDPOINT'S NEIGHBOR sequence with co-occurrence between the two endpoints. Different input shape, different lever.</em><br/><br/>Architectural diff.</>}
+        options={[
+          {key:"a", text:"They are the same model."},
+          {key:"b", text:"Different input shape and different headline lever. (1) Transformer-Risk's input is ONE card's own auth-event tape; the transformer reads a sequence of (BIN, merchant_id, MCC, geo, dt, channel) tokens of that card. There's no second endpoint and no co-occurrence concept. (2) DyGFormer's input is BOTH endpoints' neighbor sequences with a per-token co-occurrence count BETWEEN them — the model is scoring an interaction (U, V) by looking at their joint structure. (3) Pretraining: Transformer-Risk's lever is cross-issuer pretrain (network-only data). DyGFormer's lever is the architectural encoding (co-occurrence + patching). They optimize for different fraud surfaces — auth-time per-card scoring vs link-prediction on a dynamic graph.", correct:true},
+          {key:"c", text:"Both use BERT."},
+          {key:"d", text:"DyGFormer is a sequence model only."},
+        ]}
+        trap={<>(c) shallow; (d) wrong about graph structure.</>}
+        lens={<>Same backbone (transformer), different inputs and different levers.</>}
+        stretch={<>Could you stack them — auth-tape transformer feature into a DyGFormer node embedding?</>}
+      />
+
+      {/* C7 — sequence length / window */}
+      <VIS.TrapProblem
+        id="dyg-p21"
+        difficulty="medium"
+        title="P21 — Neighbor window N: 32, 200, or 5000?"
+        scenario={<><em>Discriminating insight: patching makes longer windows tractable; the marginal AUC keeps gaining past 200 for some fraud types. 200-500 is production sweet spot; 5000 hits feature-store I/O ceiling.</em><br/><br/>Pick N.</>}
+        options={[
+          {key:"a", text:"32 — short."},
+          {key:"b", text:"200-500. The whole point of patching is to handle longer neighbor windows than TGAT's typical 20-50 — that's where co-occurrence picks up rare shared mules and long-range patterns. 32 throws away that advantage. 5000 saturates feature-store I/O bandwidth (10kB per endpoint per call * millions of calls/minute), and the marginal-AUC curve flattens beyond ~500 for most fraud types. Production tier-1s settle in the 200-500 range; tune by curve flattening on the held-out set.", correct:true},
+          {key:"c", text:"5000 — more is better."},
+          {key:"d", text:"Match model dim."},
+        ]}
+        trap={<>(a) defeats the patching advantage; (c) hits I/O wall; (d) is unprincipled.</>}
+        lens={<>N is the lever patching unlocks. 200-500 is the production sweet spot.</>}
+        stretch={<>What pre-deploy signal tells you N is too small?</>}
+      />
+
+      {/* B2 — sounds-reasonable */}
+      <VIS.TrapProblem
+        id="dyg-p22"
+        difficulty="hard"
+        title="P22 — Junior suggests: 'Drop the co-occurrence encoding — patching alone gives long-range, and that's the win.' Diagnose."
+        scenario={<><em>Discriminating insight: ablations in the DyGFormer paper show co-occurrence is the BIGGER of the two contributions on the link-prediction benchmarks. Drop it and you have TGAT-with-patching, which the paper also reports — and which loses 3-8pt MRR vs full DyGFormer.</em><br/><br/>Diagnose the proposal.</>}
+        options={[
+          {key:"a", text:"Sounds right — patching is the lever."},
+          {key:"b", text:"Wrong. The paper's ablation: full DyGFormer vs DyGFormer-without-co-occurrence (i.e., patching-only) loses 3-8pt MRR across benchmarks; vs DyGFormer-without-patching (co-occurrence only on short sequences) loses 1-3pt. Co-occurrence is the BIGGER contribution. Intuition: patching enables long-range, but long-range alone is just more TGAT context. Co-occurrence supplies a NEW signal (shared neighbors between endpoints) that the model couldn't see at all otherwise. The junior is dropping the lever and keeping the enabler.", correct:true},
+          {key:"c", text:"Drop both — use TGN."},
+          {key:"d", text:"Keep both — patching is the bigger lever."},
+        ]}
+        trap={<>(a)(d) misread the ablation; (c) abandons the architecture.</>}
+        lens={<>Always check the paper's ablations before removing 'unnecessary' components.</>}
+        stretch={<>Why does the ablation gap depend on the benchmark — when does co-occurrence matter most?</>}
+      />
+
+      {/* D5 — hyperparameter intuition */}
+      <VIS.TrapProblem
+        id="dyg-p23"
+        difficulty="medium"
+        title="P23 — Increase model depth from 2 to 6 layers — what likely happens?"
+        scenario={<><em>Discriminating insight: with only 16 patch tokens, deep attention over-smooths quickly. 2-4 layers is the sweet spot. Going deeper hurts before helping.</em><br/><br/>Depth choice.</>}
+        options={[
+          {key:"a", text:"Strictly better."},
+          {key:"b", text:"Likely WORSE. With only ~16 patch-tokens entering attention (8 patches per endpoint), 6 layers of self-attention over-smooths — every patch token's representation collapses toward the global mean after 5-6 layers, losing inter-patch distinction. 2-4 layers gives enough mixing to combine co-occurrence signal with temporal context without over-smoothing. As a heuristic, depth should scale roughly with log(num_tokens). 6 layers would be sensible if you had hundreds of tokens; on 16 patch-tokens, it's overkill.", correct:true},
+          {key:"c", text:"Strictly better — more is better."},
+          {key:"d", text:"Same — depth doesn't matter at this scale."},
+        ]}
+        trap={<>(a)(c)(d) ignore over-smoothing at small token count.</>}
+        lens={<>Few tokens = shallow transformer. Over-smoothing is real.</>}
+        stretch={<>How would you detect over-smoothing — what's the diagnostic?</>}
+      />
+
+      {/* B4 — choice between TGN and DyGFormer */}
+      <VIS.TrapProblem
+        id="dyg-p24"
+        difficulty="hard"
+        title="P24 — A team has both TGN and DyGFormer in offline eval; DyGFormer wins on link-pred but is heavier per call. Which to deploy?"
+        scenario={<><em>Discriminating insight: depends on the deployment shape — per-call latency budget, write-vs-read ratio, ops complexity tolerance. Stateful TGN is cheaper per call but heavier in ops (memory store, leakage discipline); stateless DyGFormer is simpler in ops but needs strong feature store.</em><br/><br/>Pick.</>}
+        options={[
+          {key:"a", text:"Always pick the higher-AUC model."},
+          {key:"b", text:"Depends on three factors. (1) Per-call latency budget vs ops complexity: TGN is cheaper per call (small GRU + K=20 attention) but expensive in ops (memory store, train/eval discipline, snapshot logging for delayed labels, ATO via stale memory). DyGFormer is heavier per call (transformer over patches, full feature-store fetch) but simpler operationally (stateless = no leakage surface, idempotent as-of queries for delayed labels). (2) Event rate vs read rate: TGN amortizes well at high event rate, low read rate. DyGFormer is better when reads dominate writes. (3) Team's tolerance for stateful-system bugs: if you can't staff TGN's state-management complexity, DyGFormer's higher per-call cost is worth the ops savings.", correct:true},
+          {key:"c", text:"Pick TGN — it's faster."},
+          {key:"d", text:"Pick DyGFormer — it's newer."},
+        ]}
+        trap={<>(a)(c)(d) collapse the decision to one axis.</>}
+        lens={<>State vs no-state is an ops + latency trade, not just an accuracy trade.</>}
+        stretch={<>When does stacking (DyGFormer for scoring, TGN-memory-as-feature) win over picking one?</>}
+      />
+
+      {/* F3 — failure-mode reverse engineering */}
+      <VIS.TrapProblem
+        id="dyg-p25"
+        difficulty="hard"
+        title="P25 — Production symptom: DyGFormer's lift over TGAT-with-patching has dropped from 8pt to 1pt over 6 months. Which design choice eroded?"
+        scenario={<><em>Discriminating insight: the co-occurrence encoding is the lever; if shared-neighbor structure has changed (e.g., fraud rings now use single-use mules), c_u and c_v collapse and the encoding stops carrying signal. Monitor the (c_u, c_v) distribution.</em><br/><br/>Reverse engineer.</>}
+        options={[
+          {key:"a", text:"Train the model longer."},
+          {key:"b", text:"The co-occurrence encoding is the headline lever vs TGAT-with-patching. If the (c_u, c_v) distribution has shifted toward zero — which happens when fraud rings move to one-time-use mules per victim, or when the neighbor-window length is shortened so shared neighbors fall out — the encoding stops carrying signal. Diagnose by plotting the (c_u, c_v) distribution over the last 6 months. If it has collapsed toward zero, the architectural lever has eroded; counter-defenses include lengthening the neighbor window (more chance to catch shared mules), adding 2-hop co-occurrence, or augmenting with cross-card pattern detection upstream.", correct:true},
+          {key:"c", text:"Bigger model."},
+          {key:"d", text:"Adversary is too strong; abandon DyGFormer."},
+        ]}
+        trap={<>(a)(c) don't address the diagnostic; (d) defeatist.</>}
+        lens={<>Diagnose by monitoring the lever's distribution, not just the final metric.</>}
+        stretch={<>What pre-deploy signal would have caught this before the 6-month decay?</>}
+      />
+
+      {/* C8 — interaction with edge features */}
+      <VIS.TrapProblem
+        id="dyg-p26"
+        difficulty="medium"
+        title="P26 — Edge features (amount, channel) per event — where do they enter relative to co-occurrence?"
+        scenario={<><em>Discriminating insight: edge features are concatenated into the per-token vector ALONGSIDE the co-occurrence count, BEFORE patching. The transformer can then learn that a high-c_u high-amount neighbor token is especially fraud-indicative.</em><br/><br/>Edge feature placement.</>}
+        options={[
+          {key:"a", text:"Edge features go into a separate stream."},
+          {key:"b", text:"Edge features (amount, channel, country) for each event are concatenated INTO the per-token vector alongside (neighbor_id_embedding, dt-encoding, c_u, c_v) BEFORE patching. The transformer's attention then learns joint patterns — for instance, 'a neighbor with high c_u and high amount and CNP channel within the last hour is much riskier than the same neighbor with low amount.' Sticking edge features into a parallel stream loses these per-token interactions. The patch projection mixes all per-token features uniformly; downstream attention disentangles which combinations matter.", correct:true},
+          {key:"c", text:"After patching only."},
+          {key:"d", text:"Edge features aren't used."},
+        ]}
+        trap={<>(a)(c) split signals that should fuse; (d) factually wrong.</>}
+        lens={<>All per-token signals concatenate at the token level, before patching.</>}
+        stretch={<>What if edge features include very-high-cardinality fields (e.g., merchant subcategory)?</>}
       />
     </VIS.Section>
 
@@ -1701,38 +1976,45 @@ flowchart TB
       <ul>
         <li>
           <a href="https://arxiv.org/abs/2303.13047" target="_blank" rel="noopener">
-            <strong>Yu et al. — Towards Better Dynamic Graph Learning: New Architecture and Unified Library (DyGFormer)</strong>
+            <strong>Yu et al. — Towards Better Dynamic Graph Learning: New Architecture and Unified Library</strong>
           </a>{" "}
           <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2023)</span>
-          <br/>The original paper. Read Sec 3 (architecture), Sec 4 (ablations) — the ablation table is the key part. Section 5 has the benchmarks.
+          <br/>The DyGFormer paper. Section 3 introduces the co-occurrence encoding + patching; Section 5 has the ablations that quantify each contribution. The ablations are why P22 has its answer.
         </li>
         <li>
           <a href="https://github.com/yule-BUAA/DyGLib" target="_blank" rel="noopener">
-            <strong>DyGLib — reference implementation</strong>
+            <strong>DyGLib — Official reference implementation + dynamic-graph library</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(code)</span>
-          <br/>Official PyTorch library implementing TGN, TGAT, JODIE, DyRep, DyGFormer under a common API. Use this for honest replication before trusting any single paper's reported numbers.
+          <span style={{color:"#64748b", fontSize:14}}>(repo)</span>
+          <br/>Read <code>models/DyGFormer.py</code> for the co-occurrence + patching code. Pairs with TGN / TGAT / JODIE implementations under the same interface — useful for apples-to-apples ablation reading.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2207.10128" target="_blank" rel="noopener">
-            <strong>Huang et al. — Temporal Graph Benchmark for Machine Learning on Temporal Graphs (TGB)</strong>
+          <a href="https://tgb.complexdatalab.com/" target="_blank" rel="noopener">
+            <strong>Temporal Graph Benchmark (TGB) — leaderboard + tasks</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2023)</span>
-          <br/>The standardized benchmark used by all recent temporal-graph papers. Read Sec 4 (evaluation protocol) for what fair comparison requires.
+          <span style={{color:"#64748b", fontSize:14}}>(benchmark)</span>
+          <br/>The benchmark on which DyGFormer's 5-15% MRR lift over TGN is measured. Useful for sanity-checking any in-house claim of improvement.
         </li>
         <li>
-          <a href="https://distill.pub/2021/gnn-intro/" target="_blank" rel="noopener">
-            <strong>Distill.pub — A Gentle Introduction to Graph Neural Networks</strong>
+          <a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">
+            <strong>Jay Alammar — The Illustrated Transformer</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(interactive blog)</span>
-          <br/>The clearest visual intro to GNN basics. Read before tackling temporal extensions. Interactive diagrams.
+          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
+          <br/>Re-read if the transformer/attention mechanics aren't second-nature. P4 (patching) builds on the standard ViT-style trick.
         </li>
         <li>
-          <a href="https://www.youtube.com/watch?v=GXhBEj1ZtE8" target="_blank" rel="noopener">
-            <strong>Stanford CS224W — Temporal Graph Learning lectures (video)</strong>
+          <a href="https://arxiv.org/abs/2002.07962" target="_blank" rel="noopener">
+            <strong>Xu et al. — TGAT (Inductive Representation Learning on Temporal Graphs)</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(video, ~75 min)</span>
-          <br/>Jure Leskovec's CS224W coverage of TGN, TGAT, and DyGFormer. The cleanest single source pulling all three together.
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2020)</span>
+          <br/>DyGFormer reuses TGAT's Fourier time-encoding. Read Section 3.1 to internalize phi(dt).
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener">
+            <strong>Dosovitskiy et al. — An Image is Worth 16x16 Words (ViT)</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2021)</span>
+          <br/>The patching trick DyGFormer borrows. ViT patches images; DyGFormer patches neighbor sequences. Read for the linear-projection-of-concatenation construction.
         </li>
       </ul>
     </VIS.Section>

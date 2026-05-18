@@ -1414,282 +1414,556 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// TGN (Temporal Graph Networks) — Fraud SOTA · Real-time / streaming graph fraud
-// Memory module updated per edge event for incremental GNN scoring without retraining.
+// TGN — Temporal Graph Networks. Concept-specific anchors:
+//   (1) per-node MEMORY vector (RNN-style state) updated as events arrive
+//   (2) temporal attention over recent neighbor interactions with time encoding
+//   (3) event-driven (continuous-time) — NOT snapshot/static GNN, NOT transformer-over-patches
+// Strip "memory module / RNN-state / event-driven temporal attention" and answers should fail.
 
 const App = () => (
   <main style={{maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65}}>
     <VIS.Hero
-      pill="Fraud SOTA · Real-time / streaming graph fraud"
-      title="TGN (Temporal Graph Networks)"
-      subtitle="Per-node memory updated by every edge event lets a GNN score streaming transactions without retraining the whole graph."
+      pill="Fraud SOTA · Memory-augmented temporal GNN"
+      title="TGN — Temporal Graph Networks"
+      subtitle="Per-node RNN-style memory updated event-by-event, with temporal attention over recent neighbors. Continuous-time, not snapshots."
       byline={[
-        {label: "Paper", value: "Rossi et al., ICML 2020 GRL"},
-        {label: "Production", value: "LinkedIn Eng 2024"},
-        {label: "L3", value: "Streaming GNN"},
+        {label: "Source", value: "Rossi et al. — Temporal Graph Networks for Deep Learning on Dynamic Graphs (ICML GRL 2020)"},
+        {label: "L3", value: "Memory module + temporal attention + time encoding"},
+        {label: "Anchor", value: "Per-node RNN memory updated by message-passing on each event"},
       ]}/>
 
     <VIS.TLDR>
-      A batch GNN must re-aggregate over a node's full k-hop neighborhood on every scoring call — minutes per scoring batch on a fraud graph with hundreds of millions of edges. TGN avoids this by maintaining a small{" "}
-      <VIS.Term def="A per-node hidden state vector that is updated by every edge event involving the node. Acts as a compressed summary of the node's interaction history.">memory vector</VIS.Term>{" "}
-      per node that captures its history; when a new edge arrives, TGN updates only the two endpoints' memories via a recurrent module and runs a tiny temporal embedding step. Online scoring becomes milliseconds. Cost: the memory drifts as the world changes and must be periodically refreshed or retrained.
+      Static{" "}
+      <VIS.Term def="Graph Neural Network — message-passing model that aggregates features from a node's neighbors. Vanilla GCN/GAT assume the graph is fixed at training time.">GNN</VIS.Term>{" "}
+      treats the user-merchant-device graph as a snapshot — but fraud is a STREAM of events arriving in continuous time. TGN gives every node a small RNN-style{" "}
+      <VIS.Term def="A per-node hidden vector (e.g., dim 100) that summarizes everything the node has done. Updated like a GRU hidden state every time the node participates in a new event.">memory</VIS.Term>{" "}
+      vector that is updated by a message each time the node participates in an interaction. To score a transaction at time t, TGN pulls the node's CURRENT memory + runs temporal attention over its recent neighbors with a learned time-encoding of how-long-ago each neighbor event was. This is fundamentally different from a transformer-over-event-sequences (no per-node memory state) and from a snapshot GCN (no event-driven update, no time encoding).
     </VIS.TLDR>
 
-    <VIS.Section id="sec-what" title="What it is">
+    <VIS.Section id="sec-what" title="What it is — memory + temporal attention, event-driven">
       <p>
-        Imagine a payments graph: nodes are accounts, edges are transactions, every transaction arrives with a timestamp. A batch GNN like GraphSAGE would recompute every node's embedding from scratch on each scoring batch. At edge-per-second rates that is infeasible.
+        Imagine 5 fraud analysts each carrying a small notebook for every user, merchant, device, and IP in the network. Every time an event happens (a tap, a login, a transfer), the analyst flips to the two participating notebooks, reads the current page, writes a new line summarizing the event, and the two notebooks each get a fresh "current summary" page. That fresh page is the node's <strong>memory</strong>. When a new transaction needs to be scored, the analyst doesn't re-read the entire ledger — they read the current page of each participant's notebook, glance at recent visitors in the room (temporal attention over neighbors), and decide.
       </p>
-      <p>
-        TGN's trick: every node carries a small memory vector. When a new edge (u, v, t) arrives, three things happen:
-      </p>
+
       <ol>
-        <li><strong>Message function</strong> — combines the source memory, destination memory, edge features, and elapsed time into a message vector for each endpoint.</li>
-        <li><strong>Memory updater</strong> — a GRU or LSTM consumes the message and updates the node's memory in place.</li>
-        <li><strong>Temporal embedding</strong> — when a downstream task needs an embedding (e.g., fraud scoring), a lightweight attention over recent temporal neighbors plus the node's memory produces the prediction.</li>
+        <li><strong>Memory module:</strong> each node n has a state vector s_n(t) that summarizes its history up to time t. It is updated by a GRU-like cell each time n participates in an event. Dim ~ 100-200.</li>
+        <li><strong>Message function:</strong> when event (u, v, t, edge-features) arrives, compute messages m_u and m_v from current memories s_u(t-), s_v(t-), the time delta since their last update, and edge features.</li>
+        <li><strong>Memory updater:</strong> a GRU cell takes the message and the previous memory to produce the new memory: s_u(t) = GRU(m_u, s_u(t-)).</li>
+        <li><strong>Embedding module:</strong> at scoring time, compute a node embedding z_n(t) by temporal attention over n's recent temporal neighbors. Each neighbor contributes its memory + a learned time-encoding phi(t - t_neighbor) of how long ago the interaction was.</li>
+        <li><strong>Time encoding:</strong> a learned function phi: R -&gt; R^d that maps "how long ago" to a vector — usually a learned Fourier basis. This lets attention down-weight stale neighbors and up-weight fresh ones.</li>
+        <li><strong>Training trick — batch consistency:</strong> within a batch, memory is read with the state AS OF the start of the batch, then updated at the end. This decouples gradient computation from sequential memory updates and is what makes TGN parallelizable.</li>
       </ol>
-      <p>
-        The result: each transaction triggers an O(1)-per-node update; scoring a new transaction is a single forward pass through the temporal embedding head.
-      </p>
 
       <VIS.Mermaid chart={`
 flowchart TB
-  E["New edge u-v at time t"]
-  E --> MSG["Compute message"]
-  MSG --> MU["Update memory of u"]
-  MSG --> MV["Update memory of v"]
-  MU --> EMB["Temporal embedding"]
-  MV --> EMB
-  EMB --> SCR["Fraud score"]
-  style MU fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-  style MV fill:#fee2e2,stroke:#dc2626,stroke-width:2px
-      `} />
-      <p>The red boxes are the TGN-specific memory updates; the embedding/scoring step is similar to any GNN head.</p>
-
-      <VIS.Equation display tex={`s_u(t) = \\text{GRU}(m_{u}(t), s_u(t^{-})), \\quad m_u(t) = \\phi(s_u(t^{-}), s_v(t^{-}), e_{uv}, \\Delta t)`} />
-      <p>s_u(t) is u's memory after the event, s_u(t-) is its memory just before, m is the message, phi is the message function. Each event touches only the two endpoint memories.</p>
+  E["Event u v t features"]
+  E --> M["Message function"]
+  M --> G["GRU memory updater"]
+  G --> S["Node memory s_n(t)"]
+  S --> A["Temporal attention over neighbors"]
+  N["Neighbor memories plus phi(dt)"] --> A
+  A --> Z["Node embedding z_n(t)"]
+  Z --> D["Fraud score for event"]
+  style S fill:#fef3c7,stroke:#d97706,stroke-width:2px
+  style A fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+  style D fill:#fee2e2,stroke:#dc2626,stroke-width:2px
+      `}/>
+      <p>Yellow = per-node RNN memory (the TGN-defining piece). Blue = temporal attention with time encoding. Red = the event-time score. Memory is persistent across events; attention is per-scoring-call.</p>
     </VIS.Section>
 
-    <VIS.Section id="sec-diff" title="How it differs from the baseline">
-      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8}}>
+    <VIS.Section id="sec-why" title="Why memory + time encoding beats snapshot-GNN and beats sequence-transformer">
+      <p>
+        A snapshot GNN runs message passing on the graph as of a fixed time and produces stale embeddings — by the time a card-testing burst happens, you need to re-run the whole snapshot to react. TGN instead runs message passing only on the two participating nodes per event; everyone else's memory stays put. This is O(events) work, not O(graph) work, and is what makes it production-feasible.
+      </p>
+      <p>
+        A sequence transformer (e.g., DyGFormer) reads a flat sequence of recent neighbor events with patch tokenization. It does NOT carry per-node state between calls — each scoring call recomputes from scratch over the patch. TGN carries a per-node memory that has been incrementally updated over the entire history, so a node's "current summary" already reflects events from days/months ago, not just the patch window.
+      </p>
+
+      <table style={{width:"100%", borderCollapse:"collapse", marginTop:8, fontSize:14}}>
         <thead>
           <tr style={{background:"#1f3a5f", color:"#fff"}}>
             <th style={{padding:"8px 10px", textAlign:"left"}}>Aspect</th>
-            <th style={{padding:"8px 10px", textAlign:"left"}}>Batch GNN (GraphSAGE)</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Snapshot GCN/GAT</th>
+            <th style={{padding:"8px 10px", textAlign:"left"}}>Sequence transformer (DyGFormer)</th>
             <th style={{padding:"8px 10px", textAlign:"left"}}>TGN</th>
           </tr>
         </thead>
         <tbody>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Update unit</td>
-            <td style={{padding:"8px 10px"}}>Recompute whole graph</td>
-            <td style={{padding:"8px 10px"}}>Two memory vectors per edge event</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Time awareness</td>
-            <td style={{padding:"8px 10px"}}>Static graph snapshot</td>
-            <td style={{padding:"8px 10px"}}>Per-event timestamp in message</td>
-          </tr>
-          <tr style={{background:"#e8f0fa"}}>
-            <td style={{padding:"8px 10px"}}>Latency for new edge</td>
-            <td style={{padding:"8px 10px"}}>Minutes to hours</td>
-            <td style={{padding:"8px 10px"}}>1-5 ms</td>
-          </tr>
-          <tr>
-            <td style={{padding:"8px 10px"}}>Memory drift</td>
-            <td style={{padding:"8px 10px"}}>None (recomputed)</td>
-            <td style={{padding:"8px 10px"}}>Yes — needs periodic refresh</td>
-          </tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Per-node state</td><td style={{padding:"6px 10px"}}>None</td><td style={{padding:"6px 10px"}}>None (patch-only)</td><td style={{padding:"6px 10px"}}>RNN-style memory s_n(t)</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Time handling</td><td style={{padding:"6px 10px"}}>Discrete snapshots</td><td style={{padding:"6px 10px"}}>Patch positions + time</td><td style={{padding:"6px 10px"}}>Continuous time encoding phi(dt)</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Update unit</td><td style={{padding:"6px 10px"}}>Re-run whole graph</td><td style={{padding:"6px 10px"}}>Per-call recompute</td><td style={{padding:"6px 10px"}}>Per-event message + GRU on 2 nodes</td></tr>
+          <tr><td style={{padding:"6px 10px"}}>Long-range history</td><td style={{padding:"6px 10px"}}>Snapshot window</td><td style={{padding:"6px 10px"}}>Patch window (e.g., 32 events)</td><td style={{padding:"6px 10px"}}>All history compressed in memory</td></tr>
+          <tr style={{background:"#e8f0fa"}}><td style={{padding:"6px 10px"}}>Inference cost per event</td><td style={{padding:"6px 10px"}}>High (re-run snapshot)</td><td style={{padding:"6px 10px"}}>O(patch x attention)</td><td style={{padding:"6px 10px"}}>O(neighbors at attention) + GRU</td></tr>
         </tbody>
       </table>
     </VIS.Section>
 
-    <VIS.Section id="sec-when" title="When to pick">
-      <ul>
-        <li><strong>Streaming fraud scoring at edge-per-second rates</strong> — payments, real-time bidding, account-takeover detection.</li>
-        <li><strong>Heterogeneous node types with rapid event flow</strong> — accounts, merchants, devices each updating asynchronously.</li>
-        <li><strong>When historical signal matters but full recomputation is infeasible</strong> — TGN compresses history into the memory vector.</li>
-      </ul>
-    </VIS.Section>
-
-    <VIS.Section id="sec-limits" title="Limitations and gotchas">
-      <VIS.Callout kind="gotcha" title="Memory drifts after 24 hours">
-        Once the data distribution shifts (new fraud pattern, post-holiday traffic), the recurrent memory accumulates stale signal. LinkedIn's 2024 deployment reports F1 drift of 2-4 points per day if memory is never refreshed. Set a refresh policy: full retrain weekly, partial memory reset on drift signals.
+    <VIS.Section id="sec-limits" title="Limits and gotchas — the memory-module-specific ones">
+      <VIS.Callout kind="gotcha" title="Memory leakage — train/eval contamination">
+        Memory is stateful. If during eval you forget to roll memory back to its training-cutoff state, you score test events with memory that has already absorbed test events. Recall looks ~10pt better offline than in production. Fix: snapshot memory at the train/eval boundary and ALWAYS reset before eval batches.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Memory is a tiny information bottleneck">
-        A 100-dim memory vector cannot hold everything about a node with 10K interactions. DyGFormer's selling point is that it skips the memory and re-attends over the raw temporal neighbor list when the bandwidth matters.
+      <VIS.Callout kind="warn" title="Cold-node memory is near-zero">
+        A brand-new node (first transaction) has an uninitialized memory vector. Its embedding is driven entirely by the neighbor attention. Cold-start handling needs side features (KYC, device fingerprint) injected as the initial memory, not zeros.
       </VIS.Callout>
-      <VIS.Callout kind="warn" title="Cold-start nodes get zero memory">
-        A brand-new account has an all-zeros memory; the temporal embedding head gets nothing useful for the first few events. Combine with a tabular fallback model for the cold-start window.
+      <VIS.Callout kind="warn" title="Memory staleness — silent decay">
+        A node that hasn't transacted in 90 days still has its 90-day-old memory. Without time decay or re-init, an attacker who takes over a long-dormant account inherits its "trusted" memory. Defense: time-decay on memory or use phi(dt-since-update) as a confidence weight.
+      </VIS.Callout>
+      <VIS.Callout kind="gotcha" title="Batch-order non-determinism">
+        Memory updates depend on event order WITHIN a batch. Re-shuffling a batch can change which message lands in memory first, and subtly shift training trajectories. Use the "memory frozen during batch, updated after" trick from the paper; do not update memory mid-batch.
+      </VIS.Callout>
+      <VIS.Callout kind="warn" title="Neighbor sampler bias">
+        At scoring time you sample K most recent neighbors. If K is too small, you miss multi-hop ring structure; if too large, latency blows. Most production deployments use K=20 with uniform-recent sampling.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — 10 trap problems">
+    <VIS.Section id="sec-drill" title="Drill — concept-specific trap problems">
       <p style={{color:"#475569", marginBottom: 16}}>
-        Ten interview-grade traps on TGN, debugging memory drift, and the tradeoff against batch GNN and DyGFormer.
+        Every problem hinges on something only TGN does: per-node RNN memory updated event-by-event, learned time-encoding phi(dt) for continuous time, the message-then-GRU pipeline, the batch-frozen-then-updated memory trick, and event-driven (O(events)) compute. Strip "memory module / RNN-state / time-encoding / event-driven" and the answer must no longer work.
       </p>
 
+      {/* B3 — STAKEHOLDER PITCH */}
       <VIS.TrapProblem
         id="tgn-p1"
         difficulty="hard"
-        title="P1 — Memory drifts after 24 hours. Retrain or trust?"
-        scenario={<>You deploy TGN. Wednesday morning F1 is 0.85. By Thursday morning F1 has drifted to 0.82, and by Friday to 0.80. Retraining the full TGN takes 6 hours of GPU time. What's the operating policy?</>}
+        title="P1 — Risk PM asks: 'Why TGN over a snapshot GraphSAGE we already run nightly?'"
+        scenario={<><em>Discriminating insight: the night-batch snapshot is hours stale by the time card-testing fires. TGN's per-node MEMORY updated event-by-event means the node's state already reflects the most recent event before the next one is scored — no re-batch required. Strip "per-node memory + event-driven update" and the pitch is generic streaming.</em><br/><br/>Pick the pitch that justifies TGN.</>}
         options={[
-          {key:"a", text:"Two-tier refresh: lightweight memory reset every 24h (warm-start from yesterday's model, replay last 24h of edges), full retrain weekly when the lighter refresh stops recovering performance. Monitor F1 + memory norm drift as triggers.", correct:true},
-          {key:"b", text:"Retrain TGN nightly from scratch."},
-          {key:"c", text:"Trust the memory; F1 will self-correct."},
-          {key:"d", text:"Switch to batch GNN."},
+          {key:"a", text:"TGN is a newer architecture, so it must be better."},
+          {key:"b", text:"Snapshot GraphSAGE re-runs message passing on the entire graph at fixed cadence (e.g., nightly); between snapshots, scores are stale. TGN gives every node an RNN-style memory vector s_n(t) that is updated by a GRU only on the two nodes participating in each new event. A scoring call at time t reads the current memory plus runs temporal attention over recent neighbors with a learned time encoding phi(dt). Effective update latency drops from hours (snapshot cadence) to milliseconds (per-event), and total compute is O(events) instead of O(graph). The mechanism that delivers this is the per-node memory + event-driven message-passing — a snapshot model has neither.", correct:true},
+          {key:"c", text:"TGN uses transformers, and transformers are better than GCNs."},
+          {key:"d", text:"TGN scales to more nodes."},
         ]}
-        trap={<>(b) wastes 6h GPU/day. (c) is wishful — memory does NOT self-correct under distribution shift. (d) abandons the latency win that motivated TGN.</>}
-        lens={<>(a) is the LinkedIn pattern. Cheap daily memory reset preserves most of the architecture's win; weekly full retrain handles deeper drift. Monitor (i) F1 on a held-out canary set and (ii) memory-norm distribution shift as the trigger to escalate from daily to full retrain.</>}
-        stretch={<>What feature on the input edges would shift first under a new fraud pattern?</>}
+        trap={<>(a) is recency bias. (c) is architecturally wrong — TGN's core is RNN-style memory + attention over neighbors, not a transformer stack over events. (d) doesn't capture the event-driven update advantage.</>}
+        lens={<>B3 redact-test: strip "per-node memory" / "event-driven update" / "time-encoding" and only (b) collapses. The pitch IS the mechanism.</>}
+        stretch={<>What's the bound on update-latency for TGN vs snapshot cadence — what does it depend on?</>}
       />
 
+      {/* A1 — vs static GNN */}
       <VIS.TrapProblem
         id="tgn-p2"
         difficulty="hard"
-        multiSelect
-        title="P2 — Which symptoms indicate TGN memory has drifted vs other failures?"
-        scenario={<>Production TGN F1 drops 5 points overnight. Which signals point to memory drift vs other root causes? Select all that are diagnostic for memory drift specifically.</>}
+        title="P2 — A teammate insists 'TGN is just GraphSAGE with timestamps as edge features'. Diagnose."
+        scenario={<><em>Discriminating insight: adding timestamps as edge features doesn't give nodes persistent state. TGN's per-node memory s_n(t) carries forward across events; GraphSAGE has no such state.</em><br/><br/>Junior says timestamps-as-features is equivalent. Diagnose.</>}
         options={[
-          {key:"a", text:"Performance recovers immediately after a full memory reset on the same model weights.", correct:true},
-          {key:"b", text:"Performance degrades smoothly over hours, not as a step function.", correct:true},
-          {key:"c", text:"Performance for new accounts is unaffected while established accounts get worse.", correct:true},
-          {key:"d", text:"Sudden step drop at midnight UTC.", correct:false},
-          {key:"e", text:"Higher false-positive rate on a specific merchant category.", correct:false},
+          {key:"a", text:"Correct — timestamps are all you need."},
+          {key:"b", text:"Wrong on the core mechanism. GraphSAGE-with-timestamp-edge-features still computes embeddings as f(node features, neighbor features) — there is no persistent per-node state between calls. TGN adds two new modules that have no GraphSAGE analog: (1) a per-node memory vector s_n(t) updated by a GRU on each event the node participates in, so a node's state compresses its ENTIRE history without re-traversing it; (2) a learned time-encoding phi(dt) so attention down-weights stale neighbors. Drop memory and phi and you have a stale snapshot model with timestamps decorating edges.", correct:true},
+          {key:"c", text:"TGN is just GraphSAGE with attention."},
+          {key:"d", text:"TGN is just a transformer."},
         ]}
-        trap={<>(d) suggests a deploy / feature pipeline issue, not drift. (e) suggests a localized data issue, not memory accumulation.</>}
-        lens={<>(a) (b) (c) are the drift fingerprint: smooth degradation, accumulation in nodes with long histories, recovery on reset. Step drops (d) and localized misfires (e) point elsewhere (deploy, schema change, regional outage).</>}
-        stretch={<>What metric would you put on the on-call dashboard to detect this earlier?</>}
+        trap={<>(a) ignores stateful memory. (c) ignores the GRU memory and time encoding. (d) confuses TGN (RNN memory + attention) with DyGFormer (transformer over patches).</>}
+        lens={<>Memory is THE distinguishing module. Static-GNN-plus-timestamps is not TGN.</>}
+        stretch={<>What would you have to add to GraphSAGE to recover TGN's capability — and at what compute cost?</>}
       />
 
+      {/* A2 — vs DyGFormer */}
       <VIS.TrapProblem
         id="tgn-p3"
-        difficulty="medium"
-        title="P3 — Batch size for TGN training"
-        scenario={<>You train TGN with batch size 128 (128 edge events per step). Convergence is fine but slow. A colleague suggests batch size 4096 to speed it up. What's the gotcha?</>}
+        difficulty="hard"
+        title="P3 — TGN vs DyGFormer: both are 'dynamic graph models'. Where does the mechanism differ?"
+        scenario={<><em>Discriminating insight: TGN carries a PERSISTENT per-node RNN memory (state survives across calls). DyGFormer is a TRANSFORMER over patches of recent neighbor sequences — no per-node state, recomputed each call. Don't blur into "temporal GNN".</em><br/><br/>Trace the mechanism diff.</>}
         options={[
-          {key:"a", text:"In TGN, all events within a batch are processed against the SAME memory snapshot before any memory updates — large batches violate temporal causality between events that should have updated each other. Keep batch size small (128-512) and parallelize across non-overlapping node sets instead.", correct:true},
-          {key:"b", text:"Large batches need more learning rate."},
-          {key:"c", text:"Batch size has no effect on TGN."},
-          {key:"d", text:"Use gradient accumulation."},
+          {key:"a", text:"They're the same thing — both are dynamic graph models."},
+          {key:"b", text:"Different core mechanism. (1) TGN: per-node RNN memory s_n(t) updated by a GRU on each event; at scoring, read memory + run temporal attention with learned time-encoding phi(dt) over K recent neighbors. State PERSISTS across scoring calls. (2) DyGFormer: at scoring time, gather the node's recent neighbor sequence, chunk into patches, run a transformer over the patches. There is NO per-node state between calls — the patch is recomputed each time. Implications: TGN compresses unbounded history into memory; DyGFormer is bounded by patch window. TGN's update is O(2 nodes per event) — cheap streaming. DyGFormer recomputes the full patch per scoring call — heavier inference but richer per-call structure.", correct:true},
+          {key:"c", text:"TGN is older, DyGFormer is newer; otherwise identical."},
+          {key:"d", text:"DyGFormer uses attention, TGN does not."},
         ]}
-        trap={<>(b) and (d) are generic tricks that miss the temporal-causality issue. (c) is wrong.</>}
-        lens={<>(a) — TGN's correctness depends on processing events in temporal order with up-to-date memory. A 4096-event batch with shared snapshot means later events in the batch do not see earlier events' updates. The original paper recommends batch sizes of 200; production deployments cap at 512.</>}
-        stretch={<>How does node-disjoint batching let you bump the effective batch size?</>}
+        trap={<>(a)(c) blur the mechanism. (d) wrong — TGN's embedding module IS temporal attention over neighbors; the difference is per-node state + RNN updater.</>}
+        lens={<>Persistent-state RNN memory (TGN) vs stateless transformer over patch (DyGFormer). Same problem, opposite state assumption.</>}
+        stretch={<>For which deployment regimes does the TGN's persistent-memory advantage matter most — high event rate, long-tail dormant accounts, or both?</>}
       />
 
+      {/* C1 — memory mechanics */}
       <VIS.TrapProblem
         id="tgn-p4"
         difficulty="hard"
-        title="P4 — Cold-start node: zero memory"
-        scenario={<>A new account opens at 10:00 AM. By 10:05 AM it has 3 transactions. TGN's temporal embedding head outputs near-uniform fraud probability for this account. Why?</>}
+        title="P4 — Walk through what happens to node U's memory when event (U, V, t, $50) arrives."
+        scenario={<><em>Discriminating insight: message uses CURRENT memory of both endpoints + time delta + edge features; GRU then updates the memory. The time-delta is dt since this node's last update, not absolute t.</em><br/><br/>Mechanics check.</>}
         options={[
-          {key:"a", text:"Memory vector is initialized to zero; with only 3 events the GRU has barely moved it. The temporal embedding head depends on memory as its primary signal, so output is dominated by the zero prior.", correct:true},
-          {key:"b", text:"GRU is broken."},
-          {key:"c", text:"3 events are too few for any model."},
-          {key:"d", text:"Need to retrain TGN."},
+          {key:"a", text:"U's memory is replaced by edge features."},
+          {key:"b", text:"Step 1: compute message m_U = MSG(s_U(t-), s_V(t-), dt_U = t - last_update(U), edge_features). The message uses the CURRENT memories of both endpoints, the time since U was last touched (not since the graph last updated), and the edge features. Step 2: s_U(t) = GRU(m_U, s_U(t-)). Step 3: symmetric update for V. Step 4: events on OTHER nodes leave their memories untouched. Net effect: O(2-node update) per event regardless of graph size.", correct:true},
+          {key:"c", text:"Run message passing over all neighbors of U."},
+          {key:"d", text:"Increment a counter."},
         ]}
-        trap={<>(b)-(d) misattribute the issue. The trap is candidates who blame the model rather than understanding the architecture's cold-start floor.</>}
-        lens={<>(a) — TGN's memory compresses history; cold-start has no history. Either (i) fall back to a tabular model for first N events, (ii) initialize memory from a "similar account" k-NN, (iii) bootstrap memory from registration features via a learned projection. Most production teams pick (i).</>}
-        stretch={<>How many events does TGN typically need before the memory is meaningful?</>}
+        trap={<>(a) drops historical state. (c) describes a snapshot GNN, not TGN's event-driven update. (d) trivializes the mechanism.</>}
+        lens={<>The atomic operation is message-on-event-then-GRU-update-on-2-nodes. Internalize this and TGN clicks.</>}
+        stretch={<>Why does using dt-since-last-update on the message (not absolute t) matter for stability?</>}
       />
 
+      {/* C2 — time encoding */}
       <VIS.TrapProblem
         id="tgn-p5"
         difficulty="hard"
-        multiSelect
-        title="P5 — TGN vs DyGFormer choice"
-        scenario={<>You're choosing between TGN and DyGFormer for streaming fraud. Which scenarios favor TGN?</>}
+        title="P5 — Time encoding phi(dt): why a learned Fourier-like basis rather than a scalar dt?"
+        scenario={<><em>Discriminating insight: attention scores are dot-products; a scalar dt cannot disambiguate "5 seconds ago" from "5 days ago" with multiplicative attention. A learned Fourier basis maps dt into a vector where dot-product naturally separates time scales.</em><br/><br/>Why Fourier-style time encoding?</>}
         options={[
-          {key:"a", text:"Sub-10ms p99 latency budget and millions of nodes.", correct:true},
-          {key:"b", text:"GPU memory is tight; cannot fit long temporal neighbor lists.", correct:true},
-          {key:"c", text:"Fraud patterns require attending over 1000+ historical events to detect.", correct:false},
-          {key:"d", text:"Most accounts have fewer than 50 lifetime events.", correct:true},
-          {key:"e", text:"You have abundant offline compute for batch retraining.", correct:false},
+          {key:"a", text:"To make the math prettier."},
+          {key:"b", text:"Temporal attention computes a softmax over dot-products between the query (current node memory) and key vectors (neighbor memory + time encoding). A scalar dt added to the key contributes a single dimension; the attention head can't learn rich non-linear weighting of dt vs neighbor identity. A learned Fourier basis phi(dt) = [sin(omega_1 dt), cos(omega_1 dt), ..., sin(omega_d dt), cos(omega_d dt)] with learnable omegas spans multiple time scales simultaneously, so the same head can attend strongly to events seconds-ago AND weeks-ago when relevant. Empirically this gives 2-4pt AUC over scalar dt.", correct:true},
+          {key:"c", text:"To match transformer positional encoding."},
+          {key:"d", text:"Because dt is unbounded."},
         ]}
-        trap={<>(c) is DyGFormer's sweet spot — attention over long temporal neighbor sequences beats memory compression when history matters. (e) is irrelevant.</>}
-        lens={<>TGN wins when latency and memory are tight (a, b) and when histories are short (d). DyGFormer wins when you can afford the attention compute and the historical signal is rich. Many production deployments run both: TGN online, DyGFormer for forensics.</>}
-        stretch={<>At what GPU memory budget does DyGFormer become infeasible?</>}
+        trap={<>(a) is non-substantive. (c) is shallow analogy; (d) is solved by log-scaling alone.</>}
+        lens={<>Time encoding has to be expressive enough for attention to learn multi-scale time weighting. Fourier basis is the simplest such expressive parameterization.</>}
+        stretch={<>How many Fourier frequencies are needed before returns diminish?</>}
       />
 
+      {/* C3 — batch-frozen memory */}
       <VIS.TrapProblem
         id="tgn-p6"
-        difficulty="medium"
-        title="P6 — TGN with node features"
-        scenario={<>Your accounts have static features (industry, registration country). TGN's memory captures dynamic state. Where do the static features go?</>}
+        difficulty="hard"
+        title="P6 — During training, why is memory READ at batch start and UPDATED at batch end, not per-event?"
+        scenario={<><em>Discriminating insight: per-event memory updates create a serial dependency across events in a batch, killing GPU parallelism. The frozen-read / batched-update trick decouples gradient computation from memory state.</em><br/><br/>Why this asymmetric read/write?</>}
         options={[
-          {key:"a", text:"Concatenate static features with the memory vector before the temporal embedding head; let the head learn how to weight static vs dynamic signal.", correct:true},
-          {key:"b", text:"Inject static features into the message function."},
-          {key:"c", text:"Use static features only for cold-start."},
-          {key:"d", text:"Ignore static features."},
+          {key:"a", text:"To save memory."},
+          {key:"b", text:"If memory were updated per event, event k+1 in the batch would depend on event k's GRU output — fully serial, no GPU parallelism. The paper's trick: at batch start, snapshot memory s(t_start) as the read state for ALL events in the batch; compute messages and attention in parallel using that snapshot; at batch end, replay the GRU updates on the in-batch events to produce s(t_end) for the NEXT batch's read. This decouples gradient flow from sequential memory updates, enabling batched GPU training. Cost: small staleness within a batch (events early in batch don't see events later in same batch).", correct:true},
+          {key:"c", text:"To avoid double counting."},
+          {key:"d", text:"To make memory deterministic."},
         ]}
-        trap={<>(b) leads to redundant inclusion in every event message. (c) wastes signal post cold-start. (d) discards information.</>}
-        lens={<>(a) is the original-paper pattern. Static features compose at the embedding head; dynamic state lives in memory. Many forks also pass static features through the message function for richer event encoding, but the head-level concatenation is the baseline.</>}
-        stretch={<>What if some "static" features change weekly (e.g., risk tier)?</>}
+        trap={<>(a) is incidental. (c) is not the reason. (d) is solved differently.</>}
+        lens={<>Batch-frozen-read + end-of-batch-update is THE engineering trick that makes TGN trainable at scale. Lose it and training serializes.</>}
+        stretch={<>What's the batch-size vs intra-batch-staleness tradeoff?</>}
       />
 
+      {/* C4 — memory dim */}
       <VIS.TrapProblem
         id="tgn-p7"
-        difficulty="hard"
-        title="P7 — Negative sampling during training"
-        scenario={<>TGN is typically trained with link prediction: given two nodes, predict whether they will interact. Negative samples are random non-existent edges. Why does naive uniform negative sampling underperform for fraud?</>}
+        difficulty="medium"
+        title="P7 — Memory dim: 32, 100, or 1024?"
+        scenario={<><em>Discriminating insight: memory has to compress an entire node history; too small = forgetting, too large = expensive GRU on every event. 100-200 is the empirical sweet spot.</em><br/><br/>Pick the memory dim.</>}
         options={[
-          {key:"a", text:"Random negatives are too easy — most pairs of accounts will not transact. Fraud detection needs hard negatives: pairs that LOOK like they should transact but did not. Use frequency-weighted or k-NN-based negative sampling.", correct:true},
-          {key:"b", text:"Negatives must be balanced with positives 1:1."},
-          {key:"c", text:"Negatives slow down training."},
-          {key:"d", text:"Use only positive examples."},
+          {key:"a", text:"32 — fastest."},
+          {key:"b", text:"100-200. The memory is a compressed summary of a node's entire history; 32 is too small to retain multi-pattern usage (e.g., commuter + weekend traveler + occasional online shopper) and the GRU's forgetting accelerates. 1024 makes every event's GRU + message compute expensive at hundreds of thousands of events per second; embedding tables blow VRAM. 100-200 captures enough state for typical user/merchant nodes without blowing the per-event budget. Pair with a richer per-node static embedding table if you need more capacity.", correct:true},
+          {key:"c", text:"1024 — bigger is better."},
+          {key:"d", text:"Same as embedding dim."},
         ]}
-        trap={<>(b) is a separate concern. (c) is unrelated to performance. (d) breaks the discriminative objective.</>}
-        lens={<>(a) — uniform negatives produce a model that easily distinguishes most pairs but cannot tell genuine non-fraud accounts apart from fraudsters that look normal. Hard-negative mining (degree-weighted, k-NN, or in-batch with memory similarity) is the production pattern.</>}
-        stretch={<>How does hard-negative ratio interact with class-imbalance loss like focal?</>}
+        trap={<>(a) loses signal; (c) is wasteful; (d) is not a principled choice.</>}
+        lens={<>Memory dim is bottleneck-by-design — it forces compression of history.</>}
+        stretch={<>What signals show the memory is the binding constraint vs other modules?</>}
       />
 
+      {/* C5 — neighbor sampling */}
       <VIS.TrapProblem
         id="tgn-p8"
         difficulty="medium"
-        title="P8 — Edge feature engineering for TGN"
-        scenario={<>Beyond timestamp, which edge features add the most value in a payments TGN?</>}
+        title="P8 — Temporal attention samples K recent neighbors. K = 5, 20, or 500?"
+        scenario={<><em>Discriminating insight: K controls attention's view of the local neighborhood. K too small misses ring structure; K too large blows latency. K=20 with uniform-recent sampling is the production default.</em><br/><br/>Pick K.</>}
         options={[
-          {key:"a", text:"Amount, currency, merchant category, channel (card / wire / ACH), time-since-prev-edge between same pair, and a flag for cross-border. Amount and time-since-prev are usually top two by feature importance.", correct:true},
-          {key:"b", text:"Only the timestamp."},
-          {key:"c", text:"User-agent string."},
-          {key:"d", text:"Edge features do not matter for TGN."},
+          {key:"a", text:"5 — fastest."},
+          {key:"b", text:"20, with uniform-recent sampling among neighbors seen in the last few hours. K=5 misses multi-merchant ring patterns and burst windows; K=500 blows attention's O(K) cost and produces flat softmax. The neighbor distribution is heavy-tailed (a few hot merchants dominate), so uniform-recent over the top-K-by-recency captures both hot-merchant prior and any unusual recent neighbor. The memory module already compresses long-range history, so K=20 is enough — attention is for fine-grained local pattern.", correct:true},
+          {key:"c", text:"500 — more neighbors is better."},
+          {key:"d", text:"All neighbors."},
         ]}
-        trap={<>(b) ignores rich domain signal. (c) is plausible but is a node-side feature, not edge. (d) misunderstands the architecture.</>}
-        lens={<>(a) — TGN's message function consumes edge features explicitly. Amount and time-since-prev are the highest-signal features at most fintech deployments; cross-border and channel come close. Senior MLEs should be able to name these from memory.</>}
-        stretch={<>How would you handle currency conversion when amount is in heterogeneous currencies?</>}
+        trap={<>(a) loses local structure; (c)(d) blow latency without recall gain.</>}
+        lens={<>Memory does long-range; attention does local. K calibrates the local lens.</>}
+        stretch={<>Why does the answer change for merchant nodes (very high degree) vs user nodes?</>}
       />
 
+      {/* D1 — wrong intuition */}
       <VIS.TrapProblem
         id="tgn-p9"
         difficulty="hard"
-        title="P9 — TGN inference at 100K QPS"
-        scenario={<>The platform wants to score 100K transactions/sec with TGN. Naive: one GPU per request stream. What's the right architecture?</>}
+        title="P9 — 'Memory is just a fancy aggregated feature — equivalent to last-N-days transaction stats.' Where does the intuition break?"
+        scenario={<><em>Discriminating insight: hand-aggregated stats are FIXED projections (sum, mean, count). Memory is a LEARNED non-linear compression by a GRU — it preserves order, learns what to keep/forget, and interacts with neighbor identity via attention.</em><br/><br/>Break the aggregate-stats intuition.</>}
         options={[
-          {key:"a", text:"Shard nodes across multiple TGN replicas by hash of node ID; each replica owns its node memories in a Redis-style store and processes edge events for nodes it owns. Cross-shard edges trigger a memory-read RPC.", correct:true},
-          {key:"b", text:"One giant GPU."},
-          {key:"c", text:"Run TGN on CPU; embarrassingly parallel."},
-          {key:"d", text:"Batch all events into 1-minute windows."},
+          {key:"a", text:"The intuition is fine."},
+          {key:"b", text:"Hand-aggregated features (sum_30d, mean_amount, distinct_merchant_count) are FIXED projections chosen by the modeler; they're commutative — order is destroyed. TGN's GRU memory is a LEARNED non-linear compression that (1) preserves order — a small-amt then big-amt event leaves different memory than the reverse, (2) learns its own forget gate — rare-but-important events stay longer, (3) interacts with neighbor identity at scoring time via attention, so the same memory state produces different embeddings depending on WHICH neighbors are nearby. None of these are recoverable by adding more aggregates.", correct:true},
+          {key:"c", text:"Memory uses more bits than aggregates."},
+          {key:"d", text:"GRU is just a sum."},
         ]}
-        trap={<>(b) does not scale past one GPU's memory limit. (c) ignores that the temporal embedding head needs GPU for attention. (d) destroys the streaming property and brings back batch-GNN latency.</>}
-        lens={<>(a) — production deployments shard the node memory by ID hash; each replica is responsible for a node set and reads cross-shard memory on demand. Cross-shard reads are O(1) per cross-shard edge; locality of money flow keeps the cross-shard rate manageable.</>}
-        stretch={<>How do you handle node migrations across shards on rebalance?</>}
+        trap={<>(c) is shallow; (d) factually wrong — GRU has gated multiplicative dynamics.</>}
+        lens={<>Learned compression with order-sensitivity is qualitatively different from hand-aggregated statistics.</>}
+        stretch={<>Can you back-derive a known aggregate from a trained memory? When does it fail?</>}
       />
 
+      {/* D2 — silent memory leakage */}
       <VIS.TrapProblem
         id="tgn-p10"
         difficulty="hard"
-        title="P10 — TGN beats batch GNN by 2 F1. Ship?"
-        scenario={<>Offline eval: TGN reaches F1 = 0.84 on a temporal-split fraud benchmark. Production GraphSAGE (batch, daily refresh) hits F1 = 0.82 on the same split. The team wants to ship TGN. What checks are required first?</>}
+        title="P10 — Offline: AUC 0.92. Production: 0.82. Diagnose."
+        scenario={<><em>Discriminating insight: memory is stateful — if eval doesn't reset memory to the train-cutoff state, eval batches score using memory that already absorbed test events. Classic TGN footgun.</em><br/><br/>Diagnose the 10pt gap.</>}
         options={[
-          {key:"a", text:"Replicate the GraphSAGE baseline with HOURLY refresh under matched training compute; check whether the gap holds when GraphSAGE is freshened more often. Also verify TGN's memory-drift recovery story under simulated distribution shift before shipping.", correct:true},
-          {key:"b", text:"Ship TGN — 2 F1 is significant."},
-          {key:"c", text:"A/B test in production for 4 weeks."},
-          {key:"d", text:"Add a GBDT baseline."},
+          {key:"a", text:"Production has worse data."},
+          {key:"b", text:"Memory leakage across the train/eval boundary. Memory is a stateful module — at the end of training, s_n(T_train) reflects all training events. If eval is run without resetting memory, the FIRST eval event is scored using post-train memory, the second using memory updated by the first eval event, etc. Future test events leak into the memory state used to score earlier test events; offline metrics inflate. Fix: at the train/eval boundary, snapshot memory; reset to that snapshot before each eval pass and never update it from eval events. Better still: roll memory forward only on a STRICT past-only basis with chronological eval.", correct:true},
+          {key:"c", text:"Quantization drift."},
+          {key:"d", text:"Random seed mismatch."},
         ]}
-        trap={<>(b) skips the freshness-confounder check. (c) is expensive without offline confirmation. (d) is good practice but not the discriminating check between two GNNs.</>}
-        lens={<>(a) — the GraphSAGE vs TGN gap can collapse if you give GraphSAGE hourly refresh. The real win of TGN is the LATENCY profile (online edge updates), not necessarily the offline F1. Frame the decision around the latency value, with offline F1 as a sanity check.</>}
-        stretch={<>How would you separate "fresher data" from "better architecture" in the ablation?</>}
+        trap={<>(a)(c)(d) miss the stateful-memory cause.</>}
+        lens={<>Stateful modules invert the train/eval discipline you internalized from stateless models. Always ask: what's the state, and is it leaking?</>}
+        stretch={<>How would you detect this leakage automatically before launch?</>}
+      />
+
+      {/* D3 — cold node */}
+      <VIS.TrapProblem
+        id="tgn-p11"
+        difficulty="medium"
+        title="P11 — A brand-new user appears at time t with one transaction. Memory is uninitialized. Score?"
+        scenario={<><em>Discriminating insight: cold-node memory is near-zero; the embedding is driven entirely by neighbor attention. Inject KYC/device side features as the initial memory rather than relying on zeros.</em><br/><br/>Cold-start handling.</>}
+        options={[
+          {key:"a", text:"Block all new users."},
+          {key:"b", text:"Initialize the new node's memory from its side features (KYC age, applicant risk, device fingerprint, geo) projected into memory dim, NOT zero. Then run the first scoring call as usual — attention will pick up signal from the counter-party (merchant) memory, which IS warm. The memory updater will absorb signal over the next few events. Without side-feature initialization, cold-node memory is zero and the embedding collapses to merchant-only signal, which is too coarse.", correct:true},
+          {key:"c", text:"Approve all new users."},
+          {key:"d", text:"Wait for 10 events."},
+        ]}
+        trap={<>(a)(c) are policy extremes; (d) loses real-time scoring.</>}
+        lens={<>Memory needs a sensible prior. Side features are the prior; zero is not.</>}
+        stretch={<>How many events before the memory dominates over the side-feature initialization?</>}
+      />
+
+      {/* D4 — staleness on dormant account */}
+      <VIS.TrapProblem
+        id="tgn-p12"
+        difficulty="hard"
+        title="P12 — A dormant account (no activity 90 days) suddenly has a $5000 transfer. Memory still says 'low-risk commuter'. Why is this a problem and how to fix?"
+        scenario={<><em>Discriminating insight: memory has no built-in time decay. A 90-day-old memory is treated as freshly current. Account-takeover attacks exploit this by reactivating dormant accounts. Fix: time-decay or use phi(dt-since-last-update) as a confidence weight on memory.</em><br/><br/>Stale memory on dormant account.</>}
+        options={[
+          {key:"a", text:"Not a problem — old memory is still informative."},
+          {key:"b", text:"Real problem. TGN's memory has no built-in decay; a 90-day-old memory is still treated as current. An ATO attacker who acquires a long-dormant 'good' account inherits its full reputation. Fix: at scoring time, blend memory with a decay factor exp(-lambda * dt_since_last_update) so stale memory contributes less; OR feed dt_since_last_update as an explicit feature to the embedding module; OR re-initialize from side features after dormancy beyond a threshold. The simplest production fix is to expose dt_since_last_update to the downstream classifier — it's the single most predictive ATO feature.", correct:true},
+          {key:"c", text:"Re-train the whole TGN."},
+          {key:"d", text:"Block all dormant-account transactions."},
+        ]}
+        trap={<>(a) misses the ATO surface; (c) doesn't fix the architectural gap; (d) is policy hack.</>}
+        lens={<>Memory persistence is a feature AND a vulnerability. Stale memory needs explicit handling.</>}
+        stretch={<>What's the right decay rate — and why is it likely log-scaled?</>}
+      />
+
+      {/* E1 — batch-order bug */}
+      <VIS.TrapProblem
+        id="tgn-p13"
+        difficulty="hard"
+        title="P13 — Two training runs with identical data give different validation AUC by 1pt. Bug?"
+        scenario={<><em>Discriminating insight: memory updates are batch-order-sensitive. Shuffling events within a batch changes the order in which messages compose into memory. Use the batch-frozen-then-updated trick consistently and seed the shuffler.</em><br/><br/>Diagnose 1pt run-to-run variance.</>}
+        options={[
+          {key:"a", text:"All runs vary by 1pt — that's normal."},
+          {key:"b", text:"Batch-order non-determinism. Inside a batch, the order events are processed at the end-of-batch GRU replay determines what state propagates to the next batch's memory read. Two runs with different shuffles produce different memory trajectories and different gradients. Fixes: (1) seed the data loader's shuffle, (2) ensure within-batch events are sorted by timestamp (the paper's recipe), (3) verify the end-of-batch replay is deterministic. Without all three, expect 0.5-1pt variance.", correct:true},
+          {key:"c", text:"GPU non-determinism."},
+          {key:"d", text:"Learning rate too high."},
+        ]}
+        trap={<>(a) accepts the bug; (c) is a different source and usually smaller; (d) doesn't explain the structure.</>}
+        lens={<>Stateful + batched + shuffled = three sources of order sensitivity. Pin all three.</>}
+        stretch={<>How do you isolate batch-order vs GPU non-determinism in a diagnostic?</>}
+      />
+
+      {/* E2 — neighbor sampler bias under burst */}
+      <VIS.TrapProblem
+        id="tgn-p14"
+        difficulty="hard"
+        title="P14 — Production uses K=20 most-recent neighbors. A merchant suddenly logs 10k events in 1 minute. Why does recall on that merchant collapse?"
+        scenario={<><em>Discriminating insight: most-recent sampler fills the K slots entirely with this 1-minute burst, dropping the merchant's longer-term neighbor structure. The attention layer sees only the burst — no comparative context.</em><br/><br/>Recall collapse on bursty merchant.</>}
+        options={[
+          {key:"a", text:"Memory is overloaded."},
+          {key:"b", text:"The 'most-recent K' sampler is biased by burst rate. When a merchant absorbs 10k events in a minute, the K=20 slots are entirely filled by events from that minute; the attention layer sees no comparison neighbors from prior context. Effective receptive field shrinks to a single burst, the model can't tell normal-burst (Costco at lunch) from card-testing-burst. Fix: use a mixed sampler that reserves slots for diverse recent windows (e.g., 10 from last hour, 10 stratified over last day), or sample inversely proportional to local event rate so bursts don't crowd out context.", correct:true},
+          {key:"c", text:"K=20 is just too small."},
+          {key:"d", text:"Train the model longer."},
+        ]}
+        trap={<>(a) blames memory; (c) misses the structural bias; (d) doesn't address the sampling bias.</>}
+        lens={<>Neighbor sampler is a hidden hyperparameter with large impact on burst behavior.</>}
+        stretch={<>Can the sampler be learned (e.g., RL bandit on slot allocation)?</>}
+      />
+
+      {/* E3 — VRAM at scale */}
+      <VIS.TrapProblem
+        id="tgn-p15"
+        difficulty="hard"
+        title="P15 — Memory dim 128, 100M nodes. Memory table = 51 GB. Plan."
+        scenario={<><em>Discriminating insight: 100M times 128 times 4B = 51GB exceeds A100 80GB after other overhead. Memory table is sharded across GPUs OR offloaded to host RAM with hot-cold caching by node activity.</em><br/><br/>Plan the deployment.</>}
+        options={[
+          {key:"a", text:"Buy a bigger GPU."},
+          {key:"b", text:"Memory table dominates VRAM and is access-skewed (a few percent of nodes get most events). Plan: (1) shard memory across N GPUs by node-id hash with NCCL all-to-all for cross-shard messages; OR (2) keep hot nodes (top 10% by recent activity) in GPU memory and cold nodes in pinned host RAM, with on-demand swap and a periodic re-evaluation of hot-set membership; OR (3) cap memory dim to 64 and accept ~1pt AUC loss. Production deployments usually combine (1) and (2). 'Buy bigger GPU' doesn't scale — production tables are TB-scale.", correct:true},
+          {key:"c", text:"Don't use TGN at this scale."},
+          {key:"d", text:"Store memory in Redis only."},
+        ]}
+        trap={<>(a) doesn't scale; (c) abandons the use case; (d) blows latency.</>}
+        lens={<>Memory table is the scaling bottleneck of TGN at billion-edge graphs. Sharding + hot-cold tiering is the standard answer.</>}
+        stretch={<>What changes if memory dim is doubled to 256?</>}
+      />
+
+      {/* E4 — chargeback delay */}
+      <VIS.TrapProblem
+        id="tgn-p16"
+        difficulty="medium"
+        title="P16 — Confirmed-fraud labels arrive 30-60 days late. Does TGN's stateful memory make this easier or harder?"
+        scenario={<><em>Discriminating insight: stateful memory makes delayed-label correction HARDER because the memory state when the label arrives differs from the state when the event was scored. Snapshot memory at scoring time and replay updates against the snapshot, not current memory.</em><br/><br/>How memory interacts with delayed labels.</>}
+        options={[
+          {key:"a", text:"Easier — memory tracks everything."},
+          {key:"b", text:"Harder. When the chargeback arrives 60 days after the original event, the node's memory has been updated by hundreds of subsequent events. Computing gradient on the original event must use the memory state AS OF that event, not current — otherwise you train on a different feature distribution than was scored. Standard fix: snapshot the memory state at scoring time and persist (event_id, memory_snapshot, neighbor_sample) so that when the delayed label arrives you can replay the forward pass against the snapshot and compute correct gradients. Without snapshotting, you train against current-memory features that the model never actually saw.", correct:true},
+          {key:"c", text:"Same — memory doesn't matter for labels."},
+          {key:"d", text:"Easier because of attention."},
+        ]}
+        trap={<>(a)(c)(d) miss the snapshot-at-scoring requirement.</>}
+        lens={<>Stateful memory + delayed labels = mandatory snapshot logging at scoring time.</>}
+        stretch={<>What's the storage cost of snapshotting memory for every event? Compression options?</>}
+      />
+
+      {/* F1 — when NOT to use */}
+      <VIS.TrapProblem
+        id="tgn-p17"
+        difficulty="medium"
+        title="P17 — Fraud problem with mostly SINGLE-shot interactions (one-time gift-card purchases, no repeat users). TGN appropriate?"
+        scenario={<><em>Discriminating insight: TGN's value is in compressing per-node history into memory. If nodes have ~1 event each, memory never accumulates and the model degenerates to a single-event scorer. A simple GBDT on transaction features wins.</em><br/><br/>Use TGN here?</>}
+        options={[
+          {key:"a", text:"Yes — TGN is always best."},
+          {key:"b", text:"No. TGN's value proposition is memory: compressing many events per node into a learned state. When most nodes have 1 event each, memory is just the message from that single event — there's nothing to compress, no history to leverage, and attention has no temporal neighbors of meaning. A flat GBDT (or even logistic regression) on transaction features will match or beat TGN at a fraction of the cost. Use TGN where nodes have rich histories (returning users, repeated merchants); skip it for true one-shot graphs.", correct:true},
+          {key:"c", text:"Yes — TGN handles cold-start."},
+          {key:"d", text:"Yes — graphs are always better."},
+        ]}
+        trap={<>(a)(c)(d) generalize TGN beyond its core advantage.</>}
+        lens={<>Use TGN where node-history accumulates. Where it doesn't, the model is over-engineered.</>}
+        stretch={<>Roughly how many events per node before TGN starts beating GBDT?</>}
+      />
+
+      {/* F2 — adversarial */}
+      <VIS.TrapProblem
+        id="tgn-p18"
+        difficulty="hard"
+        title="P18 — Attacker wants to poison a victim's TGN memory before the fraudulent event. How and how to defend?"
+        scenario={<><em>Discriminating insight: memory absorbs every event including the attacker's pre-attack 'normal-looking' priming events. Defense needs influence-bound limits + anomaly detection on memory deltas + secondary signals not in the graph.</em><br/><br/>Memory poisoning.</>}
+        options={[
+          {key:"a", text:"Memory cannot be poisoned."},
+          {key:"b", text:"Attack: send a sequence of small, normal-looking events (e.g., $2, $5, $3) to the victim node before the big hit; each event drags memory toward 'normal active user' state, lowering the score on the subsequent fraud event. Defenses: (1) bound the GRU update magnitude per event (gradient clipping at inference) so no single event can dominate, (2) detect anomalous memory deltas — a node whose memory moves much faster than typical is suspect, (3) ensemble with a fresh-features model that doesn't depend on memory state, so the attacker cannot compromise both, (4) restrict who can write to memory of a high-value node (KYC reverification on dormant accounts before any new event updates memory).", correct:true},
+          {key:"c", text:"Add more layers."},
+          {key:"d", text:"Increase memory dim."},
+        ]}
+        trap={<>(a) ignores the attack; (c)(d) increase capacity but don't restrict influence.</>}
+        lens={<>Adversaries who know the architecture target the state-update path. Limits + monitoring + ensemble.</>}
+        stretch={<>How to detect memory-poisoning in real time without false-positive blocking legit ramp-ups?</>}
+      />
+
+      {/* C6 — multi-hop */}
+      <VIS.TrapProblem
+        id="tgn-p19"
+        difficulty="hard"
+        title="P19 — Does TGN see 2-hop ring patterns (mule A pays mule B who pays mule C) by default?"
+        scenario={<><em>Discriminating insight: a single attention layer only sees 1-hop neighbors. Multi-hop = stacked attention layers OR longer attention via neighbor-of-neighbor sampling at each call.</em><br/><br/>Multi-hop reach.</>}
+        options={[
+          {key:"a", text:"Yes, memory captures everything."},
+          {key:"b", text:"Not by default — depends on the embedding module's depth. A single temporal-attention layer at scoring time sees only 1-hop neighbors (and their memories). To see 2-hop patterns explicitly, stack two attention layers (the second attends to first-layer embeddings of neighbors, which themselves were computed from THEIR neighbors). This doubles per-call neighbor sampling. Alternative: memory implicitly carries 2-hop signal because the neighbor's memory was updated by ITS own events (which include 2-hop nodes), but this is lossy. For ring detection specifically, explicit 2-3 attention layers + a neighbor-of-neighbor sampler is the production answer.", correct:true},
+          {key:"c", text:"No — TGN is single-hop only."},
+          {key:"d", text:"Yes — automatically infinite-hop."},
+        ]}
+        trap={<>(a)(d) overclaim; (c) misses that stacked attention extends reach.</>}
+        lens={<>Reach = attention layers, not memory dim. Memory compresses history; attention extends spatial reach.</>}
+        stretch={<>At what point does adding attention layers stop helping (over-smoothing)?</>}
+      />
+
+      {/* C7 — directed vs undirected */}
+      <VIS.TrapProblem
+        id="tgn-p20"
+        difficulty="medium"
+        title="P20 — Money flows are DIRECTED edges. Does TGN handle direction?"
+        scenario={<><em>Discriminating insight: yes, but only if message function uses edge direction as input. Symmetric m_u = m_v destroys direction. Use directional message m_out from u to v different from m_in to v from u.</em><br/><br/>Direction handling.</>}
+        options={[
+          {key:"a", text:"TGN is undirected only."},
+          {key:"b", text:"TGN handles direction if you define the message function asymmetrically: m_u_outgoing = f_out(s_u, s_v, dt, edge_features) and m_v_incoming = f_in(s_v, s_u, dt, edge_features) with separate parameters. Otherwise, if you use a symmetric m_u = m_v = f(s_u, s_v, dt, ef), direction is destroyed. For money-flow fraud (sender vs receiver have different risk profiles), the asymmetric formulation is mandatory. Likewise, attention queries from a sender should use outgoing-edge keys, not the bag.", correct:true},
+          {key:"c", text:"Direction doesn't matter."},
+          {key:"d", text:"Use absolute amounts only."},
+        ]}
+        trap={<>(a) factually wrong; (c)(d) lose key signal.</>}
+        lens={<>Directionality is an explicit modeling choice in the message function, not free.</>}
+        stretch={<>What if direction flips temporarily (refund)? How to encode?</>}
+      />
+
+      {/* E5 — debugging memory drift */}
+      <VIS.TrapProblem
+        id="tgn-p21"
+        difficulty="medium"
+        multiSelect
+        title="P21 — Suspect memory drift in production: select all diagnostics that would help."
+        scenario={<><em>Discriminating insight: stateful systems need state-specific diagnostics — memory norm over time, dt-since-last-update distribution, top-k changers, train/prod state diff.</em><br/><br/>Select all useful diagnostics.</>}
+        options={[
+          {key:"a", text:"Plot the L2 norm of memory vectors over time per node-class (user / merchant / device).", correct:true},
+          {key:"b", text:"Histogram of dt-since-last-update across all nodes — heavy left tail vs heavy right tail tells you stale-memory share.", correct:true},
+          {key:"c", text:"Compare training-end memory state to current-prod memory state via cosine similarity per node.", correct:true},
+          {key:"d", text:"Per-event loss curve."},
+          {key:"e", text:"Top-K nodes by memory change in the last day.", correct:true},
+          {key:"f", text:"Total transaction volume."},
+        ]}
+        trap={<>(d) is loss-side, not memory-state; (f) is throughput, not drift.</>}
+        lens={<>State diagnostics are diff-from-training-state, not loss curves.</>}
+        stretch={<>Which diagnostic catches POISONING vs natural drift first?</>}
+      />
+
+      {/* B2 — sounds-reasonable */}
+      <VIS.TrapProblem
+        id="tgn-p22"
+        difficulty="hard"
+        title="P22 — Junior proposes: 'Reset memory every 24h to prevent stale state.' Diagnose."
+        scenario={<><em>Discriminating insight: nightly reset destroys the long-range history compression that IS the point of memory. Use selective decay or dt-aware blending, not blunt reset.</em><br/><br/>Diagnose the reset proposal.</>}
+        options={[
+          {key:"a", text:"Good idea — eliminates staleness."},
+          {key:"b", text:"Wrong tradeoff. Memory's value is compressing months of history into a current state; nightly reset throws that away every day. A user's pattern from 30 days ago (e.g., 'they buy gas every Sunday') vanishes daily. Stale state IS a problem but the fix is dt-aware blending (decay weighted by dt_since_last_update) or selective re-init only on signal (dormancy beyond 60 days), not blunt nightly wipe. The reset cure is worse than the staleness disease.", correct:true},
+          {key:"c", text:"Reset every event instead."},
+          {key:"d", text:"Reset for low-value users only."},
+        ]}
+        trap={<>(c) destroys memory entirely; (d) doesn't address the structural issue.</>}
+        lens={<>Don't destroy state to fix staleness. Use selective decay.</>}
+        stretch={<>How would you A/B nightly-reset vs dt-aware blending?</>}
+      />
+
+      {/* F3 — distinguishing failure modes */}
+      <VIS.TrapProblem
+        id="tgn-p23"
+        difficulty="hard"
+        title="P23 — Production: recall on RETURNING users high, on NEW users low. Which TGN module is responsible and what's the fix?"
+        scenario={<><em>Discriminating insight: returning users have warm memory; new users rely entirely on attention + side features. The gap is the cold-memory regime; fix is side-feature initialization, not architecture overhaul.</em><br/><br/>Trace the failure mode.</>}
+        options={[
+          {key:"a", text:"Attention module — broken."},
+          {key:"b", text:"Memory module — specifically, cold-start regime. Returning users have multi-event memory that the GRU has shaped over time; their embedding draws strongly from memory. New users have near-zero (or zero) memory and the embedding collapses to attention-over-merchant + zeros. Fix: initialize new-user memory from side features (KYC, applicant risk, device, geo) projected into memory dim; add a 'newness' indicator as a feature to the downstream classifier; lower the decision threshold during the first N events; pair with a parallel cold-start classifier (GBDT on side features) ensembled with TGN.", correct:true},
+          {key:"c", text:"Time encoding."},
+          {key:"d", text:"Neighbor sampler."},
+        ]}
+        trap={<>(a)(c)(d) are wrong-module diagnoses.</>}
+        lens={<>Performance gaps by user-tenure point to memory's cold-start regime, not attention or sampling.</>}
+        stretch={<>How long is the cold-start regime — 5 events? 50?</>}
+      />
+
+      {/* C8 — decoder */}
+      <VIS.TrapProblem
+        id="tgn-p24"
+        difficulty="medium"
+        title="P24 — What's the decoder on top of the embedding z_n(t) for binary fraud classification?"
+        scenario={<><em>Discriminating insight: for edge classification (is THIS transaction fraud?), concat the two endpoint embeddings + edge features and feed an MLP. For node classification (is this account fraudulent?), MLP on the node embedding alone.</em><br/><br/>Decoder design.</>}
+        options={[
+          {key:"a", text:"Just take the dot product of the two embeddings."},
+          {key:"b", text:"For an edge classification task (label = is this transaction fraud?), the standard decoder concatenates the two endpoint embeddings z_u(t), z_v(t) with the edge features, optionally adds element-wise product or difference, and passes through a 2-3 layer MLP with sigmoid output. Dot-product alone (a) is too restrictive — it imposes a metric structure that loses sign / direction. For node classification (label on the user, not the transaction), MLP on z_n(t) alone is fine.", correct:true},
+          {key:"c", text:"Use a transformer."},
+          {key:"d", text:"Use a single linear layer."},
+        ]}
+        trap={<>(a) is too restrictive; (c) is overkill at the head; (d) is under-parameterized.</>}
+        lens={<>Edge tasks: concat-endpoints + edge features + MLP. Node tasks: MLP on node embedding.</>}
+        stretch={<>Does adding element-wise product help for edge classification? When?</>}
+      />
+
+      {/* A3 — TGN within the family */}
+      <VIS.TrapProblem
+        id="tgn-p25"
+        difficulty="hard"
+        title="P25 — Place TGN relative to JODIE, DyRep, and TGAT — what's TGN's specific contribution?"
+        scenario={<><em>Discriminating insight: TGN is the framework that GENERALIZES these — explicit memory module (JODIE has node states, DyRep has coupled equations) + temporal attention (TGAT) + time encoding (TGAT), unified with the batch-frozen-then-updated trick.</em><br/><br/>Family placement.</>}
+        options={[
+          {key:"a", text:"TGN is unrelated to those."},
+          {key:"b", text:"TGN explicitly subsumes them as a configurable framework: (1) JODIE-style coupled node memory + projection = setting TGN's embedding module to a simple projection, no attention; (2) DyRep-style point-process coupling = setting TGN's memory updater to one that conditions on event-type; (3) TGAT-style temporal attention without memory = setting TGN's memory module to identity. TGN's specific contribution is the unification + the batch-frozen-memory training trick that makes it trainable at scale, plus showing each piece (memory, message function, embedding module) is independently swappable. It is the framework, not just another model.", correct:true},
+          {key:"c", text:"TGN is identical to TGAT."},
+          {key:"d", text:"TGN is the snapshot version of DyRep."},
+        ]}
+        trap={<>(c) ignores memory module; (d) confuses snapshot with event-driven.</>}
+        lens={<>TGN's contribution is the unified, modular framework — pick the right modules per task.</>}
+        stretch={<>If you had to drop one TGN module, which loses the most performance — memory, attention, or time-encoding?</>}
+      />
+
+      {/* D5 — intuition trap on graph density */}
+      <VIS.TrapProblem
+        id="tgn-p26"
+        difficulty="hard"
+        title="P26 — On a denser graph (avg degree 5000), does TGN scale gracefully?"
+        scenario={<><em>Discriminating insight: attention is O(K) where K is neighbor sample size — degree doesn't enter directly. But high-degree nodes (popular merchants) get TONS of memory updates, leading to memory saturation and gradient noise.</em><br/><br/>High-degree regime.</>}
+        options={[
+          {key:"a", text:"Yes, fine, O(events) compute."},
+          {key:"b", text:"Mostly graceful but two failure modes appear at extreme degree. (1) Compute: per-event cost is still O(2-node update + K attention) regardless of degree, so throughput scales. (2) Memory saturation: a hot merchant getting 10k events/minute has its memory updated 10k times/minute — gradient saturates, the GRU's forget gate eventually rewrites useful long-range state every few seconds, and signal-to-noise on memory degrades. Fix: differentiate update LR per node (lower for hot nodes), or sample which events update memory for hot nodes. (3) Neighbor sampler bias under burst (see P14).", correct:true},
+          {key:"c", text:"No — attention blows up O(degree)."},
+          {key:"d", text:"Yes, perfectly."},
+        ]}
+        trap={<>(c) factually wrong — attention is over K-sample, not full degree; (a)(d) miss the memory-saturation failure mode.</>}
+        lens={<>Compute scales fine; signal-to-memory ratio at hot nodes is the real high-degree problem.</>}
+        stretch={<>What's the right sampling rule for which events update memory at hot nodes?</>}
       />
     </VIS.Section>
 
@@ -1699,36 +1973,43 @@ flowchart TB
           <a href="https://arxiv.org/abs/2006.10637" target="_blank" rel="noopener">
             <strong>Rossi et al. — Temporal Graph Networks for Deep Learning on Dynamic Graphs</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML 2020 GRL workshop)</span>
-          <br/>The original TGN paper. Read Sec 3 (memory module), Sec 4 (training), and Sec 5 (ablation table) — those three sections cover everything you'll be asked at interview.
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICML GRL 2020)</span>
+          <br/>The original paper. Read sections 3.1-3.4 for memory + message + embedding module formalism; section 3.5 for the batch-frozen-memory training trick.
         </li>
         <li>
           <a href="https://towardsdatascience.com/temporal-graph-networks-ab8f327f2efe" target="_blank" rel="noopener">
-            <strong>TDS — Temporal Graph Networks (Michael Bronstein, co-author blog)</strong>
+            <strong>Michael Bronstein — Temporal Graph Networks (blog)</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(blog)</span>
-          <br/>The co-author's own write-up — much more readable than the paper. Best first read for building intuition before tackling the math.
+          <span style={{color:"#64748b", fontSize:14}}>(blog, 2020)</span>
+          <br/>The author's plain-English walkthrough. The diagrams of memory + message + GRU are clearer than the paper figures.
         </li>
         <li>
           <a href="https://github.com/twitter-research/tgn" target="_blank" rel="noopener">
-            <strong>twitter-research/tgn — official reference implementation</strong>
+            <strong>Twitter Research — Official TGN reference implementation</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(code)</span>
-          <br/>Twitter's PyTorch reference implementation. <code>modules/memory.py</code> shows exactly how the memory updater is structured — useful for debugging memory drift.
+          <span style={{color:"#64748b", fontSize:14}}>(repo)</span>
+          <br/>Read <code>modules/memory.py</code> and <code>train_self_supervised.py</code>. The batch-frozen-then-updated trick is in the training loop, not the model class — easy to miss without the code.
         </li>
         <li>
-          <a href="https://www.youtube.com/watch?v=0tw66aTfWaI" target="_blank" rel="noopener">
-            <strong>Emanuele Rossi — Temporal Graph Networks (PyG seminar, video)</strong>
+          <a href="https://distill.pub/2021/gnn-intro/" target="_blank" rel="noopener">
+            <strong>Distill — A Gentle Introduction to Graph Neural Networks</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(video, ~45 min)</span>
-          <br/>First-author talk with the cleanest diagrams of the message + memory + embedding modules. Best 45 minutes for visual learners.
+          <span style={{color:"#64748b", fontSize:14}}>(blog, 2021)</span>
+          <br/>If GNNs aren't yet intuitive, start here for message-passing before TGN's temporal extension.
         </li>
         <li>
-          <a href="https://arxiv.org/abs/2207.10128" target="_blank" rel="noopener">
-            <strong>TGB Benchmark — A Temporal Graph Benchmark</strong>
+          <a href="https://arxiv.org/abs/2002.07962" target="_blank" rel="noopener">
+            <strong>Xu et al. — Inductive Representation Learning on Temporal Graphs (TGAT)</strong>
           </a>{" "}
-          <span style={{color:"#64748b", fontSize:14}}>(paper, NeurIPS 2023)</span>
-          <br/>The standardized benchmark for TGN vs DyGFormer vs friends. Read before claiming any new TGL paper's gains as production-ready.
+          <span style={{color:"#64748b", fontSize:14}}>(paper, ICLR 2020)</span>
+          <br/>The temporal attention + Fourier time-encoding module that TGN reuses. Read for the time-encoding derivation (Section 3.1).
+        </li>
+        <li>
+          <a href="https://snap.stanford.edu/jodie/" target="_blank" rel="noopener">
+            <strong>Kumar et al. — JODIE: Predicting Dynamic Embedding Trajectory</strong>
+          </a>{" "}
+          <span style={{color:"#64748b", fontSize:14}}>(paper, KDD 2019)</span>
+          <br/>JODIE's coupled user-item memory is TGN's intellectual predecessor. Useful to see what TGN generalizes.
         </li>
       </ul>
     </VIS.Section>
