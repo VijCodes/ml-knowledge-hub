@@ -1745,32 +1745,50 @@
 
 const PIECES = [
   // sources
-  { id:"post_ingest",       category:"data",    shape:"stream_source", label:"Post ingest\n3B posts/day\ntext+img+video" },
+  { id:"post_ingest",       category:"data",    shape:"stream_source", label:"Post ingest\n3B posts/day\ntext+img+video",
+    tooltip:"Streaming source: every post the platform receives. ~3B/day across text, image, and video — the firehose every downstream stage must handle." },
   // cascade stage 1 (cheap)
-  { id:"hash_lookup",       category:"infra",   shape:"store",         label:"Known-bad\nhash store\n(perceptual)" },
-  { id:"cheap_text_clf",    category:"model",   shape:"service",       label:"Cheap text\nclassifier\n<5ms" },
-  { id:"cheap_img_clf",     category:"model",   shape:"service",       label:"Mobilenet\nvisual classifier\n<10ms" },
+  { id:"hash_lookup",       category:"infra",   shape:"store",         label:"Known-bad\nhash store\n(perceptual)",
+    tooltip:"In-memory store of perceptual hashes for known-bad content (CSAM, viral spam). A hash match = instant action, no model call needed. Cheapest possible signal." },
+  { id:"cheap_text_clf",    category:"model",   shape:"service",       label:"Cheap text\nclassifier\n<5ms",
+    tooltip:"Tier-1 text classifier (FastText / linear). Runs on 100% of posts. Sub-5ms per call. Catches obvious cases; uncertain ones escalate to BERT." },
+  { id:"cheap_img_clf",     category:"model",   shape:"service",       label:"Mobilenet\nvisual classifier\n<10ms",
+    tooltip:"Tier-1 image classifier (MobileNet — small CNN designed for edge inference). Runs on every image, <10ms. Uncertain images escalate to ViT in tier-2." },
   // cascade stage 2 (mid)
-  { id:"deep_text_clf",     category:"model",   shape:"service",       label:"BERT text\nmulti-label\n50ms" },
-  { id:"deep_img_clf",      category:"model",   shape:"service",       label:"ViT visual\nclassifier\n80ms" },
-  { id:"video_clf",         category:"model",   shape:"service",       label:"Video classifier\n(sampled frames)\n200ms" },
+  { id:"deep_text_clf",     category:"model",   shape:"service",       label:"BERT text\nmulti-label\n50ms",
+    tooltip:"Tier-2 text model: fine-tuned BERT, multi-label (one head per policy: hate, self-harm, spam, etc.). ~50ms. Only called on the 10% the cheap tier marked uncertain." },
+  { id:"deep_img_clf",      category:"model",   shape:"service",       label:"ViT visual\nclassifier\n80ms",
+    tooltip:"Tier-2 image model: Vision Transformer (ViT). ~80ms per image. Called only on visually-ambiguous posts the cheap MobileNet flagged uncertain." },
+  { id:"video_clf",         category:"model",   shape:"service",       label:"Video classifier\n(sampled frames)\n200ms",
+    tooltip:"Video model: samples frames (e.g., 1 fps), classifies each, aggregates. ~200ms per video. Sampling keeps cost bounded vs full-frame inference." },
   // routing (diamond)
-  { id:"confidence_router", category:"monitor", shape:"control",       label:"Confidence\nrouter\n(per-policy thr.)" },
+  { id:"confidence_router", category:"monitor", shape:"control",       label:"Confidence\nrouter\n(per-policy thr.)",
+    tooltip:"The cascade's brain: reads cheap-model scores; high confidence (either direction) → action; ambiguous → escalate to expensive model; still ambiguous → human queue. Thresholds set per policy." },
   // HITL queue with SLA fan-out
-  { id:"self_harm_q",       category:"infra",   shape:"queue",         label:"Self-harm\nqueue\n<30s SLA" },
-  { id:"spam_q",            category:"infra",   shape:"queue",         label:"Spam queue\n<10min SLA" },
-  { id:"reviewer_pool",     category:"model",   shape:"service",       label:"Reviewer pool\n8K humans\nelastic shift" },
+  { id:"self_harm_q",       category:"infra",   shape:"queue",         label:"Self-harm\nqueue\n<30s SLA",
+    tooltip:"Priority queue for suicide/self-injury content. SLA: <30s to reviewer. Tightest deadline because a false negative can cost a life." },
+  { id:"spam_q",            category:"infra",   shape:"queue",         label:"Spam queue\n<10min SLA",
+    tooltip:"Lower-priority queue for spam / scam content. SLA: <10min. Larger backlog tolerated because cost-of-delay is annoyance, not harm." },
+  { id:"reviewer_pool",     category:"model",   shape:"service",       label:"Reviewer pool\n8K humans\nelastic shift",
+    tooltip:"~8000 human reviewers globally. Elastic shift scheduling matches the diurnal traffic pattern. Each priority queue has dedicated capacity allotment." },
   // feedback / retrain
-  { id:"label_bus",         category:"infra",   shape:"queue",         label:"Reviewer-labeled\nfeedback bus\n→ retrain" },
-  { id:"cheap_retrain",     category:"model",   shape:"service",       label:"Weekly retrain\ncheap models\non human labels" },
+  { id:"label_bus",         category:"infra",   shape:"queue",         label:"Reviewer-labeled\nfeedback bus\n→ retrain",
+    tooltip:"Stream of (post, reviewer-label) pairs published by the reviewer pool. Consumed by the retrain job: every borderline post a human labeled becomes a future training example." },
+  { id:"cheap_retrain",     category:"model",   shape:"service",       label:"Weekly retrain\ncheap models\non human labels",
+    tooltip:"Periodic job (weekly) that re-fits the tier-1 cheap classifiers on accumulated reviewer labels. Closes the loop: borderline posts today → smarter cheap model next week." },
   // surge handling
-  { id:"surge_buffer",      category:"infra",   shape:"queue",         label:"Surge buffer\n(news-event\n10x spike)" },
-  { id:"backpressure_ctrl", category:"monitor", shape:"control",       label:"Backpressure\ncontroller\n(threshold tune)" },
+  { id:"surge_buffer",      category:"infra",   shape:"queue",         label:"Surge buffer\n(news-event\n10x spike)",
+    tooltip:"Elastic buffer absorbing traffic spikes (e.g., breaking news → 10x posts/sec). Decouples ingest rate from cascade throughput so upstream doesn't drop posts during surges." },
+  { id:"backpressure_ctrl", category:"monitor", shape:"control",       label:"Backpressure\ncontroller\n(threshold tune)",
+    tooltip:"Monitors queue depth + cascade latency. On surge, raises the confidence-router threshold so fewer borderline posts escalate — keeps the human queue from drowning. Releases when surge ends." },
   // outcome
-  { id:"action_svc",        category:"model",   shape:"service",       label:"Action service\nremove/limit/\nshadow-ban" },
+  { id:"action_svc",        category:"model",   shape:"service",       label:"Action service\nremove/limit/\nshadow-ban",
+    tooltip:"Terminal stage: applies the decision. Actions vary by policy + confidence: remove (delete), limit (reduce reach), shadow-ban (invisible to others), or no-op." },
   // distractors
-  { id:"deep_first",        category:"model",   shape:"service",       label:"Run BERT+ViT\nFIRST on every\npost" },
-  { id:"flat_review",       category:"infra",   shape:"queue",         label:"Single FIFO\nreview queue\n(no SLA tiers)" },
+  { id:"deep_first",        category:"model",   shape:"service",       label:"Run BERT+ViT\nFIRST on every\npost",
+    tooltip:"DISTRACTOR. Running the expensive tier-2 models on all 3B posts = ~700 GPU-years/day. The cascade exists precisely because this is unaffordable." },
+  { id:"flat_review",       category:"infra",   shape:"queue",         label:"Single FIFO\nreview queue\n(no SLA tiers)",
+    tooltip:"DISTRACTOR. One queue for all policies. Self-harm posts (30s SLA) sit behind spam posts (10min SLA) — SLA missed by construction. Per-policy queues are non-negotiable." },
 ];
 
 const EXPECTED_PIECES = [
@@ -1923,6 +1941,8 @@ function ExcalidrawCanvas({ pieces, expectedPieces, expectedEdges }) {
       React.createElement("div", { style:{width:"100%", fontSize:13, color:"#475569", fontWeight:600, marginBottom:4}}, "Palette — click to drop a piece onto the canvas"),
       pieces.map((p) => React.createElement("button", { key: p.id, type:"button", onClick: () => addPiece(p),
         disabled: revealed || !!placedIdMap[p.id],
+        "data-rv-info": p.tooltip || undefined,
+        "aria-label": p.tooltip ? `${p.label.split("\n")[0]} — ${p.tooltip}` : undefined,
         style:{ padding:"6px 10px", fontSize:13, cursor: placedIdMap[p.id] ? "default" : "pointer",
           background: placedIdMap[p.id] ? "#f1f5f9" : "#ffffff", opacity: placedIdMap[p.id] ? 0.5 : 1,
           border:"1px solid #cbd5e1", borderLeft:`4px solid ${{data:"#0ea5e9", model:"#8b5cf6", infra:"#f59e0b", monitor:"#10b981"}[p.category] || "#94a3b8"}`,
