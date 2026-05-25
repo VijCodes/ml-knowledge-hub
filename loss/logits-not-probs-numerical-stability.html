@@ -2295,6 +2295,176 @@ flowchart TB
       </VIS.Callout>
     </VIS.Section>
 
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
+      <p style={{ color: "#475569", marginBottom: 16 }}>
+        Problems spanning the six taxonomy axes (A identity, B application, C mechanism, D intuition,
+        E operations, F failure modes). Each passes the redaction test: the trap must hinge on the
+        double-nonlinearity bug and precision-at-the-extremes, not generic "read the docs" advice.
+        Commit before revealing the lens.
+      </p>
+
+      <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
+
+      <VIS.TrapProblem
+        id="lnp-a1"
+        difficulty="medium"
+        title="A1 — What does 'WithLogits' actually mean?"
+        scenario={<>A new hire sees both <code>BCELoss</code> and <code>BCEWithLogitsLoss</code> and asks what the suffix means and which input each expects. Pick the option that states the contract correctly.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BCELoss(p)            <- expects a PROBABILITY in (0,1); you sigmoid first
+BCEWithLogitsLoss(z)  <- expects a LOGIT; it applies sigmoid INTERNALLY (stable)
+rule: the loss with 'WithLogits' OWNS the squash; feed it raw logits`}</pre>}
+        options={[
+          { key: "a", text: "Both expect probabilities; 'WithLogits' just means the loss returns logits instead of a scalar." },
+          { key: "b", text: "BCELoss expects a probability (you must sigmoid first); BCEWithLogitsLoss expects a raw logit and applies sigmoid internally on a numerically stable path. Feed the with-logits version raw logits.", correct: true },
+          { key: "c", text: "'WithLogits' means the loss skips the sigmoid entirely and treats the logit as if it were already a probability." },
+          { key: "d", text: "They are aliases for the same function; the name is cosmetic." },
+        ]}
+        trap={<>(a) and (d) deny the contract difference. (c) is the dangerous misread — the with-logits loss does NOT skip the squash, it applies it internally (which is the whole point).</>}
+        lens={<>'WithLogits' = the loss owns the sigmoid/softmax and applies it on the stable log-sum-exp path. So you feed it raw logits and put NO activation on the model's final layer. BCELoss is the legacy path that trusts you to have already produced a valid probability.</>}
+        stretch={<>What is the CrossEntropyLoss analog of this contract — does it own the softmax or expect probabilities?</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
+
+      <VIS.TrapProblem
+        id="lnp-b1"
+        difficulty="medium"
+        title="B1 — Reporting probabilities the right way"
+        scenario={<>You correctly train with BCEWithLogitsLoss on raw logits. Now the product team needs calibrated probabilities to display. A junior wants to add a Sigmoid layer to the model so it "just outputs probabilities." Pick the option with the right approach.</>}
+        options={[
+          { key: "a", text: "Add a Sigmoid layer to the model output so it always emits probabilities everywhere." },
+          { key: "b", text: "Keep the model emitting logits for the loss; apply sigmoid OUTSIDE the loss at inference time (e.g. torch.sigmoid(model(x)) under no_grad) to produce probabilities for display.", correct: true },
+          { key: "c", text: "Switch training to BCELoss(sigmoid(z)) so the model and reporting are consistent." },
+          { key: "d", text: "Report the raw logits to the product team; probabilities are unnecessary." },
+        ]}
+        trap={<>(a) re-introduces the double-sigmoid bug the moment the with-logits loss is also used. (c) abandons the stable training path. (d) ignores a real product need.</>}
+        lens={<>Separate the training graph from reporting. The model outputs logits, the loss owns the squash during training, and you apply sigmoid/softmax <em>at inference</em>, outside the loss, to report probabilities. Adding a model-side sigmoid is exactly the change that breaks training if a with-logits loss is in play.</>}
+        stretch={<>If the displayed probabilities look mis-calibrated, is the fix a model-side sigmoid or a separate calibration step? Why?</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
+
+      <VIS.TrapProblem
+        id="lnp-c1"
+        difficulty="hard"
+        title="C1 — Why the forward loss looks fine but the gradient dies"
+        scenario={<>For a confident logit z=−30 with true label 0, BCELoss(sigmoid(z)) reports a sensible-looking forward loss, yet training stalls. Pick the option that explains where the damage actually is.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`z = -30, y = 0
+  sigmoid(z) ~= 9.4e-14   (below fp16 floor ~1.2e-7)
+  forward: -log(1 - 9.4e-14) ~= 9.4e-14   (looks fine!)
+  backward: d/dz of [sigmoid -> log] multiplies TWO saturating slopes
+            -> underflows to 0 / NaN exactly where the model is most confident`}</pre>}
+        options={[
+          { key: "a", text: "The forward loss is fine, so there is no real problem; the stall is unrelated." },
+          { key: "b", text: "The damage is in the backward pass: the stacked sigmoid→log graph multiplies two saturating derivatives, which underflow to 0 or NaN at confident logits — the gradient dies exactly where signal is needed; the fused softplus form (BCEWithLogitsLoss) keeps it exact.", correct: true },
+          { key: "c", text: "The forward loss is wrong and should be a large number, not ~9e−14." },
+          { key: "d", text: "The stall is from too small a learning rate; increase it 10×." },
+        ]}
+        trap={<>(a) trusts the forward value and misses that gradients are what train the model. (c) misreads the forward value — −log(1−tiny) IS correctly tiny here. (d) treats a precision bug as a step-size issue.</>}
+        lens={<>A reasonable-looking forward loss can hide a dead gradient. Stacking sigmoid then log multiplies two saturating slopes; in finite precision their product underflows or NaNs at confident logits. The fused BCEWithLogitsLoss differentiates softplus(−z) directly, recovering the clean bounded gradient. Always check the gradient, not just the loss value.</>}
+        stretch={<>Write −log σ(z) as a softplus and explain why its derivative stays well-behaved at z=−30.</>}
+      />
+
+      <VIS.TrapProblem
+        id="lnp-c2"
+        difficulty="hard"
+        title="C2 — softplus is the stable identity"
+        scenario={<>You want to convince a reviewer that the with-logits path is exact, not just 'more stable.' Pick the option that gives the exact identity it uses.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`-log(sigmoid(z)) = -log( 1/(1+e^-z) ) = log(1 + e^-z) = softplus(-z)
+softplus is itself computed stably via a max-shift:
+  softplus(x) = max(x,0) + log(1 + e^-|x|)   -> no overflow, no log(0)`}</pre>}
+        options={[
+          { key: "a", text: "The with-logits path just clamps the probability to a safe range; there is no exact identity." },
+          { key: "b", text: "−log σ(z) = log(1+e^−z) = softplus(−z), an exact identity; softplus is itself evaluated with a max-shift (max(x,0)+log(1+e^−|x|)) so it never overflows or hits log(0) for any z.", correct: true },
+          { key: "c", text: "The with-logits path uses a Taylor approximation of the sigmoid that is accurate to a few decimal places." },
+          { key: "d", text: "It rounds tiny probabilities up to 1e−7 and proceeds with the naive formula." },
+        ]}
+        trap={<>(a) and (d) describe clamping/rounding hacks, which the fused path specifically avoids. (c) calls an exact algebraic identity an approximation.</>}
+        lens={<>The with-logits loss rewrites −log σ(z) as the exact softplus(−z) = log(1+e^−z), then evaluates softplus with its own max-shift so neither overflow nor log(0) can occur. It is exact, not approximate — which is why it preserves the gradient that clamping would distort.</>}
+        stretch={<>For the multi-class case, what is the analogous exact identity used by CrossEntropyLoss?</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
+
+      <VIS.TrapProblem
+        id="lnp-d1"
+        difficulty="hard"
+        title="D1 — Why the probability throws away what the logit kept"
+        scenario={<>A teammate argues the logits-vs-probs rule is just a coding-style preference: "z=−20 and z=−40 both sigmoid to basically zero, and the loss only cares about the probability anyway, so handing it the probability loses nothing that matters." Pick the option that corrects this precision intuition.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`logit -> sigmoid(p), true label 1, then -log(p):
+  z = -20  ->  p ~= 2.1e-9    in fp32 -log(p) ~= 20.0   (recoverable)
+  z = -40  ->  p ~= 4.2e-18   underflows to 0.0 in fp16 -> -log(0) = inf/NaN
+the LOGIT scale stays linear & distinct; the PROBABILITY scale collapses both to ~0
+dL/dz = p - y: from logits it is exactly (p - 1); from a floored p it is -1 or NaN`}</pre>}
+        options={[
+          { key: "a", text: "The teammate is right — once the probability rounds to ~0 the gradient is the same either way, so passing probs is harmless." },
+          { key: "b", text: "The probability scale is the lossy one: distinct confident logits (−20 vs −40) map to probabilities that underflow to the same ~0 (or to 0 exactly), destroying the magnitude the gradient needs; the logit path keeps z linear and lets the loss recover −log p = softplus(−z) exactly, so the gradient stays finite where the prob path underflows to NaN.", correct: true },
+          { key: "c", text: "Both representations are equally precise; the only difference is that logits are unbounded, which is purely a storage-format concern." },
+          { key: "d", text: "Passing probabilities is actually more precise because (0,1) is a smaller range, so floats pack more mantissa bits into it." },
+        ]}
+        trap={<>(a) accepts the false premise that a floored probability carries the same gradient — it does not (−log(0) is ±inf/NaN, not a finite signal). (c) reduces a precision-loss problem to a cosmetic range comment. (d) inverts how floating point works: the mantissa is relative, and the squash compresses many distinct large-magnitude logits into a few indistinguishable near-zero probabilities.</>}
+        lens={<>This rule is about representation precision, not style. A confident logit lives on an unbounded linear scale where −20 and −40 are clearly different; sigmoid maps both to vanishingly small probabilities that float can no longer tell apart (and may round to exactly 0). Once p underflows, −log p and its gradient are ruined. Keeping logits lets the loss evaluate −log σ(z)=softplus(−z) exactly and recover a finite gradient precisely where the model is most confident — the regime the probability representation cannot encode.</>}
+        stretch={<>fp16 underflows sigmoid around z≈−16; fp32 around z≈−87. How does choosing logits over probs change the effective confidence range your training can represent in each precision?</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
+
+      <VIS.TrapProblem
+        id="lnp-e1"
+        difficulty="medium"
+        title="E1 — A five-minute audit for this bug"
+        scenario={<>You inherit a model that trains slowly to a poor ceiling. You suspect a logits-vs-probabilities mistake. Pick the option that is the fastest reliable check.</>}
+        options={[
+          { key: "a", text: "Re-run training with a 10× larger learning rate to see if it speeds up." },
+          { key: "b", text: "Check two things: (1) is the model's final layer linear (no Sigmoid/Softmax) given a with-logits loss? and (2) what is the spread of predicted probabilities — clustering near 0.5–0.73 signals a double sigmoid. Inspect state, not the loss scalar.", correct: true },
+          { key: "c", text: "Compare the loss value against a magic threshold of 0.3; below means fine, above means broken." },
+          { key: "d", text: "Add gradient clipping and assume the issue is resolved if the loss decreases." },
+        ]}
+        trap={<>(a) and (d) blindly twiddle hyperparameters without confirming the cause. (c) invents a meaningless absolute threshold (the real baseline is data-dependent, e.g. log 2 / log C).</>}
+        lens={<>The decisive evidence is structural: the final-layer activation and the predicted-probability distribution. A with-logits loss requires a linear head; probabilities bunched in (0.5, 0.73) betray a double sigmoid. Verify the state of the model and its outputs directly rather than guessing from the loss number.</>}
+        stretch={<>If the head is linear and probabilities span (0,1) fully, what is the next most likely cause of the slow ceiling?</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
+
+      <VIS.TrapProblem
+        id="lnp-f1"
+        difficulty="hard"
+        title="F1 — Clamping the probability to stop NaNs"
+        scenario={<>A custom BCE-on-probabilities loop NaNs at confident predictions. A teammate fixes it by clamping p to [1e−7, 1−1e−7] and declares it solved. Pick the option with the senior critique.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`clamp p to [1e-7, 1-1e-7]:
+  stops log(0) NaN  ✓
+  but the gradient near the clamp is now FLAT/biased (clamp has zero slope)
+  -> the model gets a distorted error signal exactly at confident points
+better: feed logits to BCEWithLogitsLoss -> softplus path, exact, no clamp`}</pre>}
+        options={[
+          { key: "a", text: "Clamping is the standard, complete fix and matches what frameworks do internally." },
+          { key: "b", text: "Clamping stops the NaN but biases the gradient near the clamp boundary (the clamp's slope is 0 there), distorting the error signal exactly at confident points; the proper fix is to feed logits to BCEWithLogitsLoss (softplus path), which is exact with no clamp.", correct: true },
+          { key: "c", text: "Clamping is fine because 1e−7 is below any value that matters to training." },
+          { key: "d", text: "The NaN means the data is corrupt; clamping masks a labeling bug." },
+        ]}
+        trap={<>(a) asserts frameworks clamp — they do not; they use softplus/log-sum-exp. (c) ignores that confident predictions (the clamped region) carry important gradient signal. (d) misattributes a numerical bug to data.</>}
+        lens={<>Clamping treats the symptom (the NaN) but introduces a flat, biased gradient at the boundary — precisely where confident predictions live. The structural fix keeps everything in logits so the probability is never materialized at the dangerous edge; BCEWithLogitsLoss's softplus form is exact there and needs no clamp.</>}
+        stretch={<>Why does a clamp create a zero-gradient region, and how does that bias which examples the model learns from?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lnp-f2"
+        difficulty="hard"
+        title="F2 — log(softmax) by hand for a KL/distillation loss"
+        scenario={<>For a distillation loss you need student log-probabilities. A teammate writes <code>torch.log(torch.softmax(logits, dim=-1))</code>. On confident logits the loss occasionally NaNs. Pick the option with the cause and fix.</>}
+        options={[
+          { key: "a", text: "log(softmax(x)) and log_softmax(x) are identical; the NaN must come from the teacher targets." },
+          { key: "b", text: "Computing softmax then log materializes tiny probabilities that underflow to 0, after which log(0)=−∞ → NaN; use torch.log_softmax (fused, max-shifted) which computes log-probabilities directly in log space.", correct: true },
+          { key: "c", text: "log(softmax(x)) is unstable only for negative logits; add a constant to all logits to make them positive." },
+          { key: "d", text: "The fix is to apply softmax twice for extra normalization before taking the log." },
+        ]}
+        trap={<>(a) claims numerical equivalence — they are mathematically equal but numerically different (the two-step path underflows). (c) misunderstands shift-invariance (adding a constant changes nothing) and the actual cause. (d) re-introduces a double-softmax bug.</>}
+        lens={<>log(softmax(x)) forms the probability vector first, so tiny entries underflow to 0 and log(0) NaNs. log_softmax fuses the two operations with the log-sum-exp max-shift and produces log-probabilities directly, never materializing the underflow-prone probabilities. Same identity, but only the fused op is numerically safe — the same lesson as 'feed logits, not probs.'</>}
+        stretch={<>For a KL distillation loss, which terms need log-probs and which need probs, and how do you get each safely?</>}
+      />
+    </VIS.Section>
+
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>

@@ -2281,6 +2281,200 @@ flowchart TB
       </VIS.Callout>
     </VIS.Section>
 
+    <VIS.Section id="sec-drill" title="Drill — trap problems">
+      <p style={{ color: "#475569", marginBottom: 16 }}>
+        Problems spanning the six taxonomy axes (A identity, B application, C mechanism, D intuition,
+        E operations, F failure modes). Each passes the redaction test: the trap must hinge on the
+        log-sum-exp numerics (overflow ceiling, exact max-shift), not generic "use the library" advice.
+        Commit before revealing the lens.
+      </p>
+
+      <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
+
+      <VIS.TrapProblem
+        id="lse-a1"
+        difficulty="hard"
+        title="A1 — Is subtracting the max an approximation?"
+        scenario={<>A reviewer rejects your log-softmax implementation: "you subtract max(z) before exponentiating — that changes the softmax, so the loss is approximate." Pick the option with the right rebuttal.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`softmax(z)_i = exp(z_i) / sum_j exp(z_j)
+subtract constant m from every logit:
+  exp(z_i - m) / sum_j exp(z_j - m)
+  = [exp(z_i)/exp(m)] / [sum_j exp(z_j)/exp(m)]
+  = exp(z_i) / sum_j exp(z_j)          <- exp(m) cancels EXACTLY`}</pre>}
+        options={[
+          { key: "a", text: "The reviewer is right; subtracting the max is a numerical approximation that slightly biases the loss, so the gradient it produces drifts from the true softmax-CE gradient." },
+          { key: "b", text: "Softmax is shift-invariant: subtracting any constant m from all logits leaves the probabilities exactly unchanged (the exp(m) cancels top and bottom). The max-shift is an exact identity, picked so the largest exponent is exp(0)=1.", correct: true },
+          { key: "c", text: "It is exact only when the logits are non-negative; otherwise it introduces error." },
+          { key: "d", text: "It changes the probabilities but the error is below fp32 epsilon, so it does not matter in practice." },
+        ]}
+        trap={<>(a) and (d) treat an exact algebraic identity as approximate. (c) invents a non-negativity condition — the cancellation holds for any real logits.</>}
+        lens={<>Adding/subtracting a constant to all logits multiplies every exp by the same factor, which cancels in softmax's ratio — so the probabilities are identical. The max is chosen specifically because it makes the largest shifted exponent exp(0)=1, capping the exponentials at 1 and preventing overflow. Exact and stable.</>}
+        stretch={<>Could you subtract the mean instead of the max and still be exact? Would it be as stable?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lse-a2"
+        difficulty="medium"
+        title="A2 — Two reasons to fuse, don't conflate them"
+        scenario={<>An interviewer asks why softmax and CE are fused into one op. A candidate answers only "for the clean p − y gradient." Pick the option that completes the picture for THIS concept.</>}
+        options={[
+          { key: "a", text: "The clean gradient is the only reason; numerical stability is a separate, unrelated library detail." },
+          { key: "b", text: "There are two distinct reasons: (1) the clean (p − y) gradient, and (2) numerical stability — the fused log-softmax applies the log-sum-exp max-shift so the forward pass never overflows/underflows. This concept is about reason (2).", correct: true },
+          { key: "c", text: "Fusion is purely a speed optimization with no effect on numerics or gradients." },
+          { key: "d", text: "Fusion exists so the model can output probabilities directly instead of logits." },
+        ]}
+        trap={<>(a) drops the numerical reason this concept is about. (c) reduces it to speed. (d) inverts the point — fusion is precisely what lets the model output raw logits and never materialize probabilities.</>}
+        lens={<>Two independent motivations converge on the same fused op: the matched-link gradient (p − y) and log-sum-exp numerical stability. They are separate facts — you could have a clean gradient and still overflow if you computed the forward pass naively. The fused op delivers both.</>}
+        stretch={<>Which of the two reasons still matters if you only need the loss value and never call backward?</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
+
+      <VIS.TrapProblem
+        id="lse-b1"
+        difficulty="hard"
+        title="B1 — fp16 training makes this non-optional"
+        scenario={<>You move a stable fp32 training run to fp16 mixed precision for speed. The same code now produces NaN loss within a few hundred steps, even though logits look "reasonable" (max around 30–40). Pick the option with the right diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`overflow ceilings for exp(z):
+  fp32: z > ~89   (max ~3.4e38)
+  fp16: z > ~11   (max ~65504)
+naive softmax in fp16 with a logit of 30 -> exp(30) >> 65504 -> inf -> NaN`}</pre>}
+        options={[
+          { key: "a", text: "fp16 has a bug; revert to fp32 permanently." },
+          { key: "b", text: "fp16 overflows exp(z) at z≈11 (vs ≈89 for fp32), so logits of 30–40 overflow a naive softmax that was fine in fp32; using the fused log_softmax / CrossEntropyLoss (max-shift) keeps exp ≤ 1 and stays finite in fp16.", correct: true },
+          { key: "c", text: "The NaN is from underflow on small logits, unrelated to precision; clamp logits to [0, 5]." },
+          { key: "d", text: "fp16 cannot represent logits above 10, so the model is fundamentally untrainable in mixed precision." },
+        ]}
+        trap={<>(a) throws away the speed win instead of fixing the cause. (c) misattributes overflow to underflow and clamps (which distorts the distribution). (d) is false — fp16 represents 30 fine; it is exp(30) that overflows.</>}
+        lens={<>fp16's much lower overflow ceiling (exp overflows at z≈11) is exactly why naive softmax that worked in fp32 NaNs in fp16. The max-shift caps the largest exponent at exp(0)=1, so the fused op stays finite at any precision. This is why fused log-softmax is mandatory under mixed precision, not just nice-to-have.</>}
+        stretch={<>bf16 has the same exponent range as fp32 but fewer mantissa bits — does it have the same overflow problem? What problem does it have instead?</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
+
+      <VIS.TrapProblem
+        id="lse-c1"
+        difficulty="hard"
+        title="C1 — Why the shifted sum can never hit log(0)"
+        scenario={<>After the max-shift, the loss takes log of the sum of exponentials. A teammate worries this log could still blow up to −∞ if all the shifted logits are very negative. Pick the option that explains why it cannot.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`after subtracting m = max(z):
+  the max element becomes z_max - m = 0  ->  exp(0) = 1
+  so the sum = 1 + (other terms in (0,1])  >= 1 always
+  log(sum) >= log(1) = 0   ->  never log(0), never -inf`}</pre>}
+        options={[
+          { key: "a", text: "It can still hit log(0) if every logit is identical and very negative." },
+          { key: "b", text: "After the shift, the max element contributes exp(0)=1, so the sum is always ≥ 1; log of something ≥ 1 is ≥ 0 and can never be log(0). The shift simultaneously prevents overflow (exp ≤ 1) and underflow-to-zero of the sum.", correct: true },
+          { key: "c", text: "The log is protected by an epsilon added inside the library, not by the max-shift itself." },
+          { key: "d", text: "It cannot hit log(0) because logits are always positive after a ReLU." },
+        ]}
+        trap={<>(a) ignores that the shift forces one term to exp(0)=1. (c) attributes the safety to an epsilon hack rather than the structural guarantee. (d) assumes a ReLU that need not exist on logits.</>}
+        lens={<>The max-shift does double duty: every exponent is ≤ 0 so exp ≤ 1 (no overflow), AND the max term is exactly exp(0)=1 so the summed denominator is ≥ 1 (no log(0)). Both failure ends are closed by the same single subtraction — that is the elegance of log-sum-exp.</>}
+        stretch={<>What is −log p_true in terms of the shifted quantities, written without ever forming a probability?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lse-c2"
+        difficulty="hard"
+        title="C2 — The loss never needs the probabilities"
+        scenario={<>A candidate insists you must compute the softmax probabilities first and then take their log to get CE. Pick the option that shows the fused path skips probabilities entirely.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`CE for one-hot = -log p_true
+log p_true = z_true - m - log(sum_j exp(z_j - m))
+so  CE = (m + log sum_j exp(z_j - m)) - z_true   = LSE(z) - z_true
+       -> computed straight from LOGITS; no probability is ever materialized`}</pre>}
+        options={[
+          { key: "a", text: "You must materialize all probabilities first; there is no way to compute CE without them." },
+          { key: "b", text: "CE for a one-hot target is LSE(z) − z_true, computed directly from logits via the max-shifted log-sum-exp — the probabilities are never formed, which is both more stable and slightly faster.", correct: true },
+          { key: "c", text: "You only need the true-class probability p_true, which still requires a full softmax to normalize." },
+          { key: "d", text: "The probabilities are needed for the forward loss but not the backward pass." },
+        ]}
+        trap={<>(a) and (c) both insist on forming probabilities — but LSE gives log p_true directly. (c)'s 'still requires full softmax' misses that log-sum-exp IS the normalizer, computed in log space. (d) invents a forward/backward split that does not apply.</>}
+        lens={<>−log p_true = LSE(z) − z_true. The log-sum-exp term is the log-normalizer, computed with the max-shift entirely in log space. No probability vector is ever built, so the underflow-prone p values never appear. Skipping them is both more numerically stable and marginally faster.</>}
+        stretch={<>For a soft target (label smoothing), the loss is −Σ y_c log p_c — can you still avoid materializing all probabilities?</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
+
+      <VIS.TrapProblem
+        id="lse-d1"
+        difficulty="medium"
+        title="D1 — 'Overflow only happens with absurd logits'"
+        scenario={<>A teammate argues the max-shift is theoretical: "real logits stay small, so exp never overflows; the naive softmax is fine in practice." Pick the option that corrects this.</>}
+        options={[
+          { key: "a", text: "The teammate is right for any realistic model; the max-shift only matters in contrived examples." },
+          { key: "b", text: "Logits can grow large from runaway confidence, missing normalization, or temperature scaling, and in fp16 exp overflows at z≈11 — well within the range real training hits; the max-shift is routinely load-bearing, not theoretical.", correct: true },
+          { key: "c", text: "Overflow is impossible because frameworks clamp all logits to [−10, 10] by default." },
+          { key: "d", text: "The danger is only underflow, never overflow, so the worry is misplaced." },
+        ]}
+        trap={<>(a) underestimates how easily logits grow (poor normalization, temperature, long training). (c) invents a default clamp that does not exist. (d) drops the overflow half entirely.</>}
+        lens={<>Logits routinely reach magnitudes that overflow exp — especially in fp16 (ceiling at z≈11) or when a layer norm is missing and one logit runs away. The max-shift costs almost nothing and removes the failure mode entirely, which is why every production softmax uses it.</>}
+        stretch={<>Name three concrete training conditions that push logits large enough to matter.</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
+
+      <VIS.TrapProblem
+        id="lse-e1"
+        difficulty="medium"
+        title="E1 — Debugging a NaN loss"
+        scenario={<>A training run produces NaN loss at step 1. Logits, when printed, contain one value around 800. Pick the option with the most likely cause and the correct fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`grep the loss code:
+  probs = softmax(logits)        # exp(800) -> inf in fp32
+  loss  = -log(probs[target])    # log(inf/inf) = log(NaN) = NaN
+fix: loss = CrossEntropyLoss()(logits, target)   # fused, max-shifted`}</pre>}
+        options={[
+          { key: "a", text: "The NaN is exploding gradients; add gradient clipping and retry." },
+          { key: "b", text: "Someone computed softmax then log by hand; the logit of ~800 overflows exp to inf and inf/inf → NaN. The fix is to use the fused CrossEntropyLoss / log_softmax (max-shifted) on raw logits, and separately investigate why a logit reached 800.", correct: true },
+          { key: "c", text: "The data has a NaN label; clean the dataset." },
+          { key: "d", text: "fp32 cannot represent 800, so the input tensor is corrupt." },
+        ]}
+        trap={<>(a) treats a forward-pass domain/overflow error as a gradient-magnitude problem (clipping won't help a NaN forward loss). (c) and (d) misattribute the cause — fp32 represents 800 fine; it is exp(800) that overflows.</>}
+        lens={<>NaN at step 1 with a hand-rolled softmax+log and a large logit is the canonical overflow signature: exp(800)=inf, inf/inf=NaN. Switch to the fused max-shifted op. But also ask <em>why</em> a logit hit 800 — usually a missing normalization or bad init — because the fused op will hide the symptom, not the underlying instability.</>}
+        stretch={<>After switching to CrossEntropyLoss the NaN disappears but accuracy is poor — what does that tell you about the logit-of-800?</>}
+      />
+
+      <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
+
+      <VIS.TrapProblem
+        id="lse-f1"
+        difficulty="hard"
+        title="F1 — Subtracting the mean instead of the max"
+        scenario={<>An engineer implements their own stable softmax but subtracts the MEAN of the logits instead of the max, reasoning "any constant cancels, so the mean is fine." Pick the option with the right critique.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`logits = [1000, 1, 1], mean ~= 334
+  subtract mean: [666, -333, -333]
+  exp(666) still overflows!  (mean does not cap the largest exponent)
+subtract max=1000: [0, -999, -999]
+  exp(0)=1, exp(-999)~=0  -> safe`}</pre>}
+        options={[
+          { key: "a", text: "Mean-subtraction is equally safe; both are constants, so both prevent overflow." },
+          { key: "b", text: "Both give the exact same probabilities (any constant cancels), but only the MAX guarantees the largest shifted exponent is exp(0)=1; the mean can leave a large positive shifted logit that still overflows.", correct: true },
+          { key: "c", text: "Mean-subtraction changes the probabilities, so it is wrong on correctness grounds alone." },
+          { key: "d", text: "Neither is needed; modern hardware handles exp(1000) without overflow." },
+        ]}
+        trap={<>(c) is the tempting-but-wrong critique — mean-subtraction is still <em>correct</em> (any constant cancels); its flaw is purely numerical. (a) misses that the mean doesn't cap the largest exponent. (d) is false about hardware limits.</>}
+        lens={<>Shift-invariance makes any constant correct, but stability requires capping the LARGEST exponent at exp(0)=1 — only the max does that. With logits [1000,1,1], subtracting the mean (~334) still leaves 666, and exp(666) overflows. The max is the unique choice that closes the overflow end.</>}
+        stretch={<>Is there any logit distribution where mean-subtraction happens to be safe? What does that require?</>}
+      />
+
+      <VIS.TrapProblem
+        id="lse-f2"
+        difficulty="hard"
+        title="F2 — Re-exponentiating after log-sum-exp"
+        scenario={<>An engineer correctly computes stable log-probabilities with log-sum-exp, then exponentiates them back to probabilities "to be safe" before computing the loss. On very negative log-probs the loss underflows. Pick the option with the right read.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`stable:   logp_true = -40  (perfectly representable)
+mistake:  p_true = exp(-40) = 4e-18  -> may underflow in fp16 (-> 0)
+          then -log(0) = +inf  -> the underflow you avoided returns`}</pre>}
+        options={[
+          { key: "a", text: "Re-exponentiating is harmless; exp and log are inverses, so nothing is lost." },
+          { key: "b", text: "Exponentiating a very negative log-prob (e.g. −40) produces a tiny probability (≈4e−18) that can underflow to 0, and −log(0)=+∞ reintroduces the exact failure log-sum-exp was designed to avoid; stay in log space and use log p_true directly.", correct: true },
+          { key: "c", text: "The underflow is a separate hardware bug unrelated to the round-trip." },
+          { key: "d", text: "You must always convert to probabilities before the loss, so the underflow is unavoidable." },
+        ]}
+        trap={<>(a) treats exp/log as lossless in floating point — they are not at the extremes. (c) denies the causal link. (d) is false — CE needs only log p_true, never the probability.</>}
+        lens={<>Log-space numbers like −40 are perfectly representable; the corresponding probability 4e−18 is not (it underflows in fp16). The whole point of log-sum-exp is to stay in log space, so re-materializing the probability throws away the protection. The loss only needs log p_true — keep it there.</>}
+        stretch={<>When do you legitimately need to exponentiate back to probabilities, and how do you do it safely at inference?</>}
+      />
+    </VIS.Section>
+
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
