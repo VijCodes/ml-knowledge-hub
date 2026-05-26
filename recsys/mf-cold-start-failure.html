@@ -2167,295 +2167,247 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: MATRIX FACTORIZATION FAILS ON COLD START.
+// Delta: a brand-new user or item has zero observed entries, so its factor row/column is never touched by any
+//   gradient step and stays at its random/zero initialization. The learned dot product against an untrained factor
+//   is therefore noise — MF structurally cannot place a cold entity from interactions alone, because the only thing
+//   that moves a factor is an observed rating involving it. The fix is to seed the cold factor from SIDE features
+//   (content) until ratings arrive. Diagram shows the rating matrix + which factors got gradient updates (SETUP only).
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="RecSys"
+      title="MF fails on cold start"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Matrix Factorization" },
+        { label: "Subtopic", value: "A new user or item with zero observed ratings has a factor vector that no gradient step ever updates, so it stays at init and its dot products are noise; MF cannot place a cold entity without side features" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>Matrix factorization learns a latent vector for every user and every item, but the <em>only</em> thing
+      that moves a vector is an observed rating that involves it.</strong>{" "}
+      A brand-new item with zero ratings is never on either side of any training example, so its
+      <VIS.Term def="The learned latent vector for an item in matrix factorization; the item's coordinates in the shared user/item embedding space. Written q_i.">item factor</VIS.Term> q&#8345;
+      never receives a gradient and stays frozen at its random (or zero) initialization. Scoring that item is then a dot
+      product against an <em>untrained</em> vector &mdash; the output is noise that has nothing to do with the item's
+      content. This is a structural property of the model, not a tuning bug: no learning rate, regularizer, or extra
+      epoch helps, because there is no signal to learn from. The same holds for a brand-new user. The standard fix is to
+      not start the factor from random at all &mdash; seed q&#8345; from a content vector (genre, cast, text embedding)
+      so the cold item lands somewhere meaningful, then let ratings refine it as they arrive. The failure modes:
+      assuming more training fixes it, blaming the random seed, and treating a frozen-at-init factor as if it carried
+      real preference signal.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Which factors actually got trained?">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        A streaming catalog runs MF nightly. This morning a new movie, item 7, was added with zero ratings so far. The
+        readout shows which item factors received at least one gradient update last night and which did not. Item 7 is
+        about to be scored for every user. Work out what its predicted scores will actually reflect.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`item  ratings_observed  factor q_i updated last night?
+1     2,041             yes
+2       877             yes
+5        13             yes
+7         0             no  (added today, still at init)
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
-
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+score(user u, item 7) = p_u . q_7   where q_7 = random init`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Item 7 has no observed entry, so no training example ever contained it. Derive what the dot product
+        p&#8444;&#183;q&#8327; represents when q&#8327; was never moved from its initialization, and why running more
+        epochs on the same data would not change that.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: trace the gradient">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`MF update for one observed rating r_ui (SGD):
+   e_ui   = r_ui - p_u . q_i
+   q_i   += lr * (e_ui * p_u - lambda * q_i)
+   p_u   += lr * (e_ui * q_i - lambda * p_u)
+
+the update to q_i is only ever triggered by a rating ON item i.
+
+item 7 has zero ratings  ->  the q_7 update never fires
+   q_7 stays = q_7(init)  for every epoch
+   score = p_u . q_7(init)  ->  a dot product against noise
+
+more epochs only re-loop over ratings 1..N, none of which touch item 7.`}</pre>
+      <p>
+        The gradient for an item factor is gated by the existence of a rating on that item. With zero ratings the gate
+        never opens, so the factor is mathematically untouched no matter how long you train. The predicted score is the
+        dot product of a real user vector with an initialization-noise vector &mdash; arbitrary. This is why the fix has
+        to change the <em>starting point</em> (seed q&#8327; from content) rather than the optimizer: you cannot
+        optimize a parameter that appears in zero loss terms.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Why each non-fix is a non-fix">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Proposed remedy</th><th>Why it does not place the cold item</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Train more epochs</td><td>Re-loops the same ratings; none involve the cold item, so its factor still never updates</td></tr>
+          <tr><td>Lower the regularizer</td><td>Regularization only shrinks factors that <em>do</em> get gradients; it cannot create a gradient</td></tr>
+          <tr><td>Try a different random seed</td><td>Swaps one noise vector for another; the score is still meaningless</td></tr>
+          <tr><td>Seed factor from content features</td><td>Places the cold item near similar warm items so its dot products are sensible until ratings arrive</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="A parameter in zero loss terms cannot be learned">
+        Pure interaction-based MF can only place an entity once it appears in at least one observed rating. A
+        zero-rating user or item contributes to no loss term, so its factor receives no gradient and stays at init &mdash;
+        its scores are noise. This is structural, not a bug, which is why the remedy is to inject an outside signal:
+        initialize the cold factor from side features (content embeddings) so it starts somewhere reasonable, then let
+        the normal updates take over as interactions accumulate.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>an entity with zero observed ratings appears in zero loss
+        terms, so its MF factor never receives a gradient and stays at init; only side features can place it.</strong>{" "}
+        Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="cs-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — Why the cold factor is noise"
+        scenario={<>A teammate says a freshly added movie scores randomly under MF "because the model has not had time to converge on it yet." Pick the statement that correctly names what is actually happening.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`new item: 0 observed ratings
+training examples containing it: 0
+its factor q_i after training: = init`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "Its factor appears in no training example, so it receives no gradient and stays at its initialization.", correct: true },
+          { key: "b", text: "Its factor has been updated a few times but has not yet converged, so more epochs will sharpen it.", correct: false },
+          { key: "c", text: "Its factor was overwritten by the regularizer toward zero, which is why every dot product collapses to noise.", correct: false },
+          { key: "d", text: "Its factor collided with a popular item's factor in the embedding space, so their scores became indistinguishable.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
-        options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
-        ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) assumes the factor is being trained slowly, but it is trained zero times. (c) regularization only acts on factors that receive gradients. (d) there is no collision; the factor is simply untouched.</>}
+        lens={<>An item with zero ratings is never on either side of any observed entry, so it contributes to no loss term and its factor receives no gradient at all &mdash; it remains exactly at its random or zero initialization. The score is then a dot product against that initialization noise. "Not converged yet" is wrong because convergence requires gradients, and there are none; regularization and collisions describe forces on factors that <em>do</em> train, which this one never does.</>}
+        stretch={<>What single change to the pipeline would let this item score sensibly on day one?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="cs-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Day-one launch of a new title"
+        scenario={<>You launch a high-profile new title that must be recommendable the moment it goes live, before it has any ratings. The recommender is a trained MF model. Pick the soundest approach to place it on day one.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`new title at launch: 0 ratings
+need: sensible scores for all users immediately
+content available: genre, cast, synopsis embedding`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Initialize the title's factor from its content vector so it lands near similar warm titles until ratings arrive.", correct: true },
+          { key: "b", text: "Retrain the full MF model an extra ten epochs at launch so the new title's factor has time to settle in.", correct: false },
+          { key: "c", text: "Lower the regularization strength for the launch run so the new title's factor is free to grow large quickly.", correct: false },
+          { key: "d", text: "Re-roll the random seed for the new title's factor a few times and keep whichever gives the highest scores.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) extra epochs re-loop ratings that never include the new title. (c) regularization cannot create a gradient for a factor with no loss terms. (d) every seed is equally meaningless noise.</>}
+        lens={<>Because no amount of training touches a zero-rating factor, the only way to place the title on day one is to give it a meaningful starting vector from outside the interaction data &mdash; seed its factor from a content embedding (genre, cast, synopsis) so it begins near similar warm titles whose factors <em>are</em> trained. As ratings accumulate, ordinary updates refine it away from the content prior. Extra epochs, looser regularization, and seed re-rolls all operate on a factor that participates in zero loss terms, so none of them can help.</>}
+        stretch={<>Once real ratings arrive, how should the influence of the content prior change over time?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="cs-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — What gates the factor update"
+        scenario={<>A teammate is convinced that with enough epochs every item factor eventually gets trained "because the optimizer sweeps the whole parameter space." Pick the correct account of when an item factor receives a gradient.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`q_i update fires only inside the loop over
+observed ratings r_ui.
+
+item with 0 ratings -> never in the loop`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "An item factor is updated only when an observed rating on that item is processed, so a zero-rating item is never updated.", correct: true },
+          { key: "b", text: "The optimizer visits every factor each epoch, so all factors are updated regardless of how many ratings they have.", correct: false },
+          { key: "c", text: "Item factors are updated from the global mean rating each epoch, so even zero-rating items drift toward it over time.", correct: false },
+          { key: "d", text: "Item factors are updated whenever any user factor changes, so a popular user's training propagates to all items.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) the optimizer only touches parameters that appear in the current loss term. (c) the global mean feeds a bias term, not the latent factor, and still requires the item to be in a loss term. (d) gradients flow only through co-occurring (user, item) pairs, not from arbitrary user updates.</>}
+        lens={<>The gradient for an item factor q&#8327; comes only from loss terms that contain a rating on item i; the SGD or ALS update for q&#8327; is computed from that item's observed entries. An item with zero ratings appears in no such term, so its factor is never in the computation and never moves. The optimizer does not "sweep all parameters" independently of the data; it only updates parameters that the current batch's loss depends on. Bias terms and other users' updates likewise require a co-occurring rating to reach this item.</>}
+        stretch={<>How does this same gating explain why a user who has rated nothing also gets noise scores?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="cs-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — One rating vs zero ratings"
+        scenario={<>Two new items launch the same day. By night, item A has received exactly one rating and item B still has zero. A teammate expects both to score as pure noise since "one rating is basically nothing." Predict the non-obvious consequence for the next training run.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`item A: 1 observed rating
+item B: 0 observed ratings
+both factors started at the same init`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "Item A's factor now gets a real gradient and moves off init, while item B's stays frozen at init as pure noise.", correct: true },
+          { key: "b", text: "Both factors remain pure noise, since a single rating carries too little signal to move a latent factor at all.", correct: false },
+          { key: "c", text: "Item B's factor moves more, since with no ratings the regularizer is free to push it furthest from the origin.", correct: false },
+          { key: "d", text: "Both factors converge to the same vector, since they share an initialization and see nearly identical data.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) is the trap: it conflates "noisy estimate" with "no estimate." (c) inverts the regularizer, which shrinks, never grows. (d) ignores that one item now has a gradient and the other has none.</>}
+        lens={<>The threshold that matters is not "few vs many" ratings but "at least one vs zero." With a single rating, item A finally appears in one loss term, so its factor receives a (noisy but real) gradient and moves off the initialization toward something data-driven. Item B, with zero ratings, is in no loss term and stays exactly at init &mdash; genuinely undefined, not merely under-trained. The qualitative cliff sits between zero and one observed interaction, which is precisely why cold start is a structural boundary rather than a continuum of data sparsity.</>}
+        stretch={<>Why is the one-rating estimate still fragile, and what regularizer would you want most for it?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="cs-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Catalog with constant new arrivals"
+        scenario={<>Your catalog adds thousands of new items daily, all of which must be recommendable immediately. A teammate proposes simply retraining MF more frequently to keep up. Pick the soundest operational design.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`new items per day: thousands, 0 ratings each
+requirement: recommendable on arrival
+MF retrain cadence: nightly`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Maintain a content-feature path that seeds each new item's factor on arrival, with MF refining it as ratings accrue.", correct: true },
+          { key: "b", text: "Retrain MF every few minutes so newly added items are folded into the factor matrix almost as soon as they arrive.", correct: false },
+          { key: "c", text: "Hold new items out of recommendations until each has accumulated enough ratings to train a stable factor on its own.", correct: false },
+          { key: "d", text: "Assign every new item the catalog's average item factor so it inherits typical behavior until it is trained.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) more frequent retrains still cannot train a factor for an item with zero ratings. (c) violates the day-one requirement and starves new items of the exposure they need to earn ratings. (d) the average factor is not specific to the item's content and recommends it to the wrong users.</>}
+        lens={<>Frequent retraining does not solve cold start because the missing ingredient is a gradient, and a zero-rating item supplies none no matter how often you retrain. The durable design is a separate content path that maps each new item's features to an initial factor on arrival, so it is placed near relevant warm items immediately; MF then refines that factor as interactions accumulate. Holding items out breaks the day-one requirement and creates an exposure deadlock, and the catalog-average factor ignores the item's actual content.</>}
+        stretch={<>How would you detect when an item has enough ratings to graduate off its content prior?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="cs-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — A cold item ranking surprisingly high"
+        scenario={<>An item with zero ratings occasionally surfaces near the top of some users' recommendations. A teammate concludes the model has discovered the item is genuinely a great match. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`cold item: 0 ratings, factor = random init
+for some users: p_u . q_init happens to be large
+result: item ranks high for those users`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "A random init vector can have a large dot product with some users by chance, producing high scores that carry no signal.", correct: true },
+          { key: "b", text: "The model has correctly learned the item is a strong match for those users from its training on the catalog.", correct: false },
+          { key: "c", text: "Those users rated the item already, which is why its factor aligned with their preferences during training.", correct: false },
+          { key: "d", text: "The high rank proves the random initialization happened to encode the item's true content features accurately.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) the factor was never trained, so it cannot have "learned" anything. (c) contradicts the premise of zero ratings. (d) a random vector encoding true content is coincidence, not a property to rely on.</>}
+        lens={<>A high score from a cold item is a false positive: its factor is a random initialization vector, and a random vector will, by chance, have a large dot product with some user vectors. That looks like a strong match but reflects nothing about the item, because no gradient ever shaped the factor. Concluding the model "learned" the match, or that the user must have rated it, contradicts the zero-rating premise; a lucky random alignment is not signal. This is exactly why cold items should be scored from content, not from an untrained factor whose occasional high scores are pure noise.</>}
+        stretch={<>What guardrail would stop untrained factors from ever ranking above well-supported ones?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://en.wikipedia.org/wiki/Cold_start_(recommender_systems)" target="_blank" rel="noopener">
+            <strong>Cold start (recommender systems)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(new-user and new-item cold start, content-based remedies)</span>
+          <br/>Covers why interaction-only models cannot place a zero-history entity and how side features and hybrid models bootstrap them.
         </li>
       </ul>
     </VIS.Section>

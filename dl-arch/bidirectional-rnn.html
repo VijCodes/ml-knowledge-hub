@@ -2167,295 +2167,267 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: BIDIRECTIONAL RNN.
+// Delta: a BiRNN runs TWO independent RNNs over the sequence -- one left-to-right, one right-to-left -- and concatenates
+//   their per-position states, so each position's representation sees BOTH its left and right context. This doubles params
+//   and output width. The decisive constraint candidates miss: it requires the WHOLE sequence up front, so it CANNOT be
+//   used for autoregressive/streaming generation (the backward pass needs future tokens). Great for tagging/encoding,
+//   wrong for left-to-right decoding. Diagram shows the two-direction SETUP and concatenation only; it never prints "needs
+//   full sequence" or "can't generate" as a stated conclusion.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
       pill="DL"
-      title="GELU: The Transformer Activation"
+      title="Bidirectional RNN Reads Both Directions"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "RNN / LSTM / GRU" },
+        { label: "Subtopic", value: "A BiRNN runs one RNN forward and one backward and concatenates their states, so each position sees full left and right context, doubling params and output width; usable only when the whole sequence is available, not for autoregressive generation" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>A bidirectional RNN runs two independent recurrent passes over the sequence &mdash; one left-to-right and one
+      right-to-left &mdash; and{" "}
+      <VIS.Term def="At each position, the forward RNN's state (left context) and the backward RNN's state (right context) are stacked into one longer vector. This is how a single representation captures both sides.">concatenates</VIS.Term> the
+      two states at each position, so every position's representation encodes both its left and its right context.</strong>{" "}
+      Because there are two RNNs, a BiRNN has about double the parameters and produces an output vector twice as wide (a
+      256-unit BiLSTM emits a 512-dim vector per token). Seeing both sides typically lifts accuracy a few points on tasks
+      like sequence tagging and NER. But the backward pass needs the future tokens, so a BiRNN can only be used when the{" "}
+      <VIS.Term def="The model is given the entire input sequence before producing any output. This is required because the backward RNN must read tokens that come after each position.">whole sequence is available up front</VIS.Term> &mdash;
+      it cannot do <VIS.Term def="Generating one token at a time, each conditioned on the tokens produced so far, with no access to future tokens. Language generation works this way, which is why a backward pass is impossible there.">autoregressive generation</VIS.Term> where
+      tokens are produced one at a time with no access to the future. The failure modes: using a BiRNN for left-to-right
+      decoding, forgetting it doubles params and width, thinking the two passes share weights, and assuming peeking at the
+      future is harmless even in generation.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Why one direction misses half the context">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        A teammate tags each word in a sentence with a unidirectional RNN and notices the model struggles on words whose
+        correct label depends on what comes <em>after</em> them. Before reading on, work out how you could give each
+        position access to both its past and its future, and what new requirement that imposes on when the model can run.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`sequence: x_1 x_2 ... x_T
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
+forward RNN:   ->  h_fwd_t  (left context: x_1 ... x_t)
+backward RNN:  <-  h_bwd_t  (right context: x_t ... x_T)
 
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
+per-position output: concat(h_fwd_t, h_bwd_t)
 
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+what does the backward pass need that the forward pass does not?`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Note that the backward state at position t depends on tokens after t. Derive both what concatenation gives each
+        position and what computational requirement the backward direction imposes.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: two passes, concatenated, and the constraint">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BiLSTM, 256 hidden units per direction:
+  forward LSTM:  256-dim state per token
+  backward LSTM: 256-dim state per token
+  output per token = concat = 512-dim
+  params ~ 2x a single 256-unit LSTM (two separate cells)
+
+backward state at position t uses x_{t+1}, ..., x_T
+  -> need the full sequence before computing position t's output
+
+can you produce token t's output before seeing token t+1?`}</pre>
+      <p>
+        A 256-unit BiLSTM runs a forward and a backward LSTM, each emitting a 256-dim state, concatenated to a 512-dim output
+        per token, with roughly double the parameters of a single 256-unit LSTM because the two directions have separate
+        weights. The catch is that the backward state at position t depends on tokens t+1 through T, so the model must have
+        the entire sequence in hand before it can finalize any position's output. That makes it ideal for encoding a known
+        sequence but impossible for generating one left to right. (Why peeking at future tokens is fatal specifically in
+        autoregressive generation is unpacked in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Unidirectional vs bidirectional">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of a BiRNN</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Passes</td><td>Two independent RNNs: one forward, one backward</td></tr>
+          <tr><td>Per-position output</td><td>Concatenation of forward and backward states (double width)</td></tr>
+          <tr><td>Context seen</td><td>Both left and right context at every position</td></tr>
+          <tr><td>When usable</td><td>Only with the full sequence; not for autoregressive generation</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Both sides, but only when you have them">
+        Concatenating a forward and a backward pass lets each position condition on its full surrounding context, which is
+        exactly what tagging and encoding tasks want, at the cost of double the parameters and output width. The hard
+        constraint is timing: the backward pass needs the future, so a BiRNN is fine when the whole sequence is given but
+        unusable for left-to-right generation, where the future tokens do not yet exist.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>a BiRNN concatenates a forward and a backward pass so each
+        position sees both sides, doubling params and width, but it needs the full sequence and cannot generate
+        autoregressively.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="birnn-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What a BiRNN is"
+        scenario={<>A teammate describes a BiRNN as "a single RNN that processes the sequence twice with the same weights and averages the results." Pick the statement that correctly describes a BiRNN.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`forward RNN -> states
+backward RNN <- states
+per position: combine the two -- how?`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "Two separate RNNs, forward and backward, whose per-position states are concatenated into one vector.", correct: true },
+          { key: "b", text: "One RNN run twice with shared weights, and the two passes are averaged into a single state per position.", correct: false },
+          { key: "c", text: "One RNN that processes the reversed sequence only, discarding the original left-to-right ordering entirely.", correct: false },
+          { key: "d", text: "Two RNNs sharing one weight matrix, so the forward and backward passes are tied and add no extra parameters.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) the two passes have separate weights and are concatenated, not averaged. (c) it uses both directions, not just the reversed one. (d) the directions have independent weights, so params roughly double.</>}
+        lens={<>A bidirectional RNN consists of two independent recurrent networks &mdash; one reading left-to-right, one reading right-to-left &mdash; each with its own weights, and their per-position states are concatenated into a single representation. It is not one shared-weight RNN run twice and averaged, it does not discard the forward direction, and the two directions do not share a weight matrix, so the parameter count roughly doubles. Concatenating two separately learned passes is what gives each position both left and right context.</>}
+        stretch={<>If a single direction emits a 128-dim state, what is the BiRNN's per-position output dimension?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="birnn-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — What each position gets to see"
+        scenario={<>A teammate says "in a BiRNN, each position still only sees the tokens before it, just computed more accurately." Pick the statement that correctly describes the context each position sees.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`forward state at t: from x_1 ... x_t
+backward state at t: from x_t ... x_T
+concatenated: covers which span?`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "Both left and right context: the forward state covers the past, the backward state covers the future.", correct: true },
+          { key: "b", text: "Only the left context, since both RNNs ultimately summarize the tokens up to the current position.", correct: false },
+          { key: "c", text: "Only the right context, since the dominant backward pass overrides the forward pass at each position.", correct: false },
+          { key: "d", text: "Only the current token, since concatenating two states cancels the surrounding context they each carried.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) the backward state explicitly carries the future, so context is not left-only. (c) the forward pass is not overridden; both are kept. (d) concatenation preserves both contexts, it does not cancel them.</>}
+        lens={<>By concatenating the forward state (which summarizes tokens up to and including position t, the left context) with the backward state (which summarizes tokens from t onward, the right context), each position's representation encodes both sides of the sequence. It is not left-only (the backward pass supplies the future), the backward pass does not override the forward one (both are retained), and concatenation preserves rather than cancels the two contexts. Full bidirectional context is precisely the advantage for labeling tasks where a token's role depends on what follows it.</>}
+        stretch={<>Why is seeing the right context especially helpful for a word like a homograph whose sense depends on later words?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="birnn-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Picking an encoder for NER"
+        scenario={<>You are building a named-entity tagger where many labels depend on words appearing after the token being tagged, and the full sentence is always available. A teammate proposes a unidirectional left-to-right LSTM for simplicity. Pick the soundest encoder.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: tag each token (NER)
+full sentence available at inference
+many labels depend on following words`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "A bidirectional RNN, so each token's label can use both preceding and following words in the sentence.", correct: true },
+          { key: "b", text: "A unidirectional left-to-right LSTM, since simplicity matters and earlier context is enough for tagging.", correct: false },
+          { key: "c", text: "A unidirectional right-to-left LSTM, since reversing the direction captures the following-word dependence fully.", correct: false },
+          { key: "d", text: "Two unidirectional LSTMs trained separately and used to vote, since ensembling beats a single bidirectional model.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) left-to-right misses the following-word dependence that the task explicitly has. (c) right-to-left then misses the preceding context; one direction is never enough here. (d) a BiRNN already fuses both directions per position; separate voting models do not share that joint representation.</>}
+        lens={<>Because labels depend on words both before and after each token and the whole sentence is available, a bidirectional RNN is the natural fit: it concatenates a forward and a backward pass so every token's representation conditions on both sides, which is exactly why BiLSTMs are standard for NER and tagging. A left-to-right model misses the following-word dependence and a right-to-left model misses the preceding context, so any single direction is insufficient. Two separately trained unidirectional models voting do not produce the joint per-position bidirectional representation a BiRNN gives; the integrated forward+backward concatenation is the point.</>}
+        stretch={<>What would change about this recommendation if you had to tag tokens in a live, streaming transcript?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="birnn-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why a BiRNN cannot generate autoregressively"
+        scenario={<>A teammate wants to use a BiRNN as a language-model decoder that generates text one token at a time, and cannot see why it will not work. Pick the explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`autoregressive generation: produce token t using only tokens 1 ... t-1
+BiRNN backward state at t needs tokens t+1 ... T
+at generation time, do tokens after t exist yet?`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "The backward pass needs future tokens that do not exist yet during generation, so it cannot be computed.", correct: true },
+          { key: "b", text: "A BiRNN generates fine; the backward pass simply uses zeros for the not-yet-generated future tokens.", correct: false },
+          { key: "c", text: "The forward pass is too slow for generation, so a BiRNN is merely impractical rather than fundamentally unusable.", correct: false },
+          { key: "d", text: "Generation fails only because of the doubled parameters; pruning the backward RNN restores a usable decoder.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) zero-filling the future fakes the input and breaks the model's premise; it does not validly generate. (c) the issue is impossibility, not speed. (d) pruning the backward RNN just yields a unidirectional model, conceding the point.</>}
+        lens={<>Autoregressive generation produces token t using only tokens 1..t-1, but a BiRNN's backward state at position t depends on tokens t+1..T, which do not exist yet during generation &mdash; so the backward pass simply cannot be computed. Substituting zeros for the missing future tokens fabricates input the model was never trained on and violates the causal premise of generation, so it does not validly work. The problem is fundamental impossibility, not slowness or parameter count; removing the backward RNN to fix it just produces an ordinary unidirectional decoder, which is the standard choice for generation.</>}
+        stretch={<>What property must a model's attention or recurrence have to be valid for left-to-right generation?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="birnn-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — The validation score that lied"
+        scenario={<>A teammate trains a BiRNN to predict the next token and gets near-perfect validation accuracy, far above any unidirectional baseline, then is shocked it produces gibberish when actually generating text. Predict the non-obvious cause.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: predict next token, BiRNN encoder
+validation next-token accuracy: near perfect
+actual generation: gibberish
+what did the backward pass see during validation?`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "The backward pass saw the future during scoring, leaking the answer; that future is absent at generation time.", correct: true },
+          { key: "b", text: "The model overfit the validation set, so more regularization will make its generation coherent and fluent.", correct: false },
+          { key: "c", text: "The decoding temperature was wrong at generation, so tuning it alone will recover the validation-level quality.", correct: false },
+          { key: "d", text: "The validation set was simply easier than generation, so the gap reflects data difficulty, not information leakage.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) it is leakage, not overfitting; the score is inflated by seeing the target's neighbors. (c) temperature cannot recover information that does not exist at generation. (d) the gap is from future-token leakage, not dataset difficulty.</>}
+        lens={<>During teacher-forced scoring the whole sequence is present, so the BiRNN's backward pass at position t reads tokens after t &mdash; including information about the very token being predicted &mdash; which leaks the answer and inflates next-token accuracy to near-perfect. At generation time those future tokens do not exist, so the model loses the signal it was effectively relying on and produces gibberish. This is information leakage through the backward direction, not overfitting, a temperature issue, or dataset difficulty. The lesson: a bidirectional encoder must never be used for a causal next-token objective.</>}
+        stretch={<>Which architectural choice (used by GPT) prevents exactly this kind of future-token leakage?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="birnn-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Sizing the layer that follows a BiLSTM"
+        scenario={<>You stack a classification layer on top of a BiLSTM with 300 hidden units per direction, feeding the per-token output into a linear layer. A teammate sets the linear layer's input dimension to 300. Pick the correct input dimension.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BiLSTM: 300 units forward + 300 units backward
+per-token output = concat(forward, backward)
+linear layer input dim = ?`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "600, because the per-token output concatenates the 300-dim forward and 300-dim backward states.", correct: true },
+          { key: "b", text: "300, because the forward and backward states are averaged into a single 300-dim vector per token.", correct: false },
+          { key: "c", text: "150, because the bidirectional output halves the hidden width to keep the parameter count constant.", correct: false },
+          { key: "d", text: "900, because the output stacks the forward, backward, and a combined third state for each token.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) the states are concatenated, not averaged, so the width doubles. (c) bidirectionality doubles, never halves, the output width. (d) there is no third combined state; only two directions are concatenated.</>}
+        lens={<>A BiLSTM concatenates its forward and backward states, so with 300 units per direction the per-token output is 300 + 300 = 600-dimensional, and any layer consuming it must expect 600 inputs. The states are not averaged (that would lose information and keep 300), the output width doubles rather than halves, and there is no third combined state to make it 900. Forgetting the doubling is a common shape bug when adding a head on top of a bidirectional encoder.</>}
+        stretch={<>How does the parameter count of this linear head compare to one placed on a unidirectional LSTM of the same per-direction width?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="birnn-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — The streaming tagger that stalls"
+        scenario={<>A teammate deploys a BiLSTM tagger on a live audio transcription stream and finds it cannot emit a tag for a word until the entire utterance ends, causing unacceptable latency. They blame the inference server. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`deployment: live streaming transcript, low-latency tags needed
+model: BiLSTM (needs backward pass over the whole utterance)
+symptom: no tag until the utterance completes
+blamed: the inference server`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "The backward pass needs the full utterance, so a BiLSTM is wrong for streaming; use a unidirectional or windowed model.", correct: true },
+          { key: "b", text: "The inference server is misconfigured, so optimizing it will let the BiLSTM emit tags before the utterance ends.", correct: false },
+          { key: "c", text: "The hidden state is too large, so shrinking it will let the bidirectional model produce low-latency streaming tags.", correct: false },
+          { key: "d", text: "The batch size is too small, so increasing it removes the dependence on seeing the complete utterance first.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) no server tuning can supply future tokens the backward pass requires. (c) hidden size does not change the need for the full sequence. (d) batch size is irrelevant to the per-utterance future dependence.</>}
+        lens={<>A BiLSTM's backward pass at any position depends on the tokens that come after it, so it structurally cannot finalize a tag until the entire utterance is available &mdash; which is exactly the latency the teammate observes. This is inherent to bidirectionality, not a server, hidden-size, or batch-size issue; none of those can conjure the future context the backward direction requires. For low-latency streaming you need a unidirectional model (left context only) or a limited-lookahead windowed approach that waits for only a few future tokens, accepting a small bounded delay. The architecture choice, not the infrastructure, is the problem.</>}
+        stretch={<>How does a bounded-lookahead window trade a little latency for some right-context benefit?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://www.deeplearningbook.org/contents/rnn.html" target="_blank" rel="noopener">
+            <strong>Deep Learning Book, Ch. 10: Sequence Modeling (RNNs)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(bidirectional RNNs, forward/backward passes, when applicable)</span>
+          <br/>Covers bidirectional RNNs, how the forward and backward states combine to give full context, and why they require the complete sequence.
         </li>
       </ul>
     </VIS.Section>

@@ -2167,295 +2167,304 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: PROBABILITY CALIBRATION.
+// Delta: calibration = "do predicted probabilities match observed frequencies?" (among cases scored ~0.7, ~70%
+//   are positive). Logistic regression, trained on log-loss, is USUALLY well-calibrated out of the box; a
+//   reliability diagram (predicted vs observed) and the Brier score quantify it. Tree ensembles (random forests,
+//   boosting, SVMs) are often MIS-calibrated and need post-hoc Platt (sigmoid) or isotonic recalibration.
+//   Crucial: calibration is about probability VALUES, not ranking -- a perfectly-ranking (high-AUC) model can be
+//   badly calibrated, and recalibrating monotonically leaves AUC unchanged. Diagram shows a reliability curve +
+//   Brier setup only; the candidate infers calibration-vs-discrimination and the fix.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="Classical"
+      title="Probability Calibration"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Logistic Regression" },
+        { label: "Subtopic", value: "Logistic regression is usually well-calibrated so its outputs approximate true frequencies, checked by a reliability diagram and Brier score; tree ensembles and SVMs often need post-hoc Platt or isotonic recalibration" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong><VIS.Term def="Calibration: whether predicted probabilities match observed frequencies. A model is calibrated if, among cases it scores 0.7, about 70 percent are actually positive.">Calibration</VIS.Term> asks
+      whether a model&rsquo;s predicted probabilities match reality &mdash; if it says 0.7, are about 70% of such cases
+      truly positive? Logistic regression, trained on log-loss, is usually well-calibrated out of the box; many tree
+      ensembles and SVMs are not and need post-hoc recalibration.</strong>{" "}
+      You check calibration with a <VIS.Term def="Reliability diagram: bins predictions by their predicted probability and plots, for each bin, the predicted value against the observed positive frequency. A calibrated model hugs the diagonal.">reliability
+      diagram</VIS.Term> (predicted probability vs observed frequency &mdash; a calibrated model hugs the 45-degree
+      diagonal) and the <VIS.Term def="Brier score: the mean squared error between predicted probabilities and the 0/1 outcomes. Lower is better; it rewards both calibration and discrimination.">Brier
+      score</VIS.Term> (mean squared error of the probabilities; lower is better). The key distinction: calibration is
+      about the probability <em>values</em>, not the <VIS.Term def="Discrimination (ranking): how well a model orders positives above negatives, summarised by AUC. Independent of calibration: a model can rank perfectly yet output mis-scaled probabilities.">ranking</VIS.Term>.
+      A model can rank cases perfectly (high AUC) yet be badly calibrated, and a monotonic recalibration (<VIS.Term def="Platt scaling: fits a logistic (sigmoid) to map a model's raw scores to calibrated probabilities. Isotonic regression fits a free monotonic mapping instead.">Platt
+      scaling</VIS.Term> or <VIS.Term def="Isotonic regression: a non-parametric, monotonic recalibration that fits a step function from scores to probabilities; more flexible than Platt but needs more data.">isotonic
+      regression</VIS.Term>) fixes the values while leaving the ranking &mdash; and the AUC &mdash; untouched. The
+      failure modes: assuming high AUC implies calibrated probabilities; reading raw boosted-tree scores as true
+      probabilities; and fitting the recalibrator on the same data used to train the model.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Do the probabilities mean what they say?">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        A model&rsquo;s predictions are binned by predicted probability; the table shows the observed positive rate in
+        each bin. Read the reliability data below and work out whether the model is calibrated &mdash; and whether that
+        question is the same as whether it ranks well.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <div style={{ margin: "16px 0" }}>
+        <VIS.Equation display tex={"\\text{calibrated:}\\;\\; \\Pr(y=1 \\mid \\hat p = q) \\approx q,\\qquad \\text{Brier} = \\tfrac{1}{n}\\sum_i (\\hat p_i - y_i)^2"} />
+      </div>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`predicted bin   observed positive rate
+   ~0.1               0.30
+   ~0.3               0.48
+   ~0.5               0.62
+   ~0.7               0.80
+   ~0.9               0.95
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
-
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+note: the bins are correctly ORDERED (higher pred -> higher rate)
+but does each predicted value match its observed rate?`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Notice the observed rates rise with the predicted bin (good ranking) but sit consistently above the predicted
+        value at the low end. Decide whether this model is calibrated, and whether good ordering settles that.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: ranks fine, mis-scaled values">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`bins are monotonic in observed rate -> AUC is high
+   (the model ORDERS cases well)
+
+but predicted 0.1 -> observed 0.30   (under-confident low)
+    predicted 0.3 -> observed 0.48
+   -> the points sit OFF the diagonal -> mis-calibrated
+
+reliability diagram: curve bows above the diagonal
+Brier score: inflated by the value errors
+
+fix: fit a monotonic map (Platt or isotonic) on held-out data
+   -> reshapes the VALUES onto the diagonal
+   -> ordering (and AUC) unchanged`}</pre>
+      <p>
+        The bins are monotonic, so the model ranks cases well and would post a high AUC. Yet each predicted value
+        misses its observed rate (0.1 vs 0.30, 0.3 vs 0.48), so the reliability curve bows off the diagonal and the
+        Brier score is inflated &mdash; the model discriminates well but is mis-calibrated. The remedy is a monotonic
+        recalibration map (Platt scaling fits a sigmoid; isotonic fits a free monotonic step function) learned on a
+        held-out set, which slides the predicted values onto the diagonal. Because the map is monotonic it preserves
+        the ordering, so AUC is unchanged while the Brier score and reliability improve. (When to choose Platt vs
+        isotonic, and which models tend to need it, is taken up in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Calibration vs discrimination">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What it means / who needs it</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Calibration</td><td>Predicted values match observed frequencies</td></tr>
+          <tr><td>Discrimination (AUC)</td><td>How well the model ranks positives above negatives</td></tr>
+          <tr><td>Logistic regression</td><td>Usually well-calibrated (log-loss training)</td></tr>
+          <tr><td>Trees / boosting / SVM</td><td>Often mis-calibrated &mdash; need Platt or isotonic</td></tr>
+          <tr><td>Effect of monotonic recal</td><td>Fixes values; leaves ranking and AUC unchanged</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Two independent questions: ordering, and the numbers themselves">
+        Discrimination (can the model rank?) and calibration (are the probability values right?) are independent. A
+        high-AUC model can be badly calibrated, and recalibrating it monotonically leaves the AUC untouched while
+        fixing the numbers. Logistic regression is usually calibrated already because log-loss training rewards honest
+        probabilities; tree ensembles, boosting, and SVMs frequently are not, so they get a post-hoc Platt (sigmoid)
+        or isotonic map. Always fit that map on data the base model did not see, and check it with a reliability
+        diagram and the Brier score.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>calibration is whether predicted values match observed
+        frequencies (checked by reliability diagram and Brier score), is independent of ranking/AUC, holds usually for
+        logistic regression but often not for tree ensembles, and is fixed by a monotonic Platt or isotonic map on
+        held-out data.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="cal-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What calibration means"
+        scenario={<>A teammate says &ldquo;a model is calibrated if it ranks the positives above the negatives well.&rdquo; Pick the statement that correctly defines calibration.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`two distinct questions:
+  does it ORDER cases well?
+  do its predicted VALUES match observed frequencies?
+which one is calibration?`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "Calibration means predicted probabilities match observed frequencies, so among 0.7-scored cases about 70% are real.", correct: true },
+          { key: "b", text: "Calibration means the model ranks positives above negatives well, so a higher AUC directly implies better calibration." },
+          { key: "c", text: "Calibration means the model achieves high accuracy at the default 0.5 threshold across a balanced test set." },
+          { key: "d", text: "Calibration means the predicted probabilities are spread widely between zero and one rather than bunched together." },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) that is discrimination/ranking (AUC), which is independent of calibration. (c) accuracy at a threshold is neither calibration nor ranking. (d) the spread of probabilities is not calibration.</>}
+        lens={<>Calibration is about the probability values matching reality: among all cases assigned about 0.7, roughly 70% should be positive. That is distinct from ranking (AUC), from threshold accuracy, and from how widely the scores are spread. A model can rank perfectly yet be mis-calibrated, which is exactly why calibration is checked separately with a reliability diagram.</>}
+        stretch={<>Can a model be perfectly calibrated yet useless at ranking? Sketch how.</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="cal-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — Which models tend to be calibrated"
+        scenario={<>A teammate says &ldquo;all classifiers output well-calibrated probabilities by default, so raw scores can always be read as true probabilities.&rdquo; Pick the statement that correctly characterises this.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`logistic regression: trained on log-loss
+random forest / boosting / SVM: other objectives
+which tend to be calibrated out of the box?`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "Logistic regression is usually calibrated, but tree ensembles and SVMs often are not and need recalibration.", correct: true },
+          { key: "b", text: "All classifiers are calibrated by default, so the raw scores of any model can be read as true probabilities." },
+          { key: "c", text: "Tree ensembles are calibrated by default while logistic regression usually needs a post-hoc recalibration step." },
+          { key: "d", text: "No classifier is ever calibrated, so every model's scores must be recalibrated before they can be used at all." },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) tree ensembles and SVMs are frequently mis-calibrated, so &ldquo;all by default&rdquo; is false. (c) inverts it: logistic regression is the usually-calibrated one. (d) logistic regression is usually calibrated, so &ldquo;no classifier ever&rdquo; is too strong.</>}
+        lens={<>Because logistic regression is trained on log-loss &mdash; a proper scoring rule that rewards honest probabilities &mdash; it is usually well-calibrated out of the box. Random forests, boosted trees, and SVMs optimise other objectives and often produce mis-calibrated scores (boosting tends to push them toward 0/1; bagging toward the centre), so they commonly need Platt or isotonic recalibration. It is not true that all models are calibrated, nor that none are.</>}
+        stretch={<>Why does boosting tend to push probabilities toward 0 and 1?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
-        difficulty="hard"
+        id="cal-b1"
+        difficulty="medium"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Costs multiplied by probabilities"
+        scenario={<>A downstream system multiplies a boosted-tree model&rsquo;s probability by a dollar cost to make expected-value decisions. The model has high AUC, so a colleague trusts its probabilities directly. Pick the soundest read.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`model: boosted trees, high AUC
+use: probability x cost -> expected value
+assumption: high AUC -> trustworthy probabilities`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Check calibration and recalibrate if needed, since high AUC does not ensure the probability values are accurate.", correct: true },
+          { key: "b", text: "Trust the probabilities directly, since a high AUC guarantees the predicted values are accurate enough to multiply." },
+          { key: "c", text: "Raise the decision threshold instead, since adjusting the threshold corrects mis-scaled probabilities for cost math." },
+          { key: "d", text: "Retrain with more trees, since adding estimators makes a boosted model's probabilities self-calibrate over time." },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
+        trap={<>(b) high AUC is about ranking, not value accuracy; boosted scores are often mis-calibrated. (c) the threshold does not change the probability values used in the expected-value product. (d) more trees do not fix calibration; boosting often worsens it toward 0/1.</>}
+        lens={<>Multiplying probabilities by costs requires the probability <em>values</em> to be accurate, which AUC does not guarantee &mdash; AUC only measures ranking. Boosted trees are frequently mis-calibrated, so you must check a reliability diagram and, if it bows off the diagonal, apply a Platt or isotonic recalibration (on held-out data). A threshold change does not affect the values, and adding trees does not self-calibrate the model.</>}
+        stretch={<>After recalibration, would the model&rsquo;s AUC change, and why or why not?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-b2"
+        id="cal-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
+        title="B2 — Platt versus isotonic"
+        scenario={<>You must recalibrate a model and have a large held-out calibration set. A colleague insists Platt scaling (a sigmoid) is always the right choice regardless of the data. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`calibration set: large
+Platt: fits a sigmoid (2 parameters)
+isotonic: free monotonic step function
+distortion shape: not necessarily sigmoidal`}</pre>}
         options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
+          { key: "a", text: "With ample data, isotonic can fit non-sigmoidal distortions that Platt's fixed sigmoid shape cannot capture.", correct: true },
+          { key: "b", text: "Platt scaling is always best, since a two-parameter sigmoid fits any calibration distortion regardless of its shape." },
+          { key: "c", text: "Isotonic is always worse, since a step-function mapping cannot improve calibration on any real dataset at all." },
+          { key: "d", text: "The two are identical, since Platt and isotonic always produce the same recalibrated probabilities on any data." },
         ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) Platt assumes a sigmoidal distortion; it cannot fit arbitrary shapes. (c) isotonic does improve calibration, especially with enough data. (d) the two are different methods and generally give different maps.</>}
+        lens={<>Platt scaling fits a two-parameter sigmoid, which works well when the mis-calibration is sigmoidal and when data is limited, but it cannot represent a distortion of a different shape. Isotonic regression fits a free monotonic mapping, so with a large calibration set it can correct non-sigmoidal distortions Platt would miss &mdash; at the cost of needing more data to avoid overfitting. They are distinct methods, and neither is universally best; the data size and distortion shape decide.</>}
+        stretch={<>With only a small calibration set, why might Platt be the safer choice?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="cal-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why recalibration leaves AUC unchanged"
+        scenario={<>A teammate asks why applying Platt or isotonic recalibration does not change the model&rsquo;s AUC. Pick the correct account of the mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`recalibration map: monotonic (order-preserving)
+AUC depends on: the RANK order of scores
+what does a monotonic map do to the order?`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "Platt and isotonic are monotonic maps, so they preserve the score ordering, and AUC depends only on that ordering.", correct: true },
+          { key: "b", text: "Recalibration retrains the base model, so AUC stays fixed only because the new training happens to reproduce it." },
+          { key: "c", text: "AUC ignores the predicted probabilities entirely, so any transformation of the scores leaves it mechanically unchanged." },
+          { key: "d", text: "Recalibration rescales all scores by the same constant, so the AUC is preserved by that uniform multiplication." },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) recalibration fits a map on top of fixed scores; it does not retrain the base model. (c) AUC does use the scores &mdash; specifically their order; it is not blind to them. (d) isotonic is not a constant rescale; it is a free monotonic map.</>}
+        lens={<>Both Platt and isotonic recalibration are monotonic (order-preserving) transformations of the scores, and AUC is a function only of the rank order of positives versus negatives. Since a monotonic map cannot change that order, the AUC is unchanged while the probability values are reshaped onto the diagonal. It is not a retrain, AUC is not blind to the scores (it uses their ranks), and isotonic is more than a constant rescale.</>}
+        stretch={<>Which calibration metric, unlike AUC, would move after recalibration?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="cal-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Two models, same Brier?"
+        scenario={<>Model P has higher AUC than model Q, and a teammate assumes P must therefore have the lower (better) Brier score. Predict the non-obvious direction for whether higher AUC guarantees a lower Brier score.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`model P: higher AUC, but poorly calibrated
+model Q: lower AUC, but well calibrated
+Brier = mean (pred - outcome)^2  (rewards calibration too)`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "Not guaranteed: a poorly calibrated high-AUC model can have a worse Brier score than a calibrated lower-AUC one.", correct: true },
+          { key: "b", text: "Guaranteed: a higher AUC always produces a lower Brier score, since better ranking implies better probabilities." },
+          { key: "c", text: "Guaranteed: Brier score depends only on the ranking, so the model with higher AUC must have the lower Brier score." },
+          { key: "d", text: "Not comparable: the Brier score and AUC measure unrelated quantities, so neither can ever be compared between models." },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) AUC measures ranking; Brier also penalises mis-calibrated values, so higher AUC does not guarantee lower Brier. (c) Brier depends on the actual values, not only ranking. (d) they are different but both comparable across models.</>}
+        lens={<>The Brier score is the mean squared error of the probability values, so it penalises mis-calibration as well as poor ranking. A high-AUC but badly calibrated model (P) can post mis-scaled probabilities that inflate its Brier above that of a well-calibrated lower-AUC model (Q). So higher AUC does not guarantee a better Brier &mdash; the counterintuitive result that the better ranker can be the worse probability estimator. Recalibrating P would lower its Brier without changing its AUC.</>}
+        stretch={<>The Brier score decomposes into calibration and refinement terms &mdash; which one does recalibration improve?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="cal-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Where to fit the recalibrator"
+        scenario={<>You will recalibrate a model and a colleague proposes fitting the Platt sigmoid on the same data the base model was trained on, to use all the data. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`base model: trained on dataset D
+proposed: fit Platt on D too (reuse all data)
+concern: ?`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Fit the recalibrator on a held-out split, since calibrating on the training data gives optimistic, biased scores.", correct: true },
+          { key: "b", text: "Fit the recalibrator on the training data as proposed, since reusing all the data always yields the best calibration." },
+          { key: "c", text: "Fit the recalibrator on the test set, since the test set is the most representative data for the calibration map." },
+          { key: "d", text: "Skip the held-out split and trust the raw scores, since a properly trained model never needs separate calibration data." },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) the base model overfits its training data, so its training scores are over-confident and bias the recalibrator. (c) fitting on the test set leaks it and biases the final evaluation. (d) many models do need a separate calibration set; raw scores are often mis-calibrated.</>}
+        lens={<>The base model is over-confident on its own training data, so fitting the calibration map there inherits that optimism and yields biased probabilities. Calibrate on a held-out split (or use cross-validated calibration), and reserve the test set strictly for final evaluation so it is not leaked. Reusing the training data does not give the best calibration, and trusting raw scores ignores that many models are mis-calibrated.</>}
+        stretch={<>How does scikit-learn&rsquo;s cross-validated CalibratedClassifierCV use the data to avoid this bias?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="cal-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — Recalibration that did not raise AUC"
+        scenario={<>An engineer recalibrated a mis-calibrated boosted model with isotonic regression; the reliability diagram now hugs the diagonal and the Brier score improved, but the AUC is identical. A teammate calls the recalibration a failure because AUC did not move. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`after isotonic recalibration:
+  reliability curve -> hugs diagonal
+  Brier score -> improved
+  AUC -> unchanged
+claim: "failure, AUC did not improve"`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "Recalibration fixes values, not ranking, so unchanged AUC with improved Brier is exactly the intended success.", correct: true },
+          { key: "b", text: "The recalibration failed, since a successful calibration step should also raise the model's AUC on the same data." },
+          { key: "c", text: "The isotonic map was mis-fit, since correct recalibration always increases AUC along with the Brier improvement." },
+          { key: "d", text: "The improvement is an artifact, since the Brier score cannot improve unless the AUC improves alongside it." },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) recalibration is not meant to change ranking, so unchanged AUC is expected, not a failure. (c) a correct monotonic recalibration leaves AUC fixed by design. (d) Brier (a value metric) can improve while AUC (a ranking metric) stays fixed.</>}
+        lens={<>Recalibration is a monotonic remapping of the probability values, so by design it improves calibration (reliability curve on the diagonal, lower Brier) while leaving the ranking &mdash; and therefore the AUC &mdash; unchanged. Unchanged AUC alongside an improved Brier is precisely the signature of a successful recalibration, not a failure. Expecting AUC to rise misunderstands what calibration fixes.</>}
+        stretch={<>If the AUC had <em>dropped</em> after recalibration, what would that imply about the fitted map?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://scikit-learn.org/stable/modules/calibration.html" target="_blank" rel="noopener">
+            <strong>scikit-learn: probability calibration</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(reliability diagrams, Brier score, Platt and isotonic recalibration)</span>
+          <br/>Covers how to assess calibration and how Platt (sigmoid) and isotonic recalibration map raw scores to honest probabilities.
         </li>
       </ul>
     </VIS.Section>

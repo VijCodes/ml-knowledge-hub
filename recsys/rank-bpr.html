@@ -2167,295 +2167,251 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: BAYESIAN PERSONALIZED RANKING (BPR).
+// Delta: BPR is a PAIRWISE loss built specifically for IMPLICIT feedback. For each training triple
+//   (user u, observed item i, sampled UNobserved item j) it maximizes log sigma(x_ui - x_uj) -- it only ever asks
+//   that an item the user interacted with scores ABOVE a sampled item they did not. It never tries to predict an
+//   absolute score; the unobserved item j is a SAMPLED assumed-negative, not a labeled dislike. This sidesteps the
+//   one-class problem (no explicit negatives) by turning "i seen, j unseen" into a relative-order constraint, and it
+//   optimizes AUC-like ranking rather than pointwise calibration. The distinctive facets: the triple structure, the
+//   sampled negative, the sigmoid-of-difference objective, and that j is assumed-negative not known-negative.
+//   Diagram shows the triple + the score-difference SETUP only (never the resulting AUC).
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="RecSys"
+      title="Bayesian Personalized Ranking"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Ranking Objectives" },
+        { label: "Subtopic", value: "A pairwise loss for implicit feedback: for each (user, observed item i, sampled unobserved item j) maximize log-sigmoid of the score difference, pushing seen items above sampled-unseen ones without ever predicting an absolute score" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>BPR is a pairwise ranking loss designed for implicit feedback, where you have positives but no labeled
+      negatives.</strong>{" "}
+      It trains on triples (user u, observed item i, sampled <em>un</em>observed item j) and maximizes
+      log&nbsp;&sigma;(x&#770;&#8444;&#8345; &minus; x&#770;&#8444;&#8332;) &mdash; the
+      <VIS.Term def="The standard logistic / sigmoid function. In BPR, sigma is applied to the score difference x_ui - x_uj, so the loss is small when the observed item already outscores the sampled one and large when the order is wrong.">log-sigmoid</VIS.Term> of
+      the difference between the user's score for the observed item and for the sampled one. In plain terms: it only ever
+      asks that an item the user actually interacted with be ranked <em>above</em> a randomly sampled item they did not.
+      It never tries to predict an absolute rating. Crucially, the sampled item j is an <em>assumed</em> negative, not a
+      known dislike &mdash; BPR sidesteps the one-class problem (implicit data has no explicit negatives) by converting
+      "i was seen, j was not" into a relative-order constraint. Because it optimizes pairwise order, BPR targets an
+      AUC-like ranking objective directly rather than pointwise calibration, which is why a BPR-trained factorization
+      often beats a pointwise one on ranking metrics with the same factors. The failure modes: treating j as a confirmed
+      negative, expecting calibrated probabilities out of it, and ignoring that the sampling distribution for j shapes
+      what the model learns.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — The training triple">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        BPR does not train on single (user, item) labels. It trains on triples. The readout shows one triple: a user, an
+        item they interacted with, and an item sampled from the ones they did not. Work out what constraint BPR places on
+        this triple, and what it does <em>not</em> assume about item j.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`triple for user u:
+   i = an item u interacted with        (observed positive)
+   j = an item u did NOT interact with  (SAMPLED, assumed negative)
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
+scores from the model:
+   x_ui = p_u . q_i
+   x_uj = p_u . q_j
 
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+BPR objective for this triple:  maximize  log sigma( x_ui - x_uj )`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        The loss only depends on the <em>difference</em> x&#770;&#8444;&#8345; &minus; x&#770;&#8444;&#8332;, not on the
+        individual values. Derive why this means BPR never needs an absolute target, and why calling j a confirmed
+        dislike would be wrong even though it is used on the negative side of the pair.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: what the gradient does">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss for one triple:  L = -log sigma(x_ui - x_uj)
+
+case A: order already correct, x_ui - x_uj = +3.0
+   sigma(3.0) ~ 0.95  ->  -log(0.95) ~ 0.05   (tiny loss, tiny gradient)
+
+case B: order wrong, x_ui - x_uj = -2.0
+   sigma(-2.0) ~ 0.12  ->  -log(0.12) ~ 2.1    (large loss, large gradient)
+   gradient PUSHES x_ui up and x_uj down until i outranks j
+
+what BPR never does:
+   it never says "x_ui should equal 1" or "x_uj should equal 0"
+   only the RELATIVE order of the pair is optimized`}</pre>
+      <p>
+        The gradient is large exactly when the observed item is ranked below the sampled one and near zero once the
+        observed item already wins. So BPR concentrates learning on fixing wrong orderings and leaves correctly-ordered
+        pairs alone. The absolute scores are free to drift; only their order is pinned. This is the pairwise mechanism
+        that makes BPR optimize ranking rather than calibration.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — What each design choice buys you">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Choice</th><th>Why it matters</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Triple (u, i, j)</td><td>Turns one-class positives into pairwise order constraints; no explicit negatives needed</td></tr>
+          <tr><td>Sampled j</td><td>j is assumed-negative, drawn from un-interacted items, not a labeled dislike</td></tr>
+          <tr><td>&sigma; of difference</td><td>Loss depends only on relative order, so no absolute target is required</td></tr>
+          <tr><td>Pairwise objective</td><td>Optimizes an AUC-like ranking, often beating pointwise on ranking metrics</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Rank the seen above the sampled-unseen, nothing more">
+        BPR's whole contract is "an interacted item should outrank a sampled un-interacted one." It needs no explicit
+        negatives because it manufactures relative-order constraints from the one-class data, and it needs no absolute
+        targets because its loss sees only the score difference. The sampled item j is treated as a soft, assumed
+        negative &mdash; not a confirmed dislike &mdash; which is exactly what makes BPR appropriate for implicit
+        feedback. The price is that its outputs are ranking scores, not calibrated probabilities.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>BPR maximizes log&nbsp;&sigma; of the score difference over
+        triples (u, observed i, sampled j), turning one-class positives into pairwise order constraints with j an
+        assumed (not confirmed) negative.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="bp-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What BPR optimizes"
+        scenario={<>A teammate says BPR "predicts a calibrated probability that the user will click each item." Pick the statement that correctly describes BPR's objective.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`objective: maximize log sigma(x_ui - x_uj)
+depends on: difference of two scores`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "It maximizes the log-sigmoid of the score difference, so it optimizes that observed items outrank sampled unseen ones.", correct: true },
+          { key: "b", text: "It predicts a calibrated click probability per item by fitting each item's score to a 0 or 1 label directly.", correct: false },
+          { key: "c", text: "It optimizes the whole ranked list at once against the ideal ordering using a smooth list-metric surrogate.", correct: false },
+          { key: "d", text: "It maximizes the cosine similarity between the user and item embeddings without any notion of negatives.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
-        options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
-        ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) describes pointwise calibration, which BPR explicitly avoids. (c) describes a listwise loss, not BPR's pairwise one. (d) ignores the negative item that defines the pairwise comparison.</>}
+        lens={<>BPR's objective is the log-sigmoid of the difference x&#770;&#8444;&#8345; &minus; x&#770;&#8444;&#8332;, so it optimizes the <em>relative order</em> of an observed item against a sampled unseen one &mdash; a pairwise goal. It never fits a per-item 0/1 label (that is pointwise calibration) and never scores the entire list against an ideal ordering (that is listwise). And it fundamentally relies on the negative item j; a bare similarity with no negatives would not impose any ranking constraint.</>}
+        stretch={<>Why are BPR's raw scores unsuitable as click-probability estimates?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="bp-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Implicit clicks, want better ranking"
+        scenario={<>You have implicit click logs (positives only) and a pointwise MF whose ranking metric is mediocre. A teammate proposes labeling all non-clicked items as zeros and training harder on that. Pick the soundest approach.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`data: clicks only (no explicit negatives)
+current: pointwise MF, weak ranking
+goal: better ranking from the same factors`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Train BPR on (user, clicked item, sampled un-clicked item) triples so the model directly optimizes pairwise order.", correct: true },
+          { key: "b", text: "Label every non-clicked item a hard zero and keep training the pointwise model on the resulting dense matrix.", correct: false },
+          { key: "c", text: "Maximize cosine similarity between users and their clicked items only, ignoring all un-clicked items entirely.", correct: false },
+          { key: "d", text: "Switch to predicting the exact number of future clicks per item as a regression target for sharper scores.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) hard-labeling all non-clicks invents confirmed negatives the one-class data does not contain. (c) positives-only with no negatives imposes no ranking pressure and collapses. (d) regressing counts is pointwise calibration, not order optimization.</>}
+        lens={<>BPR is the natural fit: it converts one-class clicks into pairwise constraints by sampling an un-clicked item per positive and requiring the clicked item to outrank it, optimizing ranking with the same latent factors. Hard-labeling every non-click as a confirmed zero misrepresents implicit data and reintroduces the MNAR bias; a positives-only similarity objective has no contrast to learn order from; and regressing click counts is pointwise calibration, which is exactly the objective that left ranking mediocre.</>}
+        stretch={<>How does the negative-sampling distribution change BPR's behavior on popular items?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="bp-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why no absolute target is needed"
+        scenario={<>A teammate is confused that BPR has no target value like "1 for click." Pick the correct account of why BPR needs no absolute label.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = -log sigma(x_ui - x_uj)
+only the difference enters
+adding a constant to both scores: loss unchanged`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "The loss depends only on the score difference, so any constant shift cancels and only relative order is constrained.", correct: true },
+          { key: "b", text: "BPR has a hidden absolute target of 1 for i and 0 for j, applied internally before the sigmoid is computed.", correct: false },
+          { key: "c", text: "The sigmoid forces both scores to lie in zero to one, which serves as an implicit absolute calibration target.", correct: false },
+          { key: "d", text: "Absolute targets are unnecessary because BPR freezes the user factor and only ever moves the item factors.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) there is no hidden 1/0 target; only the difference matters. (c) the sigmoid acts on the difference, not on each score individually. (d) BPR updates user and item factors together; nothing is frozen.</>}
+        lens={<>Because the loss is &minus;log&nbsp;&sigma;(x&#770;&#8444;&#8345; &minus; x&#770;&#8444;&#8332;), it is invariant to adding any constant to both scores &mdash; only their difference, i.e. their relative order, affects it. So there is nothing to pin an absolute value to, and none is needed. There is no hidden 1/0 target; the sigmoid is applied to the difference, not to each score to bound it; and BPR's gradient moves the user and item factors jointly. This shift-invariance is precisely why BPR optimizes order, not calibration.</>}
+        stretch={<>Given this invariance, what role does the regularizer play in keeping factors bounded?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="bp-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — The sampled negative might be liked"
+        scenario={<>For a user, BPR samples item j (un-interacted) as the negative in a triple, but j is actually an item the user would love and simply never saw. A teammate worries this single mislabeled negative will ruin the model. Predict the non-obvious consequence.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`j: un-interacted, but actually a would-be favorite
+used once as the negative in one triple
+training samples millions of triples`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "j is only an assumed negative sampled occasionally, so one such triple is averaged out over many and does little harm.", correct: true },
+          { key: "b", text: "The model is permanently corrupted, since BPR treats every sampled j as a confirmed dislike that cannot be undone.", correct: false },
+          { key: "c", text: "BPR detects that j is actually a positive and automatically discards the triple before computing the gradient.", correct: false },
+          { key: "d", text: "j will be ranked highest for the user, since being sampled as a negative paradoxically boosts an item's score.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) treats j as a confirmed negative, the central misconception. (c) BPR has no oracle to detect false negatives. (d) is nonsense; the gradient pushes a negative down, not up.</>}
+        lens={<>The point of BPR is that j is an <em>assumed</em>, soft negative, sampled anew each step, not a confirmed dislike. A would-be favorite that happens to be sampled as the negative in a few triples contributes a small downward pull that is swamped by the many triples where it (or similar items) appear as positives or correctly-ordered comparisons, so it averages out. BPR does not permanently brand j a dislike, has no mechanism to detect false negatives, and certainly does not boost an item for being sampled negative. This tolerance to occasional false negatives is what makes pairwise sampling workable on one-class data.</>}
+        stretch={<>When does false-negative sampling stop being benign and start hurting (e.g. hard-negative mining)?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="bp-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Generating triples efficiently"
+        scenario={<>Your catalog has millions of items, so you cannot pair each positive with every un-interacted item. A teammate proposes enumerating all (i, j) pairs per user. Pick the soundest training scheme.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`positives per user: many
+un-interacted items: ~entire catalog
+all pairs: infeasible`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Sample one (or a few) un-interacted items per positive each step, so each triple is cheap and coverage builds over epochs.", correct: true },
+          { key: "b", text: "Enumerate every (positive, un-interacted) pair per user, since only the full pair set yields a correct BPR model.", correct: false },
+          { key: "c", text: "Drop the sampling and revert to a pointwise model, since generating triples is inherently too expensive at this scale.", correct: false },
+          { key: "d", text: "Precompute a fixed negative for each positive once and reuse that exact pairing for every epoch unchanged.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) all-pairs is astronomically large for a million-item catalog. (c) sampling makes BPR tractable, so abandoning it is unnecessary. (d) a frozen negative per positive reduces diversity and can bias toward whatever was sampled first.</>}
+        lens={<>BPR is trained by stochastic sampling: each step draws one (or a few) un-interacted items as negatives for each positive, so a triple is cheap and, across epochs, the positive is compared against a broad, freshly-sampled set of negatives. Enumerating all pairs is infeasible at catalog scale, reverting to pointwise forfeits the ranking objective, and freezing a single negative per positive narrows the comparisons and can bake in sampling bias. Fresh per-step sampling is the standard, scalable recipe.</>}
+        stretch={<>Would you sample negatives uniformly or proportional to popularity, and why?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="bp-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — Reading BPR scores as probabilities"
+        scenario={<>A team trains BPR and then feeds its raw scores into a downstream system that expects calibrated click probabilities. The downstream thresholding behaves erratically. A teammate blames the threshold. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BPR scores: optimized for ORDER only
+downstream: expects probabilities in [0,1]
+result: thresholding erratic`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "BPR optimizes only relative order, so its scores are not calibrated probabilities and should not be thresholded as such.", correct: true },
+          { key: "b", text: "The scores are valid probabilities and the threshold value is simply set wrong; tuning the threshold will fix it.", correct: false },
+          { key: "c", text: "BPR is broken, since a correct ranking model must always emit calibrated probabilities for downstream use.", correct: false },
+          { key: "d", text: "The issue is the regularizer strength; lowering it will rescale the scores into the zero-to-one probability range.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) assumes the scores are probabilities; they are not. (c) emitting calibrated probabilities is not a property of a ranking model. (d) regularization does not turn order scores into probabilities.</>}
+        lens={<>Because BPR's loss is shift-invariant and targets only relative order, its outputs are ranking scores with no probabilistic meaning &mdash; their absolute magnitude is arbitrary. Feeding them to a system that thresholds on calibrated probabilities is a category error, which is why the behavior is erratic. The fix is either to calibrate the scores explicitly (e.g. a separate calibration step) or to use a pointwise/probabilistic model where calibration is part of the objective. Re-tuning the threshold, blaming the model, or adjusting regularization none of them confer a probabilistic interpretation the loss never aimed for.</>}
+        stretch={<>What lightweight post-hoc step would map BPR scores to usable probabilities?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://arxiv.org/abs/1205.2618" target="_blank" rel="noopener">
+            <strong>BPR: Bayesian Personalized Ranking from Implicit Feedback (Rendle et al.)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(pairwise triple loss, sampled assumed-negatives)</span>
+          <br/>The original paper deriving the BPR-OPT criterion, the triple sampling scheme, and why pairwise order beats pointwise on implicit ranking.
         </li>
       </ul>
     </VIS.Section>

@@ -2167,295 +2167,269 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: GLOBAL AVERAGE POOLING (GAP) CLASSIFIER HEAD.
+// Delta: instead of flattening the final feature map into a giant vector and feeding a huge dense layer, GAP collapses each
+//   channel's WHOLE spatial map to a single number (its spatial mean), yielding one value per channel. That removes the
+//   enormous flatten+dense weight matrix, dramatically cutting params and overfitting, and makes the head agnostic to input
+//   spatial size (only channel count matters). One small FC then maps the C-vector to classes. Diagram shows the
+//   collapse-each-channel-to-its-mean SETUP and the two competing head sizes only; it never prints the param savings or the
+//   "less overfitting" conclusion.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
       pill="DL"
-      title="GELU: The Transformer Activation"
+      title="Global Average Pooling Replaces Dense Heads"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Classic CNNs" },
+        { label: "Subtopic", value: "GAP collapses each feature-map channel to its spatial mean, producing one value per channel and removing the huge flatten+dense layer, which cuts parameters and overfitting; standard in ResNet and Inception classifier heads" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>Global average pooling takes the final convolutional feature map and replaces the usual{" "}
+      <VIS.Term def="Reshaping a HxWxC feature map into one long vector of length H*W*C, then feeding it to a dense layer. The dense weight matrix is huge because its input dimension is the full flattened size.">flatten-then-dense</VIS.Term> head
+      with a single operation: average each channel's entire spatial map down to one number, giving a C-length vector (one
+      value per channel).</strong>{" "}
+      A small fully connected layer then maps that C-vector to the class logits. Because GAP discards the spatial dimensions
+      by averaging rather than flattening, it removes the enormous dense weight matrix whose input size was H*W*C &mdash; for
+      a 7x7x2048 map, that is a 100,352-input dense layer (around 100M params) versus a 2048-input one (around 2M). Fewer
+      parameters means far less overfitting and a head that no longer depends on the exact input spatial size, only the
+      channel count. This is the standard classifier head in ResNet and Inception. The failure modes: thinking GAP keeps the
+      spatial dimensions, confusing it with max pooling, believing it has learnable weights, and assuming it forces a fixed
+      input resolution the way a flatten+dense head does.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Why the flatten+dense head dominates the param count">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        A teammate's CNN has a small convolutional trunk but a final dense head with more parameters than the entire rest of
+        the network, and it overfits badly. They consider just adding dropout. Before reading on, work out where those
+        parameters come from when you flatten a feature map into a dense layer, and what a pure averaging step would do to
+        that count.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final feature map: 7 x 7 x 2048
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
+option A (flatten + dense):
+  flatten -> 7*7*2048 = 100,352 inputs -> 1000-way FC
 
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
+option B (GAP + dense):
+  average each channel's 7x7 map -> 2048 values -> 1000-way FC
 
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+what drives each head's parameter count?`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Note that GAP collapses each channel's 7x7 spatial map to a single mean. Derive what the dense layer's input
+        dimension becomes in each case, and what that does to the weight count.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the two head sizes">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final map 7x7x2048, 1000 classes
+
+flatten + dense:
+  dense input dim = 7*7*2048 = 100,352
+  weights ~ 100,352 * 1000 ~ 100,352,000  (~100M)
+
+GAP + dense:
+  GAP output dim = 2048  (one mean per channel)
+  weights ~ 2048 * 1000 ~ 2,048,000  (~2.05M)
+
+compare the two weight counts`}</pre>
+      <p>
+        Flattening makes the dense input 100,352-dimensional, so the classifier weight matrix is about 100M parameters. GAP
+        first averages each channel's 7x7 map to a single value, so the dense input is just 2048-dimensional and the
+        classifier is about 2.05M parameters &mdash; roughly fifty times smaller. The averaging step itself has no learnable
+        weights at all; it is a fixed reduction. (Why this also makes the head input-size agnostic, and why it tends to
+        overfit less, is unpacked in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Flatten+dense head vs GAP head">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of a GAP head</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>What it outputs</td><td>One value per channel (a C-length vector); spatial dims gone</td></tr>
+          <tr><td>Learnable weights</td><td>None in the GAP itself; only the small final FC has weights</td></tr>
+          <tr><td>Param effect</td><td>Removes the huge flatten+dense matrix; far fewer params</td></tr>
+          <tr><td>Input-size dependence</td><td>Works for any spatial size; only the channel count must match</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Average away the spatial dimensions">
+        Flattening a feature map forces a dense layer whose input is the full H*W*C, so the classifier weights explode with
+        spatial size. GAP sidesteps this by averaging each channel to one number before the dense layer, collapsing the input
+        to just C. The result is orders of magnitude fewer parameters, less overfitting, and a head that no longer cares
+        about the input resolution &mdash; which is why ResNet and Inception use it.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>GAP averages each channel's whole spatial map to one value,
+        removing the huge flatten+dense matrix, cutting params and overfitting, and making the head input-size
+        agnostic.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="gap-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What GAP outputs"
+        scenario={<>A teammate says global average pooling "averages over the channels, leaving a single spatial feature map." Pick the statement that correctly describes GAP's output.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`input feature map: 7 x 7 x 2048
+GAP averages over which dimensions?
+what shape comes out?`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "One value per channel: it averages each channel's spatial map, giving a 2048-length vector.", correct: true },
+          { key: "b", text: "A single 7x7 map: it averages across the 2048 channels, collapsing depth but keeping the spatial grid.", correct: false },
+          { key: "c", text: "A 7x7x2048 map with smoothed values, since averaging is applied locally within small spatial windows.", correct: false },
+          { key: "d", text: "A single scalar: it averages over channels and space at once into one number summarizing the whole map.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) GAP averages over space per channel, not over channels. (c) it is a global reduction, not a local smoothing. (d) it keeps one value per channel, not a single scalar.</>}
+        lens={<>Global average pooling averages over the spatial dimensions of each channel independently, so a 7x7x2048 map becomes a 2048-length vector &mdash; one mean per channel. It does not average across channels (that would collapse depth and keep the grid), it is not a local windowed smoothing (the average is over the whole map), and it does not reduce to a single scalar (each channel keeps its own value). Preserving the channel axis while discarding space is exactly what lets a small dense layer read off class evidence per feature channel.</>}
+        stretch={<>Why is it useful to keep one value per channel rather than collapse everything to a scalar?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="gap-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — GAP vs max pooling"
+        scenario={<>A teammate uses the terms "global average pooling" and "global max pooling" interchangeably. Pick the statement that correctly distinguishes GAP.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`per channel, reduce the whole spatial map to one value
+GAP uses which reduction?
+does it have learnable weights?`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "GAP takes the spatial mean per channel and has no learnable weights; it is a fixed averaging reduction.", correct: true },
+          { key: "b", text: "GAP takes the spatial maximum per channel, identical in effect to global max pooling but renamed.", correct: false },
+          { key: "c", text: "GAP learns a weighted average per channel, with the weights trained jointly with the rest of the network.", correct: false },
+          { key: "d", text: "GAP applies a small convolution per channel first, then averages, so it does carry trainable parameters.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) that is global max pooling; GAP uses the mean. (c) the average is unweighted and fixed, not learned. (d) GAP has no conv and no parameters of its own.</>}
+        lens={<>Global average pooling reduces each channel's spatial map by taking its mean, and it has no learnable parameters &mdash; it is a fixed reduction. Global max pooling instead takes the per-channel maximum, which keeps only the single strongest response and behaves quite differently. GAP also does not learn weights or apply any convolution of its own; the only weights in the head live in the small final fully connected layer that follows. The mean-versus-max distinction matters because averaging integrates evidence across the whole map rather than betting on one peak location.</>}
+        stretch={<>In what situation might global max pooling be preferable to average pooling?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="gap-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Shrinking an overfit classifier head"
+        scenario={<>A network has a 7x7x512 final map feeding a flatten+dense head that holds most of the model's parameters and overfits hard. A teammate proposes adding heavy dropout to the dense head. Pick the change that most directly cuts the head's parameters.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final map: 7x7x512
+current head: flatten (7*7*512 = 25,088) -> 1000-way FC
+symptom: head dominates params, heavy overfit`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Replace flatten with GAP so the dense input is 512, shrinking the classifier matrix by roughly 49x.", correct: true },
+          { key: "b", text: "Add heavy dropout to the dense head, since dropout alone removes the parameter explosion and the overfit.", correct: false },
+          { key: "c", text: "Halve the number of classes the head predicts, since fewer outputs is the main lever on head parameters.", correct: false },
+          { key: "d", text: "Insert another dense layer before the classifier, since more depth in the head regularizes it against overfit.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) dropout masks activations but leaves the ~25M-weight matrix in place. (c) the input dim (25,088) dominates, not the 1000 outputs. (d) adding dense layers increases parameters, worsening the problem.</>}
+        lens={<>Flattening makes the dense input 7*7*512 = 25,088, so the classifier matrix is about 25,088*1000 ~ 25M weights &mdash; the source of both the parameter bloat and the overfitting. Swapping flatten for GAP averages each channel to one value, dropping the dense input to 512 and the matrix to about 512*1000 ~ 0.5M, roughly 49x smaller. Dropout only masks activations during training and leaves the giant matrix intact; cutting classes barely moves the count because the input dimension dominates; and adding dense layers increases parameters. GAP attacks the cause by removing the spatial dimensions before the dense layer.</>}
+        stretch={<>After switching to GAP, would the same dropout still be necessary, and why or why not?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="gap-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why a GAP head accepts variable input sizes"
+        scenario={<>A teammate notices that after switching to a GAP head, the same network runs on 224x224 and 320x320 images without changing the classifier, whereas the old flatten+dense head required a fixed size. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`larger input -> larger final spatial map (e.g. 7x7 vs 10x10)
+flatten: dense input dim changes with spatial size
+GAP: averages each channel regardless of spatial size
+what does the dense layer see in each case?`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "GAP outputs one value per channel for any spatial size, so the dense input dim is fixed at the channel count.", correct: true },
+          { key: "b", text: "GAP resizes every feature map to 7x7 first, so the dense layer always sees the same flattened length.", correct: false },
+          { key: "c", text: "The network internally crops larger inputs back to 224x224, so the spatial size never actually varies.", correct: false },
+          { key: "d", text: "The dense layer pads its input with zeros to a fixed length, so any spatial size maps to the same dimension.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) GAP averages, it does not resize to a fixed grid. (c) no internal cropping; the conv trunk processes the larger map. (d) there is no zero-padding trick; GAP simply removes the spatial axis.</>}
+        lens={<>A larger input produces a larger final spatial map, which is why a flatten+dense head breaks: its input dimension is H*W*C and changes with spatial size. GAP averages each channel's whole map to a single number no matter how big that map is, so its output is always a C-length vector and the following dense layer's input dimension is fixed at the channel count. There is no resizing to a canonical grid, no internal crop, and no zero-padding &mdash; the spatial axis is simply integrated away by averaging, which is precisely what decouples the head from input resolution.</>}
+        stretch={<>If you wanted dense prediction (per-pixel output) instead of a single label, why would GAP be the wrong head?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="gap-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Why fewer head params can raise test accuracy"
+        scenario={<>A teammate is surprised that replacing a 100M-param flatten+dense head with a 2M-param GAP head improved validation accuracy, expecting that removing capacity should only hurt. Predict the non-obvious reason accuracy went up.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`flatten+dense head: ~100M params, memorizes spatial coordinates
+GAP head: ~2M params, averages out spatial position
+training set: limited size
+what does the smaller head trade away, and gain?`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "The huge head overfit by memorizing position-specific patterns; GAP's averaging is a strong regularizer.", correct: true },
+          { key: "b", text: "GAP increases the network's total capacity, so more capacity is what raised the validation accuracy here.", correct: false },
+          { key: "c", text: "The flatten head was simply too slow to train fully, so GAP only helped by letting training finish in time.", correct: false },
+          { key: "d", text: "Smaller heads always beat larger ones on any dataset, so the result holds regardless of training set size.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) GAP reduces, not increases, capacity; that is the point. (c) the gain is generalization, not training-time budget. (d) the benefit is data-dependent; with enough data a larger head could compete.</>}
+        lens={<>A 100M-parameter flatten+dense head can memorize where features appear, fitting position-specific noise in a limited training set and overfitting. GAP averages each channel over all positions, so it cannot encode exact spatial coordinates &mdash; it is a strong structural regularizer that forces the head to rely on overall feature presence. With limited data, removing that excess capacity reduces overfitting more than it reduces useful capacity, so validation accuracy rises. This is a generalization gain, not extra capacity or merely faster training, and it is contingent on the data regime: with vastly more data the gap would narrow.</>}
+        stretch={<>For a task where the position of a feature is itself the signal, why might GAP hurt?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="gap-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Wiring a GAP classifier head"
+        scenario={<>You are building a classifier head on top of a trunk that emits a 14x14x1280 feature map for a 100-class problem. Pick the soundest head.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`trunk output: 14x14x1280
+classes: 100
+build the head`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "GAP to a 1280-vector, then a 1280-to-100 dense layer producing the class logits.", correct: true },
+          { key: "b", text: "Flatten to 14*14*1280, then a dense layer to 100, since flattening preserves all the spatial information.", correct: false },
+          { key: "c", text: "GAP to a 1280-vector, then reshape it back to 14x14 before a dense layer, to keep a spatial map for the FC.", correct: false },
+          { key: "d", text: "Apply a 100-channel 1x1 conv, then flatten the 14x14x100 map straight into the 100 logits without pooling.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) flattening reintroduces the ~250K-input dense layer this design avoids. (c) GAP already removed the spatial dims; reshaping back is meaningless. (d) flattening 14x14x100 again gives a 19,600-input dense layer, defeating the purpose.</>}
+        lens={<>The GAP head averages the 14x14x1280 map to a 1280-length vector, then a single 1280-to-100 dense layer maps it to the class logits &mdash; a head with about 128K weights instead of the millions a flatten would produce. Flattening to 14*14*1280 reintroduces the huge dense matrix GAP exists to avoid, reshaping a GAP output back to a grid is incoherent since the spatial axis is already gone, and flattening even a 100-channel 1x1-conv output still yields a large dense input. The canonical, parameter-light head is GAP followed by one small FC.</>}
+        stretch={<>How does this head's parameter count change if the trunk's channel count doubles to 2560?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="gap-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — The averaged-away localization"
+        scenario={<>A teammate uses a GAP-headed classifier as the backbone for a task that must report WHERE in the image an object is, and finds the model can say what is present but not where. They blame the conv trunk. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: report object location
+head: GAP -> dense (classification)
+GAP averages each channel over all positions
+what happens to spatial information at the head?`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "GAP averages away spatial position, so the head discards location; a head that preserves space is needed.", correct: true },
+          { key: "b", text: "The conv trunk is too shallow to encode position, so deepening the trunk is what restores localization.", correct: false },
+          { key: "c", text: "GAP is fine for localization, so the missing location must be a labeling bug in the training data.", correct: false },
+          { key: "d", text: "Average pooling should be swapped for max pooling, since the maximum preserves the object's coordinates.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) the trunk does encode position in its spatial map; GAP is what throws it away. (c) GAP genuinely removes location, so it is not a data bug. (d) global max pooling also discards coordinates; it keeps the peak value, not its location.</>}
+        lens={<>By averaging each channel over every spatial position, GAP collapses the feature map to a per-channel vector and so deliberately discards where features occur &mdash; it answers what is present, not where. The conv trunk still holds spatial information in its 2D feature maps; the loss happens at the GAP head. For localization or detection you keep the spatial map and use a head that preserves it (e.g. dense per-position prediction or detection heads). Global max pooling would not help, since it too reduces each channel to a single value and drops the coordinates of the peak.</>}
+        stretch={<>What lightweight technique recovers approximate localization from a GAP-trained classifier without retraining the trunk?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://arxiv.org/abs/1312.4400" target="_blank" rel="noopener">
+            <strong>Network in Network (global average pooling)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(per-channel spatial averaging, removing the dense head, regularization)</span>
+          <br/>Introduces global average pooling as a replacement for fully connected classifier heads, motivating the parameter and overfitting reductions later adopted by ResNet and Inception.
         </li>
       </ul>
     </VIS.Section>

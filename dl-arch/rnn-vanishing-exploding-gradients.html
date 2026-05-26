@@ -2167,295 +2167,268 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: VANISHING VS EXPLODING GRADIENTS IN RNNs.
+// Delta: both pathologies come from repeated multiplication by the recurrent weight W_h during BPTT. If W_h's largest
+//   singular value is < 1 the gradient shrinks geometrically (VANISHING); if > 1 it grows geometrically (EXPLODING). The
+//   two have DIFFERENT fixes: gradient clipping caps exploding magnitudes (preserving direction), while gated cells
+//   (LSTM/GRU) provide an additive path that mitigates vanishing -- clipping does NOT fix vanishing, and gating is not what
+//   stops explosion. Diagram shows the singular-value-to-the-power-T arithmetic and the two regimes SETUP only; it never
+//   prints which fix maps to which failure as a stated conclusion.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
       pill="DL"
-      title="GELU: The Transformer Activation"
+      title="Vanishing vs Exploding Gradients"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "RNN / LSTM / GRU" },
+        { label: "Subtopic", value: "Repeated multiplication by W_h shrinks gradients when its largest singular value is below 1 (vanishing) or blows them up when above 1 (exploding); gradient clipping fixes explosions, gated cells (LSTM/GRU) mitigate vanishing" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>In an RNN, the gradient propagated back through time is repeatedly multiplied by the recurrent weight W_h, so
+      its magnitude is governed by W_h's{" "}
+      <VIS.Term def="The largest singular value of a matrix sets the maximum factor by which it can stretch a vector. For the recurrent Jacobian it controls whether repeated multiplication shrinks or grows the gradient.">largest singular value</VIS.Term> raised
+      to the number of steps.</strong>{" "}
+      When that value is below 1 the gradient decays geometrically toward zero &mdash;{" "}
+      <VIS.Term def="The gradient reaching early timesteps becomes vanishingly small, so the network cannot learn long-range dependencies. Caused by a recurrent scale below 1 over many steps.">vanishing gradients</VIS.Term> &mdash;
+      and early timesteps stop learning; when it is above 1 the gradient grows without bound &mdash;{" "}
+      <VIS.Term def="The gradient grows geometrically over timesteps, producing huge or NaN updates that derail training. Caused by a recurrent scale above 1.">exploding gradients</VIS.Term>.
+      Crucially the two have different remedies: gradient clipping caps the norm of an exploding gradient while keeping its
+      direction, and gated cells like LSTM and GRU add a near-identity path that lets gradients flow without geometric
+      decay, mitigating vanishing. The failure modes: thinking one fix solves both, applying clipping to a vanishing
+      gradient (it does nothing), expecting gating to stop explosions, and conflating the two pathologies as a single
+      problem when they sit on opposite sides of 1.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Why one matrix controls both pathologies">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        A teammate sees an RNN whose early-timestep gradients are essentially zero on one run, and whose loss spikes to NaN
+        on another, and assumes these are two unrelated bugs needing the same fix. Before reading on, work out how repeated
+        multiplication by the recurrent weight produces both behaviors, and why the appropriate remedy differs between them.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`gradient back through T steps ~ (W_h-related scale)^T
+let sigma = largest singular value of the recurrent Jacobian
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
+  sigma < 1  ->  sigma^T -> 0     (one regime)
+  sigma > 1  ->  sigma^T -> big   (other regime)
 
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+two regimes, one matrix -- do they share a fix?`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
+        Note that the same scale sigma drives both regimes depending on whether it is below or above 1. Derive why capping a
+        magnitude helps one case but not the other.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the two regimes and their fixes">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exploding case: sigma = 1.1, T = 100
+  1.1^100 ~ 13,780x  -> NaN-prone
+  fix: clip global grad norm to tau = 5
+       g <- g * tau / ||g||   (caps size, keeps direction)
 
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
+vanishing case: sigma = 0.9, T = 100
+  0.9^100 ~ 2.7e-5   -> early steps get almost no signal
+  clipping a near-zero gradient does... nothing useful
+  fix: a gated cell with an additive path (LSTM/GRU)
 
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
+which fix matches which regime?`}</pre>
       <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        In the exploding case the gradient grows about 1.1^100 ~ 13,780-fold, so clipping the global norm to a threshold
+        rescales it back to a safe size while preserving its direction. In the vanishing case the gradient has already shrunk
+        to about 0.9^100 ~ 2.7e-5; clipping a tiny gradient changes nothing, so the remedy is structural &mdash; a gated cell
+        whose additive path lets the gradient flow without the geometric decay. (Why clipping is direction-preserving, and
+        why gating creates a near-identity path, is unpacked in the drill lenses.)
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-contrast" title="Beat 3 — Two pathologies, two fixes">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of RNN gradients</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Shared cause</td><td>Repeated multiplication by the recurrent weight over time</td></tr>
+          <tr><td>Vanishing regime</td><td>Largest singular value below 1; gradient decays geometrically</td></tr>
+          <tr><td>Exploding regime</td><td>Largest singular value above 1; gradient grows geometrically</td></tr>
+          <tr><td>Matching fixes</td><td>Clipping for explosion; gated cells (LSTM/GRU) for vanishing</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Opposite sides of one">
+        Vanishing and exploding gradients are the same geometric mechanism on opposite sides of a singular value of 1, so
+        they cannot share a fix. Clipping bounds a runaway magnitude but does nothing to a gradient that has already shrunk
+        to near zero; gated cells open an additive, near-identity path that preserves gradient flow but do not, by
+        themselves, cap an explosion. Diagnosing which side of 1 you are on tells you which remedy applies.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>repeated multiplication by W_h drives gradients to zero (singular
+        value below 1, vanishing) or to infinity (above 1, exploding); clipping fixes explosion, gated cells mitigate
+        vanishing.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="veg-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What distinguishes the two regimes"
+        scenario={<>A teammate says vanishing and exploding gradients are "two names for the same instability." Pick the statement that correctly distinguishes them.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`gradient scale ~ sigma^T, sigma = largest singular value of W_h Jacobian
+sigma < 1 vs sigma > 1
+what separates the two cases?`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "Vanishing is the recurrent scale below 1 shrinking gradients; exploding is the scale above 1 growing them.", correct: true },
+          { key: "b", text: "They are identical: both are just the gradient norm becoming unstable, with no meaningful distinction.", correct: false },
+          { key: "c", text: "Vanishing happens in the forward pass and exploding in the backward pass, so they affect different tensors.", correct: false },
+          { key: "d", text: "Vanishing is caused by a too-large learning rate and exploding by a too-small one, set by the optimizer.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) they are opposite regimes, not the same. (c) both are backward-pass gradient effects, not split across passes. (d) neither is set by the learning rate; the recurrent scale drives both.</>}
+        lens={<>The two pathologies are opposite cases of the same geometric mechanism: the gradient propagated back through time scales like the recurrent Jacobian's largest singular value raised to the number of steps. Below 1 that power drives the gradient toward zero (vanishing), so early timesteps stop learning; above 1 it grows without bound (exploding), producing huge or NaN updates. They are not a single undifferentiated instability, not split between forward and backward passes, and not artifacts of the learning rate &mdash; the side of 1 the singular value falls on is what decides which you face.</>}
+        stretch={<>What happens to the gradient if the largest singular value is almost exactly 1?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="veg-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — What each fix targets"
+        scenario={<>A teammate claims "gradient clipping and LSTMs both solve the vanishing-gradient problem." Pick the statement that correctly maps fixes to pathologies.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`fix 1: clip the gradient norm to a threshold
+fix 2: use a gated cell (LSTM/GRU)
+which fix targets exploding, which vanishing?`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "Clipping targets exploding gradients by capping magnitude; gated cells target vanishing via an additive path.", correct: true },
+          { key: "b", text: "Both fixes target vanishing gradients, so clipping and gated cells are interchangeable remedies for it.", correct: false },
+          { key: "c", text: "Clipping targets vanishing by boosting small gradients; gated cells target exploding by bounding large ones.", correct: false },
+          { key: "d", text: "Both fixes target exploding gradients, and vanishing is left unaddressed by either of these techniques.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) clipping does nothing for vanishing. (c) clipping only shrinks large gradients; it never boosts small ones, and gating addresses vanishing not explosion. (d) gated cells specifically address vanishing.</>}
+        lens={<>Gradient clipping rescales an over-large gradient back below a threshold, so it directly addresses exploding gradients while preserving direction &mdash; but it can only shrink magnitudes, never amplify a gradient that has already vanished, so it does nothing for vanishing. Gated cells like LSTM and GRU introduce an additive, near-identity path for the cell state that lets gradients flow over many steps without geometric decay, which mitigates vanishing. The two fixes are not interchangeable: each targets one side of the singular-value-1 boundary.</>}
+        stretch={<>Why can a fix that only caps magnitude never repair a gradient that has decayed to near zero?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="veg-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Early steps that never learn"
+        scenario={<>An RNN trains stably (no spikes) but cannot learn dependencies more than a few dozen steps back; the recurrent Jacobian's largest singular value is around 0.9. A teammate proposes adding gradient clipping. Pick the soundest fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptom: long-range learning fails, training stable
+largest singular value ~ 0.9
+gradient to far steps ~ 0.9^T -> tiny`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Switch to a gated cell (LSTM/GRU) whose additive path preserves gradient flow over many steps.", correct: true },
+          { key: "b", text: "Add gradient clipping, since capping the gradient norm is what restores the lost long-range learning signal.", correct: false },
+          { key: "c", text: "Raise the learning rate sharply, since a bigger step compensates for the gradient having shrunk to near zero.", correct: false },
+          { key: "d", text: "Reduce the sequence length seen in training, since shorter sequences make the long-range failure irrelevant.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) clipping only shrinks large gradients; the gradient here is already tiny. (c) a huge learning rate amplifies noise and destabilizes; it does not recover lost long-range signal. (d) shortening sequences dodges the task rather than fixing the model.</>}
+        lens={<>A largest singular value around 0.9 means the gradient to distant timesteps decays like 0.9^T to near zero, so the model gets almost no signal for long-range dependencies &mdash; classic vanishing, consistent with the stable (non-spiking) training. The structural fix is a gated cell whose additive cell-state path lets gradients flow over many steps without geometric decay. Gradient clipping only caps large magnitudes and cannot revive a vanished gradient; cranking the learning rate amplifies noise without restoring the missing long-range signal; and shortening sequences abandons the task instead of enabling it.</>}
+        stretch={<>If instead the singular value were 1.2 and training spiked, which fix would you reach for first?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="veg-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why clipping preserves direction"
+        scenario={<>A teammate worries that clipping the gradient norm will point the optimizer in the wrong direction. Pick the explanation for what norm-clipping actually does.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`if ||g|| > tau:
+  g <- g * (tau / ||g||)
+else:
+  g unchanged
+what does this transform do to g?`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "It rescales the whole gradient vector by a positive scalar, shrinking its length but keeping its direction.", correct: true },
+          { key: "b", text: "It zeroes out the largest components of the gradient, which changes the direction it points the optimizer.", correct: false },
+          { key: "c", text: "It clips each coordinate independently to tau, which can rotate the gradient away from its true direction.", correct: false },
+          { key: "d", text: "It flips the sign of the gradient when the norm is exceeded, reversing the update to undo the overshoot.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) norm-clipping scales the whole vector; it does not drop components. (c) that describes per-coordinate (value) clipping, which can change direction; norm-clipping does not. (d) it never flips the sign.</>}
+        lens={<>Global norm clipping multiplies the entire gradient vector by the positive scalar tau/||g|| whenever its norm exceeds tau, which shrinks the vector's length to tau while leaving its direction unchanged &mdash; every component is scaled by the same factor. So the optimizer still steps in the true descent direction, just with a bounded magnitude, which is exactly what you want for an exploding gradient. This is different from per-coordinate value clipping, which truncates each component separately and can rotate the gradient; norm-clipping is the direction-preserving variant, and it never zeroes components or flips signs.</>}
+        stretch={<>How would per-coordinate value clipping differ in its effect on the gradient direction?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="veg-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Clipping that quietly did nothing"
+        scenario={<>A teammate adds gradient clipping to an RNN that suffers vanishing gradients, observes that training looks unchanged, and concludes clipping is broken in their framework. Predict the non-obvious explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`problem: vanishing gradients (sigma < 1)
+gradient norms: already far below the clip threshold tau
+added: clip to tau
+observed: no change in training`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "The gradients are already below tau, so the clip never triggers; clipping cannot help a vanishing gradient.", correct: true },
+          { key: "b", text: "The clipping implementation is buggy, since correctly applied clipping should always change vanishing training.", correct: false },
+          { key: "c", text: "The threshold tau is set too high, so lowering it will let clipping finally cure the vanishing gradients.", correct: false },
+          { key: "d", text: "Clipping silently amplifies small gradients, so the lack of change means the amplification factor was too weak.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) the framework is fine; clipping simply has nothing to clip. (c) lowering tau cannot help; the gradient is small, and shrinking it further would only hurt. (d) clipping never amplifies; it only caps.</>}
+        lens={<>Clipping only acts when the gradient norm exceeds the threshold tau. With vanishing gradients the norms are already far below tau, so the clip condition never fires and training is byte-for-byte unchanged &mdash; the tool is working correctly, it simply has nothing to do. Lowering tau cannot help because clipping can only shrink, never grow, a gradient, and shrinking an already-tiny gradient would make matters worse. The mismatch is conceptual: clipping is the exploding-gradient remedy, while vanishing requires a structural change such as a gated cell.</>}
+        stretch={<>What observable signal would have told the teammate they had a vanishing rather than an exploding problem?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="veg-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Setting up a stable RNN training run"
+        scenario={<>You are setting up training for an RNN on long sequences and want to guard against both pathologies up front. Pick the soundest combination of measures.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`risks: vanishing (long-range) AND exploding (spikes)
+levers: gated cell, gradient clipping, both, neither
+choose a combination`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Use a gated cell for vanishing and add gradient clipping for spikes, since the two risks need different remedies.", correct: true },
+          { key: "b", text: "Use only gradient clipping, since capping the gradient norm guards against both vanishing and exploding at once.", correct: false },
+          { key: "c", text: "Use only a gated cell, since LSTMs eliminate exploding gradients entirely, making clipping redundant always.", correct: false },
+          { key: "d", text: "Use neither and just lower the learning rate, since a small enough step controls both pathologies together.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) clipping does not address vanishing. (c) gated cells mitigate vanishing but do not by themselves prevent all explosions; clipping is still common with LSTMs. (d) a small LR slows training and does not cure vanishing's lost signal.</>}
+        lens={<>The two risks have different remedies, so guarding against both means combining them: a gated cell (LSTM/GRU) provides the additive path that mitigates vanishing and enables long-range learning, while gradient clipping caps any remaining magnitude spikes &mdash; which is why clipping is still standard practice even with LSTMs and large Transformers. Clipping alone leaves vanishing unaddressed, a gated cell alone does not guarantee against explosions, and simply lowering the learning rate slows training without restoring the long-range signal that vanishing destroys.</>}
+        stretch={<>Why is gradient clipping still recommended even when training an LSTM rather than a vanilla RNN?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="veg-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — One fix applied to the wrong pathology"
+        scenario={<>A teammate's RNN loss spikes to NaN during training. They respond by switching from a vanilla RNN to an LSTM but keep no gradient clipping, and the occasional NaN spikes persist. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptom: NaN loss spikes (exploding)
+applied fix: vanilla RNN -> LSTM, no clipping
+result: spikes still occur occasionally`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "Gating mitigates vanishing, not explosions, so the spikes need gradient clipping regardless of the cell type.", correct: true },
+          { key: "b", text: "The LSTM must be misconfigured, since a correctly built LSTM removes exploding gradients on its own entirely.", correct: false },
+          { key: "c", text: "The remaining spikes prove the data is corrupt, since an LSTM would otherwise eliminate all NaN losses fully.", correct: false },
+          { key: "d", text: "The hidden state is too small for the LSTM, so widening it is what will finally stop the NaN loss spikes.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) a correct LSTM still does not guarantee against explosions; gating addresses vanishing. (c) the spikes point to exploding gradients, not corrupt data. (d) hidden width does not control the exploding mechanism.</>}
+        lens={<>Switching to an LSTM addresses vanishing gradients via its additive cell-state path, but it does not by itself prevent exploding gradients &mdash; the recurrent dynamics can still produce large gradient norms, so NaN spikes persist when clipping is absent. The remedy for explosions is gradient clipping, which is independent of cell type and remains standard practice with LSTMs. The continuing spikes are not evidence of a misconfigured LSTM, corrupt data, or an undersized hidden state; they are the expected result of treating an exploding-gradient symptom with a vanishing-gradient remedy. Add clipping.</>}
+        stretch={<>Conversely, if an LSTM still failed at very long-range dependencies, would adding clipping help, and why or why not?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://arxiv.org/abs/1211.5063" target="_blank" rel="noopener">
+            <strong>On the Difficulty of Training Recurrent Neural Networks</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(spectral radius, vanishing/exploding analysis, gradient clipping)</span>
+          <br/>Pascanu et al. analyze why repeated multiplication by the recurrent weight causes vanishing and exploding gradients, and introduce gradient norm clipping for the exploding case.
         </li>
       </ul>
     </VIS.Section>

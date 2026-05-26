@@ -2167,295 +2167,271 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: CENTRALIZING FEATURES SO TRAINING AND SERVING READ THE SAME VALUES (Applied / Prime Video).
+// Delta: a feature store materializes a feature ONCE and serves it to BOTH offline training and online inference, with
+//   an offline store (historical, point-in-time) and an online store (low-latency, current). Two wins: (1) eliminates
+//   skew by construction — both read the same materialized value; (2) reuse — many teams read one canonical feature
+//   instead of each re-deriving a slightly different one. It is NOT a model store, NOT a cache. Diagrams show SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="Applied"
+      title="Centralizing Features So Training and Serving Read the Same Values"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Feature Engineering at Scale" },
+        { label: "Subtopic", value: "A feature store materializes features once and serves them to both training and inference, eliminating skew and letting teams reuse features instead of re-deriving them" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>A feature store computes a feature once and hands the same materialized value to both training and
+      serving.</strong>{" "}
+      It has two faces: an <em>offline store</em> that serves historical, point-in-time-correct values for building
+      training sets, and an <em>online store</em> that serves the current value at low latency for inference. This buys
+      two things. First, skew is removed by construction: training and serving read the <em>same</em> stored value
+      rather than two re-implementations that can drift. Second, reuse: many teams read one canonical
+      "user 30-day genre affinity" instead of each deriving its own slightly different version. The failure mode is
+      treating the store as a cache or a model registry, or expecting the online store to answer historical questions
+      &mdash; each face exists for a different read pattern, and confusing them reintroduces the skew the store removes.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — One value, two read patterns">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        A feature store materializes a feature and exposes it through two interfaces. Notice that the same logical
+        feature is read differently by training and by serving, but it is the same value lineage.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`feature: "user 30-day genre affinity"
+materialized once by a single pipeline
+        |
+        +--> offline store: historical, point-in-time  (training reads)
+        +--> online store : current value, low latency  (serving reads)
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
-
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+both faces derive from the same materialized feature definition`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
+        Training needs the value as it was at past prediction times; serving needs the value as of now, fast. The store
+        answers both from one definition, so the model trains and is scored on the same feature lineage &mdash; the
+        defining benefit of a <VIS.Term def="A system that materializes features once and serves them to both training and inference through an offline (historical) and an online (low-latency current) interface.">feature store</VIS.Term>.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
+    <VIS.Section id="sec-worked" title="Beat 2 — Two teams, one feature">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`without a store:
+  ranking team:       derives genre-affinity its own way
+  notifications team: derives genre-affinity its own way
+  -> two slightly different vectors, two chances to skew
 
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
+with a store:
+  one pipeline materializes genre-affinity
+  ranking + notifications both READ the same vector
+  -> one definition, reused, no per-team drift`}</pre>
       <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Centralizing the feature gives every consumer the identical value and removes the duplicated derivation work.
+        The store is the single source for that feature, so a fix or improvement to its definition propagates to all
+        readers at once instead of being re-patched in each team's pipeline. Reuse and skew-elimination are the same
+        mechanism seen from two angles.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What the store is and is not">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Read pattern</th><th>Right interface</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Build a training set with past values</td><td>Offline store &mdash; historical, point-in-time</td></tr>
+          <tr><td>Score a live request right now</td><td>Online store &mdash; current value, low latency</td></tr>
+          <tr><td>Reuse a feature across many teams</td><td>The shared materialized definition</td></tr>
+          <tr><td>Store trained model artifacts</td><td>Model registry &mdash; not the feature store</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Same stored value is the skew guarantee">
+        The feature store removes skew not by enforcing matching code but by making training and serving read the same
+        materialized value. The offline face answers historical questions and the online face answers current ones, but
+        both descend from one feature definition, so reuse across teams and parity across paths come from the same
+        centralization.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>a feature store materializes a feature once and serves the
+        same value to training (offline, historical) and serving (online, current), removing skew and enabling reuse
+        across teams.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="fs-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What a feature store is"
+        scenario={<>A teammate says "a feature store is just a cache that speeds up feature lookups at serving." Pick the statement that correctly describes it.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`materialize once -> offline + online faces
+what is this system?`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "A system that materializes a feature once and serves the same value to both training and online inference.", correct: true },
+          { key: "b", text: "A serving-side cache only, since its entire purpose is to make online feature reads faster under latency budgets.", correct: false },
+          { key: "c", text: "A registry of trained models, since centralizing artifacts is what lets teams share and reuse production models.", correct: false },
+          { key: "d", text: "A logging system for predictions, since recording model outputs is how a team keeps training and serving aligned.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) a cache is only the online face; the store also serves historical training reads. (c) that describes a model registry. (d) prediction logging is a different mechanism.</>}
+        lens={<>A feature store materializes each feature once and exposes it through an offline interface for historical training reads and an online interface for low-latency serving reads, so both consume the same value lineage. Calling it a cache captures only the online face and misses the historical training role and the skew guarantee. It is not a model registry or a prediction log; those store different objects for different purposes.</>}
+        stretch={<>Which face of the store does a nightly training job read, and why not the online one?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="fs-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — Offline store versus online store"
+        scenario={<>A teammate thinks the offline and online stores hold unrelated data. Pick the statement that correctly relates them.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`offline: historical, point-in-time
+online: current, low latency
+relationship?`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "Both serve the same feature definition; offline returns past point-in-time values, online returns the current one.", correct: true },
+          { key: "b", text: "They hold unrelated features, so a feature in the online store need not exist in the offline store at all.", correct: false },
+          { key: "c", text: "The online store holds history and the offline store holds the current value, optimized for fast live reads.", correct: false },
+          { key: "d", text: "They are identical copies, so a training job could read the online store and get the same historical values.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) both faces descend from the same definition. (c) reverses the roles of the two stores. (d) the online store holds current values, not history, so training cannot use it for past values.</>}
+        lens={<>The offline and online stores are two access patterns over the same feature definition: the offline store returns historical, point-in-time-correct values for building training sets, while the online store returns the current value at serving latency. They are neither unrelated nor interchangeable, the online store cannot answer "what was this value last April," which is exactly why training reads offline and serving reads online.</>}
+        stretch={<>What goes wrong if you build a training set by reading the online store?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
-        difficulty="hard"
+        id="fs-b1"
+        difficulty="medium"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Two teams keep disagreeing"
+        scenario={<>The ranking and notifications teams each compute "30-day genre affinity" in their own pipeline and their numbers never match, causing inconsistent behavior. Pick the soundest fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`team A vector != team B vector
+same feature name, two pipelines`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Materialize the feature once in a shared store and have both teams read it instead of each deriving it.", correct: true },
+          { key: "b", text: "Have both teams copy team A's pipeline code, since duplicating the better implementation will align the values.", correct: false },
+          { key: "c", text: "Average the two teams' vectors at read time, since a blend of both definitions is closer to the true affinity.", correct: false },
+          { key: "d", text: "Let each team keep its own version, since a feature meaning slightly different things per team is acceptable.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
+        trap={<>(b) duplicated code drifts again over time. (c) averaging two wrong definitions does not create one correct one. (d) inconsistent meaning is the problem, not an acceptable state.</>}
+        lens={<>Centralizing the feature in a store so it is materialized once and read by both teams gives a single canonical value, eliminating the per-team drift and the duplicated derivation. Copying code reintroduces two implementations that diverge again, averaging conflates two definitions, and tolerating per-team versions is the inconsistency itself. The store turns a reuse and a consistency problem into one solved by a single definition.</>}
+        stretch={<>Once centralized, how does a fix to the feature definition reach both teams?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-b2"
+        id="fs-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
+        title="B2 — Reading the wrong face"
+        scenario={<>An engineer builds a training set by querying the online store for each historical example's feature value. Offline metrics look unusually strong. Pick the soundest assessment.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`training set built from ONLINE store (current values)
+labels are from the past
+offline metric: unusually strong`}</pre>}
         options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
+          { key: "a", text: "The online store gives current values, so past labels were paired with future feature values and leaked.", correct: true },
+          { key: "b", text: "The strong metric is trustworthy, since the online store is the freshest and most accurate source available.", correct: false },
+          { key: "c", text: "The choice is harmless, since the online and offline stores always return the same value for any given entity.", correct: false },
+          { key: "d", text: "The metric is strong because online reads are faster, so the training job simply saw more examples per hour.", correct: false },
         ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) freshness is the bug here, not a virtue, for historical rows. (c) the online store does not return historical values. (d) read speed does not change the metric.</>}
+        lens={<>The online store returns the value as of now, so attaching it to a past label pairs each example with feature information that did not exist at prediction time, a leakage that inflates offline metrics and collapses online. The offline store exists precisely to return point-in-time-correct historical values for training. Using the wrong face reintroduces exactly the skew and leakage the store is meant to prevent, which the suspiciously strong offline number is a symptom of.</>}
+        stretch={<>What property of the offline store prevents this leak that the online store cannot?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="fs-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why the store removes skew"
+        scenario={<>A teammate asks how a feature store guarantees parity better than carefully sharing transformation code. Pick the correct mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`shared code: same logic, two executions
+feature store: same materialized value, two reads`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "Both paths read one stored value rather than recomputing it, so there is no second execution that can diverge.", correct: true },
+          { key: "b", text: "The store rewrites the model so it becomes insensitive to feature values, removing skew at the model level.", correct: false },
+          { key: "c", text: "The store runs training and serving on identical hardware, so numerical differences between paths disappear.", correct: false },
+          { key: "d", text: "The store deletes one of the two code paths, so only the serving path remains and training reuses its outputs.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) the store does not alter the model. (c) hardware is not the mechanism. (d) training does not reuse the serving path; both read a materialized value.</>}
+        lens={<>Sharing transformation code still executes that code twice, in batch and online, leaving room for input or environment differences to diverge. A feature store materializes the value once and both training and serving simply read that stored value, so there is no second computation to drift. Parity becomes a read of a single artifact rather than agreement between two executions, which is a stronger guarantee than shared logic alone.</>}
+        stretch={<>Where can skew still creep in even with a feature store, and how is it bounded?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="fs-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — The store that slowed everyone down"
+        scenario={<>A team adopts a feature store but points every online request at the offline historical store for "consistency." Latency spikes and a teammate concludes feature stores are inherently slow. Predict the non-obvious implication.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`online requests -> OFFLINE store (historical, slow)
+latency spikes
+claim: "feature stores are slow"`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "Serving was routed to the historical face, so the latency is a misuse, not a property of feature stores.", correct: true },
+          { key: "b", text: "Feature stores are inherently slow, since centralizing features always adds a network hop that dominates latency.", correct: false },
+          { key: "c", text: "The fix is to drop the store, since any system serving both training and inference cannot meet a latency budget.", correct: false },
+          { key: "d", text: "The store needs more replicas, since the only way to speed up historical reads is to scale them horizontally.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) the slowness comes from using the wrong face, not from the store concept. (c) the online face is built for low latency; dropping the store is overcorrection. (d) the issue is routing to the historical store, not replica count.</>}
+        lens={<>The latency spike comes from serving live requests against the offline historical store, which is optimized for large point-in-time joins, not millisecond reads. Routing serving to the online store, which is built for low latency, restores speed while preserving the same feature definition. The lesson is that the two faces have different read patterns; using the historical face for live serving is a misuse, not evidence that feature stores are slow.</>}
+        stretch={<>What read pattern distinguishes the online store's design from the offline store's?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="fs-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — When a store is worth it"
+        scenario={<>A small team has one model and one feature used only by that model. Pick the soundest stance on adopting a full feature store.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`one model, one feature, one consumer
+question: adopt a full feature store now?`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Weigh it against the cost: a store pays off most with many features or consumers, less for a single isolated one.", correct: true },
+          { key: "b", text: "Adopt it immediately, since every model regardless of scale strictly requires a feature store to function safely.", correct: false },
+          { key: "c", text: "Never adopt one, since feature stores are only marketing and add no real parity or reuse benefit at any scale.", correct: false },
+          { key: "d", text: "Adopt it only after a skew incident, since there is no way to anticipate parity needs before one actually occurs.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) a full store is overhead for a single isolated feature. (c) denies the genuine parity and reuse benefits at scale. (d) parity needs are predictable from scale, not only after an incident.</>}
+        lens={<>A feature store's payoff scales with the number of features and consumers it deduplicates and the skew it prevents across paths. For a single feature used by one model, the parity benefit can be met with a shared transform and a parity test, and the store's operational overhead may not be justified yet. The senior judgment is to match the investment to the breadth of reuse and the skew risk, not to adopt or reject it categorically.</>}
+        stretch={<>At what point in feature or team count does the store's overhead clearly pay for itself?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="fs-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — Stale online features"
+        scenario={<>A store is in place, but the pipeline that refreshes the online store fails silently for a day, so serving reads day-old values while training reads fresh offline ones. Online quality drops. A teammate blames the model. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`online store refresh: failed silently (1 day stale)
+offline store: fresh
+serving reads stale -> online quality drops`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "A stale online store made serving read outdated values, so it is a freshness skew, not a model defect.", correct: true },
+          { key: "b", text: "The model is broken, since a feature store eliminates all skew and any drop must come from the model itself.", correct: false },
+          { key: "c", text: "The offline store is wrong, since training should have matched the stale online values to keep the two aligned.", correct: false },
+          { key: "d", text: "The latency budget is exceeded, since stale values are only ever caused by the online store responding too slowly.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) a store removes recomputation skew but not freshness failures of its own pipeline. (c) training should use fresh point-in-time values, not match a stale bug. (d) staleness is a refresh failure, not a latency issue.</>}
+        lens={<>A feature store removes skew from divergent recomputation, but it introduces a new dependency: the pipeline that keeps the online store fresh. When that refresh fails silently, serving reads stale values while training reads correct ones, producing a freshness skew that degrades online quality. The fix is monitoring and alerting on online-store freshness, not blaming the model. The store changes the failure mode from code drift to pipeline-freshness gaps that must be watched.</>}
+        stretch={<>What freshness SLA and alarm would have caught the silent refresh failure within minutes?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <strong>Feature stores: offline and online serving for training-serving consistency</strong>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(materialize once, point-in-time offline reads, low-latency online reads, feature reuse)</span>
+          <br/>Covers how a single materialized feature served to both training and inference removes skew and enables cross-team reuse, plus the freshness dependencies it introduces.
         </li>
       </ul>
     </VIS.Section>

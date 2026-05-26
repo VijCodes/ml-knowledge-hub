@@ -2167,295 +2167,266 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: VANILLA RNN HIDDEN-STATE RECURRENCE.
+// Delta: an RNN carries a hidden state h_t = tanh(W_x x_t + W_h h_{t-1} + b), reusing the SAME weights at every timestep.
+//   Two consequences candidates conflate: (1) weight sharing across time means the param count is independent of sequence
+//   length T (it handles variable-length input), but (2) the recurrence makes h_t depend on h_{t-1}, so timesteps must be
+//   computed in order -- it cannot parallelize over t. Diagram shows the recurrence equation and the unrolled chain SETUP
+//   only; it never prints "params independent of T" or "cannot parallelize" as a stated conclusion.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
       pill="DL"
-      title="GELU: The Transformer Activation"
+      title="RNN Hidden-State Recurrence"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "RNN / LSTM / GRU" },
+        { label: "Subtopic", value: "An RNN updates h_t = tanh(W_x x_t + W_h h_{t-1} + b), reusing the same weights across time so it handles variable-length sequences; the recurrence couples all timesteps, which is also why it cannot parallelize over t" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>A vanilla RNN maintains a{" "}
+      <VIS.Term def="A vector that summarizes everything the network has seen so far in the sequence. It is updated at each timestep and passed forward to the next, carrying context through time.">hidden state</VIS.Term> updated
+      by h_t = tanh(W_x x_t + W_h h_(t-1) + b), applying the <em>same</em> weight matrices W_x, W_h and bias b at every
+      timestep.</strong>{" "}
+      <VIS.Term def="The same weight matrices are applied at every timestep instead of learning separate weights per position. This is what makes the param count independent of sequence length.">Sharing weights across time</VIS.Term> means
+      the parameter count depends only on the input and hidden dimensions, not on the sequence length T, so one RNN handles
+      sequences of any length. But the same recurrence creates a hard dependency: h_t needs h_(t-1), which needs h_(t-2),
+      and so on, so the timesteps must be computed strictly in order and the layer{" "}
+      <VIS.Term def="Because each hidden state depends on the previous one, you cannot compute all timesteps at once; they form a sequential chain. This is the throughput cost that motivated attention-based models.">cannot be parallelized over time</VIS.Term>.
+      That sequential bottleneck is exactly what Transformers later removed. The failure modes: thinking each timestep has its
+      own weights, believing params grow with sequence length, assuming the timesteps can run in parallel like a CNN, and
+      forgetting the same h carries all past context forward.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Why a fixed-width feedforward net is the wrong tool">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        A teammate wants to process sentences of varying length and proposes a feedforward net with a separate weight matrix
+        per word position, padding everything to the longest sentence. It is huge and cannot handle a sentence longer than
+        the padding. Before reading on, work out how reusing one set of weights at every position would change the parameter
+        count, and what new constraint that reuse imposes on computation.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`recurrence (same W_x, W_h, b at every step):
+  h_t = tanh(W_x x_t + W_h h_{t-1} + b)
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
+unrolled:
+  x_1 -> h_1 -> h_2 -> ... -> h_T
+          ^      ^             (each h depends on the previous)
 
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+what does reusing the weights buy, and what does the chain cost?`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Note that the same W_x and W_h appear at every step, and that h_t is computed from h_(t-1). Derive both the
+        parameter-count consequence and the computation-order consequence.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: counting params, then tracing the chain">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`input dim 100, hidden dim 256:
+  W_x: 256 x 100 = 25,600
+  W_h: 256 x 256 = 65,536
+  b:   256
+  total = 91,392 params  -- the SAME for T=10 or T=10,000
+
+forward pass over T steps:
+  h_1 = tanh(W_x x_1 + W_h h_0 + b)
+  h_2 = tanh(W_x x_2 + W_h h_1 + b)   <- needs h_1 first
+  ...
+  can you compute h_2 before h_1?`}</pre>
+      <p>
+        The parameter count is 25,600 + 65,536 + 256 = 91,392, fixed regardless of how long the sequence is, because the
+        same three tensors are reused at every step. But computing h_2 requires h_1, which requires h_0, so the forward pass
+        walks the timesteps strictly in order &mdash; there is no way to compute later hidden states before earlier ones.
+        (Why this sequential dependency is the throughput ceiling that motivated attention is unpacked in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Two consequences of weight sharing across time">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of a vanilla RNN</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Weights across time</td><td>Same W_x, W_h, b reused at every timestep</td></tr>
+          <tr><td>Param count driver</td><td>Input and hidden dims only &mdash; not sequence length T</td></tr>
+          <tr><td>Variable-length input</td><td>Handled naturally; the same cell runs for any T</td></tr>
+          <tr><td>Computation order</td><td>Strictly sequential over t; cannot parallelize across time</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="One cell, run again and again">
+        Weight sharing across time is a double-edged property. It makes the param count independent of sequence length and
+        lets one RNN process inputs of any length &mdash; the upside. But because each hidden state is built from the
+        previous one, the timesteps form a chain that must be walked in order, so the layer cannot exploit parallel hardware
+        across time. That sequential dependency, not the parameter count, is the RNN's defining cost.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>an RNN reuses the same weights at every timestep, so params are
+        independent of sequence length, but the recurrence forces strictly sequential computation over time.</strong> Commit
+        before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="rnn-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What an RNN reuses across time"
+        scenario={<>A teammate describes an RNN as "a deep feedforward net with one distinct layer per timestep." Pick the statement that correctly describes the weights across time.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`h_t = tanh(W_x x_t + W_h h_{t-1} + b)
+across t = 1, 2, ..., T
+are W_x, W_h, b the same or different per step?`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "The same W_x, W_h, b are applied at every timestep, so one cell is reused along the whole sequence.", correct: true },
+          { key: "b", text: "Each timestep has its own distinct weight matrices, so the network depth equals the sequence length.", correct: false },
+          { key: "c", text: "The weights are shared only between adjacent timesteps, with a fresh set every few positions along the way.", correct: false },
+          { key: "d", text: "Only the bias is shared across time; the weight matrices are learned separately for each timestep position.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) is the per-position feedforward view; the RNN reuses one cell. (c) sharing is across all steps, not local windows. (d) all of W_x, W_h, b are shared, not just the bias.</>}
+        lens={<>A vanilla RNN applies one shared set of parameters &mdash; W_x, W_h, and b &mdash; at every timestep, so the same cell is unrolled along the sequence rather than there being a separate layer per position. It is not a per-timestep feedforward stack, the sharing is global across all steps rather than local, and all parameters are shared, not just the bias. This full weight sharing is what makes the model's size independent of sequence length and lets it run on inputs of any length.</>}
+        stretch={<>Given full weight sharing, what does the param count depend on instead of T?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="rnn-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — What the hidden state carries"
+        scenario={<>A teammate claims "the hidden state h_t only encodes the current input x_t." Pick the statement that correctly describes what h_t holds.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`h_t = tanh(W_x x_t + W_h h_{t-1} + b)
+h_t is built from x_t AND h_{t-1}
+what information does h_t summarize?`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "A summary of the current input and all prior context, since h_t is built from x_t and h_(t-1).", correct: true },
+          { key: "b", text: "Only the current input x_t, since the tanh discards whatever was in the previous hidden state.", correct: false },
+          { key: "c", text: "Only the previous hidden state h_(t-1), since the current input is added in at the next step instead.", correct: false },
+          { key: "d", text: "A fixed positional encoding of timestep t, independent of the actual input values seen so far.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) h_(t-1) is an explicit input to h_t, so prior context is not discarded. (c) x_t enters at this step, not the next. (d) h_t is input-dependent, not a fixed position code.</>}
+        lens={<>The update h_t = tanh(W_x x_t + W_h h_(t-1) + b) combines the current input x_t with the previous hidden state h_(t-1), and since h_(t-1) was itself built from h_(t-2) and earlier inputs, h_t is a running summary of the whole prefix of the sequence. It is not just the current input (the previous state is fed in explicitly), not just the previous state (the current input is mixed in now), and not a fixed positional code (its content depends entirely on the inputs observed). That accumulating summary is how the RNN carries context forward through time.</>}
+        stretch={<>Why might information from very early timesteps fade by the time you reach h_t?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="rnn-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Handling variable-length sequences"
+        scenario={<>You must classify sentences ranging from 3 to 300 words. A teammate proposes a feedforward net with a separate weight block per position, padded to 300. Pick the soundest approach.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`sentences: 3 to 300 words
+goal: one model that handles any length
+option: per-position weights (padded) vs one shared recurrent cell`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Use a recurrent cell with shared weights, so the same parameters process a sequence of any length.", correct: true },
+          { key: "b", text: "Use per-position weight blocks padded to 300, since a fixed maximum length keeps the architecture simple.", correct: false },
+          { key: "c", text: "Train a separate model for each sentence length bucket, since one model cannot span 3 to 300 words.", correct: false },
+          { key: "d", text: "Truncate every sentence to exactly 3 words, since equal lengths are required for a single weight matrix.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) per-position weights bloat params and cap length at 300. (c) one shared cell already spans all lengths; many models is wasteful. (d) truncating to 3 words destroys most of the signal.</>}
+        lens={<>Because an RNN reuses the same W_x, W_h, b at every timestep, a single recurrent cell processes a 3-word or a 300-word sentence with the identical parameters &mdash; variable length is handled for free. Per-position weight blocks make the parameter count scale with the padded maximum and hard-cap the length at 300; training one model per length bucket multiplies cost for no benefit; and truncating to the shortest length throws away most of the input. Weight sharing across time is precisely the property that makes one recurrent model the right tool for variable-length sequences.</>}
+        stretch={<>What practical issue arises when you batch sentences of very different lengths together?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="rnn-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why an RNN cannot parallelize over time"
+        scenario={<>A teammate expects to speed up RNN training by computing all timesteps of a sequence simultaneously on the GPU, the way a CNN processes all pixels at once, and is puzzled it does not work. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`h_2 = tanh(W_x x_2 + W_h h_1 + b)
+h_2 requires h_1
+h_1 requires h_0
+can the steps be computed all at once?`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "Each h_t needs h_(t-1), so the steps form a chain that must run in order; time cannot be parallelized.", correct: true },
+          { key: "b", text: "The steps could run fully in parallel, so the slowdown is only a missing GPU kernel, not a real constraint.", correct: false },
+          { key: "c", text: "The tanh is the bottleneck, so replacing it with a cheaper activation removes the sequential dependency.", correct: false },
+          { key: "d", text: "Parallelism is blocked only by the bias term, which can be precomputed to let all timesteps run together.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) the dependency is structural, not a missing kernel. (c) the bottleneck is the recurrence, not the activation. (d) the bias is irrelevant; the h_(t-1) dependency is the blocker.</>}
+        lens={<>The recurrence makes h_t a function of h_(t-1), which is a function of h_(t-2), and so on back to h_0, so the hidden states form a strict chain that must be evaluated in order &mdash; you cannot compute h_2 until h_1 exists. This is a structural data dependency, not a missing GPU kernel, and it has nothing to do with the choice of activation or the bias term. A CNN parallelizes because its pixels have no such cross-position dependency; the RNN's sequential coupling over time is exactly the throughput limitation that attention-based models were designed to remove.</>}
+        stretch={<>Which family of models removed this dependency, and what did it replace the recurrence with?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="rnn-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Param count across two sequence lengths"
+        scenario={<>A teammate trains the same RNN cell on 50-token sequences and later on 5,000-token sequences, and expects the 5,000-token model to have roughly 100x more parameters. Predict the non-obvious outcome.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`same cell, input dim 100, hidden dim 256
+run A: T = 50
+run B: T = 5,000
+compare the parameter counts`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "Both have the same param count; weights are shared across time, so T does not enter the total.", correct: true },
+          { key: "b", text: "Run B has roughly 100x more parameters, since a longer sequence unrolls into proportionally more weights.", correct: false },
+          { key: "c", text: "Run B has slightly more parameters, since the hidden state must be wider to summarize a longer sequence.", correct: false },
+          { key: "d", text: "Run A has more parameters, since shorter sequences pack the same information into a denser weight matrix.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) unrolling reuses the same weights; it does not create new ones. (c) hidden width is a fixed hyperparameter, not set by T. (d) sequence length does not change the weight matrix size at all.</>}
+        lens={<>Because the same W_x, W_h, and b are reused at every timestep, the parameter count is set entirely by the input and hidden dimensions &mdash; here 91,392 &mdash; and is identical whether T is 50 or 5,000. Unrolling a longer sequence reuses those shared weights more times; it does not introduce new ones, so there is no 100x growth. The hidden width is a fixed hyperparameter chosen independently of T, and a longer sequence does not require a wider state to be representable. What does grow with T is the compute and memory of the forward/backward pass, not the parameter count.</>}
+        stretch={<>If parameters stay fixed, what cost actually grows with sequence length during training?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="rnn-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Sizing the recurrent weight matrices"
+        scenario={<>You are configuring an RNN cell with input dimension 64 and hidden dimension 128. Pick the correct shapes for the weight matrices.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`input dim = 64, hidden dim = 128
+h_t = tanh(W_x x_t + W_h h_{t-1} + b)
+shape W_x, W_h, b?`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "W_x is 128x64, W_h is 128x128, b is length 128, since W_h maps the hidden state to itself.", correct: true },
+          { key: "b", text: "W_x is 64x128, W_h is 64x64, b is length 64, since the matrices map down into the input space.", correct: false },
+          { key: "c", text: "W_x is 128x64, W_h is 64x64, b is length 64, since W_h operates in the input dimension, not the hidden one.", correct: false },
+          { key: "d", text: "W_x and W_h are both 128x128, b is length 128, since every matrix in the cell must be square.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) outputs must live in the hidden dim 128, not the input dim. (c) W_h must map hidden-to-hidden (128x128), not in the input space. (d) W_x is not square; its input side is the 64-dim input.</>}
+        lens={<>Both terms in the update must produce a 128-dim vector to match the hidden state, so W_x maps the 64-dim input up to 128 (shape 128x64), W_h maps the 128-dim previous state to 128 (shape 128x128), and the bias b has length 128. The matrices map into the hidden space, not down into the input space, and W_x is rectangular because its input side is the 64-dim input; only W_h is square because it transforms the hidden state to itself. These shapes give the 91,392-style count that depends on dims, not on T.</>}
+        stretch={<>What is this cell's total parameter count with these dimensions?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="rnn-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — The throughput ceiling blamed on hardware"
+        scenario={<>A teammate's RNN trains slowly on very long sequences even on a powerful GPU, and they conclude the GPU is underpowered and request a faster one. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`long sequences, powerful GPU, low utilization
+each timestep waits for the previous hidden state
+attempted fix: buy a faster GPU`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "The sequential recurrence underuses parallel hardware; a faster GPU barely helps, attention-style models do.", correct: true },
+          { key: "b", text: "The GPU is genuinely too slow, so upgrading to a faster card is the correct way to raise the throughput.", correct: false },
+          { key: "c", text: "The parameter count is too large for the GPU, so reducing the hidden dimension is what will speed it up.", correct: false },
+          { key: "d", text: "The batch size is too small, so simply increasing it removes the per-timestep sequential dependency.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) a faster GPU cannot parallelize an inherently sequential chain over time. (c) the param count is modest; the bottleneck is the time dependency. (d) larger batches help utilization somewhat but do not break the per-step dependency.</>}
+        lens={<>An RNN's hidden states must be computed in order because each depends on the previous, so a long sequence forces a long chain of dependent steps that leaves a parallel GPU mostly idle &mdash; the bottleneck is the recurrence, not raw GPU speed. A faster card barely helps because the work cannot be spread across time, and shrinking the hidden dimension or enlarging the batch does not remove the per-timestep dependency (batching across sequences helps utilization but not the sequential depth). The real remedy is an architecture without this dependency, such as a Transformer, which processes all positions in parallel via attention.</>}
+        stretch={<>Why does batching many sequences together improve GPU utilization without removing the sequential depth?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://karpathy.github.io/2015/05/21/rnn-effectiveness/" target="_blank" rel="noopener">
+            <strong>The Unreasonable Effectiveness of Recurrent Neural Networks</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(hidden-state recurrence, weight sharing across time, sequence modeling)</span>
+          <br/>Karpathy's walkthrough of how an RNN reuses one cell across time to model variable-length sequences, with intuition for the recurrence and its sequential nature.
         </li>
       </ul>
     </VIS.Section>

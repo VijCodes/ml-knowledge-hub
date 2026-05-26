@@ -2167,295 +2167,272 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: LambdaMART.
+// Delta: LambdaMART = LambdaRank gradients + MART (gradient-boosted regression trees). Boosted trees FIT THE LAMBDA
+//   pseudo-gradients each round (the trees regress on the lambdas, not on the labels). It is the workhorse for TABULAR LTR
+//   (won the Yahoo LTR Challenge). Trap: the trees are fit to the lambdas, not to relevance; the model class is GBDT, not a
+//   neural net. Diagram shows the per-round (compute lambdas -> fit tree -> add) loop only; never prints the inference.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="IR"
+      title="LambdaMART"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Learning to Rank" },
+        { label: "Subtopic", value: "LambdaMART pairs LambdaRank's metric-weighted gradients with gradient-boosted regression trees: each boosting round fits a tree to the lambda pseudo-gradients, making it the workhorse for tabular learning-to-rank" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong><VIS.Term def="LambdaMART: a learning-to-rank model that fits gradient-boosted regression trees to LambdaRank's per-document lambda gradients.">LambdaMART</VIS.Term> combines
+      LambdaRank's gradients with <VIS.Term def="Multiple Additive Regression Trees: gradient-boosted regression trees built one at a time, each fitting the current pseudo-gradient.">MART</VIS.Term> (gradient-boosted
+      regression trees):</strong> each boosting round computes the lambda for every document from the current scores and the
+      swap-induced NDCG changes, then fits a regression tree to those lambdas and adds it (scaled by a learning rate) to the
+      ensemble. The crucial point is what the trees regress on: the lambda pseudo-gradients, not the relevance labels. So the
+      metric-aware, position-weighted signal from LambdaRank becomes the target that each tree approximates. The model class is
+      gradient-boosted trees, not a neural network, which is why LambdaMART is the workhorse for tabular learning-to-rank and won
+      the Yahoo Learning-to-Rank Challenge. The failure modes: thinking the trees fit the relevance labels, confusing it for a
+      neural ranker, dropping the lambda step (which makes it a plain relevance regressor), and forgetting it inherits
+      LambdaRank's metric-impact weighting.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Boost trees onto the lambdas">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        Each round, LambdaMART computes the lambda for every document, fits one regression tree to predict those lambdas, and
+        adds the tree to the running score function. The labels enter only indirectly, through the lambdas.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`round t:
+   1. compute lambda_i for each doc from current scores + |Delta NDCG|
+   2. fit a regression tree to the lambdas (target = lambda, NOT relevance)
+   3. scores += learning_rate * tree_output
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
-
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+repeat for ~hundreds of trees;  model class = gradient-boosted trees`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
+        The trees are regressors, but their target is the metric-weighted pseudo-gradient, so the ensemble descends toward
+        better NDCG. Nothing here fits a relevance label directly, and nothing is a neural network.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example">
+      <p>One boosting round on a query's documents:</p>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`stage t:
+   compute lambda_i per doc from current scores and Delta NDCG
+   fit a regression tree to the lambda values
+   add tree * eta to the scores         (eta = 0.1)
 
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
+repeat for ~500 trees`}</pre>
       <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        The tree learns to predict the lambda each document should receive given its features, and a small fraction (the
+        learning rate) of that prediction nudges the scores. Over hundreds of rounds the additive ensemble drives the
+        position-weighted metric up, one shrunken tree at a time.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What the trees fit, and the model class">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of LambdaMART</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Tree target</td><td>The lambda pseudo-gradients, not the relevance labels</td></tr>
+          <tr><td>Model class</td><td>Gradient-boosted regression trees (MART), not a neural net</td></tr>
+          <tr><td>Metric awareness</td><td>Inherited from LambdaRank's swap-induced delta-NDCG weighting</td></tr>
+          <tr><td>Where it wins</td><td>Tabular feature LTR; won the Yahoo LTR Challenge</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="LambdaRank's gradient, boosted by trees">
+        LambdaMART is the marriage of two ideas: LambdaRank supplies a metric-aware gradient, and gradient boosting supplies a
+        powerful regressor to chase that gradient with trees. Each tree fits the lambdas, so the ensemble optimizes NDCG
+        through a tree model, which is exactly why it dominates tabular ranking rather than neural rankers.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>LambdaMART boosts regression trees onto LambdaRank's lambda
+        pseudo-gradients (the trees fit the lambdas, not the labels); the model class is gradient-boosted trees and it inherits
+        the metric-impact weighting, making it the workhorse for tabular LTR.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="lm-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What the trees are fit to"
+        scenario={<>A teammate describes LambdaMART as boosting regression trees that each predict the document's relevance label. Pick the statement that correctly describes the tree target.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`each LambdaMART tree regresses on ( ? )
+candidates:
+   the lambda pseudo-gradients
+   the relevance labels`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { text: "Each tree fits the lambda pseudo-gradients, so the ensemble chases the metric-weighted gradient, not the labels.", correct: true },
+          { text: "Each tree fits the relevance labels directly, so the ensemble is a plain relevance regressor over the documents.", correct: false },
+          { text: "Each tree fits the raw misordered-pair count, so the ensemble minimizes inversions with no metric weighting at all.", correct: false },
+          { text: "Each tree fits the softmax top-one probabilities, so the ensemble matches a listwise distribution over the list.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>Fitting labels directly makes it a relevance regressor, not LambdaMART. It does not fit the raw inversion count. And it does not fit listwise softmax probabilities.</>}
+        lens={<>In LambdaMART each boosting round fits a regression tree whose target is the lambda, the metric-weighted pseudo-gradient from LambdaRank, not the relevance label. That is what carries the position-aware, NDCG-impact signal into a tree model. Fitting the labels directly would make the ensemble a plain relevance regressor with pointwise weaknesses; fitting the inversion count or a softmax distribution describes other methods. The lambda-as-target is the defining link between LambdaRank and boosting.</>}
+        stretch={<>What weakness would the model inherit if the trees fit relevance labels instead of lambdas?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="lm-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — What model class LambdaMART is"
+        scenario={<>A teammate assumes LambdaMART is a deep neural ranker because it optimizes NDCG. Pick the statement that correctly describes its model class.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`LambdaMART model class = ( ? )
+candidates:
+   gradient-boosted regression trees
+   a deep neural network`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { text: "It is gradient-boosted regression trees, an additive ensemble of trees, which is why it excels on tabular features.", correct: true },
+          { text: "It is a deep neural network, trained end to end by backpropagation over the documents of each query in the list.", correct: false },
+          { text: "It is a single large regression tree, grown once to full depth to capture the entire ranking function at once.", correct: false },
+          { text: "It is a linear scoring model, fitting one weight per feature with no interactions between the input features.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>It is not a neural network, despite optimizing NDCG. It is not a single tree but an ensemble. And it is not a linear model; trees capture interactions.</>}
+        lens={<>LambdaMART's model class is gradient-boosted regression trees (MART), an additive ensemble built one shrunken tree at a time. Optimizing NDCG comes from the lambda gradients it fits, not from being neural; in fact its tree structure, which handles heterogeneous tabular features and their interactions without scaling, is exactly why it dominates tabular learning-to-rank and won the Yahoo challenge. It is neither a single tree nor a linear model. Assuming neural conflates the objective with the model class.</>}
+        stretch={<>Why does a tree ensemble handle heterogeneous tabular features more readily than a neural ranker?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="lm-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Choosing a ranker for tabular features"
+        scenario={<>You must rank documents from a few hundred heterogeneous tabular features (BM25, price, CTR, age) with graded labels and a tight training budget. A teammate insists only a deep neural ranker can be competitive. Pick the soundest reading.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`features: ~hundreds of heterogeneous tabular signals
+labels: graded; budget: tight
+candidates: LambdaMART  vs  a deep neural ranker`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { text: "LambdaMART is a strong fit, since boosted trees handle heterogeneous tabular features and optimize NDCG via lambdas.", correct: true },
+          { text: "Only a deep neural ranker can compete, since tree ensembles cannot optimize a position-weighted metric like NDCG.", correct: false },
+          { text: "A plain linear model is the right fit, since hundreds of tabular features are best combined with one weight each.", correct: false },
+          { text: "Pointwise regression on the labels is the right fit, since tabular features make absolute label accuracy sufficient.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
+        trap={<>Tree ensembles absolutely can optimize NDCG via the lambdas; the neural-only claim is false. A linear model misses feature interactions. Pointwise regression ignores relative order.</>}
+        lens={<>LambdaMART is precisely the tool for this setting: gradient-boosted trees natively handle heterogeneous tabular features and their interactions, and the lambda gradients make the ensemble optimize the position-weighted NDCG, all at modest training cost. The claim that only neural rankers can optimize NDCG is wrong, since the metric awareness comes from the lambdas, not the model class; a linear model misses interactions and pointwise regression ignores order. On tabular features LambdaMART is the established strong baseline, which is why it won the Yahoo challenge.</>}
+        stretch={<>What would have to be true about the features for a neural ranker to overtake LambdaMART here?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
+        id="lm-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
+        title="B2 — Recomputing lambdas across rounds"
+        scenario={<>A teammate computes the lambdas once before boosting starts and reuses those same lambda values as the tree target for every subsequent round. Pick the soundest reading.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`lambdas depend on the CURRENT scores and current ranking
+proposed: compute lambdas once, reuse for all rounds
+question: is reusing the initial lambdas sound?`}</pre>}
         options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
+          { text: "Recompute lambdas each round, since they depend on the current scores and ranking that boosting keeps changing.", correct: true },
+          { text: "Reuse the initial lambdas for all rounds, since the pseudo-gradient target is fixed once the labels are known.", correct: false },
+          { text: "Recompute lambdas only if the features change, since the lambda depends on the inputs rather than the current scores.", correct: false },
+          { text: "Reuse the initial lambdas but rescale them by the round number, since only their magnitude drifts across boosting.", correct: false },
         ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>Lambdas are not fixed by the labels; they depend on current scores and the current ranking, which change each round. They do not depend only on features. And a round-number rescale does not capture the changing ranking.</>}
+        lens={<>The lambda for each document is computed from the current scores and the current ranking (through the swap-induced NDCG change), and boosting changes the scores every round, so the lambdas must be recomputed at each round. Reusing the initial lambdas freezes a pseudo-gradient that no longer matches the evolving ranking, breaking the descent; the lambdas are not a fixed function of the labels or of the features alone, and a magnitude rescale cannot recover the changed ranking. Per-round recomputation is what keeps the boosting trajectory metric-faithful.</>}
+        stretch={<>Why does freezing the lambdas eventually stall or misdirect the boosting trajectory?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="lm-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why fitting lambdas optimizes the metric"
+        scenario={<>A teammate cannot see how regression trees, which minimize squared error to a target, end up optimizing a ranking metric. Pick the explanation of how fitting the lambdas achieves it.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`a tree regresses (squared error) onto a TARGET
+in LambdaMART the target is the lambda = metric-weighted gradient
+what does following these targets accomplish?`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { text: "The lambdas are the metric's descent direction, so fitting them steps the scores toward better NDCG each round.", correct: true },
+          { text: "The squared-error fit to lambdas minimizes label error, so the metric gain is really just better label regression.", correct: false },
+          { text: "Fitting lambdas counts inversions, so the trees minimize misordered pairs with no connection to a position-weighted metric.", correct: false },
+          { text: "Fitting lambdas normalizes the scores to probabilities, so the metric improves only because the outputs become calibrated.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>Fitting lambdas is not label regression (the target is the gradient, not the label). It is not an inversion count. And it does not calibrate scores to probabilities.</>}
+        lens={<>In gradient boosting each tree fits the current pseudo-gradient of the objective, and in LambdaMART that pseudo-gradient is the lambda, which is the metric-weighted descent direction toward better NDCG. So when a tree regresses onto the lambdas and a shrunken version is added to the scores, the ensemble takes a step along the metric's gradient, improving NDCG round by round. The squared-error fit is just how boosting approximates the gradient with a tree; the target being the lambda, not the label, is what makes the procedure optimize the ranking metric rather than label accuracy.</>}
+        stretch={<>Why is fitting the gradient with a tree the standard way gradient boosting optimizes any objective?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="lm-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Shrinking the learning rate improves the final ranker"
+        scenario={<>A teammate halves LambdaMART's learning rate and, keeping everything else fixed, finds the final NDCG improves rather than just training slower. They expected only a speed change. Predict the non-obvious reason a smaller learning rate can raise final quality.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`learning rate halved, more rounds allowed
+final NDCG: improved (not just slower training)
+why would smaller steps yield a better final ranker?`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { text: "Smaller steps regularize the additive ensemble, reducing overfitting to each round's lambdas and generalizing better.", correct: true },
+          { text: "A smaller learning rate only slows training, so an improved final NDCG must be a measurement or validation-split error.", correct: false },
+          { text: "A smaller learning rate fits each tree to the labels more tightly, so the gain comes from better per-item accuracy.", correct: false },
+          { text: "A smaller learning rate increases each tree's depth automatically, so the gain comes from larger-capacity trees.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>A smaller rate is not purely a speed knob; it regularizes. It does not fit labels (the target is the lambda). And it does not change tree depth.</>}
+        lens={<>Shrinking the learning rate means each tree contributes only a small fraction of its predicted lambda, so the ensemble takes many small, averaged steps rather than a few large ones, which regularizes the additive model and reduces overfitting to the noisy per-round lambda estimates, improving generalization and final validation NDCG. It is not merely slower training, it does not fit labels (the target is the lambda), and it does not alter tree depth. This shrinkage-as-regularization effect is a general and well-known property of gradient boosting that LambdaMART inherits.</>}
+        stretch={<>Why does the shrinkage interact with the number of trees, so the two must be tuned together?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="lm-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Grouping data for LambdaMART training"
+        scenario={<>You train LambdaMART and must supply the data with query-group boundaries. A teammate omits the group information and feeds all rows as one undifferentiated set. Pick the soundest implementation choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`lambdas come from per-query swaps and per-query NDCG
+decision: provide query-group boundaries, or feed all rows ungrouped?`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { text: "Provide query-group boundaries, since lambdas and the NDCG delta are defined within each query, not across queries.", correct: true },
+          { text: "Feed all rows ungrouped, since boosting computes the lambdas correctly without knowing which query a row belongs to.", correct: false },
+          { text: "Provide groups only for the largest queries, since small queries contribute too few pairs to need group boundaries.", correct: false },
+          { text: "Shuffle rows across queries before training, since mixing queries gives the trees a more diverse lambda target set.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>Without groups the swap deltas and NDCG would be computed across unrelated queries, corrupting the lambdas. Skipping small-query groups still corrupts them. Shuffling across queries breaks the per-query structure entirely.</>}
+        lens={<>The lambda for a document comes from swaps within its own query and the resulting per-query NDCG change, so LambdaMART must be told the query-group boundaries; without them the swap deltas and NDCG would be computed across documents from unrelated queries, producing meaningless lambdas. Omitting groups for any query, large or small, corrupts those documents' targets, and shuffling across queries destroys the grouping outright. Correct query-group boundaries are what keep the per-query lambda computation, and thus the whole method, valid.</>}
+        stretch={<>What symptom in training would hint that the query-group boundaries were specified wrongly?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="lm-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — Dropping the lambda step"
+        scenario={<>To simplify, a team replaces LambdaMART's tree target with the raw relevance labels, keeping the boosted trees. Offline label error improves but NDCG and top-of-list quality regress, and a teammate insists boosted trees on labels must rank at least as well. Pick the soundest diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`changed: tree target = relevance labels (dropped the lambda step)
+result: label error down, NDCG and top quality down
+claim: "boosted trees on labels rank at least as well"`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { text: "Fitting labels makes it a pointwise tree regressor, so it loses the metric-impact weighting and ranks the top worse.", correct: true },
+          { text: "Boosted trees on labels rank at least as well, so the NDCG regression must be a measurement or labeling artifact.", correct: false },
+          { text: "Fitting labels still optimizes NDCG, since the metric awareness lives in the trees rather than in the lambda target.", correct: false },
+          { text: "Fitting labels maximizes catalog coverage, so the NDCG drop reflects an exposure change rather than worse ordering.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>Boosted trees on labels do not rank at least as well; they lose the metric weighting. The metric awareness lives in the lambda, not the trees. And coverage is unrelated.</>}
+        lens={<>Dropping the lambda step and regressing the trees on the relevance labels turns LambdaMART into a pointwise gradient-boosted regressor: it minimizes absolute label error but no longer carries LambdaRank's swap-induced, position-weighted gradient, so it loses the metric-impact weighting and orders the top worse, exactly the observed NDCG regression. The metric awareness lived entirely in the lambda target, not in the trees, so removing it cannot rank as well. The fix is to restore the lambda pseudo-gradient as the tree target and validate on NDCG, not label error.</>}
+        stretch={<>Why does the choice of tree target, not the tree model, determine whether the ensemble optimizes the ranking metric?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://en.wikipedia.org/wiki/Learning_to_rank" target="_blank" rel="noopener">
+            <strong>Learning to rank &mdash; LambdaMART</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(LambdaRank gradients, gradient-boosted trees, tabular LTR)</span>
+          <br/>Covers how LambdaMART boosts regression trees onto the lambda gradients and why it dominates tabular ranking.
         </li>
       </ul>
     </VIS.Section>

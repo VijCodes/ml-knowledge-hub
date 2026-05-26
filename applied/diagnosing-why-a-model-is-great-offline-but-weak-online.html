@@ -2167,295 +2167,271 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: DIAGNOSING WHY A MODEL IS GREAT OFFLINE BUT WEAK ONLINE (Applied / Prime Video).
+// Delta: train/serve SKEW is the umbrella diagnosis — ANY difference between the data a model trained on and the data
+//   it meets in production: (1) feature-code skew (computed differently), (2) distribution skew (serving population
+//   differs), (3) timing/freshness skew (values arrive late). It is the PRIME SUSPECT when offline >> online, distinct
+//   from overfitting (which shows in offline holdout) and from a wrong metric (a framing issue). Diagrams show SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="Applied"
+      title="Diagnosing Why a Model Is Great Offline but Weak Online"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Train/Serve Skew" },
+        { label: "Subtopic", value: "Train/serve skew is any difference between the data a model trained on and the data it meets in production; it is the prime suspect when online lags offline" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>When a model shines offline but disappoints online, the leading suspect is train/serve skew, not a weak
+      model.</strong>{" "}
+      Skew is an umbrella term for any difference between the data the model trained on and the data it actually meets
+      in production. It comes in three flavors: <em>feature-code skew</em> (a feature computed one way in training and
+      another at serving), <em>distribution skew</em> (the live population or inputs differ from training), and
+      <em>timing skew</em> (values arrive stale or are joined at the wrong moment). The distinguishing fact is that
+      skew lives in the gap between offline and online, so it is invisible to an offline holdout, which is precisely why
+      it is different from overfitting and from a mis-chosen metric. The failure mode is treating an offline-to-online
+      gap as a modeling problem, reaching for more capacity or more data, when the inputs at serving simply differ from
+      the inputs at training.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — The three flavors of skew">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        Lay out where a train-versus-serve difference can hide. Each flavor is a distinct gap, and all of them sit
+        between the offline world and the online one.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`train data  ----------- gap? -----------  serve data
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
+flavor 1 feature-code : same feature, two code paths -> values differ
+flavor 2 distribution : live inputs/population differ from training
+flavor 3 timing       : serving values stale or joined at wrong time
 
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+all three are invisible to an offline holdout (same data, same pipeline)`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
+        Every flavor is a mismatch between training inputs and serving inputs, and none of them shows up when you
+        evaluate on held-out training-shaped data. That is the defining property of
+        <VIS.Term def="Any difference between the data and pipeline a model trained on and the data and pipeline it meets at serving time, spanning feature code, input distribution, and timing.">train/serve skew</VIS.Term>: it lives in the gap the offline evaluation never crosses.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
+    <VIS.Section id="sec-worked" title="Beat 2 — Skew versus its look-alikes">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptom: offline +4% NDCG, online flat
 
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
+train/serve skew : serving inputs differ from training inputs
+  -> shows ONLY as offline >> online (the holdout looked fine)
 
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
+overfitting      : model memorized training set
+  -> shows as train-metric >> holdout-metric (visible OFFLINE)
+
+wrong metric     : optimized a proxy unrelated to value
+  -> offline metric itself was the wrong target (a framing issue)`}</pre>
       <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        The three diagnoses leave different fingerprints. Overfitting is detectable on the offline holdout; a wrong
+        metric is a framing error in what offline measured; only skew hides specifically in the offline-to-online gap.
+        So an offline-strong, online-weak result with a clean holdout points first at skew, and the next step is to find
+        which flavor.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-contrast" title="Beat 3 — Reading the fingerprint">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Evidence</th><th>Most likely diagnosis</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Holdout strong, online weak, holdout near train</td><td>Train/serve skew &mdash; gap is offline-to-online</td></tr>
+          <tr><td>Train metric far above holdout metric</td><td>Overfitting &mdash; visible offline, not skew</td></tr>
+          <tr><td>Offline metric climbs, business value does not</td><td>Wrong metric &mdash; a framing problem</td></tr>
+          <tr><td>A serving feature differs from its training value</td><td>Skew (feature-code flavor specifically)</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Skew lives in the offline-to-online gap">
+        Overfitting and a wrong metric are both diagnosable offline, in the train-versus-holdout gap or in what the
+        metric measures. Train/serve skew is the diagnosis whose signature is specifically that a clean offline result
+        fails to reproduce online. When the holdout looks healthy and online still lags, suspect skew and identify its
+        flavor before touching the model.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>train/serve skew is any train-versus-serve data difference
+        (feature-code, distribution, or timing) and is the prime suspect when offline beats online, distinct from
+        overfitting and a wrong metric, which are diagnosable offline.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="sk-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What train/serve skew is"
+        scenario={<>A teammate says "train/serve skew just means the model overfit the training data." Pick the statement that correctly describes skew.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`train inputs vs serve inputs differ
+where does it show?`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "Any difference between training and serving data or pipeline, showing as a clean offline result failing online.", correct: true },
+          { key: "b", text: "Memorization of the training set, showing as a training metric far above the held-out validation metric offline.", correct: false },
+          { key: "c", text: "A mis-chosen offline metric, showing as the optimized proxy rising while the business value stays unchanged.", correct: false },
+          { key: "d", text: "An undersized model, showing as both the training and the held-out metric being low at the same time offline.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) describes overfitting, visible on the offline holdout. (c) describes a wrong metric, a framing issue. (d) describes underfitting, also offline.</>}
+        lens={<>Train/serve skew is any mismatch between the data and pipeline at training and at serving, whether in feature code, input distribution, or timing, and its signature is that a model which looked strong offline underperforms online. Overfitting, a wrong metric, and underfitting all reveal themselves offline, in the train-versus-holdout gap or in what the metric measures. Skew is uniquely the diagnosis that lives in the offline-to-online gap.</>}
+        stretch={<>Which look-alike could you rule out just by comparing the train metric to the holdout metric?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="sk-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — Skew versus a wrong metric"
+        scenario={<>A teammate conflates train/serve skew with optimizing the wrong metric. Pick the statement that correctly separates them.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`skew: inputs differ train vs serve
+wrong metric: offline target was misaligned`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "Skew is a data-mismatch between train and serve, while a wrong metric is an offline target misaligned with value.", correct: true },
+          { key: "b", text: "Skew and a wrong metric are identical, so fixing the offline metric automatically resolves any data mismatch.", correct: false },
+          { key: "c", text: "Skew is an offline target misalignment, while a wrong metric is a difference between training and serving inputs.", correct: false },
+          { key: "d", text: "Skew is a model-capacity issue, while a wrong metric is a difference in the random seed used during training.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) they are distinct diagnoses with different fixes. (c) reverses the two definitions. (d) skew is not capacity, and seeds are unrelated.</>}
+        lens={<>Skew is about the inputs: the data or pipeline at serving differs from training, so a clean offline result fails online. A wrong metric is about the target: the offline objective was not tied to business value, so even a perfectly served model wins a number that does not matter. They have different fixes, unify the data pipeline for skew, re-frame the metric for the latter, so conflating them sends you down the wrong remediation path.</>}
+        stretch={<>If both a skew and a wrong-metric problem were present, which would you expect to fix the online gap?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
-        difficulty="hard"
+        id="sk-b1"
+        difficulty="medium"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Clean holdout, flat online"
+        scenario={<>A ranker scores +4% NDCG on a held-out set whose metric is close to the training metric, but online watch-time is flat. Pick the soundest first diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`train NDCG ~ holdout NDCG (no overfit gap)
+holdout: +4% ; online: flat`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Suspect train/serve skew, since a clean holdout that fails online points to a train-versus-serve data gap.", correct: true },
+          { key: "b", text: "Suspect overfitting, since any model that fails to improve online has necessarily memorized its training set.", correct: false },
+          { key: "c", text: "Suspect too little capacity, since a flat online result always means the model is too small to rank correctly.", correct: false },
+          { key: "d", text: "Suspect bad luck in the A/B, since a strong offline lift should always reproduce online given a correct experiment.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
+        trap={<>(b) train and holdout match, so overfitting is ruled out. (c) capacity does not explain an offline-online gap with a clean holdout. (d) a clean offline gain need not reproduce online under skew.</>}
+        lens={<>Because the training and holdout metrics are close, overfitting is excluded, yet online is flat, which is exactly the fingerprint of train/serve skew: the serving inputs differ from training inputs in a way the holdout cannot see. Capacity and bad luck do not explain a healthy holdout that fails to transfer. The next step is to identify the skew flavor, comparing serving feature values, distributions, and timing against training, rather than retraining a bigger model.</>}
+        stretch={<>Which serving artifact would you log first to localize the skew flavor?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-b2"
+        id="sk-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
+        title="B2 — Localizing the flavor"
+        scenario={<>You suspect skew. You can compare serving feature values to training values, compare input distributions, and check feature timestamps. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`tools: value compare, distribution compare, timestamp check
+goal: find which skew flavor`}</pre>}
         options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
+          { key: "a", text: "Run all three comparisons to localize whether the gap is feature-code, distribution, or timing before any fix.", correct: true },
+          { key: "b", text: "Retrain on more data immediately, since adding examples is the standard remedy for any offline-online gap.", correct: false },
+          { key: "c", text: "Increase model capacity first, since a larger model will absorb whichever skew flavor turns out to be present.", correct: false },
+          { key: "d", text: "Change the offline metric, since a different evaluation number is the quickest way to close an online shortfall.", correct: false },
         ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) more data does not fix mismatched serving inputs. (c) capacity cannot absorb a data mismatch. (d) the metric is not implicated when the holdout matches training.</>}
+        lens={<>Skew has three flavors with three different fixes, so the diagnostic step is to compare serving versus training feature values (feature-code), input distributions (distribution), and timestamps (timing) to localize the gap before remediating. Retraining on more data, scaling capacity, or changing the metric all assume a modeling or framing fault that the clean holdout already argues against. Identify the flavor first; the fix follows from which comparison fails.</>}
+        stretch={<>If the value comparison passes but the distribution comparison fails, what does that imply?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="sk-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why a holdout cannot catch skew"
+        scenario={<>A teammate asks why even a rigorous offline holdout fails to reveal train/serve skew. Pick the correct mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`holdout: drawn from training data, training pipeline
+skew: lives in the serving data/pipeline`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "The holdout shares the training data and pipeline, so a gap that only exists at serving is never exercised.", correct: true },
+          { key: "b", text: "The holdout is too small, so the skew is present but lacks the sample size to register in the offline metric.", correct: false },
+          { key: "c", text: "The holdout uses different labels, so it measures a target unrelated to the one the serving system optimizes.", correct: false },
+          { key: "d", text: "The holdout runs on slower hardware, so numerical differences mask the skew that would otherwise be visible.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) sample size cannot reveal a gap the holdout never crosses. (c) labels are not the mechanism here. (d) hardware is irrelevant to a data-pipeline mismatch.</>}
+        lens={<>A holdout is carved from the same training data and run through the same training pipeline, so any difference that arises only in the serving data or serving pipeline is simply never present in the evaluation. The model looks strong because it is scored under training conditions. Skew, by definition, lives in the conditions the holdout does not reproduce, which is why catching it requires comparing against serving directly, via shadow or logged serving features.</>}
+        stretch={<>What evaluation, unlike a holdout, would exercise the serving pipeline before launch?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="sk-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Bigger model widens the gap"
+        scenario={<>Suspecting the model, a team trains a much larger one; its offline NDCG rises further, yet the online gap to offline grows rather than shrinks. A teammate is baffled. Predict the non-obvious cause.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`unfixed skew present
+bigger model: offline NDCG up
+offline-to-online gap: wider`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "A larger model fits the skewed training inputs harder, so it relies more on signals absent at serving.", correct: true },
+          { key: "b", text: "A larger model always closes the online gap, so the widening must be a reporting artifact in the dashboards.", correct: false },
+          { key: "c", text: "A larger model reduces offline accuracy, so the widened gap simply reflects worse offline numbers than before.", correct: false },
+          { key: "d", text: "A larger model changes the serving inputs, so the skew is introduced by the capacity increase itself.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) capacity does not fix a data mismatch; the gap can widen. (c) offline accuracy rose, not fell. (d) the model does not alter serving inputs; the skew predates it.</>}
+        lens={<>With unfixed skew, the training data contains signals that differ at serving. A larger model fits those training-only signals more aggressively, so it leans even harder on information that is wrong or absent online, widening the offline-to-online gap rather than closing it. The counterintuitive lesson is that capacity amplifies skew instead of curing it. The fix is to remove the data mismatch first; only then does extra capacity help online.</>}
+        stretch={<>Why can capacity help once the skew is fixed but hurt while it remains?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="sk-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — A standing skew check"
+        scenario={<>You want to catch skew routinely, not only after a launch disappoints. Pick the soundest operational practice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`goal: detect skew early
+options: pipeline checks vs after-the-fact`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Continuously compare serving feature values and distributions against training, and alert on divergence.", correct: true },
+          { key: "b", text: "Rely on the offline holdout each release, since a strong holdout is sufficient evidence that no skew exists.", correct: false },
+          { key: "c", text: "Wait for an online metric drop, since skew only matters once it has already affected the business metric.", correct: false },
+          { key: "d", text: "Increase the offline validation set size, since a bigger holdout will eventually surface any serving skew.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) the holdout cannot see serving-side skew. (c) waiting for a drop means harm has already occurred. (d) holdout size cannot reveal a gap the holdout never crosses.</>}
+        lens={<>Because skew is invisible offline, the durable safeguard is to monitor serving directly, comparing live feature values and input distributions against training and alerting when they diverge, so a gap is caught before it degrades online. Trusting the holdout, enlarging it, or waiting for an online drop all fail for the same reason: none of them exercises the serving pipeline. A standing serving-versus-training comparison is the practice that detects skew early.</>}
+        stretch={<>What baseline would the live distribution be compared against, and how often refreshed?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="sk-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — Months chasing the model"
+        scenario={<>For months a team tries new architectures and more data to close a persistent offline-strong, online-weak gap, with a holdout that always matches training. A teammate wants yet another architecture. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`holdout ~ train (no overfit), online lags for months
+tried: architectures, more data -> no change
+claim: "need a new architecture"`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "The persistent clean-holdout gap is a train/serve skew signature, so investigate the serving data, not the model.", correct: true },
+          { key: "b", text: "A new architecture is the answer, since a months-long online gap proves the current model family is inadequate.", correct: false },
+          { key: "c", text: "The offline metric is miscoded, since a holdout matching training always means the evaluation code is faulty.", correct: false },
+          { key: "d", text: "The online users are anomalous, since a model strong offline can only fail online when the audience is abnormal.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) more architectures have not helped because the fault is not in the model. (c) a matching holdout is normal, not a coding bug. (d) blaming users ignores the unexamined serving pipeline.</>}
+        lens={<>A months-long gap where the holdout consistently matches training and model changes do nothing is the textbook signature of train/serve skew, the fault is in the serving data or pipeline, which no architecture or data addition touches. The disciplined move is to compare serving feature values, distributions, and timing against training to localize the flavor, then fix that mismatch. Continuing to swap architectures spends effort where the problem provably is not.</>}
+        stretch={<>What single comparison, run on day one, could have saved the months of model churn?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <strong>Training-serving skew: definition, flavors, and detection</strong>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(feature-code vs distribution vs timing skew, why holdouts miss it, serving-side monitoring)</span>
+          <br/>Covers why an offline-strong, online-weak result points first at a train-versus-serve data gap and how to localize which flavor is responsible.
         </li>
       </ul>
     </VIS.Section>

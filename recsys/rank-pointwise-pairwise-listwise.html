@@ -2167,295 +2167,250 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: POINTWISE vs PAIRWISE vs LISTWISE RANKING OBJECTIVES.
+// Delta: the three families differ in WHAT the loss is computed over. Pointwise scores each item independently
+//   (regress/classify a label per item) -- it never sees a pair, so a model with great per-item calibration can still
+//   order the top-k badly. Pairwise optimizes the relative ORDER of (relevant, less-relevant) PAIRS -- it directly
+//   targets correct ordering, decoupled from absolute calibration. Listwise optimizes a function of the WHOLE ranked
+//   list (often a smooth surrogate of a list metric like NDCG). Because recsys ultimately cares about ORDER, not
+//   absolute scores, pairwise/listwise frequently beat a pointwise model with higher AUC but worse NDCG. The
+//   distinctive contrast is the unit of the loss (item / pair / list). Diagram shows the three loss units' SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="RecSys"
+      title="Pointwise, pairwise, listwise ranking"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Ranking Objectives" },
+        { label: "Subtopic", value: "Pointwise scores each item independently, pairwise optimizes the order of item pairs, listwise optimizes a whole-list metric; because recsys cares about order rather than absolute scores, pairwise and listwise often beat a higher-AUC pointwise model on ranking metrics" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>The three ranking-loss families differ in <em>what unit</em> the loss is computed over &mdash; a single
+      item, a pair of items, or a whole list.</strong>{" "}
+      <VIS.Term def="A ranking loss that scores each item independently and fits a per-item label (regression or binary classification), e.g. logistic loss on click/no-click. It never compares two items, so it optimizes calibration, not order.">Pointwise</VIS.Term> treats
+      each (user, item) as an independent prediction problem &mdash; regress or classify a per-item label like
+      click/no-click &mdash; and never compares two items during training.
+      <VIS.Term def="A ranking loss over pairs: for a more-relevant item i and a less-relevant item j, push the score of i above j (e.g. log-sigmoid of the score difference). It targets relative order directly, independent of absolute score scale.">Pairwise</VIS.Term> optimizes
+      the relative order of pairs: for a relevant item and a less-relevant one, it pushes the relevant item's score
+      higher, directly targeting correct ordering and ignoring absolute calibration.
+      <VIS.Term def="A ranking loss computed over the entire ranked list, usually a differentiable surrogate of a list metric such as NDCG, so the model optimizes the metric you actually evaluate on.">Listwise</VIS.Term> optimizes
+      a function of the entire ranked list, typically a smooth surrogate of a list metric such as NDCG. Because what a
+      recommender is graded on is the <em>order</em> of the top results, not whether each score is well-calibrated, a
+      pairwise or listwise model can deliver better ranking metrics than a pointwise model even when the pointwise model
+      has higher AUC: AUC rewards separating positives from negatives globally, while NDCG rewards getting the top few
+      exactly right. The failure modes: assuming higher per-item AUC implies better ranking, optimizing a pointwise
+      surrogate while reporting a list metric, and ignoring that the loss unit determines what is actually being
+      improved.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Same scores, three different losses">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        For one user, the model outputs scores for four items whose true relevance is known. The readout shows the scores
+        and labels. Work out what each loss family would penalize: a per-item label error, a mis-ordered pair, or a
+        suboptimal whole-list arrangement.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`item   score   true relevance
+A      0.91    relevant
+B      0.88    NOT relevant
+C      0.40    relevant
+D      0.10    NOT relevant
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
-
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+pointwise: fits each score to its 0/1 label, item by item
+pairwise:  looks at pairs like (C relevant) vs (B not) -> is C above B?
+listwise:  scores the whole ordering A,B,C,D against the ideal ordering`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Here C is relevant but ranked below the non-relevant B. Derive which loss family directly penalizes that specific
+        inversion, and why a per-item loss might be perfectly happy with these scores even though the ranking is wrong.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: high AUC, poor NDCG">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pointwise model: well-calibrated click probabilities
+   AUC = 0.78  (separates positives from negatives globally well)
+   but the single most-relevant item sits at rank 3, not rank 1
+   -> NDCG@5 mediocre, because the TOP slots are wrong
+
+pairwise model: trained to order pairs
+   AUC = 0.77  (slightly worse global separation)
+   but it pushes the most-relevant item to rank 1
+   -> NDCG@5 HIGHER, because it nails the top of the list
+
+why: AUC averages over ALL pairs equally; NDCG weights the TOP heavily.
+optimizing order (pairwise/listwise) targets the metric users feel.`}</pre>
+      <p>
+        AUC and NDCG reward different things. AUC asks "globally, do positives outscore negatives?" and a calibrated
+        pointwise model does that well. NDCG asks "are the very top slots right?" &mdash; and that is exactly what a
+        pairwise/listwise loss optimizes. So a model with marginally lower AUC can win on the ranking metric that
+        actually drives the product, because it spends its capacity on order rather than on calibrating every score.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Loss unit determines what improves">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Family</th><th>Loss unit</th><th>Directly optimizes</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Pointwise</td><td>One item</td><td>Per-item label calibration (click probability)</td></tr>
+          <tr><td>Pairwise</td><td>A pair</td><td>Relative order of relevant vs less-relevant</td></tr>
+          <tr><td>Listwise</td><td>Whole list</td><td>A list metric surrogate (e.g. NDCG)</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="You get what you optimize for: item, pair, or list">
+        The choice of loss unit is the choice of objective. Pointwise calibrates individual scores but is blind to order;
+        pairwise targets order directly via pair comparisons but does not calibrate; listwise pushes on the full ranking
+        and can align the training loss with the evaluation metric itself. Since recommenders are judged on the order of
+        the top results, a pairwise or listwise objective often wins the ranking metric even at the cost of slightly
+        worse global separation &mdash; which is why a higher-AUC pointwise model can lose on NDCG.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>the loss unit (item / pair / list) determines whether you
+        optimize calibration, relative order, or a whole-list metric, and order-targeting losses can beat a higher-AUC
+        pointwise model on ranking metrics.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="pp-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What a pairwise loss optimizes"
+        scenario={<>A teammate says a pairwise ranking loss "predicts each item's relevance score more accurately than a pointwise loss." Pick the statement that correctly describes what pairwise optimizes.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pairwise loss input: (relevant i, less-relevant j)
+target: score(i) > score(j)`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "It optimizes the relative order of item pairs, pushing relevant items above less-relevant ones regardless of absolute score.", correct: true },
+          { key: "b", text: "It optimizes each item's absolute relevance score, just more accurately than a pointwise regression does.", correct: false },
+          { key: "c", text: "It optimizes the entire ranked list against the ideal ordering, computing the loss over all items at once.", correct: false },
+          { key: "d", text: "It optimizes the global separation of positives from negatives, which is exactly the area under the ROC curve.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
-        options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
-        ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) confuses pairwise with calibration; pairwise does not target absolute scores. (c) describes listwise, not pairwise. (d) AUC-style global separation is not what a pairwise loss directly minimizes per ranking.</>}
+        lens={<>A pairwise loss is computed over pairs: for a relevant item i and a less-relevant item j it pushes score(i) above score(j), so it optimizes <em>relative order</em>, not absolute calibration. It says nothing about whether either score equals the true click probability. Calibrating absolute scores is the pointwise goal; optimizing the whole ordering at once is listwise; and global positive/negative separation is AUC, a metric, not the per-list ordering objective pairwise minimizes.</>}
+        stretch={<>What is the most common pairwise loss form used for implicit feedback?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="pp-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Top-of-list quality is what matters"
+        scenario={<>Your product shows users the top 5 recommendations and is graded on NDCG@5. A pointwise CTR model is well-calibrated but its top slots are often slightly off. A teammate wants to keep improving the pointwise calibration. Pick the soundest objective choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`product surface: top-5 list
+graded on: NDCG@5
+current loss: pointwise CTR logloss`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Switch to a pairwise or listwise objective that targets order, since NDCG@5 rewards getting the top slots right.", correct: true },
+          { key: "b", text: "Keep refining the pointwise calibration, since more accurate per-item probabilities must eventually fix the ranking.", correct: false },
+          { key: "c", text: "Optimize plain accuracy on click/no-click, since a higher classification accuracy directly improves any ranking metric.", correct: false },
+          { key: "d", text: "Maximize AUC explicitly, since AUC is the ranking metric and improving it is equivalent to improving NDCG@5.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) better calibration does not guarantee better order, especially at the top. (c) accuracy is a thresholded per-item metric, not a ranking one. (d) AUC weights all pairs equally; NDCG@5 weights the top heavily, so they are not equivalent.</>}
+        lens={<>When the metric is NDCG@5, the objective should target order at the top of the list, which is what pairwise and listwise losses do directly &mdash; listwise can even optimize a smooth surrogate of NDCG itself. Refining pointwise calibration optimizes the wrong unit: a perfectly calibrated model can still misorder near-tie items in the crucial top slots. Click/no-click accuracy is a thresholded per-item metric divorced from ranking, and AUC averages over all pairs equally, so it is not interchangeable with a top-weighted metric like NDCG@5.</>}
+        stretch={<>Which listwise loss most directly optimizes a smooth approximation of NDCG?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="pp-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why pointwise can misorder"
+        scenario={<>A teammate insists a pointwise model that perfectly predicts each item's click probability must also produce the best ranking. Pick the correct account of why this can fail.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pointwise minimizes per-item label error
+the eval metric weights the TOP slots heavily
+small errors near a tie can flip top ranks`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "Pointwise spreads error across all items, so small miscalibrations near ties can flip the heavily-weighted top ranks.", correct: true },
+          { key: "b", text: "It cannot fail, since perfectly calibrated probabilities always produce the globally optimal ranking by definition.", correct: false },
+          { key: "c", text: "It fails only because pointwise models cannot represent nonlinear interactions between user and item features.", correct: false },
+          { key: "d", text: "It fails because pointwise losses always assign every item the same score, making the ranking arbitrary.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) overstates calibration: a pointwise loss optimizes average label error, not the top-weighted order. (c) blames model capacity, not the objective mismatch. (d) is false; pointwise models produce distinct scores.</>}
+        lens={<>A pointwise loss minimizes average per-item label error, distributing its effort uniformly across items rather than concentrating on the order of the top few. Two items that are near a tie in true probability can have their ranks flipped by tiny, individually-acceptable calibration errors &mdash; and because metrics like NDCG weight the top slots heavily, those flips cost a lot. "Perfect calibration implies optimal ranking" only holds in the limit of zero error; in practice the objective mismatch is real. The failure is about <em>what is optimized</em>, not model capacity, and pointwise models clearly do produce distinct scores.</>}
+        stretch={<>How does a pairwise loss reallocate its gradient toward the items that are near a swap?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="pp-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Higher AUC, lower NDCG"
+        scenario={<>Model X has AUC 0.78; model Y has AUC 0.77 but higher NDCG@5. A teammate concludes the AUC numbers must be miscomputed because "higher AUC always means better ranking." Predict the correct interpretation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`model X: AUC 0.78, NDCG@5 lower
+model Y: AUC 0.77, NDCG@5 higher
+AUC weights all pairs equally; NDCG weights the top`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "AUC and NDCG reward different things, so Y can order the top slots better while X separates all pairs slightly better.", correct: true },
+          { key: "b", text: "The numbers must be wrong, since a higher AUC is mathematically guaranteed to yield a higher NDCG at any cutoff.", correct: false },
+          { key: "c", text: "Model X is strictly better and the NDCG result should be ignored as noise from the smaller top-k sample.", correct: false },
+          { key: "d", text: "AUC and NDCG are the same metric under a different name, so the two results directly contradict each other.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) assumes a monotone link that does not exist. (c) dismisses the metric the product is actually graded on. (d) conflates two genuinely different metrics.</>}
+        lens={<>AUC measures global separation, averaging over all positive/negative pairs equally, while NDCG@k weights the top slots heavily. A model can win the average (AUC) yet lose at the top (NDCG), and vice versa &mdash; there is no monotone guarantee linking them. So model Y nailing the top-5 order while model X separates the full set marginally better is entirely consistent. Far from a computation error, this is the canonical reason recsys teams optimize order-aware losses: the metric users feel is the top of the list, not the global pairwise average.</>}
+        stretch={<>For which deployment surface would you actually prefer the higher-AUC model X?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="pp-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Cost of pairs and lists at scale"
+        scenario={<>You want order-aware training but worry about cost: pairwise considers pairs and some listwise losses consider full lists. A teammate wants to enumerate all pairs for every user. Pick the soundest operational approach.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pointwise: O(items) terms
+all pairs: O(items^2) per user
+need: order-aware but tractable`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Use sampled pairs (a relevant item vs sampled less-relevant ones) rather than enumerating every pair exhaustively.", correct: true },
+          { key: "b", text: "Enumerate all pairs for every user, since only the full set of comparisons can train a correct pairwise model.", correct: false },
+          { key: "c", text: "Abandon order-aware training and revert to pointwise, since pairwise and listwise are always too expensive to run.", correct: false },
+          { key: "d", text: "Always use full-list listwise loss over the entire catalog per user, since it is cheaper than any pairwise scheme.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) all-pairs is O(items&sup2;) per user and explodes on large catalogs. (c) over-pessimistic; sampling makes order-aware training practical. (d) full-list over the whole catalog is generally more expensive, not less.</>}
+        lens={<>Pairwise and listwise training are made tractable by sampling, not exhaustive enumeration: the standard recipe pairs each observed positive with one or a few sampled negatives, giving order-aware gradients at roughly pointwise cost per step. Enumerating all O(items&sup2;) pairs per user is infeasible at catalog scale, abandoning order-aware training forfeits the ranking gains entirely, and a full-list loss over the whole catalog is the most expensive option, not the cheapest. Negative sampling is what lets pairwise/listwise objectives scale.</>}
+        stretch={<>How does the sampling distribution for negatives interact with the resulting ranking quality?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="pp-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — Optimizing one thing, reporting another"
+        scenario={<>A team trains a pointwise logloss model but reports and is incentivized on NDCG@10. They keep tuning logloss and are frustrated NDCG barely moves. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`training loss: pointwise logloss
+reported metric: NDCG@10
+tuning logloss -> NDCG flat`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "The training objective and the reported metric are mismatched, so optimizing logloss does not directly move NDCG.", correct: true },
+          { key: "b", text: "The model has converged, so no objective change is needed; NDCG is simply at its theoretical maximum already.", correct: false },
+          { key: "c", text: "The NDCG implementation is buggy, since correctly optimizing any loss must monotonically improve any ranking metric.", correct: false },
+          { key: "d", text: "The data is too small; logloss and NDCG would track each other perfectly given a larger training set.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) flat NDCG is not evidence of optimality. (c) no loss is guaranteed to monotonically move every metric. (d) more data does not align a calibration loss with a ranking metric.</>}
+        lens={<>This is the objective-metric mismatch: pointwise logloss optimizes per-item calibration, while NDCG@10 rewards top-weighted order, so driving logloss down need not move NDCG. The fix is to align the loss with the metric &mdash; use a pairwise or listwise objective (ideally a smooth NDCG surrogate) so the gradient pushes on order, not calibration. Flat NDCG is not proof of optimality, the metric is not necessarily buggy, and no amount of extra data makes a calibration loss into a ranking loss. You move the metric you optimize, so optimize the one you report.</>}
+        stretch={<>What is the simplest objective change that would start moving NDCG without rebuilding the model?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://en.wikipedia.org/wiki/Learning_to_rank" target="_blank" rel="noopener">
+            <strong>Learning to rank (pointwise / pairwise / listwise)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(the three loss families and which metric each targets)</span>
+          <br/>Surveys the loss-unit taxonomy and why order-aware (pairwise/listwise) objectives align better with ranking metrics than pointwise calibration.
         </li>
       </ul>
     </VIS.Section>

@@ -2167,295 +2167,247 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: SAMPLED-SOFTMAX RETRIEVAL LOSS.
+// Delta: model P(item|user) = softmax over the WHOLE catalog. The normalizer (denominator) sums e^score over MILLIONS
+//   of items -> a full softmax is infeasible per step. Sampled softmax approximates the denominator with the positive
+//   plus a small SAMPLE of negatives. But sampling biases the logits toward frequently-sampled items, so you must apply
+//   the logQ CORRECTION: subtract log q(j) (the sampling probability of item j) from each sampled logit, which debiases
+//   the softmax so the gradient is an (approximately) unbiased estimate of the full-softmax gradient. The distinctive
+//   facets: full-softmax-is-the-target, the intractable normalizer, sample-the-denominator, and the logQ correction
+//   (without it popular items that get sampled often are unfairly suppressed). Diagram shows softmax-over-catalog +
+//   the corrected-logit formula SETUP only (never the resulting probabilities).
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="RecSys"
+      title="Sampled-softmax retrieval loss"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Ranking Objectives" },
+        { label: "Subtopic", value: "Model P(item|user) as a softmax over the catalog; since the full normalizer over millions of items is infeasible, approximate it with sampled negatives and subtract log q(j) (the logQ correction) to debias the sampling distribution" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>Sampled softmax trains a retrieval model whose ideal objective is a softmax over the <em>entire</em>
+      catalog &mdash; P(item | user) &mdash; but makes it tractable by approximating the giant normalizer with a small
+      sample of negatives, then correcting for the sampling bias.</strong>{" "}
+      The exact softmax denominator sums e^score over millions of items, which is infeasible to compute every step. So
+      you replace it with the positive item plus a handful of sampled negatives. The catch: sampling negatives from some
+      distribution q makes frequently-sampled items appear in the denominator more often, biasing their estimated
+      probability. The fix is the <VIS.Term def="A correction that subtracts log q(j) from item j's logit, where q(j) is the probability that the sampling scheme drew item j. It removes the bias introduced by sampling negatives non-uniformly, so the sampled softmax gradient approximates the full-softmax gradient.">logQ correction</VIS.Term>:
+      subtract log&nbsp;q(j) from each sampled item's logit before the softmax. This debiases the estimate so the sampled
+      gradient approximates the true full-softmax gradient. Without it, popular items &mdash; which are sampled most
+      often under popularity-based sampling &mdash; get unfairly pushed down, because the model keeps seeing them as
+      negatives. This is the loss behind large-scale two-tower retrieval. The failure modes: thinking a full softmax is
+      affordable, sampling negatives but skipping the logQ correction, and confusing this retrieval softmax with a
+      pointwise click classifier.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Why the normalizer is the problem">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        The retrieval model wants P(item | user) as a softmax over the whole catalog. The readout shows the exact form.
+        The numerator is cheap; the denominator is not. Work out why the denominator is the bottleneck and what sampling
+        replaces it with.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact softmax over catalog of size M (M ~ 2,000,000):
+   P(i | u) = e^{s_ui} / SUM over ALL M items of e^{s_uj}
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                          normalizer: M dot products PER training step
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
-
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+sampled softmax replaces the denominator with:
+   the positive i  +  a small SAMPLE of K negatives  (K ~ 5,000)`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Computing the numerator for the positive is one dot product; the denominator requires M of them. Derive why the
+        sample stands in for the full sum, and why simply summing over the sampled K items (without any correction) would
+        not give the same gradient as the full softmax.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the logQ correction">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`sample K negatives from distribution q (often popularity-based)
+problem: a popular item j is sampled OFTEN, so it appears in many
+         denominators and gets pushed down too hard -> biased
+
+logQ correction: adjust each sampled logit before the softmax
+   corrected_logit(j) = s_uj - log q(j)
+   (subtract more from items that are sampled more often)
+
+then softmax over { positive i, corrected negatives } as usual.
+
+result: the sampled-softmax gradient ~ the FULL-softmax gradient
+   popular items are no longer unfairly suppressed by frequent sampling`}</pre>
+      <p>
+        The correction subtracts log&nbsp;q(j) from each sampled item's score, removing the advantage (or, for negatives,
+        the penalty) that comes purely from being sampled often. After correcting, the small sampled softmax behaves like
+        an unbiased estimate of the full softmax, so the model learns the same direction it would under the intractable
+        exact loss. Skip the correction and frequently-sampled popular items are systematically demoted.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — What each piece does">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Piece</th><th>Role</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Softmax over catalog</td><td>The exact objective: a probability distribution over all items</td></tr>
+          <tr><td>Intractable normalizer</td><td>Summing e^score over millions of items is too costly per step</td></tr>
+          <tr><td>Sampled negatives</td><td>Approximate the denominator with the positive plus K sampled items</td></tr>
+          <tr><td>logQ correction</td><td>Subtract log q(j) to debias the sampling; restores the full-softmax gradient</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Approximate the denominator, then undo the sampling bias">
+        Sampled softmax is two ideas stacked: replace the unaffordable full normalizer with a sample, and then correct
+        the sample's bias with the logQ term. The sample makes training feasible; the correction makes it
+        <em>correct</em>. Drop the correction and the very negatives you sample most &mdash; popular items under
+        popularity sampling &mdash; are unfairly suppressed, distorting retrieval. This pairing is what lets two-tower
+        models learn a catalog-wide softmax they could never compute exactly.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>the target is a catalog-wide softmax whose normalizer is
+        intractable, so you sample the denominator and apply the logQ correction (subtract log q(j)) to debias the
+        sampling and recover the full-softmax gradient.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="ss-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What sampled softmax approximates"
+        scenario={<>A teammate says sampled softmax "is just a binary classifier on click vs no-click for each sampled item." Pick the statement that correctly describes what it approximates.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`target: P(item | user) = softmax over the FULL catalog
+sampled: positive + K negatives stand in for the denominator`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "It approximates a full softmax over the catalog by sampling the normalizer, with a correction for the sampling bias.", correct: true },
+          { key: "b", text: "It is a per-item binary click classifier, fitting an independent logistic loss to each sampled item separately.", correct: false },
+          { key: "c", text: "It is a pairwise loss that only ever compares the positive to a single sampled negative, like BPR with one draw.", correct: false },
+          { key: "d", text: "It computes the exact softmax over all items cheaply by caching every item's score from the previous epoch.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
-        options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
-        ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) a per-item binary classifier is pointwise, not a shared-normalizer softmax. (c) sampled softmax normalizes over many sampled negatives jointly, not a single pairwise comparison. (d) the exact softmax is infeasible; caching stale scores does not make it exact.</>}
+        lens={<>Sampled softmax approximates a single softmax distribution over the whole catalog by replacing its intractable normalizer with the positive plus K sampled negatives, then applying the logQ correction so the estimate is unbiased. It is not a collection of independent per-item binary classifiers, not a one-negative pairwise loss (the negatives share one normalizer), and the full softmax is precisely what cannot be computed exactly each step &mdash; caching stale scores does not recover exactness.</>}
+        stretch={<>How does the shared normalizer make sampled softmax differ from N independent sigmoids?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="ss-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Two-tower retrieval over a huge catalog"
+        scenario={<>You are training two-tower retrieval over a 2M-item catalog and need a probability-of-relevance objective. A teammate wants to compute the exact softmax over all 2M items each step. Pick the soundest approach.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`catalog: 2,000,000 items
+objective: P(item | user) softmax
+constraint: per-step compute budget`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Use sampled softmax with a logQ correction, approximating the normalizer with a few thousand sampled negatives.", correct: true },
+          { key: "b", text: "Compute the exact softmax over all 2M items each step, since only the exact normalizer yields a correct gradient.", correct: false },
+          { key: "c", text: "Replace the softmax with one independent sigmoid per item and ignore the normalizer entirely for speed.", correct: false },
+          { key: "d", text: "Truncate the catalog to the 10k most popular items so the exact softmax becomes cheap enough to compute.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) the exact 2M-item normalizer per step is infeasible. (c) dropping the normalizer changes the objective and forfeits the softmax's relative competition. (d) truncating the catalog makes the long tail unretrievable.</>}
+        lens={<>Sampled softmax with the logQ correction is the standard solution: it approximates the 2M-item normalizer with a few thousand sampled negatives and debiases the sampling so the gradient tracks the true full-softmax gradient, all within budget. The exact softmax over millions of items per step is the very thing that is intractable; replacing it with independent sigmoids discards the normalized competition among items; and truncating to popular items destroys retrieval of the long tail, which is most of the catalog. This is why production two-tower retrieval uses sampled softmax.</>}
+        stretch={<>Where do the sampled negatives most cheaply come from during two-tower training?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="ss-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — What the logQ correction fixes"
+        scenario={<>A teammate samples negatives by popularity but skips subtracting log q(j). Pick the correct account of what the logQ correction does and why it is needed.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`sampling dist q: popular items sampled more
+corrected logit: s_uj - log q(j)
+without it: popular negatives over-represented in denominators`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "It subtracts log q(j) to remove the bias from sampling items at different rates, recovering the full-softmax gradient.", correct: true },
+          { key: "b", text: "It normalizes the logits into the zero-to-one range so the softmax outputs valid probabilities for each item.", correct: false },
+          { key: "c", text: "It scales the learning rate per item, taking smaller steps on items that happen to be sampled more frequently.", correct: false },
+          { key: "d", text: "It adds label smoothing to the positive so the model does not become overconfident about the clicked item.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) softmax already produces a distribution; logQ is not a range normalizer. (c) it adjusts logits, not the learning rate. (d) it is a sampling-bias correction, not label smoothing.</>}
+        lens={<>The logQ correction subtracts log&nbsp;q(j) from each sampled item's logit, where q(j) is how often the sampler draws item j. This cancels the artificial advantage or penalty an item gets purely from its sampling frequency, so the small sampled softmax becomes an unbiased estimate of the full softmax and its gradient matches. Without it, popularity-sampled items appear in many denominators and get systematically suppressed. It is not a range normalizer, a per-item learning-rate tweak, or label smoothing &mdash; it is specifically a debiasing of the sampling distribution.</>}
+        stretch={<>If you sampled negatives uniformly, what would log q(j) reduce to?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="ss-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Popular items quietly demoted"
+        scenario={<>A team uses popularity-based negative sampling and omits the logQ correction. After training, broadly popular items rank surprisingly low for everyone. A teammate assumes the model learned users dislike them. Predict the correct interpretation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`sampling: by popularity (no logQ correction)
+popular items: sampled as negatives very often
+outcome: popular items rank low everywhere`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "Frequent sampling as negatives suppressed popular items, an artifact of the missing logQ correction, not real dislike.", correct: true },
+          { key: "b", text: "The model correctly learned that users dislike popular items, since they consistently scored low after training.", correct: false },
+          { key: "c", text: "Popular items rank low because they have too few latent dimensions to represent their broad appeal accurately.", correct: false },
+          { key: "d", text: "The effect is random noise from sampling and will disappear on its own if training simply runs for more epochs.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) confuses a sampling artifact with learned preference. (c) blames capacity rather than the missing correction. (d) the bias is systematic, not noise, and persists across epochs.</>}
+        lens={<>Under popularity sampling without logQ, popular items land in the negative set far more often than rare ones, so the uncorrected softmax repeatedly pushes their scores down &mdash; a systematic bias, not learned dislike. They rank low everywhere precisely because the sampling, not the data, demoted them. Adding the logQ correction (subtracting log&nbsp;q(j)) removes this and restores their proper standing. It is not a capacity problem and not random noise that more epochs would cure; in fact more epochs of the uncorrected loss would entrench the suppression.</>}
+        stretch={<>Why does popularity sampling otherwise help, despite needing this correction?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="ss-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Where to get negatives cheaply"
+        scenario={<>You need thousands of negatives per step for sampled softmax but cannot afford a separate sampling pass per example. A teammate proposes a dedicated negative-mining service for every step. Pick the soundest operational choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`need: ~thousands of negatives per step
+constraint: minimize extra sampling cost`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Use the other positives in the same batch as shared negatives, applying the logQ correction for their sampling rate.", correct: true },
+          { key: "b", text: "Stand up a dedicated negative-mining service that fetches fresh negatives for every single training example each step.", correct: false },
+          { key: "c", text: "Use a single fixed negative per example reused across all epochs, since one negative is enough for a softmax loss.", correct: false },
+          { key: "d", text: "Compute the exact full-catalog softmax after all, since with enough machines the normalizer cost becomes negligible.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) a per-example mining service is heavy and usually unnecessary. (c) one fixed negative defeats the softmax-over-many-negatives structure and ignores correction. (d) the exact normalizer is the cost being avoided; scaling hardware is wasteful here.</>}
+        lens={<>In-batch negatives are the standard cheap source: each example's positive doubles as a negative for the other users in the same batch, giving thousands of shared negatives for free, and you apply the logQ correction using their in-batch sampling frequency (which is popularity-correlated). A dedicated per-example mining service is overkill; a single fixed negative collapses the softmax's multi-negative competition; and computing the exact full-catalog softmax is precisely the expense sampled softmax exists to avoid. In-batch sampling plus logQ is the efficient, debiased recipe.</>}
+        stretch={<>Why does in-batch sampling make the logQ correction especially important?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="ss-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — Offline loss great, retrieval skewed"
+        scenario={<>A team's sampled-softmax loss looks excellent offline, but retrieved candidate sets are dominated by rare items and miss obvious popular ones. They never applied the logQ correction. A teammate calls the model well-trained. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`no logQ correction, popularity sampling
+training loss: low
+retrieval: rare items over-surface, popular ones missing`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "Skipping logQ biased the softmax against frequently-sampled popular items, so retrieval over-surfaces rare ones.", correct: true },
+          { key: "b", text: "The model is well-trained and simply discovered that rare items are universally more relevant than popular ones.", correct: false },
+          { key: "c", text: "The retrieval index is corrupted, since a low training loss guarantees a correctly behaving retrieval stage.", correct: false },
+          { key: "d", text: "The embedding dimension is too high, causing popular items to collapse together and drop out of retrieval.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) inverts reality; the bias suppressed popular items artificially. (c) jumps to an index bug rather than the known sampling bias. (d) high dimension does not explain a popularity-correlated suppression.</>}
+        lens={<>Without the logQ correction, popularity-sampled negatives repeatedly penalize popular items, so the model under-scores them; the offline loss can still look low because it is computed under the same biased sampling, but retrieval then over-surfaces rare items and drops obvious popular ones. This is the signature of the missing correction, not genuine learned relevance, an index bug, or a dimensionality artifact. Adding the logQ term (subtract log&nbsp;q(j)) realigns the sampled softmax with the true full-softmax objective and fixes the skew.</>}
+        stretch={<>How would you A/B detect this bias if the offline loss looks fine?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://research.google/pubs/pub48840/" target="_blank" rel="noopener">
+            <strong>Sampling-Bias-Corrected Neural Modeling for Large Corpus Item Recommendations (Yi et al.)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(sampled softmax, logQ correction, in-batch negatives)</span>
+          <br/>The two-tower retrieval paper deriving the sampling-bias (logQ) correction for in-batch sampled softmax over very large catalogs.
         </li>
       </ul>
     </VIS.Section>

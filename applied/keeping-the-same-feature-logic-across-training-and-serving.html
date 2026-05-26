@@ -2167,295 +2167,269 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: KEEPING THE SAME FEATURE LOGIC ACROSS TRAINING AND SERVING (Applied / Prime Video).
+// Delta: if a feature is computed by ONE code path in the training batch job and a DIFFERENT code path in the serving
+//   request handler, the two can silently disagree (timezone, rounding, source freshness) even when each looks correct.
+//   The model trains on one definition and is scored on another -> silent degradation no offline test catches. The fix
+//   is feature/training/serving PARITY: share the transformation code so there is one definition. Diagrams show SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="Applied"
+      title="Keeping the Same Feature Logic Across Training and Serving"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "ML Lifecycle" },
+        { label: "Subtopic", value: "Computing a feature one way in the training batch job and another way in the serving path is the most common silent production bug; share the transformation code to guarantee parity" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>The same feature computed by two different code paths is two different features.</strong>{" "}
+      If the training batch job derives "days since last watch" from a nightly warehouse and the serving handler derives
+      it from a live cache, a quiet discrepancy &mdash; a timezone offset, a rounding rule, a different source cutoff
+      &mdash; shifts the value the model is scored on away from the value it trained on. Each path looks correct in
+      isolation, the model passes every offline test, and ranking quietly degrades online. This is training/serving
+      <em>parity</em>: the cure is one shared transformation, called identically in both places, so there is a single
+      definition rather than two that drift. The failure mode is re-implementing feature logic separately for batch and
+      online, then debugging a model that is fine offline and weak online without realizing its inputs differ by path.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — One feature, two code paths">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        Look at how a single feature is produced in each environment. Both implementations are individually plausible;
+        the danger is that they are not the <em>same</em> implementation.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`feature: "days since last watch"
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
+training (batch job):  read warehouse, truncate to UTC midnight, subtract
+serving (request):     read live cache, truncate to local midnight, subtract
 
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+each path: looks correct on its own
+together:  same user can get values that differ by a day`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
+        Nothing here is obviously wrong, yet the two paths can disagree for the same user on the same day. A model
+        trained on the batch definition is then scored on the serving definition &mdash; a mismatch that is invisible
+        unless you check the paths against each other, the essence of <VIS.Term def="The guarantee that a feature has exactly one definition, so the value computed during training equals the value computed at serving time for the same entity and moment.">parity</VIS.Term>.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
+    <VIS.Section id="sec-worked" title="Beat 2 — One definition, called twice">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`define ONCE, in shared code:
+  def days_since_last_watch(last_ts, now_ts):
+      # single timezone rule, single rounding rule
+      ...
 
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
+training batch job:   calls days_since_last_watch(...)
+serving request path: calls days_since_last_watch(...)
 
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
+result: same input -> same output, by construction`}</pre>
       <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        With one shared transformation invoked from both environments, the timezone and rounding rules cannot diverge,
+        because there is only one of each. Differences can still come from the input sources, so parity also requires the
+        sources to agree at the relevant moment, but the transformation itself is no longer a place where the two paths
+        can quietly disagree.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-contrast" title="Beat 3 — Where re-implementation goes wrong">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Symptom</th><th>Parity gap behind it</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Strong offline metric, flat online result</td><td>Serving computes the feature differently than training</td></tr>
+          <tr><td>Same user feature shifts by a day</td><td>Batch uses UTC, serving uses local-time rounding</td></tr>
+          <tr><td>Bug appears only for live requests</td><td>Offline replay never exercised the serving code path</td></tr>
+          <tr><td>Two teams disagree on a feature's value</td><td>Each re-implemented the transform independently</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Two implementations are the bug, not the bound">
+        Parity is violated the moment the same feature has two definitions, even if both are individually correct. The
+        only robust guarantee is a single shared transformation called identically in training and serving, so the value
+        the model learns from and the value it is scored on cannot diverge by construction.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>computing a feature by separate code paths in training and
+        serving lets them silently disagree; sharing one transformation guarantees the scored value equals the trained
+        value.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="tp-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What training-serving parity means"
+        scenario={<>A teammate says "parity just means the training and serving code are written in the same language." Pick the statement that correctly describes parity.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`same feature, training value vs serving value
+what must hold?`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "The same input yields the same feature value in both paths, ideally because one shared transform computes it.", correct: true },
+          { key: "b", text: "The training and serving code use the same programming language, since matching syntax guarantees matching values.", correct: false },
+          { key: "c", text: "The training and serving code run on the same hardware, since identical machines make the feature values agree.", correct: false },
+          { key: "d", text: "The training and serving code are written by the same engineer, since one author keeps the two definitions aligned.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) same language does not prevent two divergent implementations. (c) hardware does not fix differing transform logic. (d) one author can still write two paths that drift over time.</>}
+        lens={<>Parity is the guarantee that a feature has a single definition, so the value computed at serving equals the value computed during training for the same entity and moment. It is achieved most robustly by sharing one transformation invoked in both paths. Same language, same hardware, or same author do not give parity, because two separately maintained implementations can still diverge on timezone, rounding, or source rules.</>}
+        stretch={<>Even with one shared transform, what input-side condition can still break parity?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="tp-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — Transform parity versus source parity"
+        scenario={<>A teammate insists that sharing the transformation code is sufficient for parity. Pick the statement that most precisely scopes what sharing the transform guarantees.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`shared transform: same logic both paths
+inputs: warehouse vs live cache
+what is still at risk?`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "Sharing the transform fixes logic drift, but the input sources must also agree or values can still diverge.", correct: true },
+          { key: "b", text: "Sharing the transform fixes everything, since identical logic makes the input source irrelevant to the result.", correct: false },
+          { key: "c", text: "Sharing the transform fixes nothing, since the transformation step never affects the final feature value at all.", correct: false },
+          { key: "d", text: "Sharing the transform fixes the inputs, since calling one function forces both paths to read the same data store.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) divergent inputs still produce divergent outputs under the same logic. (c) the transform absolutely affects the value. (d) sharing logic does not by itself unify the data sources.</>}
+        lens={<>A shared transformation removes drift in the logic, the timezone and rounding rules, but the feature value also depends on its inputs. If training reads a nightly warehouse and serving reads a live cache, the same logic over different inputs can still disagree. Full parity therefore needs both a single transform and agreement on the source values at the relevant moment. Sharing code is necessary but not by itself sufficient.</>}
+        stretch={<>Which is easier to catch in testing: a transform-logic gap or an input-source gap?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
-        difficulty="hard"
+        id="tp-b1"
+        difficulty="medium"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — The off-by-a-day feature"
+        scenario={<>"Days since last watch" is computed in the batch job with UTC midnight truncation and in serving with local midnight truncation. The model ranks worse online than offline. Pick the soundest diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`batch: truncate to UTC midnight
+serving: truncate to local midnight
+offline strong, online weak`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "The two rounding rules make serving feed values the model never trained on, so it is a training-serving skew.", correct: true },
+          { key: "b", text: "The model simply overfit the training set, since an offline-online gap always indicates excessive memorization.", correct: false },
+          { key: "c", text: "The online traffic is from a different user population, so the gap reflects genuinely different user behavior.", correct: false },
+          { key: "d", text: "The serving infrastructure is too slow, so the gap comes from timeouts rather than from any feature mismatch.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
+        trap={<>(b) overfitting is not implied by a feature path mismatch. (c) the populations are the same; the rounding rule differs. (d) latency does not shift a feature by a day.</>}
+        lens={<>UTC versus local midnight truncation shifts the feature by up to a day for the same user, so serving presents inputs outside the distribution the model trained on. That is a classic training-serving skew from divergent transform logic, not overfitting, population shift, or latency. The fix is one shared truncation rule called from both paths, after which the offline strength should carry over online.</>}
+        stretch={<>How would you confirm the rounding rule, not the data source, is the culprit?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-b2"
+        id="tp-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
+        title="B2 — Choosing how to guarantee parity"
+        scenario={<>You own a feature used in both a nightly training job and a low-latency serving path. Pick the soundest way to keep them in parity.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`feature used in: batch training + online serving
+goal: one definition`}</pre>}
         options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
+          { key: "a", text: "Factor the transform into shared code both paths import, and test that both produce identical values on samples.", correct: true },
+          { key: "b", text: "Write a fast online version separately and trust that it matches the batch version because the formula is simple.", correct: false },
+          { key: "c", text: "Compute the feature only in batch and let serving skip it, since an online value is too expensive to guarantee.", correct: false },
+          { key: "d", text: "Let each team maintain its own copy and reconcile the two implementations during the quarterly planning review.", correct: false },
         ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) a separate online version is exactly how silent drift starts. (c) dropping the feature at serving changes what the model is scored on. (d) periodic reconciliation leaves drift live between reviews.</>}
+        lens={<>The robust guarantee is one shared transformation imported by both the batch job and the serving path, plus a test asserting that both paths produce identical values on sampled inputs. Maintaining separate implementations, even of a simple formula, is precisely how timezone and rounding drift appears, and dropping the feature at serving silently changes the scored input. Single definition plus a parity test catches divergence before it reaches production.</>}
+        stretch={<>What parity test would you run continuously, not just once at integration?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="tp-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why offline tests miss the bug"
+        scenario={<>A teammate asks why a thorough offline test suite passed even though serving feeds a skewed feature. Pick the correct mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`offline tests: run the training feature path
+serving skew: lives in the serving feature path`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "Offline tests exercise the training feature path, so a discrepancy unique to the serving path is never executed.", correct: true },
+          { key: "b", text: "Offline tests use too little data, so the skew exists but lacks the volume to show up in the test metrics.", correct: false },
+          { key: "c", text: "Offline tests check only labels, so feature values are never validated regardless of which path computes them.", correct: false },
+          { key: "d", text: "Offline tests run on production hardware, so the serving discrepancy is masked by matching numerical behavior.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) more data cannot reveal a path the test never runs. (c) offline eval does use features, so this is wrong. (d) hardware is not the mechanism here.</>}
+        lens={<>An offline test computes features through the training pipeline, so any divergence that lives only in the serving code path is simply never executed and therefore never detected. The model looks perfect because it is evaluated on the very definition it trained on. The skew surfaces only when the serving path runs against live requests, which is why parity tests must compare the two paths directly and why shadow exists as a stage.</>}
+        stretch={<>What single check, added to offline tests, would expose a serving-path discrepancy before launch?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="tp-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — The harmless-looking refactor"
+        scenario={<>Serving is rewritten for speed; the new code computes a feature with a slightly different but "equivalent" rounding. Offline metrics are untouched, so a teammate expects online to be safe. Predict the non-obvious outcome.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`serving refactor: "equivalent" rounding
+offline metrics: unchanged
+training path: untouched`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "The serving values now drift from training, so online can degrade while offline stays flat and looks fine.", correct: true },
+          { key: "b", text: "Online is guaranteed safe, since the rounding is equivalent and the offline metrics confirmed no regression.", correct: false },
+          { key: "c", text: "Online improves, since a faster serving path always raises ranking quality by reducing per-request latency.", correct: false },
+          { key: "d", text: "Nothing changes anywhere, since a serving-only refactor cannot alter feature values that the model consumes.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) "equivalent" rounding can still differ at boundaries, breaking parity. (c) speed does not improve ranking quality. (d) a serving-only change directly alters the scored feature value.</>}
+        lens={<>A serving-only rounding change leaves the training path and therefore the offline metrics untouched, so offline stays flat and gives false comfort, while serving now produces values that drift from training at boundary cases and degrades online. The counterintuitive part is that an "equivalent" refactor with green offline metrics is exactly the situation parity bugs hide in. Only a direct training-versus-serving value comparison would have caught it.</>}
+        stretch={<>Why does "offline metrics unchanged" provide no evidence about serving-path parity?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="tp-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Guarding parity over time"
+        scenario={<>Parity holds today because both paths share one transform. Pick the soundest practice to keep it holding as the code evolves.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`today: one shared transform, parity holds
+risk: future edits reintroduce a second path`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Add a continuous test asserting batch and serving produce identical values on sampled live inputs each run.", correct: true },
+          { key: "b", text: "Document the rounding rule in a wiki, since a written convention is enough to keep future edits consistent.", correct: false },
+          { key: "c", text: "Re-verify parity once a year, since feature logic rarely changes and frequent checks waste engineering time.", correct: false },
+          { key: "d", text: "Trust code review alone, since reviewers will always notice if someone forks the transform into a second copy.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) a wiki does not enforce anything at runtime. (c) annual checks leave drift live for months. (d) review is fallible and misses subtle source or boundary changes.</>}
+        lens={<>The durable safeguard is an automated parity test that compares batch and serving outputs on sampled inputs on every run, so any reintroduced second path or input-source drift fails fast. Documentation and code review help but do not enforce equality at runtime, and annual re-verification leaves long windows where skew can silently degrade the model. Make parity a continuously checked invariant, not a one-time integration step.</>}
+        stretch={<>What sampling strategy makes the parity test sensitive to rare boundary cases?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="tp-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — Chasing the model instead of the feature"
+        scenario={<>A ranker is strong offline but flat online; the team spends weeks tuning architecture and hyperparameters with no improvement. A teammate proposes an even bigger model. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`offline strong, online flat
+weeks of model tuning: no change
+features: computed by separate batch and serving code`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "Separate feature code paths likely feed skewed serving inputs, so the fix is parity, not a larger model.", correct: true },
+          { key: "b", text: "A bigger model is the right next step, since persistent flat online results always mean insufficient capacity.", correct: false },
+          { key: "c", text: "The offline metric is wrong, since a genuinely strong offline model must always translate into an online win.", correct: false },
+          { key: "d", text: "The learning rate is mis-set, since an offline-online gap is most commonly an optimization-schedule problem.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) capacity cannot fix mismatched inputs. (c) offline strength need not transfer under skew; the metric is not necessarily wrong. (d) the schedule is unrelated to a feature-path mismatch.</>}
+        lens={<>A strong-offline, flat-online gap that survives model tuning points to training-serving skew, and separately implemented batch and serving feature code is the prime suspect. No amount of capacity or learning-rate tuning fixes inputs that differ by path. The disciplined move is to compare the two feature paths directly, unify them behind one shared transform, and re-evaluate, rather than scaling a model whose offline quality was never the problem.</>}
+        stretch={<>What evidence would distinguish a feature-path skew from a genuine offline-metric flaw?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <strong>Training-serving skew and feature parity in production ML</strong>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(shared transformation code, parity tests, batch vs online feature paths)</span>
+          <br/>Covers why dual feature implementations silently diverge and how a single shared transform plus continuous parity checks prevent it.
         </li>
       </ul>
     </VIS.Section>

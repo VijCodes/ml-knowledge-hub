@@ -2167,295 +2167,263 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: LSTM FORGET / INPUT / OUTPUT GATES.
+// Delta: an LSTM uses THREE sigmoid gates, each owning a distinct decision: forget = what to DROP from the cell state,
+//   input = what new candidate to ADD to the cell state, output = what of the cell state to EXPOSE as the hidden state h.
+//   Together with the candidate g, that is FOUR weight matrices (f, i, g, o), so an LSTM has ~4x the params of a vanilla
+//   RNN of the same width. Candidates conflate the gates' jobs, miscount the params, or forget the output gate filters h
+//   (not c). Diagram shows the three gate equations and the 4-matrix SETUP only; it never prints "4x params" or which gate
+//   maps to which role as a stated conclusion.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
       pill="DL"
-      title="GELU: The Transformer Activation"
+      title="LSTM Forget/Input/Output Gates"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "RNN / LSTM / GRU" },
+        { label: "Subtopic", value: "Three sigmoid gates control information flow: forget decides what to drop from the cell state, input decides what new candidate to add, output decides what to expose as the hidden state; four weight matrices (f, i, g, o) make an LSTM about 4x the params of a vanilla RNN" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>An LSTM regulates its memory with three sigmoid{" "}
+      <VIS.Term def="A vector of values in [0,1] produced by a sigmoid, multiplied elementwise into another signal to control how much of it passes. A value near 1 lets information through; near 0 blocks it.">gates</VIS.Term>, each
+      owning one decision: the <em>forget</em> gate decides what to drop from the cell state, the <em>input</em> gate decides
+      how much new candidate content to add, and the <em>output</em> gate decides what part of the cell state to expose as
+      the hidden state.</strong>{" "}
+      Concretely f, i, o are sigmoid gates and g is a tanh candidate, so the cell computes c_t = f_t (elementwise) c_(t-1) +
+      i_t (elementwise) g_t and exposes h_t = o_t (elementwise) tanh(c_t). Because each of f, i, g, o has its own weight
+      matrix over the concatenated [input, previous hidden], an LSTM holds <em>four</em> such matrices, giving it roughly 4x
+      the parameters of a same-width vanilla RNN (which has just one). The failure modes: swapping which gate does what,
+      thinking the output gate edits the cell state rather than filtering the exposed hidden state, miscounting the gates as
+      one or two matrices, and forgetting the candidate g is a fourth matrix on top of the three gates.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Why a single update rule is not enough">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        A teammate wants fine control over an RNN's memory &mdash; selectively keeping some past information, writing some
+        new information, and exposing only part of it &mdash; but a vanilla RNN has only one update rule that does all three
+        jobs at once. Before reading on, work out how three independent sigmoid gates could separate "what to drop," "what to
+        add," and "what to expose," and how many weight matrices that would require.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`three gates (sigmoid) + one candidate (tanh), each over [x_t, h_{t-1}]:
+  f_t = sigmoid(W_f [x_t, h_{t-1}] + b_f)   -- forget
+  i_t = sigmoid(W_i [x_t, h_{t-1}] + b_i)   -- input
+  g_t = tanh   (W_g [x_t, h_{t-1}] + b_g)   -- candidate
+  o_t = sigmoid(W_o [x_t, h_{t-1}] + b_o)   -- output
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
-
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+how many weight matrices is that, vs a vanilla RNN's one?`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Note that each gate and the candidate has its own weight matrix over the same concatenated input. Derive what the
+        cell state and hidden state become, and what the parameter count is relative to a vanilla RNN.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the four matrices and the param count">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`hidden 256, input 256, concat dim = 256 + 256 = 512
+
+each of f, i, g, o:  W is 256 x 512, plus bias 256  -> 512*256 + 256
+four of them:        4 * (512*256 + 256) = 524,288 params
+
+vanilla RNN, same width: ~one such matrix -> ~ 1/4 the params
+
+how does this compare to the cell/hidden update roles?`}</pre>
+      <p>
+        With hidden and input dims of 256, the concatenated input is 512, so each of the four matrices is 256x512 plus a
+        256-bias; four of them total 4*(512*256 + 256) = 524,288 parameters &mdash; about four times a same-width vanilla
+        RNN, which has roughly one such matrix. The forget gate then scales the old cell state, the input gate scales the
+        candidate g being added, and the output gate scales the tanh of the resulting cell state to form h. (Why the output
+        gate filters h rather than editing c, and what each gate near 0 or 1 means, is unpacked in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Three gates, three jobs">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Gate</th><th>What it decides</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Forget (f)</td><td>How much of the previous cell state to keep vs drop</td></tr>
+          <tr><td>Input (i)</td><td>How much of the new candidate g to add to the cell state</td></tr>
+          <tr><td>Output (o)</td><td>How much of tanh(cell state) to expose as the hidden state</td></tr>
+          <tr><td>Param cost</td><td>Four matrices (f, i, g, o) &mdash; about 4x a vanilla RNN</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Separate decisions, separate matrices">
+        The power of the LSTM is that dropping old memory, writing new memory, and exposing memory are three independently
+        learned decisions rather than one entangled update. Each gate plus the candidate has its own weight matrix, which is
+        why the LSTM costs about four times a vanilla RNN of the same width. The output gate is the one most often
+        misunderstood: it filters what the cell state shows to the rest of the network, it does not alter the stored cell
+        state itself.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>forget drops from the cell, input adds to it, output filters what
+        becomes h; four matrices (f, i, g, o) make the LSTM about 4x a vanilla RNN.</strong> Commit before revealing the
+        lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="lstmg-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — Which gate does what"
+        scenario={<>A teammate says "the input gate decides what to forget and the forget gate decides what to expose." Pick the statement that correctly assigns the three gates.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`f_t, i_t, o_t are sigmoid gates
+one drops from c, one adds to c, one exposes h
+match each gate to its job`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "Forget drops from the cell state, input adds new content to it, output exposes part of it as the hidden state.", correct: true },
+          { key: "b", text: "Input drops old content from the cell state, forget exposes the hidden state, output adds the new candidate.", correct: false },
+          { key: "c", text: "Forget adds new content, input exposes the hidden state, and output decides what old content to drop instead.", correct: false },
+          { key: "d", text: "All three gates jointly drop, add, and expose together, so no single gate owns any one of the three jobs.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) scrambles all three roles. (c) also scrambles them. (d) the gates have distinct, separable jobs; that is the design.</>}
+        lens={<>The three gates own distinct decisions: the forget gate scales how much of the previous cell state to keep (what to drop), the input gate scales how much of the new candidate to add to the cell state, and the output gate scales how much of tanh(cell state) to expose as the hidden state. The whole point of the LSTM is that these are separate, independently learned controls rather than one entangled update. Swapping the roles, or claiming the gates act jointly with no division of labor, misses why the architecture gives such fine control over memory.</>}
+        stretch={<>Which two gates jointly determine the new cell state c_t?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="lstmg-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — Counting the weight matrices"
+        scenario={<>A teammate says an LSTM "has the same number of weight matrices as a vanilla RNN, just with extra gates bolted on for free." Pick the statement that correctly counts the matrices.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`components with their own W over [x_t, h_{t-1}]:
+  forget f, input i, candidate g, output o
+how many matrices, vs a vanilla RNN?`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "Four matrices (f, i, g, o), so an LSTM has roughly 4x the parameters of a same-width vanilla RNN.", correct: true },
+          { key: "b", text: "One matrix, identical to a vanilla RNN, since the gates reuse the single recurrent weight matrix.", correct: false },
+          { key: "c", text: "Two matrices, one for the gates collectively and one for the candidate, so about 2x a vanilla RNN.", correct: false },
+          { key: "d", text: "Three matrices, one per gate, with the candidate sharing the forget gate's matrix to save parameters.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) the gates do not reuse one matrix; each has its own. (c) the three gates do not share one matrix. (d) the candidate g has its own matrix; it does not share the forget gate's.</>}
+        lens={<>An LSTM has four weight matrices, one each for the forget gate, input gate, candidate, and output gate, all applied to the concatenated [input, previous hidden]. That is why a same-width LSTM has roughly four times the parameters of a vanilla RNN, which has essentially one recurrent weight matrix. The gates do not share a single matrix, there is no two-matrix collapse, and the candidate g is its own fourth matrix rather than reusing the forget gate's. The 4x parameter cost is the price of the three independent gating decisions plus the candidate.</>}
+        stretch={<>For hidden and input dim both 256, what is the LSTM's parameter count?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="lstmg-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Budgeting LSTM vs vanilla RNN width"
+        scenario={<>You have a fixed parameter budget and a teammate proposes a 512-wide LSTM, claiming it costs the same as a 512-wide vanilla RNN. Pick the soundest assessment for matching the budget.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`fixed parameter budget
+LSTM(512) has 4 matrices; RNN(512) has ~1
+how do their costs compare at equal width?`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "An LSTM(512) costs about 4x an RNN(512); to match a budget, use a narrower LSTM or accept 4x the params.", correct: true },
+          { key: "b", text: "They cost the same at width 512, so the LSTM is a free upgrade with no parameter or budget implications.", correct: false },
+          { key: "c", text: "An LSTM(512) costs about 2x an RNN(512), since only the forget and input gates add parameters beyond the base.", correct: false },
+          { key: "d", text: "An RNN(512) costs more, since its single large matrix exceeds the LSTM's four smaller gate matrices combined.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) the LSTM is not free; it has four matrices. (c) all four matrices (including g and o) add cost, not just two. (d) the four LSTM matrices total more than the one RNN matrix at equal width.</>}
+        lens={<>At equal width an LSTM has four weight matrices (forget, input, candidate, output) versus the vanilla RNN's essentially one, so it costs about four times as many parameters &mdash; a 512-wide LSTM is roughly 4x a 512-wide RNN, not free. To fit the same budget you either narrow the LSTM (so its four matrices total the budget) or accept the higher cost in exchange for the gating's benefits. The cost is not 2x (the candidate and output matrices count too), and the RNN's single matrix is smaller than the LSTM's four combined at the same width.</>}
+        stretch={<>Roughly what LSTM width matches the parameter count of a 512-wide vanilla RNN?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="lstmg-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — What the output gate actually controls"
+        scenario={<>A teammate believes the output gate "decides what to erase from the cell state." Pick the explanation for what the output gate controls.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`c_t = f_t (*) c_{t-1} + i_t (*) g_t      <- forget, input act here
+h_t = o_t (*) tanh(c_t)                  <- output acts here
+which signal does o_t modulate?`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "It modulates the hidden state h_t exposed from the cell state; it does not edit the stored cell state c_t.", correct: true },
+          { key: "b", text: "It erases content from the cell state c_t, the same job the forget gate performs each timestep.", correct: false },
+          { key: "c", text: "It adds the candidate g_t into the cell state, duplicating the role of the input gate in the update.", correct: false },
+          { key: "d", text: "It rescales the candidate before the tanh, so it changes what gets written into c_t rather than exposed.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) erasing the cell state is the forget gate's job, not the output gate's. (c) adding the candidate is the input gate's job. (d) the output gate acts after c is formed, on tanh(c), not on the candidate.</>}
+        lens={<>The output gate appears only in h_t = o_t (elementwise) tanh(c_t), so it modulates what part of the cell state is exposed as the hidden state &mdash; the view sent to the next layer and timestep &mdash; without changing the stored cell state c_t itself. Erasing the cell state is the forget gate's job and adding the candidate is the input gate's; the output gate does neither and does not touch the candidate before it is written. This separation lets the LSTM hold information in c while choosing, per step, how much of it to reveal.</>}
+        stretch={<>Why is it useful to keep information in the cell state while exposing little of it through h?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="lstmg-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Reading gate values on a working LSTM"
+        scenario={<>On a trained LSTM solving a task, a teammate observes a unit whose forget gate is near 1, input gate near 0, and output gate near 0 for a long stretch of steps, and assumes the unit is broken. Predict what the unit is non-obviously doing.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`one unit, over many steps:
+  forget gate ~ 1
+  input gate ~ 0
+  output gate ~ 0
+what behavior does this produce?`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "It holds a value unchanged and hidden: keep old state, add nothing, expose nothing, until later needed.", correct: true },
+          { key: "b", text: "The unit is dead and contributes nothing, since all three gates being extreme means it is effectively off.", correct: false },
+          { key: "c", text: "It overwrites its memory every step, since a forget gate near 1 means it is discarding the old state fully.", correct: false },
+          { key: "d", text: "It floods the next layer with its memory, since a near-0 output gate maximally exposes the cell state value.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) extreme gates encode a deliberate behavior, not a dead unit. (c) forget near 1 means keep, not discard. (d) output near 0 exposes nothing, not floods.</>}
+        lens={<>This gate pattern is a deliberate, sensible behavior: forget near 1 keeps the existing cell-state value, input near 0 adds no new content, and output near 0 exposes none of it &mdash; so the unit is latching a value, holding it unchanged and hidden across many steps until it later opens the output gate to use it. That is exactly the kind of long-range memory the gates are designed to enable, not a broken unit. Forget near 1 means keep (not discard), and output near 0 means reveal nothing (not flood); reading the gate semantics correctly shows the unit acting as a stable memory cell.</>}
+        stretch={<>What single gate value would the unit need to change to release its stored value to the network?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="lstmg-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Assembling the cell and hidden updates"
+        scenario={<>You are wiring the LSTM update from its gates f, i, o and candidate g. Pick the correct pair of equations for the cell state and the hidden state.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`have: f_t, i_t, o_t (sigmoid), g_t (tanh), c_{t-1}
+write c_t and h_t`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "c_t = f_t (*) c_(t-1) + i_t (*) g_t, then h_t = o_t (*) tanh(c_t).", correct: true },
+          { key: "b", text: "c_t = i_t (*) c_(t-1) + f_t (*) g_t, then h_t = o_t (*) tanh(c_t), swapping the forget and input roles.", correct: false },
+          { key: "c", text: "c_t = f_t (*) c_(t-1) + i_t (*) g_t, then h_t = tanh(o_t (*) c_t), applying the output gate before the tanh.", correct: false },
+          { key: "d", text: "c_t = o_t (*) c_(t-1) + i_t (*) g_t, then h_t = f_t (*) tanh(c_t), using the output gate to retain old state.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) swaps forget and input on the cell update. (c) applies the output gate inside the tanh; it should gate tanh(c_t). (d) uses the output gate for retention, which is the forget gate's job.</>}
+        lens={<>The canonical updates are c_t = f_t (elementwise) c_(t-1) + i_t (elementwise) g_t and h_t = o_t (elementwise) tanh(c_t): the forget gate retains old cell state, the input gate writes the candidate, and the output gate filters tanh of the new cell state into the hidden state. Swapping forget and input misassigns retention and writing; applying the output gate inside the tanh (tanh(o_t (elementwise) c_t)) changes the math; and using the output gate to retain old state usurps the forget gate's role. The structure must keep each gate on its own signal.</>}
+        stretch={<>If you removed the tanh around c_t in the hidden-state equation, what property might you lose?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="lstmg-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — The param blowup blamed on width"
+        scenario={<>A teammate swaps a vanilla RNN for an LSTM of the same hidden width and is startled that the parameter count roughly quadrupled and memory use jumped. They suspect a framework bug and file an issue. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`change: vanilla RNN -> LSTM, same hidden width
+observed: ~4x parameters, higher memory
+suspected: a framework bug`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "The 4x is expected: an LSTM has four weight matrices (f, i, g, o) versus the RNN's one, at equal width.", correct: true },
+          { key: "b", text: "It must be a framework bug, since an LSTM and a vanilla RNN of equal width should have equal parameters.", correct: false },
+          { key: "c", text: "The hidden width silently doubled in the conversion, so resetting it to the original value removes the 4x.", correct: false },
+          { key: "d", text: "The LSTM duplicated the layer internally, so disabling a redundant copy will bring the count back to the RNN's.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) equal-width LSTM and RNN do not have equal params; the LSTM has 4x. (c) the width did not change; the four matrices are the cause. (d) there is no duplicated layer; the four gate matrices are intrinsic.</>}
+        lens={<>The roughly 4x jump is exactly what the architecture predicts: an LSTM maintains four weight matrices &mdash; forget, input, candidate, and output &mdash; over the concatenated input, while a vanilla RNN of the same hidden width has essentially one. So at equal width the LSTM carries about four times the parameters and correspondingly more memory. This is not a framework bug, not a silently doubled hidden width, and not an internally duplicated layer; it is the inherent cost of the three gating decisions plus the candidate. If the budget matters, the fix is to narrow the LSTM, not to look for a phantom bug.</>}
+        stretch={<>How does a GRU reduce this 4x overhead while keeping most of the gating benefit?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://colah.github.io/posts/2015-08-Understanding-LSTMs/" target="_blank" rel="noopener">
+            <strong>Understanding LSTM Networks (colah)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(forget/input/output gates, the candidate, gate semantics)</span>
+          <br/>Diagrams the three gates and the candidate, showing how each controls a distinct part of the cell-state update and the exposed hidden state.
         </li>
       </ul>
     </VIS.Section>

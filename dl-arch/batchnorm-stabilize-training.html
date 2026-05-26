@@ -2167,295 +2167,265 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: BATCH NORMALIZATION.
+// Delta: BatchNorm normalizes each CHANNEL's activations across the BATCH (and spatial positions) to zero mean / unit
+//   variance, then rescales with learned gamma, beta. This smooths the loss surface and permits much higher learning rates.
+//   The decisive subtlety candidates miss: it behaves DIFFERENTLY at train (uses the current minibatch's stats) vs
+//   inference (uses running averages accumulated during training), which couples it to batch size and breaks with batch=1
+//   or distribution shift between train/eval. Diagram shows the normalize-then-affine SETUP and train/eval split only; it
+//   never prints the "couples to batch size" or "use running stats at eval" conclusion.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
       pill="DL"
-      title="GELU: The Transformer Activation"
+      title="BatchNorm Stabilizes and Speeds Training"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Classic CNNs" },
+        { label: "Subtopic", value: "Normalize each channel's activations over the batch to zero mean / unit variance, then rescale with learned gamma, beta; this smooths the loss surface and allows higher learning rates, but behaves differently at train (batch stats) vs inference (running stats)" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong>BatchNorm standardizes each channel's activations &mdash; subtract the{" "}
+      <VIS.Term def="The mean and variance computed over the current minibatch (and, for conv layers, over spatial positions too), per channel. These statistics change every step during training.">batch mean and divide by the batch std</VIS.Term> per
+      channel &mdash; then applies a learned scale gamma and shift beta so the layer can recover any distribution it needs.</strong>{" "}
+      Normalizing the activations smooths the loss surface, which lets you train with substantially higher learning rates
+      and converge faster; removing BN from a ResNet typically forces roughly an order-of-magnitude smaller learning rate.
+      The subtlety almost everyone trips on is the train/inference asymmetry: during training BN uses the{" "}
+      <VIS.Term def="At training time BN normalizes using the statistics of the current minibatch. This injects batch-dependent noise and makes the layer's behavior depend on which other examples share the batch.">current minibatch statistics</VIS.Term>, but
+      at inference it uses <VIS.Term def="Exponential moving averages of mean and variance accumulated across training batches, frozen at evaluation. Using these makes inference deterministic and independent of the eval batch.">running averages</VIS.Term> accumulated
+      during training, so it must be switched to eval mode and is fragile with batch size 1 or when train and eval
+      distributions differ. The failure modes: normalizing over the wrong axis, forgetting the learned gamma/beta, leaving
+      BN in train mode at inference (or using a tiny eval batch), and assuming BN's benefit is independent of batch size.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Why raw activations resist a high learning rate">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        A teammate's deep CNN diverges whenever they raise the learning rate, so they keep it tiny and training crawls. They
+        suspect the optimizer. Before reading on, work out what happens to the scale of activations as they pass through many
+        layers, and what a per-channel normalization step would do to the loss surface the optimizer sees.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`a channel's activations over a batch: x_1 ... x_m
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
+BatchNorm:
+  mu  = mean over the batch (per channel)
+  var = variance over the batch (per channel)
+  x_hat = (x - mu) / sqrt(var + eps)
+  y = gamma * x_hat + beta     (learned gamma, beta)
 
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+what does normalizing x do to the loss surface?`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
-
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
-      <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        Note that the mean and variance are computed over the batch, and gamma/beta are learned. Derive why this both
+        stabilizes training and why it makes the layer depend on the batch.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: train step vs inference step">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`TRAIN step (batch of m):
+  mu, var = stats of THIS minibatch
+  normalize with mu, var
+  also update running_mu, running_var (moving average)
+
+INFERENCE step (one example, or any batch):
+  normalize with running_mu, running_var  (NOT the current input's stats)
+  apply learned gamma, beta
+
+if you forget to switch modes at inference, which stats get used?`}</pre>
+      <p>
+        At training time BN uses the live minibatch statistics and simultaneously accumulates running averages of mean and
+        variance. At inference it must use those frozen running averages, not the statistics of whatever happens to be in the
+        eval batch &mdash; otherwise a single example or an unusual eval batch produces unstable, input-dependent outputs.
+        That is the entire reason frameworks have a separate eval mode for BN. (Why batch size 1 is pathological at train
+        time, and why train/eval distribution shift hurts, is unpacked in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Train mode vs inference mode">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of BatchNorm</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Normalization axis</td><td>Per channel, over the batch (and spatial positions for convs)</td></tr>
+          <tr><td>Learned parameters</td><td>Scale gamma and shift beta, applied after normalizing</td></tr>
+          <tr><td>Train-time stats</td><td>Current minibatch mean/variance; running averages updated</td></tr>
+          <tr><td>Inference-time stats</td><td>Frozen running averages, not the eval batch's own stats</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Same layer, two behaviors">
+        BatchNorm is not a single fixed function: in training it normalizes by the live minibatch, injecting batch-dependent
+        noise and coupling the layer to batch size; at inference it uses frozen running averages so outputs are
+        deterministic and independent of the eval batch. Forgetting to switch modes, or running BN with a batch of one, is
+        the most common way to get a model that trains fine but behaves strangely at test time.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>BN normalizes each channel over the batch then rescales with
+        learned gamma/beta, smoothing the loss surface, and behaves differently at train (batch stats) vs inference (running
+        stats).</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="bn-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What BN normalizes over"
+        scenario={<>A teammate says BatchNorm "normalizes each example's feature vector to unit length, like an L2 normalize." Pick the statement that correctly describes what BN computes.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`activations: batch x channels (x spatial for convs)
+BN computes mu, var along which axis?
+then does what with gamma, beta?`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { key: "a", text: "Per-channel mean/variance over the batch, normalize, then a learned per-channel scale and shift.", correct: true },
+          { key: "b", text: "Per-example L2 normalization to unit length, so each sample's feature vector has fixed magnitude.", correct: false },
+          { key: "c", text: "A single global mean/variance over all channels and examples, applied identically to every activation.", correct: false },
+          { key: "d", text: "Per-channel normalization with no learned parameters, since the fixed zero-mean unit-variance form is final.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>(b) that is L2/instance-style normalization, not BN's per-channel batch statistics. (c) BN keeps separate stats per channel, not one global value. (d) BN adds learned gamma and beta after normalizing.</>}
+        lens={<>BatchNorm computes a mean and variance for each channel across the batch (and spatial positions for conv layers), normalizes each activation by its channel's statistics, then applies a learned per-channel scale gamma and shift beta. It is not per-example L2 normalization, it does not use one global statistic across all channels, and it is not parameter-free: gamma and beta let the layer recover any mean/variance it actually needs, including undoing the normalization. The per-channel, over-the-batch axis is the defining choice.</>}
+        stretch={<>Why does the learned gamma/beta pair let BN represent the identity transform if that is optimal?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="bn-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — What changes between train and eval"
+        scenario={<>A teammate claims "BatchNorm does exactly the same computation at training and inference." Pick the statement that correctly describes the difference.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`train: normalize with ??? stats
+eval:  normalize with ??? stats
+which statistics each mode uses`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { key: "a", text: "Train uses the current minibatch stats; inference uses frozen running averages from training.", correct: true },
+          { key: "b", text: "Both modes use the current input batch's statistics, so the computation is identical in train and eval.", correct: false },
+          { key: "c", text: "Train uses running averages; inference recomputes fresh statistics from each evaluation batch instead.", correct: false },
+          { key: "d", text: "Both modes use the running averages, and the minibatch statistics are only used to update gamma and beta.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>(b) eval does not use the input batch's stats; that is the bug to avoid. (c) reverses the two modes. (d) train uses minibatch stats to normalize, not just to update affine params.</>}
+        lens={<>During training BatchNorm normalizes using the statistics of the current minibatch and, in parallel, updates running averages of mean and variance. At inference it freezes and uses those running averages instead of the eval batch's own statistics, so the output for a given input does not depend on which other examples share its batch. The two modes are genuinely different functions; using batch stats at eval (or running stats during training) is a classic source of train/test mismatch. The minibatch stats do the normalizing at train time, not merely feed the affine parameters.</>}
+        stretch={<>What goes wrong specifically if you evaluate with a batch of one while still in training mode?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="bn-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Enabling a higher learning rate"
+        scenario={<>A deep CNN without normalization diverges above a tiny learning rate, so training is slow. A teammate proposes simply lowering the learning rate further and training longer. Pick the change most likely to let you train faster at a higher learning rate.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptom: diverges unless LR is very small
+goal: train faster, tolerate a larger LR
+current: no normalization between conv layers`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { key: "a", text: "Insert BatchNorm after the conv layers, smoothing the loss surface so a larger learning rate stays stable.", correct: true },
+          { key: "b", text: "Lower the learning rate further and train for many more epochs, since stability comes only from a small LR.", correct: false },
+          { key: "c", text: "Switch the optimizer to plain SGD without momentum, since momentum is what makes the high LR diverge here.", correct: false },
+          { key: "d", text: "Add more layers, since a deeper network is inherently more stable and tolerates larger learning rates.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
-      />
-
-      <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
-        axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
-        options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
-        ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>(b) a smaller LR keeps the original slow training; it does not address the surface. (c) the optimizer is not the root cause of the LR ceiling. (d) more depth tends to worsen, not ease, the LR sensitivity.</>}
+        lens={<>BatchNorm normalizes activations layer by layer, which smooths the loss landscape and lets gradients stay well-scaled across depth, so the network tolerates a much larger learning rate and converges faster &mdash; removing BN from a network like ResNet-50 typically forces about an order-of-magnitude smaller LR. Lowering the LR further just preserves the slow regime, the optimizer choice is not the cause of the instability, and adding depth generally makes the LR ceiling worse. Inserting BN attacks the actual cause: poorly scaled activations that force a tiny step size.</>}
+        stretch={<>Besides enabling a higher LR, what mild regularization effect does BN's batch noise provide?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="bn-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why batch size 1 breaks BN at train time"
+        scenario={<>A teammate sets batch size to 1 to fit a large model in memory and finds training with BatchNorm becomes unstable and generalizes poorly. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BN train-time variance is computed over the batch
+batch size = 1
+how reliable is a variance from one sample?`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { key: "a", text: "With one sample the batch variance is degenerate, so normalization is meaningless and noisy across steps.", correct: true },
+          { key: "b", text: "Batch size 1 is fine for BN, since it just normalizes that single example to zero mean and unit variance.", correct: false },
+          { key: "c", text: "The instability comes from gamma and beta having too few updates, which more epochs at batch 1 would fix.", correct: false },
+          { key: "d", text: "Batch size 1 only affects inference, so the training instability must come from an unrelated bug elsewhere.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>(b) a single example gives a zero or undefined variance, so normalization is degenerate, not fine. (c) the problem is the statistics, not the number of gamma/beta updates. (d) BN's train-time stats are computed per batch, so batch 1 directly destabilizes training.</>}
+        lens={<>BatchNorm's training-time normalization divides by the batch variance, but with a single example that variance is essentially zero or undefined, so the normalized activations are degenerate and the per-channel statistics swing wildly from step to step. That destabilizes training and gives the model no consistent normalization to learn against. The issue is intrinsic to estimating mean/variance from one sample, not a shortage of gamma/beta updates and not an unrelated bug. When small batches are unavoidable, normalization schemes that do not depend on the batch (such as GroupNorm or LayerNorm) are the standard remedy.</>}
+        stretch={<>Which normalization would you switch to for a batch size of 1, and why does it not have this problem?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="bn-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — The model that trains well but tests badly"
+        scenario={<>A model with BatchNorm reaches excellent training accuracy, but its first deployment requests are scored one image at a time and the predictions are erratic and far worse than validation. The code never calls eval mode. Predict the non-obvious cause.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`serving: one image per request
+BN left in training mode
+each request normalized by its OWN single-image stats
+what happens to the output?`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { key: "a", text: "In train mode BN normalizes each lone image by its own stats, so single-image inference is unstable; use eval mode.", correct: true },
+          { key: "b", text: "The model overfit the training set, so the poor serving accuracy reflects generalization, not a BN mode issue.", correct: false },
+          { key: "c", text: "Single-image serving is inherently unsupported by any CNN, so batching requests is the only possible remedy.", correct: false },
+          { key: "d", text: "The running averages are wrong, so retraining the network from scratch is required to fix the predictions.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>(b) training accuracy was fine and validation was fine; the gap appears only at single-image serving, pointing at BN mode. (c) batched serving would mask it, but eval mode is the real fix. (d) the running averages are fine; they are simply not being used.</>}
+        lens={<>Left in training mode, BatchNorm normalizes each incoming image by the statistics of its own batch &mdash; which, for one image, is degenerate &mdash; so single-image predictions become unstable and unlike validation, where larger batches gave saner stats. Switching to eval mode makes BN use the frozen running averages it accumulated during training, so each image is normalized consistently and independently of batch composition. This is a mode bug, not overfitting and not a corrupted running average; the averages exist and are correct, they are simply not being applied. The fix is one line: put the model in eval mode for inference.</>}
+        stretch={<>Why does the same code appear to work if you happen to serve requests in large batches?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="bn-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Placing BN in a conv block"
+        scenario={<>You are assembling a standard conv block and must decide where BatchNorm goes relative to the conv and the activation. Pick the placement that matches common ResNet/Inception practice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`components: Conv, BatchNorm, ReLU
+arrange them into the standard block order`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { key: "a", text: "Conv, then BatchNorm, then ReLU, so activations are normalized before the nonlinearity each layer.", correct: true },
+          { key: "b", text: "ReLU, then Conv, then BatchNorm, so the nonlinearity runs on the raw input before any convolution.", correct: false },
+          { key: "c", text: "BatchNorm, then Conv, then ReLU, normalizing the raw input pixels before the first convolution runs.", correct: false },
+          { key: "d", text: "Conv, then ReLU, then BatchNorm, normalizing only after the activation has already clipped negatives.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>(b) running ReLU before the conv is nonsensical for a conv block. (c) normalizing before the conv does not stabilize the conv's own outputs. (d) the common pattern normalizes before the nonlinearity, not after.</>}
+        lens={<>The standard conv block in networks like ResNet and Inception is Conv then BatchNorm then ReLU: the conv produces activations, BN normalizes them per channel over the batch, and the nonlinearity then operates on well-scaled inputs. Normalizing before the conv would not control the conv's own output distribution, and placing BN after the ReLU normalizes already-rectified values, which is the less common ordering. (Pre-activation variants exist, but the canonical block normalizes the conv output before the nonlinearity.) The point is that BN sits between the conv and its activation to keep each layer's pre-activation distribution stable.</>}
+        stretch={<>Since BN already adds a learned shift beta, why is the conv layer's bias term usually dropped?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="bn-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — The running averages that never adapted"
+        scenario={<>A model trained on bright daytime images is deployed (correctly in eval mode) on night-vision footage with very different pixel statistics, and accuracy collapses. A teammate blames the eval-mode switch. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`train data: bright daytime
+BN running averages: fit to daytime stats
+deploy: night-vision footage (very different distribution)
+mode: eval (running averages used)`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { key: "a", text: "The frozen running averages encode the daytime distribution, so a shifted deploy distribution mismatches them.", correct: true },
+          { key: "b", text: "Eval mode is the problem, so switching BN back to training mode at deployment will restore the accuracy.", correct: false },
+          { key: "c", text: "BatchNorm cannot work on grayscale night images at all, so the layer must be removed for this deployment.", correct: false },
+          { key: "d", text: "The learned gamma and beta are corrupted by the new images, so resetting them to defaults will fix the model.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>(b) switching to train mode would normalize by the night batch's stats but reintroduces batch dependence and does not fix the underlying domain shift. (c) BN works on any channel count; the issue is distribution, not grayscale. (d) gamma/beta are fixed at inference and are not being corrupted.</>}
+        lens={<>BatchNorm's running averages are frozen estimates of the training distribution's per-channel mean and variance. When the deployment distribution shifts sharply &mdash; daytime to night-vision &mdash; those statistics no longer match the incoming activations, so normalization mis-centers and mis-scales them and accuracy drops. This is a domain-shift problem, not a mode bug: eval mode is correct, the layer is not unusable on grayscale, and the frozen gamma/beta are not being corrupted by new inputs. Remedies are recalibrating BN statistics on target-domain data or fine-tuning, not flipping back to train mode.</>}
+        stretch={<>How would re-estimating BN's running statistics on a small batch of target-domain images help here?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://arxiv.org/abs/1502.03167" target="_blank" rel="noopener">
+            <strong>Batch Normalization (Ioffe and Szegedy)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(per-channel batch stats, learned gamma/beta, train vs inference)</span>
+          <br/>Introduces BatchNorm, the normalize-then-affine formulation, the higher-learning-rate benefit, and the distinct train-time and inference-time statistics.
         </li>
       </ul>
     </VIS.Section>

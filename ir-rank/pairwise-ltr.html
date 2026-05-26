@@ -2167,295 +2167,266 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: GELU -- THE TRANSFORMER ACTIVATION.
-// Delta: GELU(x) = x * Phi(x), where Phi is the standard Gaussian CDF. It is a SMOOTH PROBABILISTIC GATE: instead of
-//   ReLU's hard 0/1 switch at x=0, GELU multiplies the input by Phi(x) in (0,1) -- the probability a standard normal is
-//   below x -- so the gate is soft and input-dependent. Two distinctive consequences: (1) it is SMOOTH (differentiable
-//   everywhere, no kink at 0), giving cleaner gradients than ReLU's elbow, and (2) it is NON-MONOTONIC -- it dips
-//   slightly NEGATIVE for moderately negative inputs (minimum near x ~ -0.75) before returning toward 0, unlike ReLU
-//   which is exactly 0 for all x<0. Default in BERT/GPT FFN blocks. The trap: thinking GELU is just "smooth ReLU" with
-//   no negative region, thinking the gate is a hard 0/1, or thinking it saturates/bounds like sigmoid (its positive side
-//   is ~unbounded, ~linear for large x). Diagram shows the x*Phi(x) gating SETUP only; never the conclusion.
+// Concept explainer: Pairwise LTR.
+// Delta: pairwise learns from PREFERENCE PAIRS (d_i > d_j): minimize the count of misordered pairs. The loss is over
+//   P(s_i > s_j), which DECOUPLES from absolute scores and directly targets relative order. Basis of RankNet/RankSVM.
+//   Weakness: it treats all inversions equally regardless of WHERE in the list (no position weighting) -> motivates LambdaRank.
+//   Diagram shows the preference-pair setup only; never prints the inference.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="DL"
-      title="GELU: The Transformer Activation"
+      pill="IR"
+      title="Pairwise LTR"
       byline={[
-        { label: "Topic", value: "Activation Functions" },
-        { label: "Subtopic", value: "GELU(x)=x*Phi(x) gates the input by the Gaussian CDF, a smooth probabilistic gate that is differentiable everywhere and dips slightly negative near x=-0.75; the default in BERT and GPT feedforward blocks" },
+        { label: "Topic", value: "Learning to Rank" },
+        { label: "Subtopic", value: "Pairwise LTR learns from preference pairs by minimizing misordered pairs over P(score_i > score_j); it decouples from absolute scores and targets relative order, but weights every inversion equally regardless of position" },
       ]} />
 
     <VIS.TLDR>
-      <strong>GELU(x)=x&middot;&Phi;(x) multiplies the input by the standard Gaussian CDF &Phi;(x), a soft
-      input&#8209;dependent gate rather than ReLU's hard on/off switch at zero.</strong>{" "}
-      Because &Phi;(x) is a smooth probability in (0,1), GELU is <em>differentiable everywhere</em> with no kink, which
-      gives cleaner gradients than ReLU's non&#8209;differentiable elbow, and it is{" "}
-      <VIS.Term def="Non-monotonic: the function does not only increase. GELU decreases over a small negative-input range, producing a shallow dip below zero before rising.">non&#8209;monotonic</VIS.Term> &mdash;
-      it dips slightly negative for moderately negative inputs (minimum near x&nbsp;&asymp;&nbsp;&minus;0.75) instead of
-      being exactly 0 like ReLU on the whole negative side. For large positive x, &Phi;(x)&rarr;1 so GELU&rarr;x
-      (roughly linear, unbounded), so it does <em>not</em> saturate the way{" "}
-      <VIS.Term def="Sigmoid: 1/(1+e^-x), squashing inputs into (0,1) and flattening for large |x|, so its derivative approaches 0.">sigmoid</VIS.Term> does on the top.
-      It is the default activation in the feedforward blocks of BERT and GPT. The failure modes: treating GELU as just a
-      smoother ReLU with no negative region, treating &Phi;(x) as a hard 0/1 gate, and assuming it saturates and bounds
-      its output like sigmoid.
+      <strong><VIS.Term def="Pairwise learning to rank: trains on ordered document pairs, minimizing the number of pairs placed in the wrong relative order rather than fitting absolute labels.">Pairwise LTR</VIS.Term> learns
+      from preference pairs <VIS.Equation tex={"d_i \\succ d_j"} /> and minimizes the number of misordered pairs by modeling</strong>{" "}
+      <VIS.Equation tex={"P(s_i > s_j)"} />.{" "}
+      Because the loss depends only on the score difference <VIS.Equation tex={"s_i - s_j"} /> within a pair, it decouples from the
+      absolute score values and targets relative order directly &mdash; the very thing pointwise leaves to chance. This is the
+      basis of RankNet and RankSVM. The key limitation is that pairwise treats every inversion as equally costly regardless of
+      where in the list it occurs: getting the top two documents wrong counts the same as getting two documents at the bottom
+      wrong, even though users care far more about the top. That position-blindness is exactly what LambdaRank later fixes by
+      weighting each pair by its impact on a rank metric. The failure modes: assuming pairwise weights the top, conflating it with
+      pointwise absolute fitting, ignoring that pair counts can grow quadratically, and expecting it to optimize NDCG directly.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What does the Gaussian-CDF gate actually do?">
+    <VIS.Section id="sec-define" title="Beat 1 — Minimize misordered preference pairs">
       <p>
-        A teammate describes GELU as "ReLU but rounded at the corner, otherwise identical." Work out what x&middot;&Phi;(x)
-        does on the negative side and for large positive inputs, and where that differs from ReLU.
+        For each pair where one document should outrank another, the loss penalizes the model when its scores order the pair
+        wrongly. Only the within-pair score difference enters, so absolute score values are irrelevant.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi = standard normal CDF, range (0,1)
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`for each preference pair d_i > d_j (from labels):
+   penalize if s_i <= s_j  (model orders them wrong)
+   loss depends on (s_i - s_j), not on s_i or s_j alone
 
-ReLU(x) = max(0, x)   (hard gate: 0 for x<0, x for x>0)
-
-sample points:
-   x =  1   ->  Phi(1)  ~ 0.841
-   x = -1   ->  Phi(-1) ~ 0.159
-   x = +4   ->  Phi(4)  ~ 1.000
-
-question: what is GELU(-1) vs ReLU(-1), and GELU(4) vs ReLU(4)?`}</pre>
+every misordered pair counts the same, wherever it sits in the list`}</pre>
       <p>
-        Reason about whether GELU is ever negative, and whether its positive side stays close to the identity x for large
-        inputs or flattens out.
+        The objective is the relative order of pairs, not their distance from labels. But the cost of a misordered pair does
+        not depend on its position, which is the seed of pairwise's weakness.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the negative dip and the linear tail">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(1)  = 1 * Phi(1)  ~ 1 * 0.841  ~  0.841
-GELU(-1) = -1 * Phi(-1) ~ -1 * 0.159 ~ -0.159   (ReLU(-1) = 0)
-GELU(4)  = 4 * Phi(4)  ~ 4 * 1.000  ~  4.000   (~ identity)
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example">
+      <p>One preference pair where the truth says A outranks B, and the model disagrees:</p>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`truth: rel(A) = 3 > rel(B) = 1   ->  preference  A > B
+model: s_A = 0.7,  s_B = 1.2      ->  predicts   B > A
 
-minimum of GELU near x ~ -0.75  ->  value ~ -0.17   (a small dip)
-
-shape summary:
-   negative side: small negative dip, NOT flat zero
-   near 0: smooth, no kink (differentiable everywhere)
-   large +x: GELU ~ x, unbounded (no top saturation)`}</pre>
+this pair is INVERTED (1 misordered pair), contributing to the loss`}</pre>
       <p>
-        At x=&minus;1 GELU returns about &minus;0.159 while ReLU returns exactly 0, so GELU keeps a small signal (and
-        gradient) on part of the negative side and has a shallow dip with minimum near x&asymp;&minus;0.75. Around zero it
-        is smooth with no kink, so it is differentiable everywhere, unlike ReLU's elbow. For large positive x, &Phi;(x)
-        approaches 1 and GELU approaches the identity x, so the positive side is essentially linear and unbounded &mdash;
-        it does not saturate at the top the way sigmoid does. BERT&#8209;base uses GELU inside its 3072&#8209;wide
-        feedforward blocks.
+        The pair is counted as one inversion. Whether A and B were the top two results or the bottom two, this inversion adds
+        the same amount to the pairwise loss, because the objective has no notion of list position.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — GELU vs ReLU vs sigmoid">
+    <VIS.Section id="sec-contrast" title="Beat 3 — Pairwise vs pointwise, and its blind spot">
       <table>
-        <thead><tr><th>Property</th><th>GELU</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of pairwise LTR</th></tr></thead>
         <tbody>
-          <tr><td>Negative side</td><td>Small negative dip (min near x&asymp;&minus;0.75), not a flat zero like ReLU</td></tr>
-          <tr><td>Smoothness</td><td>Differentiable everywhere &mdash; no kink, unlike ReLU's elbow</td></tr>
-          <tr><td>Large positive x</td><td>&Phi;(x)&rarr;1 so GELU&rarr;x: roughly linear, unbounded, no top saturation</td></tr>
-          <tr><td>Where used</td><td>Default in BERT/GPT feedforward blocks</td></tr>
+          <tr><td>Unit</td><td>Ordered document pairs within a query</td></tr>
+          <tr><td>Loss</td><td>Depends on the score difference, decoupled from absolute values</td></tr>
+          <tr><td>vs pointwise</td><td>Targets relative order directly instead of per-item label fit</td></tr>
+          <tr><td>Blind spot</td><td>Every inversion costs the same, regardless of list position</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A soft gate, not a smoothed ReLU">
-        GELU weights x by the probability &Phi;(x) that a standard normal falls below x, so the gate is a smooth value in
-        (0,1) rather than ReLU's hard 0/1. That makes GELU differentiable everywhere and gives it a small negative region
-        instead of a flat zero, while its positive tail stays close to the identity. It shares ReLU's non&#8209;saturating
-        positive side but adds smoothness and a slight negative dip &mdash; which is why transformers adopted it over plain
-        ReLU.
+      <VIS.Callout kind="insight" title="Right objective, wrong weighting">
+        Pairwise fixes pointwise's core flaw by optimizing relative order rather than absolute scores. But it weights all
+        inversions equally, so it does not know that a top-of-list mistake hurts more than a tail mistake. Closing that gap is
+        the entire motivation for LambdaRank's metric-weighted gradients.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>GELU=x&middot;&Phi;(x) is a smooth gate by the Gaussian CDF:
-        differentiable everywhere, slightly negative near x&asymp;&minus;0.75, and roughly linear/unbounded for large
-        positive x.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>pairwise learns from preference pairs, minimizing misordered pairs via
+        P(s_i &gt; s_j); the loss depends only on the score difference so it targets relative order, but it weights every inversion
+        equally regardless of position.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="gelu-a1"
+        id="pa-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What GELU does on the negative side"
-        scenario={<>A teammate says "GELU is ReLU with a rounded corner, so like ReLU it outputs exactly zero for every negative input." Pick the statement that correctly describes GELU on the negative side.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x),  Phi in (0,1)
-GELU(-1) = -1 * Phi(-1) = ?
-question: is GELU ever negative?`}</pre>}
+        title="A1 — What the pairwise loss depends on"
+        scenario={<>A teammate says the pairwise loss for a pair depends on how close each document's score is to its own relevance label. Pick the statement that correctly describes the dependence.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pairwise loss for pair (i, j) depends on ( ? )
+candidates:
+   the score difference s_i - s_j
+   each score's distance from its own label`}</pre>}
         options={[
-          { key: "a", text: "It dips slightly negative for moderately negative inputs, reaching a shallow minimum near x of about minus 0.75.", correct: true },
-          { key: "b", text: "It outputs exactly zero for every negative input, matching ReLU across the whole of the negative side exactly.", correct: false },
-          { key: "c", text: "It outputs large negative values that grow without bound as the input becomes steadily more and more negative.", correct: false },
-          { key: "d", text: "It outputs a constant negative floor for every negative input, fixed at the smallest value the gate can reach.", correct: false },
+          { text: "It depends on the score difference within the pair, so adding a constant to both scores leaves the loss unchanged.", correct: true },
+          { text: "It depends on each score's distance from its own label, so it reduces to the same per-item fit as a pointwise loss.", correct: false },
+          { text: "It depends on the absolute value of the higher score, so raising both scores equally always lowers the pairwise loss.", correct: false },
+          { text: "It depends on the sum of the two scores, so a pair with larger total score is always penalized more by the loss.", correct: false },
         ]}
-        trap={<>(b) confuses GELU with ReLU; GELU's negative side is not flat zero. (c) GELU's negative values are small and bounded, not unbounded. (d) the negative output varies with x and forms a shallow dip, not a constant floor.</>}
-        lens={<>GELU multiplies x by &Phi;(x) in (0,1), so for moderately negative x the product is a small negative number, giving a shallow dip with minimum near x&asymp;&minus;0.75. It is not flat zero like ReLU, not unbounded, and not a constant floor. This small negative region, plus smoothness, is what distinguishes GELU from ReLU.</>}
-        stretch={<>Why does a small negative region give GELU a nonzero gradient where ReLU would have exactly zero?</>}
+        trap={<>Distance from labels is the pointwise criterion, not pairwise. The loss does not depend on the higher score's absolute value, nor on the score sum; only the difference matters.</>}
+        lens={<>The pairwise loss is a function of the within-pair score difference s_i minus s_j, so it depends only on whether and by how much the model orders the pair correctly, not on absolute score values. Adding the same constant to both scores leaves the difference and the loss unchanged, which is exactly the decoupling from absolute scale that distinguishes pairwise from pointwise. Tying the loss to distance from labels would collapse it back into the per-item fitting that pointwise does.</>}
+        stretch={<>Why does dependence on only the score difference make pairwise invariant to a per-query score shift?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-a2"
+        id="pa-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — GELU for large positive inputs"
-        scenario={<>A teammate claims GELU "saturates and bounds its output for large inputs, just like sigmoid does." Pick the statement that correctly describes GELU's positive tail.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-for large x: Phi(x) -> 1
-question: what does GELU approach for large positive x?`}</pre>}
+        title="A2 — How pairwise weights a top inversion"
+        scenario={<>A teammate believes the standard pairwise loss penalizes an inversion of the top two documents more heavily than an inversion of two documents near the bottom. Pick the statement that correctly describes the weighting.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`inversion at positions (1,2) vs inversion at positions (39,40)
+question: does standard pairwise penalize them differently?`}</pre>}
         options={[
-          { key: "a", text: "It approaches the identity x and grows without bound, because the gate value approaches one for large inputs.", correct: true },
-          { key: "b", text: "It saturates onto a fixed upper asymptote for large inputs, the way the sigmoid output flattens out near one.", correct: false },
-          { key: "c", text: "It decays steadily back toward zero for large inputs, because the gate eventually shrinks the input away again.", correct: false },
-          { key: "d", text: "It oscillates around a fixed value for large inputs, because the gate keeps cycling between zero and one again.", correct: false },
+          { text: "Both inversions cost the same, since the standard pairwise loss has no term for where in the list a pair sits.", correct: true },
+          { text: "The top inversion costs more, since the standard pairwise loss multiplies each pair by a position-discount weight.", correct: false },
+          { text: "The bottom inversion costs more, since deeper pairs break more downstream relations in the pairwise objective.", correct: false },
+          { text: "Neither inversion is counted, since the pairwise loss only considers pairs that are adjacent in the final ranking.", correct: false },
         ]}
-        trap={<>(b) GELU does not bound its positive output; that is sigmoid's behavior. (c) the gate &Phi;(x) approaches 1, not 0, for large x. (d) &Phi;(x) is monotone increasing toward 1, it does not oscillate.</>}
-        lens={<>For large positive x, &Phi;(x)&rarr;1, so GELU(x)&rarr;x: the positive tail is roughly linear and unbounded, like ReLU's and unlike sigmoid's flat top. It does not saturate, decay, or oscillate. This non&#8209;saturating positive side is part of why GELU avoids upper saturation.</>}
-        stretch={<>How does an unbounded positive tail help avoid the vanishing gradients that bounded activations cause?</>}
+        trap={<>Standard pairwise has no position-discount weight, so the top is not favored. Deeper pairs do not break more relations. And pairwise considers all label-derived pairs, not only adjacent ones.</>}
+        lens={<>The standard pairwise loss sums a per-pair penalty that depends only on the score difference, with no factor for the positions involved, so a top-two inversion and a bottom-two inversion contribute equally. This position-blindness is the defining limitation of pairwise: it optimizes the right thing (relative order) but cannot express that users care more about the top. Adding exactly such a position-aware weight, tied to a rank metric, is what LambdaRank does to overcome this.</>}
+        stretch={<>What multiplicative factor would you attach to each pair to make top inversions cost more?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="gelu-b1"
+        id="pa-b1"
         difficulty="hard"
         axis="Application"
-        title="B1 — Activation for transformer feedforward blocks"
-        scenario={<>You are choosing the hidden activation for the feedforward blocks of a new transformer. A teammate wants sigmoid "because it is the classic neural-network nonlinearity." Pick the soundest choice and reasoning.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`transformer FFN block: Linear -> activation -> Linear
-candidates: GELU, sigmoid, tanh
-question: which is the established default here?`}</pre>}
+        title="B1 — Fewer inversions, worse NDCG"
+        scenario={<>A pairwise model update reduces the total number of misordered pairs on a query yet the query's NDCG drops. A teammate calls this impossible since fewer inversions should mean a better ranking. Pick the soundest reading.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`misordered pairs on query: decreased
+NDCG on same query: decreased
+claim: "fewer inversions must raise NDCG"`}</pre>}
         options={[
-          { key: "a", text: "Use GELU, the smooth non-saturating gate that has become the established default for transformer feedforward blocks.", correct: true },
-          { key: "b", text: "Use sigmoid, whose bounded output keeps the wide feedforward activations numerically stable across the deep stack.", correct: false },
-          { key: "c", text: "Use tanh on every block, since its zero-centered saturating shape is strictly required for transformers to converge.", correct: false },
-          { key: "d", text: "Use no activation here, since transformer feedforward blocks train fastest when both of the linear layers stay linear.", correct: false },
+          { text: "Pairwise counts inversions equally, so fixing many tail pairs while breaking a top pair can lower NDCG anyway.", correct: true },
+          { text: "Fewer inversions must raise NDCG, so the simultaneous NDCG drop can only be a measurement or labeling error.", correct: false },
+          { text: "Inversion count and NDCG are the same objective, so any disagreement proves the data was corrupted in this run.", correct: false },
+          { text: "Pairwise already weights top inversions, so fewer total inversions guarantees the top of the list improved too.", correct: false },
         ]}
-        trap={<>(b) sigmoid saturates and reintroduces vanishing gradients in deep stacks. (c) tanh also saturates and is not required; transformers standardized on GELU. (d) removing the activation collapses the two linear layers into one linear map.</>}
-        lens={<>GELU is the established default in transformer feedforward blocks (BERT, GPT) because it is smooth and non&#8209;saturating on the positive side, giving clean gradients at depth. Sigmoid and tanh saturate and stall deep stacks, and removing the activation collapses the block to a single linear map. GELU (or the closely related SiLU) is the right default here.</>}
-        stretch={<>What is the relationship between GELU and SiLU/Swish, and why are they often interchangeable?</>}
+        trap={<>Fewer inversions does not have to raise NDCG, because position is ignored. Inversion count and NDCG are different objectives. And pairwise does not weight top inversions.</>}
+        lens={<>Because pairwise weights every inversion equally, an update can reduce the total inversion count by correctly ordering many low-impact tail pairs while introducing a single inversion at the very top, and NDCG, which is heavily position-weighted, can fall even as the raw inversion count improves. So fewer inversions with lower NDCG is fully consistent and not a bug. The episode is the canonical demonstration that the pairwise objective is misaligned with position-weighted rank metrics, which is the gap LambdaRank closes.</>}
+        stretch={<>How many tail-pair fixes can one top-pair inversion outweigh in NDCG terms?</>}
       />
 
       <VIS.TrapProblem
-        id="gelu-b2"
-        difficulty="hard"
+        id="pa-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Replacing ReLU with GELU to smooth gradients"
-        scenario={<>A deep ReLU network trains, but a teammate wants smoother gradients near the activation threshold and proposes switching to GELU. Another teammate warns this will "remove all gradient on the negative side, just like ReLU." Pick the soundest assessment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ReLU: kink at 0, exactly 0 gradient for x<0
-GELU: x * Phi(x), differentiable everywhere
-question: does GELU also zero out the negative-side gradient?`}</pre>}
+        title="B2 — Choosing pairwise over pointwise"
+        scenario={<>Your pointwise ranker fits labels well but keeps misordering closely-relevant documents within queries. A teammate suggests switching to a pairwise loss. Pick the soundest reading of what that switch buys.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptom: pointwise misorders close-relevance docs within queries
+proposed: switch to a pairwise loss
+question: what does pairwise directly improve?`}</pre>}
         options={[
-          { key: "a", text: "GELU is smooth everywhere and keeps a small nonzero gradient over part of the negative side, unlike plain ReLU.", correct: true },
-          { key: "b", text: "GELU has exactly zero gradient for all negative inputs, so on the negative side it behaves identically to plain ReLU.", correct: false },
-          { key: "c", text: "GELU has the same sharp kink at zero as ReLU, so switching to it changes nothing about the gradient near the corner.", correct: false },
-          { key: "d", text: "GELU saturates on its negative side, so its negative-side gradient actually vanishes faster than plain ReLU's does.", correct: false },
+          { text: "Pairwise optimizes the relative order of document pairs directly, so it targets the misordering pointwise ignored.", correct: true },
+          { text: "Pairwise optimizes each document's absolute label more tightly, so it fixes ordering by improving per-item accuracy.", correct: false },
+          { text: "Pairwise optimizes a position-weighted rank metric directly, so it already prioritizes the top of the list over pairs.", correct: false },
+          { text: "Pairwise optimizes catalog coverage, so switching to it broadens inventory exposure and resolves the ordering issue.", correct: false },
         ]}
-        trap={<>(b) GELU's negative side is a smooth dip with nonzero gradient, not a flat zero. (c) GELU has no kink; it is differentiable everywhere. (d) GELU does not saturate to a negative asymptote in the relevant range; it dips then returns toward 0.</>}
-        lens={<>GELU is differentiable everywhere and its small negative dip carries a nonzero gradient over part of the negative side, so it does not zero out negative&#8209;side gradients the way ReLU does, and it has no kink at zero. The teammate's warning describes ReLU, not GELU. That smoothness and partial negative gradient is exactly the motivation for the switch.</>}
-        stretch={<>Could GELU's nonzero negative gradient reduce the dying-unit problem that plagues ReLU?</>}
+        trap={<>Pairwise does not tighten absolute label fit (that is pointwise). It does not optimize a position-weighted metric directly (that is LambdaRank). Coverage is unrelated to within-query ordering.</>}
+        lens={<>Switching to pairwise directly optimizes the relative order of document pairs, so it attacks exactly the close-document misordering that pointwise's absolute loss left to chance. It does not improve per-item label accuracy and does not yet weight by position; it simply makes correct relative order the objective. That fixes pointwise's core flaw, though it still treats all inversions equally, leaving the position-weighting improvement for a LambdaRank-style method.</>}
+        stretch={<>After moving to pairwise, what symptom would tell you that you still need position weighting?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="gelu-c1"
+        id="pa-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why GELU is a probabilistic gate"
-        scenario={<>A teammate asks what the &Phi;(x) factor in GELU actually represents and why it is called a stochastic or probabilistic gate. Pick the correct explanation.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(x) = P(Z <= x) for Z ~ standard normal
-question: what role does Phi(x) play multiplying x?`}</pre>}
+        title="C1 — Why pairwise decouples from absolute scale"
+        scenario={<>A teammate insists pairwise must care about absolute scores because it outputs scores that get sorted. Pick the explanation of why the pairwise loss is invariant to the absolute scale.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pairwise loss = g(s_i - s_j) for some increasing-in-correctness g
+add constant c to every score in the query
+what happens to each (s_i - s_j)?`}</pre>}
         options={[
-          { key: "a", text: "Phi(x) is the chance a standard normal falls below x, so x is gated by that smooth probability lying in zero to one.", correct: true },
-          { key: "b", text: "Phi(x) is a fixed constant close to one half, so it simply rescales every input by the very same factor regardless of x.", correct: false },
-          { key: "c", text: "Phi(x) is a hard zero-or-one switch on the sign of x, so it makes GELU identical to the ReLU gate right at the corner.", correct: false },
-          { key: "d", text: "Phi(x) is the derivative of the loss, so GELU ends up multiplying the input by the incoming backward gradient signal.", correct: false },
+          { text: "Each difference s_i - s_j is unchanged by a shared shift, so the loss is invariant though the sorted order is preserved.", correct: true },
+          { text: "Each difference grows by the constant c, so shifting all scores up steadily reduces the pairwise loss to zero.", correct: false },
+          { text: "The loss depends on absolute scores after sorting, so a shift changes the loss even though the ordering is preserved.", correct: false },
+          { text: "The loss becomes undefined after a shift, since pairwise requires every score to lie within the relevance label range.", correct: false },
         ]}
-        trap={<>(b) &Phi;(x) varies with x from 0 to 1; it is not a constant. (c) &Phi;(x) is a smooth probability, not a hard 0/1 switch. (d) &Phi;(x) is a property of the activation, not the loss gradient.</>}
-        lens={<>&Phi;(x) is the standard-normal CDF, the probability that a draw Z is below x, so GELU gates x by a smooth value in (0,1) that depends on the input. That soft, input&#8209;dependent gate &mdash; not a constant, not a hard switch, not the loss gradient &mdash; is what makes GELU a smooth probabilistic gate rather than ReLU's hard on/off.</>}
-        stretch={<>How does the common tanh-based approximation of GELU relate to this exact CDF form?</>}
+        trap={<>A shared shift does not change differences, so the loss does not shrink to zero. The loss does not depend on absolute scores. And it is not undefined outside the label range; scale is arbitrary.</>}
+        lens={<>The pairwise loss is a function of the score difference s_i minus s_j, and adding the same constant to every score in a query cancels in that difference, leaving the loss exactly unchanged while the sorted order is also preserved. So although the model outputs scores that are sorted, only their differences carry information, and the absolute scale is free. This invariance is precisely why pairwise targets relative order rather than absolute label values, and why it sidesteps the score-versus-label mismatch that troubles pointwise.</>}
+        stretch={<>Does multiplying all scores by a positive constant change the pairwise ordering, and does it change the loss?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="gelu-d1"
+        id="pa-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Two inputs of equal magnitude, opposite sign"
-        scenario={<>A teammate inspects GELU on inputs x=+0.5 and x=&minus;0.5 and expects "equal magnitude in means equal magnitude out, just opposite signs, since the corner is at zero." The outputs are not mirror images. Predict the non-obvious reason.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GELU(x) = x * Phi(x)
-Phi(0.5) ~ 0.691     Phi(-0.5) ~ 0.309
-question: are GELU(0.5) and GELU(-0.5) mirror images?`}</pre>}
+        title="D1 — Pairwise over-invests in the long tail"
+        scenario={<>A teammate notices a pairwise model spends most of its effort correcting orderings deep in long result lists rather than at the top, and finds this odd. Predict the non-obvious reason pairwise gradients concentrate on the tail.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`long lists: many more pairs exist among the many tail documents
+each pair contributes equal loss
+where does the bulk of the gradient signal come from?`}</pre>}
         options={[
-          { key: "a", text: "The gate value differs between the two signs, so the positive output ends up larger in magnitude than the negative one.", correct: true },
-          { key: "b", text: "The two outputs are exact mirror images of each other, because GELU is an odd function symmetric about the origin point.", correct: false },
-          { key: "c", text: "Both outputs come out as zero, because inputs of small magnitude fall inside a flat dead zone of GELU near the origin.", correct: false },
-          { key: "d", text: "The negative output is larger in magnitude, because the Gaussian gate weights negative inputs more heavily than positive.", correct: false },
+          { text: "Most pairs involve tail documents and all pairs weigh equally, so the gradient mass concentrates on tail orderings.", correct: true },
+          { text: "Pairwise weights top pairs more, so concentration on the tail proves the gradient computation contains a sign error.", correct: false },
+          { text: "Long lists have fewer pairs overall, so the tail cannot dominate and the observed concentration must be a logging artifact.", correct: false },
+          { text: "Pairwise ignores tail pairs by design, so any tail-focused effort indicates the pair-sampling code is misconfigured.", correct: false },
         ]}
-        trap={<>(b) GELU is not odd; &Phi;(x) breaks the symmetry. (c) GELU has no flat dead zone; it is smooth and nonzero for nonzero x. (d) &Phi; weights positive inputs more (&Phi;(0.5)&gt;&Phi;(&minus;0.5)), not negative ones.</>}
-        lens={<>GELU is not symmetric because the gate &Phi;(x) is larger for positive inputs (&Phi;(0.5)&asymp;0.691) than for negative ones (&Phi;(&minus;0.5)&asymp;0.309), so the positive product exceeds the negative one in magnitude. It is not an odd function, has no dead zone, and weights positive inputs more, not less. The asymmetric Gaussian gate is exactly the point.</>}
-        stretch={<>What would the output pair look like if you replaced &Phi; with a symmetric gate fixed at one half?</>}
+        trap={<>Pairwise does not weight top pairs more. Long lists have many more pairs, not fewer. And pairwise does not ignore tail pairs; it counts them all equally.</>}
+        lens={<>The number of document pairs grows roughly quadratically with list length, so a long list contains vastly more pairs among its many tail documents than among its few top ones, and since pairwise weights every pair equally, the bulk of the loss and gradient comes from tail orderings. The model therefore spends its capacity where the pairs are, not where users look. This counterintuitive misallocation, lots of effort on low-impact tail pairs, is the practical face of pairwise's position-blindness and the reason LambdaRank reweights pairs by their metric impact.</>}
+        stretch={<>How does weighting each pair by its NDCG impact redirect the gradient back toward the top?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="gelu-e1"
+        id="pa-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Cheap approximation in a tight inference budget"
-        scenario={<>You are deploying a transformer and the exact Gaussian CDF in GELU is slightly costly per call. A teammate proposes swapping in a known closed-form approximation of GELU. Pick the soundest operational stance.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact GELU uses the Gaussian CDF (erf)
-a tanh-based formula approximates it closely
-question: is a close GELU approximation acceptable?`}</pre>}
+        title="E1 — Forming training pairs efficiently"
+        scenario={<>You implement pairwise training and the naive code enumerates all document pairs per query, which is too slow for queries with thousands of candidates. A teammate proposes keeping all pairs but training on only the easiest ones. Pick the soundest implementation choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`naive: all O(n^2) pairs per query -> too slow on large n
+decision: how to sample pairs without distorting the objective?`}</pre>}
         options={[
-          { key: "a", text: "A close tanh-based approximation of GELU is standard and acceptable, tracking the exact curve to within a tiny error.", correct: true },
-          { key: "b", text: "No approximation is ever acceptable here, because only the exact Gaussian CDF can preserve the network's accuracy at all.", correct: false },
-          { key: "c", text: "Replace GELU with the sigmoid instead, because the sigmoid is the cheapest activation and behaves essentially the same.", correct: false },
-          { key: "d", text: "Drop the activation entirely under the tight budget, because the two linear layers on their own recover the same function.", correct: false },
+          { text: "Sample informative pairs (e.g. across relevance levels and near-violations) to cut cost while preserving the signal.", correct: true },
+          { text: "Keep all pairs but train only on the easiest, already-correct ones, since they are cheapest to process each step.", correct: false },
+          { text: "Form pairs only between documents of identical relevance, since equal-label pairs carry the strongest order signal.", correct: false },
+          { text: "Replace pairs with a single per-document squared-error term, since that recovers the pairwise objective more cheaply.", correct: false },
         ]}
-        trap={<>(b) the standard tanh approximation tracks GELU very closely with negligible accuracy loss. (c) sigmoid saturates and behaves quite differently from GELU. (d) removing the activation collapses the block to a linear map.</>}
-        lens={<>A widely used tanh&#8209;based closed form approximates GELU to within a tiny error and is the standard cheap substitute, so it is acceptable under a tight budget. Insisting only the exact erf works is overcautious, sigmoid is not an equivalent substitute, and dropping the activation collapses the feedforward block to a single linear map.</>}
-        stretch={<>How would you empirically confirm the approximation does not shift downstream metrics before shipping it?</>}
+        trap={<>Training only on easy correct pairs wastes steps on pairs with little gradient. Equal-label pairs encode no preference, so they carry no order signal. A per-document squared term reverts to pointwise, not pairwise.</>}
+        lens={<>The quadratic pair count is cut by sampling informative pairs, typically pairs spanning different relevance levels and pairs the model currently orders wrongly or barely right, which preserves the order-learning signal at far lower cost. Training only on easy, already-correct pairs spends compute where the gradient is near zero; pairs of equal relevance carry no preference at all; and a per-document squared term abandons pairwise for pointwise. Informative-pair sampling keeps the pairwise objective intact while making it tractable on large candidate sets.</>}
+        stretch={<>Why do equal-relevance pairs contribute no useful gradient to a pairwise loss?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="gelu-f1"
+        id="pa-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Putting GELU on the output of a classifier"
-        scenario={<>An engineer, impressed by GELU in the hidden layers, places GELU on the final layer of a multi-class classifier to produce class scores. The outputs are not a probability distribution and include negatives. A teammate blames GELU's negative dip. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`final layer activation: GELU -> unbounded, can be negative
-goal: a probability distribution over K classes
-question: is GELU the right output activation here?`}</pre>}
+        title="F1 — Pairwise optimized, top of list still wrong"
+        scenario={<>A team minimizes pairwise loss until the inversion count is very low, but users still complain the first results are wrong. A teammate insists the low inversion count proves the top is good. Pick the soundest diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pairwise inversion count: very low
+users: first results still wrong
+claim: "low inversions = good top of list"`}</pre>}
         options={[
-          { key: "a", text: "GELU is a hidden activation; a multi-class output needs softmax instead to produce one normalized probability distribution.", correct: true },
-          { key: "b", text: "The negative dip is the entire problem, so clipping GELU's output at zero will be enough to turn the scores into probabilities.", correct: false },
-          { key: "c", text: "GELU is fine on the output layer, because dividing its raw scores by their running sum always yields a valid probability vector.", correct: false },
-          { key: "d", text: "Swap GELU for ReLU on the output, because ReLU's non-negative outputs already form a proper probability distribution by themselves.", correct: false },
+          { text: "Pairwise weights all inversions equally, so a low total can still hide the few high-impact inversions at the top.", correct: true },
+          { text: "A low inversion count conclusively proves a good top of list, so the complaints must be a presentation or layout issue.", correct: false },
+          { text: "Pairwise already optimizes a position-weighted metric, so a low inversion count means the top must be ordered correctly.", correct: false },
+          { text: "Inversion count measures recall over the catalog, so the complaints mean recall fell rather than the ordering being wrong.", correct: false },
         ]}
-        trap={<>(b) clipping at zero does not normalize to a simplex and distorts gradients. (c) dividing arbitrary (possibly negative) scores by their sum is not a valid probability. (d) ReLU outputs are non&#8209;negative but unnormalized, still not a distribution.</>}
-        lens={<>GELU is a hidden&#8209;layer activation; a multi&#8209;class head needs softmax to map logits to a normalized probability simplex. The negative dip is not the root issue &mdash; the issue is using any hidden activation as the output. Clipping, naive sum&#8209;normalization of signed scores, or swapping to ReLU all fail to produce a calibrated distribution. Use softmax (paired with cross&#8209;entropy).</>}
-        stretch={<>Why must the output activation be matched to the loss, not chosen for its hidden-layer virtues?</>}
+        trap={<>A low inversion count does not prove a good top; position is ignored. Pairwise does not optimize a position-weighted metric. And inversion count is not catalog recall.</>}
+        lens={<>Because every inversion is weighted equally, a model can drive the total inversion count very low by fixing the abundant low-impact pairs while leaving a handful of high-impact inversions exactly at the top, where users notice. The pairwise objective simply has no term for position, so a low count says nothing specific about the first results. The fix is to weight each pair by its impact on a position-sensitive metric, which is precisely LambdaRank's lambda gradients; minimizing raw inversions optimizes a proxy misaligned with what users see.</>}
+        stretch={<>What change to the per-pair weight would make minimizing the loss also fix the top of the list?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">
-            <strong>Gaussian Error Linear Units (GELU)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the original paper defining x&middot;&Phi;(x) and its tanh approximation)</span>
-          <br/>Introduces the Gaussian&#8209;CDF gate, the negative dip, and the tanh-based closed form used in practice.
-        </li>
-        <li>
-          <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">
-            <strong>BERT</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(GELU as the default activation in transformer feedforward blocks)</span>
-          <br/>The model whose adoption of GELU in its FFN blocks made it the transformer default.
+          <a href="https://en.wikipedia.org/wiki/Learning_to_rank" target="_blank" rel="noopener">
+            <strong>Learning to rank &mdash; pairwise approach</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(preference pairs, RankNet/RankSVM, position-blindness)</span>
+          <br/>Covers how pairwise targets relative order via score differences and why equal pair weighting motivates LambdaRank.
         </li>
       </ul>
     </VIS.Section>
