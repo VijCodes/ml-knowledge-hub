@@ -2167,285 +2167,294 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: HINGE LOSS (SVM).
-// Delta: L = max(0, 1 - y*f(x)), y in {-1,+1}. ZERO loss once y*f >= 1 (correct beyond the margin); LINEAR penalty
-//   inside the margin (0 < y*f < 1) and on wrong side (y*f <= 0). The flat zero region => confident-correct points get
-//   ZERO gradient => only margin/violating points drive the update => sparse support vectors. Non-differentiable kink at
-//   y*f = 1. NOT log-loss: hinge stops caring past the margin, never pushes y*f -> +inf, never yields probabilities.
-// Traps: "more confident = lower loss always" (false past the margin), "hinge is differentiable everywhere",
-//   "hinge gives probabilities", "loss can go negative for very-correct points", "every training point shapes boundary".
+// Concept explainer: HETEROSCEDASTIC REGRESSION (GAUSSIAN NLL).
+// Delta: predict BOTH mean mu(x) AND input-dependent variance sigma^2(x); minimize NLL = 0.5(y-mu)^2/sigma^2 +
+//   0.5 log sigma^2. Squared error is DIVIDED by predicted variance -> auto down-weights high-noise inputs
+//   (learned loss attenuation). The +0.5 log sigma^2 term stops sigma^2 from inflating to infinity (which would
+//   zero every residual). Yields per-input (aleatoric) uncertainty, unlike a single global sigma. Named failure:
+//   variance COLLAPSE sigma^2->0 on confident points -> (y-mu)^2/sigma^2 explodes -> instability (fix: predict
+//   log sigma^2, softplus floor, beta-NLL, warmup). Distinct from multi-quantile (distribution-free, no Gaussian)
+//   and homoscedastic MSE (constant implicit sigma).
 
-// Vega-Lite: hinge loss vs the signed margin y*f(x). Flat at 0 for y*f >= 1, linear with slope -1 below.
-const HINGE = (() => {
+// Vega-Lite: hold residual r = (y-mu) = 2 fixed, sweep predicted sigma^2, plot the two NLL terms and the total.
+// Shows the optimum sigma^2 lands at the residual magnitude (r^2), not at 0 or infinity. DATA ONLY.
+const NLL = (() => {
   const rows = [];
-  for (let m = -2; m <= 3.0001; m += 0.1) {
-    const yf = +m.toFixed(2);
-    rows.push({ yf, loss: +Math.max(0, 1 - yf).toFixed(3) });
+  const r2 = 4;  // residual^2 with r = 2
+  for (let s2 = 0.3; s2 <= 16.0001; s2 += 0.3) {
+    const v = +s2.toFixed(2);
+    const fit = 0.5 * r2 / v;
+    const reg = 0.5 * Math.log(v);
+    rows.push({ s2: v, val: +fit.toFixed(3), kind: "data-fit  ½r²/σ²" });
+    rows.push({ s2: v, val: +reg.toFixed(3), kind: "penalty  ½·log σ²" });
+    rows.push({ s2: v, val: +(fit + reg).toFixed(3), kind: "total NLL" });
   }
   return rows;
 })();
-const HINGE_SPEC = {
-  width: 560, height: 240,
-  layer: [
-    {
-      mark: { type: "line", color: "#2563eb" },
-      encoding: {
-        x: { field: "yf", type: "quantitative", title: "signed margin  y·f(x)" },
-        y: { field: "loss", type: "quantitative", title: "hinge loss  max(0, 1 − y·f)" }
-      }
-    },
-    {
-      data: { values: [{ yf: 1 }] },
-      mark: { type: "rule", color: "#dc2626", strokeDash: [5, 4] },
-      encoding: { x: { field: "yf", type: "quantitative" } }
-    }
-  ]
+const NLL_SPEC = {
+  width: 560, height: 270,
+  mark: { type: "line" },
+  encoding: {
+    x: { field: "s2", type: "quantitative", title: "predicted variance σ²   (residual r = y − μ = 2, so r² = 4)" },
+    y: { field: "val", type: "quantitative", title: "loss contribution" },
+    color: { field: "kind", type: "nominal", title: "term",
+      scale: { domain: ["data-fit  ½r²/σ²", "penalty  ½·log σ²", "total NLL"], range: ["#94a3b8", "#cbd5e1", "#2563eb"] } }
+  }
 };
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
       pill="Loss"
-      title="Hinge Loss (SVM)"
+      title="Heteroscedastic Regression (Gaussian NLL)"
       byline={[
-        { label: "Topic", value: "Hinge Loss" },
-        { label: "Subtopic", value: "max(0, 1 − y·f): zero past the margin, linear inside, the kink, and sparse support vectors" },
+        { label: "Topic", value: "Regression Losses" },
+        { label: "Subtopic", value: "Predict mean and input-dependent variance — learned loss attenuation and per-input uncertainty" },
       ]} />
 
     <VIS.TLDR>
-      Hinge loss is <strong>max(0, 1 − y·f(x))</strong> with the label <strong>y ∈ &#123;−1, +1&#125;</strong>. The
-      product <strong>y·f(x)</strong> is the signed margin: positive when the prediction has the right sign. The loss is
-      <strong> exactly zero</strong> once a point is correct <em>and clears the margin</em> (y·f ≥ 1), then rises
-      <strong> linearly</strong> as the point moves inside the margin or onto the wrong side. The flat zero region is the
-      whole story: a confident-correct point produces <strong>no gradient</strong>, so only points on or inside the
-      margin shape the boundary — that is why an SVM rests on a sparse set of <strong>support vectors</strong>. The kink
-      at y·f = 1 makes hinge <strong>non-differentiable</strong> there. Unlike log-loss, hinge stops caring past the
-      margin; it never pushes confidence to infinity and never produces a probability.
+      Instead of one output, the model predicts <strong>two</strong>: a mean <strong>μ(x)</strong> and an
+      input-dependent variance <strong>σ²(x)</strong>. Training minimizes the Gaussian negative log-likelihood{" "}
+      <strong>NLL = ½·(y − μ)²/σ² + ½·log σ²</strong>. The key move is that the squared error is now{" "}
+      <strong>divided by the predicted variance</strong>, so noisy inputs — where the model declares a large
+      σ² — contribute a smaller gradient. That is{" "}
+      <VIS.Term def="The squared-error term is weighted by 1/σ²(x), so the model automatically reduces the influence of inputs it predicts to be high-noise.">learned loss attenuation</VIS.Term>: the model down-weights points it cannot fit, instead of being dragged by them. The{" "}
+      <strong>½·log σ²</strong> term is the price that stops σ² from inflating to infinity (which would otherwise
+      zero out every residual). The payoff is <strong>per-input (aleatoric) uncertainty</strong> — error bars that
+      vary by row — which a single global σ (plain MSE) cannot give. The signature failure is{" "}
+      <strong>variance collapse</strong>: σ² → 0 on over-confident points makes (y − μ)²/σ² explode and
+      destabilizes training.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-shape" title="Beat 1 — The shape: flat, then a kink, then linear">
+    <VIS.Section id="sec-shape" title="Beat 1 — The two terms pull σ² in opposite directions">
       <p>
-        Plot the loss against the signed margin <code>y·f(x)</code>. To the right of the dashed line (y·f ≥ 1) the loss
-        sits flat at zero. To the left it climbs with slope −1 — first through the margin band, then across the decision
-        boundary at y·f = 0, and on into the misclassified region.
+        Fix one point's residual at r = y − μ = 2 and sweep the predicted variance σ². The data-fit term ½r²/σ²
+        (grey) wants σ² <em>large</em> (it shrinks the penalty on the miss). The log-penalty ½·log σ² (light) wants
+        σ² <em>small</em>. The total NLL (blue) is a bowl whose minimum sits where they balance.
       </p>
-      <VIS.VegaLite spec={HINGE_SPEC} data={HINGE} />
+      <VIS.VegaLite spec={NLL_SPEC} data={NLL} />
       <p>
-        Two features matter. The <strong>flat zero region</strong> for y·f ≥ 1 means a comfortably-correct point adds
-        nothing to the loss and nothing to the gradient. The <strong>kink at y·f = 1</strong> is a corner, not a smooth
-        bend — hinge has no derivative exactly there.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: three points">
-      <p>Same model, three points at different signed margins:</p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 14 }}>{`point   y·f(x)    1 - y·f    max(0, 1 - y·f)
-P1       1.4       -0.4            0.0      (correct, beyond margin)
-P2       0.3        0.7            0.7      (correct, inside margin)
-P3      -0.5        1.5            1.5      (misclassified)`}</pre>
-      <p>
-        P1 clears the margin, so its loss and gradient are zero — it does not pull on the boundary at all. P2 is on the
-        right side but inside the margin band, so it still pays a linear penalty. P3 is misclassified and pays the most.
-        Only P2 and P3 are candidates to become <VIS.Term def="The training points that lie on or inside the margin (or are misclassified); only these have non-zero hinge loss and therefore non-zero gradient, so only they shape the decision boundary.">support vectors</VIS.Term>.
+        That balance point is the message: the optimum σ² lands near r² (the actual squared residual), so the model
+        learns a variance that matches the noise it actually sees — not zero, not infinity.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-math" title="Beat 3 — Definition and the sub-gradient">
-      <p>The hinge loss for one labeled point, with the bracket meaning "clamp negatives to zero":</p>
-      <VIS.Equation display tex={"\\mathcal{L}_{\\text{hinge}} = \\big[\\, 1 - y\\,f(x) \\,\\big]_{+} = \\max\\!\\big(0,\\; 1 - y\\,f(x)\\big), \\qquad y \\in \\{-1, +1\\}"} />
-      <p>Its (sub-)gradient with respect to the score <code>f</code> is piecewise:</p>
-      <VIS.Equation display tex={"\\frac{\\partial \\mathcal{L}}{\\partial f} = \\begin{cases} -y & \\text{if } y f < 1 \\\\ 0 & \\text{if } y f > 1 \\end{cases}"} />
-      <VIS.Callout kind="gotcha" title="Not differentiable at the margin">
-        At exactly y·f = 1 the loss has a corner, so no ordinary derivative exists; optimizers use a sub-gradient (any
-        value between −y and 0 is valid). This is why the smooth squared-hinge variant exists. The gradient is also
-        exactly zero for y·f &gt; 1 — confident-correct points are inert.
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: attenuation across two regions">
+      <p>The same residual costs different amounts depending on the variance the model assigned:</p>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 14 }}>{`residual r = y − μ = 2  in both regions
+
+clean region  (σ² = 0.25):
+  data-fit = ½ · 4 / 0.25 = 8.0    (expensive — must fit well)
+
+noisy region  (σ² = 4):
+  data-fit = ½ · 4 / 4    = 0.5    (cheap — attenuated)
+
+→ the same miss costs 16× more where the model is confident`}</pre>
+      <p>
+        A miss of 2 costs <strong>8.0</strong> in the clean region but only <strong>0.5</strong> in the noisy one —
+        a 16× difference driven entirely by the predicted σ². The model is free to "give up" on intrinsically noisy
+        inputs by raising their σ², spending its capacity where it can actually fit — provided the log σ² term keeps
+        that variance honest.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-math" title="Beat 3 — The loss and why the log term is essential">
+      <p>The Gaussian NLL for a heteroscedastic model (dropping the constant ½·log 2π):</p>
+      <VIS.Equation display tex={"\\mathcal{L}(x,y) = \\frac{1}{2}\\,\\frac{(y - \\mu(x))^2}{\\sigma^2(x)} + \\frac{1}{2}\\log \\sigma^2(x)"} />
+      <p>Setting ∂L/∂σ² = 0 for a fixed residual shows the optimal variance equals the squared residual:</p>
+      <VIS.Equation display tex={"\\frac{\\partial \\mathcal{L}}{\\partial \\sigma^2} = -\\frac{(y-\\mu)^2}{2\\sigma^4} + \\frac{1}{2\\sigma^2} = 0 \\;\\Rightarrow\\; \\sigma^2 = (y-\\mu)^2"} />
+      <VIS.Callout kind="insight" title="Drop the log term and σ² runs away">
+        Without ½·log σ², the loss is just ½(y − μ)²/σ², which any optimizer trivially minimizes by sending
+        σ² → ∞ — every residual gets divided by infinity and the loss goes to zero with <em>no learning</em>. The
+        log σ² term is the cost of claiming high uncertainty; it pins σ² to the real noise level instead of letting it
+        explode.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 4 — Hinge vs log-loss past the margin">
-      <p>The single biggest source of confusion is what happens once a point is comfortably correct:</p>
+    <VIS.Section id="sec-contrast" title="Beat 4 — Gaussian NLL vs MSE vs quantile bands">
       <table>
-        <thead><tr><th></th><th>Hinge</th><th>Log-loss (logistic)</th></tr></thead>
+        <thead><tr><th></th><th>Gaussian NLL</th><th>Plain MSE</th><th>Multi-quantile band</th></tr></thead>
         <tbody>
-          <tr><td>Loss when y·f = 5 (very correct)</td><td>0</td><td>small but &gt; 0</td></tr>
-          <tr><td>Gradient on a confident-correct point</td><td>0</td><td>small but non-zero</td></tr>
-          <tr><td>Pushes confidence to infinity?</td><td>no — stops at the margin</td><td>yes — always rewards more</td></tr>
-          <tr><td>Produces a probability?</td><td>no</td><td>yes (sigmoid of f)</td></tr>
-          <tr><td>Which points shape the boundary</td><td>only margin / violators</td><td>all points, weighted</td></tr>
+          <tr><td>Outputs</td><td>μ and σ²(x)</td><td>μ only</td><td>several quantile heads</td></tr>
+          <tr><td>Distribution assumption</td><td>Gaussian</td><td>implicit constant-σ Gaussian</td><td>none</td></tr>
+          <tr><td>Uncertainty</td><td>per-input σ²(x)</td><td>none</td><td>per-input via band width</td></tr>
+          <tr><td>Reduces to MSE when…</td><td>σ² held constant</td><td>—</td><td>—</td></tr>
+          <tr><td>Main pitfall</td><td>variance collapse σ²→0</td><td>noisy points dominate</td><td>quantile crossing</td></tr>
         </tbody>
       </table>
       <p>
-        Hinge buys you a sparse, max-margin boundary that ignores easy points entirely. Log-loss keeps every point in
-        play and gives calibrated probabilities, at the cost of never letting a confident point go quiet.
+        Gaussian NLL is the parametric route to per-input uncertainty: it assumes a Gaussian and learns its spread,
+        giving μ ± k·σ(x). It reduces exactly to MSE if you freeze σ², which is why MSE is the homoscedastic special
+        case.
       </p>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this visual's delta — <strong>hinge is zero past the margin (y·f ≥ 1)</strong>, linear
-        inside it, with a non-differentiable kink at y·f = 1, so confident-correct points have zero gradient and only
-        margin/violating points (support vectors) shape the boundary. Commit before revealing the lens.
+        Every problem hinges on this visual's delta — <strong>predict μ and σ²(x); the 1/σ² weight attenuates noisy
+        inputs; the log σ² term stops σ² from exploding; the optimum σ² equals the squared residual; and σ²→0
+        collapse destabilizes training</strong>. Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="hl-a1"
+        id="hng-a1"
         difficulty="medium"
-        title="A1 — Where does the loss first hit zero?"
-        scenario={<>A teammate sketches hinge loss against the signed margin y·f and asks where the loss first becomes exactly zero as the point gets more correct. Pick the answer.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`x-axis: signed margin  y*f(x)
-loss form: max(0, 1 - y*f)
-at which y*f does the curve reach 0?`}</pre>}
+        title="A1 — What does a heteroscedastic head output?"
+        scenario={<>A teammate says "heteroscedastic regression is just MSE with a fancier name — still one output, the prediction." Pick the precise correction.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = ½·(y − μ)²/σ² + ½·log σ²
+two quantities appear: μ and σ²
+both depend on the input x`}</pre>}
         options={[
-          { key: "a", text: "At y·f = 0, the decision boundary, where the prediction's sign just becomes correct." },
-          { key: "b", text: "At y·f = 1, the margin, beyond which the bracket goes negative and clamps to zero.", correct: true },
-          { key: "c", text: "Only as y·f → ∞, since like log-loss it keeps shrinking but never quite reaches zero." },
-          { key: "d", text: "At y·f = 0.5, the midpoint of the band, where the linear penalty is exactly halved." },
+          { key: "a", text: "It outputs one value, the prediction, and MSE is recovered exactly with no extra head at all." },
+          { key: "b", text: "It outputs two values per input — a mean μ(x) and a variance σ²(x), not one.", correct: true },
+          { key: "c", text: "It outputs the mean and a single global variance shared across every input, learned once for the dataset." },
+          { key: "d", text: "It outputs a full histogram of the target, from which the mean and variance are read off afterward." },
         ]}
-        trap={<>(a) at y·f = 0 the loss is still 1 — the sign being right is not enough. (c) confuses hinge with log-loss; hinge truly reaches zero. (d) 0.5 is not special. The bracket 1 − y·f turns negative at y·f = 1 and clamps to 0 there.</>}
-        lens={<>Hinge is max(0, 1 − y·f). The inner term hits zero at y·f = 1 and goes negative beyond, where the max clamps it to exactly zero. So the loss first reaches zero at the margin y·f = 1, not at the boundary y·f = 0, and not only in the limit. Crossing the boundary (sign correct) still leaves loss = 1.</>}
-        stretch={<>What is the loss at y·f = 0 exactly, and what does that point represent?</>}
+        trap={<>(a) it has a second output (σ²); it is not plain single-output MSE. (c) the variance is per-input σ²(x), not one global constant — that global case is just MSE. (d) it predicts μ and σ², not a histogram.</>}
+        lens={<>A heteroscedastic head predicts two input-dependent quantities: the mean μ(x) and the variance σ²(x). Plain MSE is the special case where σ² is held constant (homoscedastic). The whole point is that σ² varies by input, giving per-input uncertainty.</>}
+        stretch={<>Under what condition does Gaussian NLL collapse exactly to MSE?</>}
       />
 
       <VIS.TrapProblem
-        id="hl-a2"
+        id="hng-a2"
         difficulty="medium"
-        title="A2 — Is hinge differentiable everywhere?"
-        scenario={<>To use a plain gradient method, a teammate claims hinge loss "is differentiable everywhere, just piecewise-linear." Pick the precise statement.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`slope below y*f = 1 :  -1
-slope above y*f = 1 :   0
-what happens exactly at y*f = 1 ?`}</pre>}
+        title="A2 — What is the ½·log σ² term for?"
+        scenario={<>A teammate proposes dropping the ½·log σ² term: "the data-fit term ½(y−μ)²/σ² is the real loss; the log piece is just clutter." Pick the accurate read.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`keep only:  ½·(y − μ)²/σ²
+optimizer is free to choose σ²
+what σ² minimizes this alone?`}</pre>}
         options={[
-          { key: "a", text: "Yes, differentiable everywhere; the two linear pieces share a common derivative at the join." },
-          { key: "b", text: "No; there is a corner at y·f = 1 where the slope jumps, so a sub-gradient is used.", correct: true },
-          { key: "c", text: "No; it is non-differentiable at y·f = 0, the boundary, where the prediction flips sign." },
-          { key: "d", text: "Yes; the clamp only removes values, it never affects the smoothness of the curve." },
+          { key: "a", text: "It is clutter; dropping it leaves a valid loss whose optimum still recovers the correct per-input variance." },
+          { key: "b", text: "Without it the optimizer sends σ² → ∞ to zero out every residual; the log term pins σ² down.", correct: true },
+          { key: "c", text: "It exists only to add a constant offset; removing it shifts the loss but does not change any learned parameter." },
+          { key: "d", text: "It penalizes the mean μ, keeping the prediction from drifting, and has no effect on the learned variance." },
         ]}
-        trap={<>(a) the slopes are −1 and 0, so they do not match at the join. (c) the kink is at the margin y·f = 1, not at the boundary y·f = 0. (d) the clamp is exactly what creates the corner. A sub-gradient is needed at the kink.</>}
-        lens={<>The two pieces have slopes −1 (for y·f &lt; 1) and 0 (for y·f &gt; 1); they meet at y·f = 1 with mismatched slopes, forming a corner. No ordinary derivative exists there, so optimizers use a sub-gradient. The smooth squared-hinge variant exists precisely to remove this kink.</>}
-        stretch={<>Which loss variant removes this corner and why does that help gradient methods?</>}
+        trap={<>(a) dropping it breaks the loss — σ² is no longer identified. (c) it is not a constant; it depends on σ² and changes the optimum. (d) it penalizes σ², not μ.</>}
+        lens={<>Keep only ½(y−μ)²/σ² and the optimizer sets σ² → ∞, dividing every residual to zero with no learning. The ½·log σ² term is the cost of claiming high uncertainty; it balances the data-fit term so the optimum σ² lands at the true noise level (σ² = squared residual), not infinity.</>}
+        stretch={<>What value of σ² minimizes the full loss for a fixed residual r?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="hl-b1"
-        difficulty="medium"
-        title="B1 — A downstream stage needs probabilities"
-        scenario={<>You trained a linear classifier with hinge loss; it separates the classes well. A downstream stage needs a calibrated probability per example to set a cost-sensitive threshold. A teammate proposes reading the score off directly. Pick the right judgment.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`hinge-trained model -> raw score f(x)
-downstream need: P(class | x) in [0,1]
-hinge optimized for margin, not likelihood`}</pre>}
+        id="hng-b1"
+        difficulty="hard"
+        title="B1 — Noise level varies sharply by region"
+        scenario={<>You predict watch-time. Mainstream titles are predictable; long-tail titles are wildly noisy. Plain MSE gives a model whose errors on mainstream titles got worse over training. A teammate wants more capacity. Pick the cleaner fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`mainstream titles: low intrinsic noise
+long-tail titles:  high intrinsic noise
+MSE weights every point's squared error equally`}</pre>}
         options={[
-          { key: "a", text: "Hinge gives no probability; either calibrate the scores post-hoc or retrain with a log-loss head.", correct: true },
-          { key: "b", text: "Pass the score through a sigmoid; hinge scores are already log-odds so this is exactly calibrated." },
-          { key: "c", text: "Clamp the score to [0,1] and read it as a probability, since hinge already bounds the margin to 1." },
-          { key: "d", text: "Use the margin distance 1 − y·f directly as the probability of the predicted class for each point." },
+          { key: "a", text: "Add capacity and train longer; a bigger model under plain MSE will eventually fit both regions well." },
+          { key: "b", text: "Predict μ and σ²(x) with Gaussian NLL: noisy long-tail points get a high σ² and attenuate.", correct: true },
+          { key: "c", text: "Drop the long-tail titles entirely, since any model that touches them will be dragged off the mainstream fit." },
+          { key: "d", text: "Switch to MAE; the median is robust, so it removes the need to model per-input variance at all." },
         ]}
-        trap={<>(b) hinge scores are not log-odds, so a sigmoid is not calibrated. (c) hinge does not bound f to [0,1]; the "1" is the margin target, not a score cap. (d) the margin slack is not a probability. Hinge optimizes margin, not likelihood.</>}
-        lens={<>Hinge never models P(class | x) — it optimizes the margin, so its raw scores carry no calibrated probability. To get one you either fit a post-hoc calibrator (e.g. Platt scaling, a sigmoid fit on held-out data) or retrain with a probabilistic loss like log-loss. Pushing the score through a bare sigmoid or clamping it does not produce a calibrated probability.</>}
-        stretch={<>Why does log-loss naturally yield a probability while hinge does not, given both are functions of the same score f?</>}
+        trap={<>(a) more capacity does not change MSE's equal weighting; the noisy points keep dominating the gradient. (c) discarding real data to dodge noise is wasteful and biases the model. (d) MAE is more robust to outliers but still gives no per-input uncertainty and weights regions by count, not noise.</>}
+        lens={<>The problem is that MSE weights every squared error equally, so the high-noise long-tail drags the mainstream fit. Gaussian NLL predicts σ²(x): the long-tail points earn a high variance and are attenuated by the 1/σ² weight, freeing the model to fit the predictable mainstream — and you get per-input error bars for free. More capacity under MSE does not address the weighting.</>}
+        stretch={<>Why does Gaussian NLL give the long-tail points less gradient influence than MSE does?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="hl-c1"
+        id="hng-c1"
         difficulty="hard"
-        title="C1 — Why the boundary depends on only a few points"
-        scenario={<>An SVM trained on 10,000 points ends up resting on about 50 of them; deleting any of the other 9,950 leaves the boundary unchanged. A teammate calls this "a quirk of the solver." Reason about the real cause.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`9950 points: y*f >= 1  (beyond margin)
-   50 points: y*f <= 1  (on / inside margin)
-gradient of hinge for y*f > 1 = ?`}</pre>}
+        title="C1 — Where does the optimal σ² land?"
+        scenario={<>For a point with residual r = y − μ, a teammate guesses the optimal predicted variance is "as small as possible, to look confident." Reason about where σ² actually settles.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss(σ²) = ½·r²/σ² + ½·log σ²
+∂/∂σ² : −r²/(2σ⁴) + 1/(2σ²) = 0
+solve for σ²`}</pre>}
         options={[
-          { key: "a", text: "The solver randomly subsamples points for speed, so most never enter the optimization at all." },
-          { key: "b", text: "Points with y·f &gt; 1 have zero hinge gradient, so only margin / violating points move the boundary.", correct: true },
-          { key: "c", text: "Regularization zeroes most weights, which incidentally drops most points from the active set." },
-          { key: "d", text: "The far points cancel in pairs by symmetry, leaving only the unpaired boundary points active." },
+          { key: "a", text: "σ² settles as small as possible, since shrinking the variance always lowers the total loss for a fixed residual." },
+          { key: "b", text: "σ² settles at r² (the squared residual), where the data-fit and log terms balance.", correct: true },
+          { key: "c", text: "σ² settles at infinity, because the data-fit term keeps falling as the variance grows without any opposing force." },
+          { key: "d", text: "σ² settles at the mean of all residuals, a single global value independent of this point's own residual." },
         ]}
-        trap={<>(a) the solver sees all points; this is not subsampling. (c) the L2 penalty acts on weights, not on which points are active. (d) there is no pairwise cancellation. The driver is that the flat region gives zero gradient.</>}
-        lens={<>For any point with y·f &gt; 1 the hinge term is flat at zero, so its gradient contribution is exactly zero — it exerts no force on the weights. Only points on or inside the margin (or misclassified) have non-zero gradient, so the boundary is determined entirely by that small support-vector set. Removing an inactive point changes nothing. This is the mechanism behind SVM sparsity, not a solver artifact.</>}
-        stretch={<>If you nudged a far-correct point slightly closer but kept y·f &gt; 1, would the boundary move?</>}
+        trap={<>(a) shrinking σ² blows up the data-fit term — small is not free. (c) the log term opposes growth, so it does not run to infinity. (d) the optimum is per-point (r²), not a shared global value.</>}
+        lens={<>Setting ∂L/∂σ² = 0 gives −r²/(2σ⁴) + 1/(2σ²) = 0, i.e. σ² = r². The data-fit term pushes σ² up, the log term pushes it down, and they balance exactly at the squared residual — so σ² learns the local noise. Neither "as small as possible" nor infinity; it tracks the actual miss.</>}
+        stretch={<>If the mean head fits perfectly (r = 0), what does the optimum σ² formula suggest, and why does the floor matter?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="hl-d1"
+        id="hng-d1"
         difficulty="hard"
-        title="D1 — Adding very-correct points to the training set"
-        scenario={<>You augment training with a cluster of new points that are all extremely easy — each lands at y·f ≈ 8 under the current model. A teammate expects the hinge loss and the boundary to shift because "more data always changes the fit." Predict what happens.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`new points all at y*f ~ 8
-current support vectors unchanged
-hinge contribution of a y*f ~ 8 point = ?`}</pre>}
+        title="D1 — A 'great' loss that learned nothing"
+        scenario={<>A model's Gaussian NLL dropped dramatically and a teammate celebrates. But its μ predictions barely changed from initialization, while its σ² outputs grew huge across the board. Predict what really happened.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`NLL fell sharply
+μ(x) ≈ unchanged from init (poor fit)
+σ²(x) grew large everywhere`}</pre>}
         options={[
-          { key: "a", text: "The boundary shifts toward the new cluster, since adding points always re-weights the decision region." },
-          { key: "b", text: "Loss and boundary are unchanged; points at y·f ≈ 8 add zero loss and zero gradient.", correct: true },
-          { key: "c", text: "Loss rises because there are more terms to sum, even though each new term is individually small." },
-          { key: "d", text: "The margin widens automatically, because more correct points increase the model's effective confidence." },
+          { key: "a", text: "The model learned well; a falling NLL with large σ² means it correctly identified that the data is all high-noise." },
+          { key: "b", text: "It is explaining away a bad μ fit by inflating σ²: large variance shrinks the data-fit term.", correct: true },
+          { key: "c", text: "The labels are corrupted; only label noise can make NLL fall while the mean predictions stay fixed at init." },
+          { key: "d", text: "It is underfit on σ² only; training the variance head longer will pull μ toward the true targets automatically." },
         ]}
-        trap={<>(a) more data does not always change a hinge fit — flat-region points are inert. (c) each new term is exactly zero, so the sum does not rise. (d) the margin is set by the support vectors, which did not change. y·f ≈ 8 is deep in the flat region.</>}
-        lens={<>Each new point sits at y·f ≈ 8, far inside the flat region, so its hinge term and gradient are both exactly zero. They contribute nothing to the objective and exert no force on the weights, so neither the loss nor the boundary moves. This is the counterintuitive part: under hinge, piling on easy correct examples is a no-op — only points near or inside the margin matter. Log-loss would have reacted, if only slightly.</>}
-        stretch={<>What kind of new point would actually move the boundary?</>}
+        trap={<>(a) uniformly large σ² is a red flag, not a real finding about the data. (c) no label corruption is needed; the loss shape permits this shortcut. (d) the σ² head is doing too much, not too little; training it more worsens the shortcut.</>}
+        lens={<>The model found a shortcut: inflating σ² everywhere shrinks the ½r²/σ² data-fit term, so NLL falls even though μ never improved. The log σ² term resists this but a weak μ head plus a free σ² head can still "explain away" residuals as noise. Watch μ's fit and σ² calibration, not NLL alone — and consider β-NLL or a σ warmup so the mean learns first.</>}
+        stretch={<>What training schedule prevents σ² from absorbing residuals before μ has a chance to fit?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="hl-e1"
+        id="hng-e1"
         difficulty="hard"
-        title="E1 — Can the per-point loss ever be negative?"
-        scenario={<>While debugging, a teammate sees a point with a huge signed margin y·f = 12 and reasons that "an extremely correct point should earn negative loss, dragging the total down below zero." Pick the correct statement.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`1 - y*f at y*f = 12  ->  -11
-max(0, -11)  ->  ?
-range of max(0, .) output`}</pre>}
+        title="E1 — The variance head emits negative numbers"
+        scenario={<>Your network has a linear output unit for σ². Early in training the loss goes NaN; logs show the σ² output went negative, then near-zero. A teammate wants to lower the learning rate. Pick the cleaner fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`σ² head: raw linear output (can be negative)
+loss uses log σ² and divides by σ²
+σ² → 0 or negative → log/÷ blow up → NaN`}</pre>}
         options={[
-          { key: "a", text: "Yes; a very large margin makes 1 − y·f strongly negative, so the loss goes negative there." },
-          { key: "b", text: "No; the max(0, ·) clamps any negative inner value to zero, so the loss floor is zero.", correct: true },
-          { key: "c", text: "Yes, but only after L2 regularization, which can subtract enough to push a term below zero." },
-          { key: "d", text: "No; the loss instead asymptotes to a small positive constant for very large margins." },
+          { key: "a", text: "Lower the learning rate; a smaller step keeps the linear σ² output from ever crossing into negative values." },
+          { key: "b", text: "Predict log σ² (or softplus + a floor) so the variance stays positive and cannot collapse to 0.", correct: true },
+          { key: "c", text: "Clip the loss value when it exceeds a threshold, which prevents the NaN while leaving the σ² head linear." },
+          { key: "d", text: "Remove the log σ² term from the loss, since that term is what produces the NaN when σ² approaches zero." },
         ]}
-        trap={<>(a) ignores the outer max, which clamps at zero. (c) regularization adds a non-negative penalty; it cannot make a hinge term negative. (d) hinge reaches exactly zero, it does not asymptote to a positive constant. The clamp is the whole point.</>}
-        lens={<>The inner term 1 − y·f does go to −11 at y·f = 12, but the outer max(0, ·) clamps every negative value to zero. So a per-point hinge loss is bounded below by zero and can never reward a model with negative loss. Very-correct points simply contribute zero — they cannot pull the objective beneath its floor.</>}
-        stretch={<>How does squared hinge, max(0, 1 − y·f)², differ in its lower bound and its slope just inside the margin?</>}
+        trap={<>(a) a lower LR delays but does not prevent a linear unit from going non-positive. (c) clipping the loss masks the symptom; the σ² is still invalid. (d) removing the log term reintroduces the σ²→∞ runaway and still divides by a tiny σ².</>}
+        lens={<>A variance must be positive, so never emit it from a raw linear unit. Predict log σ² (then exponentiate) or pass the output through softplus with a small floor — this guarantees σ² &gt; 0 and prevents the divide-by-zero / log-of-nonpositive that causes the NaN. Tuning the learning rate treats the symptom, not the parameterization.</>}
+        stretch={<>Why does predicting log σ² also help optimization across the wide dynamic range of variances?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="hl-f1"
+        id="hng-f1"
         difficulty="hard"
-        title="F1 — Training loss reaches zero early"
-        scenario={<>Hinge training loss drops to exactly zero after a few epochs and stays there. A teammate concludes the model has "perfectly learned the task" and stops training. On a held-out set the boundary is needlessly close to one class. Reason about what zero hinge loss does and does not mean.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`train hinge loss = 0  (all points y*f >= 1)
-no margin-violating points remain
-but: regularizer still acts on ||w||`}</pre>}
+        title="F1 — Variance collapse on confident points"
+        scenario={<>On a cluster of easy, well-fit points the model drives σ² toward 0. Training then spikes and diverges. A teammate blames a bad batch. Reason about the real mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`easy points: μ fits well, residual r small
+model drives σ² → 0 on them
+data-fit term ½·r²/σ² with tiny σ² → huge gradient`}</pre>}
         options={[
-          { key: "a", text: "Zero hinge loss means optimal weights; the held-out asymmetry must be a data-distribution shift." },
-          { key: "b", text: "Zero only means all points clear the margin; the regularizer still tunes ||w|| and the margin width.", correct: true },
-          { key: "c", text: "The loss hit a numerical underflow; raise precision and the true non-zero loss will reappear." },
-          { key: "d", text: "Zero loss proves overfitting outright, so the only valid response is to shrink the model capacity." },
+          { key: "a", text: "A bad batch caused it; reshuffling the data will stop σ² from approaching zero on those points." },
+          { key: "b", text: "This is variance collapse: σ²→0 makes ½r²/σ² explode on any residual; floor σ² or use β-NLL.", correct: true },
+          { key: "c", text: "It is correct behavior; perfectly fit points should have exactly zero variance and contribute nothing further." },
+          { key: "d", text: "The learning rate is too low, so σ² creeps to zero; a larger step keeps the variance comfortably positive." },
         ]}
-        trap={<>(a) zero hinge is not the same as optimal — the regularized objective is not yet minimized. (c) hinge genuinely reaches zero; it is not underflow. (d) zero training loss alone does not prove overfitting. The data term is satisfied but the full objective is not done.</>}
-        lens={<>Zero hinge loss only means every training point clears the margin (y·f ≥ 1) — it says nothing about the margin's width or geometry. The full SVM objective is hinge plus an L2 penalty on ‖w‖, and that penalty keeps shaping the solution (widening the margin, shrinking weights) even when the data term is zero. Stopping at zero hinge can leave a poorly-positioned boundary. The objective, not the data term alone, signals convergence.</>}
-        stretch={<>How does the L2 term relate the weight norm ‖w‖ to the geometric margin width?</>}
+        trap={<>(a) it is a structural instability of the loss, not a batch-ordering fluke. (c) σ² = 0 is degenerate — the slightest residual then produces an enormous gradient. (d) a larger LR makes the instability worse, not better.</>}
+        lens={<>This is variance collapse: as σ² → 0 on confident points, the ½r²/σ² term and its gradient blow up for any nonzero residual, so a single slightly-off point detonates the loss. Guard it with a variance floor (softplus + eps), predict log σ², or use β-NLL / a σ-warmup so the variance cannot collapse. It is a loss-stability issue, not a bad batch.</>}
+        stretch={<>How does β-NLL re-weight the gradient to reduce sensitivity to tiny predicted variances?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://en.wikipedia.org/wiki/Hinge_loss" target="_blank" rel="noopener">
-            <strong>Hinge loss — Wikipedia</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(reference)</span>
-          <br/>The definition, the flat-then-linear shape, the kink at the margin, and the link to max-margin classifiers.
+          <a href="https://arxiv.org/abs/1703.04977" target="_blank" rel="noopener">
+            <strong>Kendall &amp; Gal — What Uncertainties Do We Need? (2017)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(paper)</span>
+          <br/>Heteroscedastic aleatoric uncertainty via predicted σ²(x) and learned loss attenuation.
         </li>
         <li>
-          <a href="https://cs231n.github.io/linear-classify/#svm" target="_blank" rel="noopener">
-            <strong>CS231n — Linear Classification (SVM loss)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(course notes)</span>
-          <br/>Worked margin examples and the multiclass generalization that builds on this binary hinge.
+          <a href="https://en.wikipedia.org/wiki/Heteroscedasticity" target="_blank" rel="noopener">
+            <strong>Heteroscedasticity — Wikipedia</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(reference)</span>
+          <br/>Why input-dependent noise breaks the constant-variance (MSE) assumption.
         </li>
       </ul>
     </VIS.Section>
