@@ -2167,288 +2167,294 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: CUSTOM & MONOTONIC CONSTRAINTS in gradient boosting.
+// Delta: because GBT only needs the gradient (and hessian) of the loss, you can plug in ANY differentiable
+//   custom loss (ranking, Tweedie, quantile/pinball) by supplying its derivatives — the tree machinery is
+//   unchanged. Separately, MONOTONIC CONSTRAINTS force the model's prediction to be non-decreasing (or
+//   non-increasing) in a chosen feature, enforced during SPLIT SELECTION (reject/clamp splits that would
+//   violate monotonicity), for business logic and interpretability — NOT a loss change. The diagram shows the
+//   custom-loss plug-in point and a monotone constraint sketch only; the candidate must infer that the loss
+//   enters via gradients and the monotone constraint enters via the split rule (two different mechanisms).
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="Classical"
+      title="Custom & Monotonic Constraints"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Gradient Boosted Trees" },
+        { label: "Subtopic", value: "Boosting needs only the loss's gradient and hessian, so any differentiable custom loss plugs in unchanged; monotonic constraints separately force the prediction non-decreasing in a feature, enforced during split selection for business logic" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Because boosting only needs a loss&rsquo;s gradient and hessian, any differentiable <VIS.Term def="A user-supplied objective — ranking, Tweedie for insurance frequency-severity, quantile pinball — that you wire in by providing its first (and second) derivatives. The tree-fitting code is unchanged.">custom loss</VIS.Term> plugs
+      in unchanged, and a separate <VIS.Term def="A constraint that forces the model's prediction to be non-decreasing (or non-increasing) as a chosen feature increases, holding other features fixed. It encodes domain logic like 'price must not fall as size rises'.">monotonic constraint</VIS.Term> forces
+      the prediction to move in one direction with a feature, enforced during split selection.</strong>{" "}
+      The loss enters through its derivatives: supply the gradient (and hessian) of a ranking, Tweedie, or
+      quantile objective and the same tree-building machinery optimises it. Monotonic constraints are a different
+      mechanism entirely &mdash; they do not change the loss; they restrict which splits and leaf values the tree
+      may take so that, as the chosen feature increases, the prediction never decreases (or never increases). The
+      constraint is enforced in the split rule, rejecting or clamping splits that would violate the required
+      direction, which buys interpretability and lets you bake in business rules. The failure modes: thinking a
+      custom loss requires rewriting the tree algorithm; trying to enforce monotonicity by editing the loss
+      function; and assuming a monotonic constraint also improves accuracy rather than trading a little fit for a
+      guarantee.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Loss via gradients, monotonicity via splits">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        Two independent levers sit on top of boosting. A custom loss is wired in by supplying its derivatives; a
+        monotonic constraint is enforced in the split selection. Read the plug-in point and the monotone sketch
+        below, and work out which mechanism each lever uses and why they are not the same thing.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <div style={{ margin: "16px 0" }}>
+        <VIS.Equation display tex={"\\text{custom loss: supply } g_i = \\partial L/\\partial F,\\ h_i = \\partial^2 L/\\partial F^2; \\qquad \\text{monotone: } x \\uparrow \\Rightarrow \\hat{y} \\not\\downarrow \\text{ (split rule)}"} />
+      </div>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`custom loss plug-in: provide gradient g and hessian h per point
+  -> tree machinery is unchanged; it just consumes g and h
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+monotone constraint on feature "sqft":
+  require prediction non-decreasing as sqft increases
+  -> enforced by rejecting/clamping splits that break the direction
+  -> the loss is NOT modified
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+which lever uses derivatives, and which uses the split rule?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Notice the custom loss touches only the per-point derivatives while the monotone constraint touches only
+        the split decision. Decide why enforcing monotonicity through the loss would be the wrong mechanism.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: two levers, two mechanisms">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`want a 90th-percentile prediction:
+  plug in the quantile (pinball) loss at tau = 0.9
+  -> supply its gradient/hessian; tree code unchanged
+
+want price to never fall as square footage rises:
+  set a monotone-increasing constraint on the sqft feature
+  -> the split finder rejects any split whose child ordering
+     would let prediction drop as sqft increases
+  -> the loss stays whatever it was`}</pre>
+      <p>
+        To predict a percentile you change the loss: supply the gradient and hessian of the pinball objective at
+        tau equal to 0.9, and the unchanged tree code optimises it &mdash; that is the custom-loss lever working
+        through derivatives. To guarantee that predicted price never drops as square footage rises, you set a
+        monotone-increasing constraint on that feature; the split finder then forbids splits and leaf assignments
+        that would let the prediction decrease in the constrained direction, while the loss is left untouched. The
+        two requirements use two different mechanisms &mdash; derivatives for the objective, the split rule for the
+        shape guarantee. (How a constraint trades accuracy for the guarantee is taken up in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Custom loss versus monotonic constraint">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>Custom loss</th><th>Monotonic constraint</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>What you supply</td><td>Gradient and hessian</td><td>A direction per feature</td></tr>
+          <tr><td>Where it enters</td><td>The per-point targets</td><td>The split selection rule</td></tr>
+          <tr><td>Changes the loss?</td><td>Yes, that is the point</td><td>No; the loss is unchanged</td></tr>
+          <tr><td>Typical purpose</td><td>Match the objective (ranking, quantile)</td><td>Business logic, interpretability</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="The objective is a derivative; the shape is a split rule">
+        Boosting&rsquo;s gradient-and-hessian interface makes custom losses cheap: ranking, Tweedie, and quantile
+        objectives all plug in by supplying their derivatives, with no change to the tree-building code. Monotonic
+        constraints are an unrelated mechanism &mdash; they leave the loss alone and instead restrict the splits and
+        leaf values so the prediction is non-decreasing (or non-increasing) in a feature, enforcing domain logic
+        and interpretability. Confusing the two &mdash; rewriting the tree code for a loss, or editing the loss for
+        monotonicity &mdash; aims each tool at the wrong layer.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>a custom loss enters through its gradient and hessian
+        with the tree code unchanged, while a monotonic constraint enters through the split-selection rule and
+        leaves the loss untouched.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="mono-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — How a custom loss is wired in"
+        scenario={<>A teammate says &ldquo;to use a custom loss in a booster you must rewrite the tree-splitting algorithm for that loss.&rdquo; Pick the statement that correctly characterises the interface.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`boosting consumes: gradient g and hessian h per point
+custom objective: some differentiable L(y, F)
+claim: must rewrite the tree splitter
+question: what does a custom loss actually require?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "Supply the loss's gradient and hessian; the tree-building code is unchanged and just consumes them.", correct: true },
+          { key: "b", text: "Rewrite the tree-splitting algorithm for the loss, since each objective needs its own bespoke split finder." },
+          { key: "c", text: "Replace the trees with a neural network, since only a network can optimise a non-squared custom objective." },
+          { key: "d", text: "Discretise the loss into classes, since boosting can only optimise classification-style objectives natively." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) the splitter is generic; it consumes gradients, so no rewrite is needed. (c) trees handle custom losses fine via derivatives. (d) boosting handles regression and ranking losses, not only classification.</>}
+        lens={<>Boosting&rsquo;s tree-building code only needs each point&rsquo;s gradient and (for second-order methods) hessian, so a custom loss is wired in simply by supplying those derivatives &mdash; the split finder and leaf-weight formula are unchanged. There is no need to rewrite the splitter, switch to a network, or discretise the problem. This generic interface is exactly what makes ranking, Tweedie, and quantile losses easy to drop in.</>}
+        stretch={<>What two callbacks does a typical boosting library expect for a custom objective?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="mono-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — How a monotone constraint is enforced"
+        scenario={<>A teammate assumes a monotonic constraint is imposed by adding a penalty term to the loss. Pick the statement that correctly names how it is enforced.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`goal: prediction non-decreasing as feature x increases
+candidate splits on x: produce child leaf values
+question: how is the monotone direction enforced?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "By restricting split selection and leaf values so a split on x cannot make the prediction decrease.", correct: true },
+          { key: "b", text: "By adding a penalty term to the loss function so that non-monotone predictions incur extra training cost." },
+          { key: "c", text: "By sorting the training rows on x before training, so the data order alone forces the prediction monotone." },
+          { key: "d", text: "By clipping the final predictions to be non-decreasing in a post-processing pass after the model is trained." },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) the constraint is structural in the splits, not a loss penalty. (c) sorting rows does not constrain the learned function. (d) post-hoc clipping is not how libraries guarantee monotonicity during fitting.</>}
+        lens={<>A monotone constraint is enforced during tree construction: when the split finder considers splitting on the constrained feature, it rejects splits (and clamps child leaf values) that would let the prediction decrease as the feature increases, propagating bounds down the tree. The loss is never modified. A loss penalty would only discourage violations softly, sorting rows does nothing structural, and post-hoc clipping does not guarantee the shape across the whole input space.</>}
+        stretch={<>Why does enforcing the constraint in the split rule give a hard guarantee that a loss penalty cannot?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="mono-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — A regulator requires a monotone rule"
+        scenario={<>A credit model must, by policy, never lower its risk score as the number of recent late payments rises. A colleague proposes encoding this by adding a term to the training loss that penalises non-monotone behaviour. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`policy: risk score non-decreasing in "recent late payments"
+requirement: a hard guarantee, audited
+colleague's plan: add a non-monotonicity penalty to the loss`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Set a monotone-increasing constraint on that feature; the split rule guarantees the direction the policy needs.", correct: true },
+          { key: "b", text: "Add a non-monotonicity penalty to the loss, since a large enough penalty guarantees the audited monotone behaviour." },
+          { key: "c", text: "Sort the training data by that feature, since training on sorted rows forces the score to rise with late payments." },
+          { key: "d", text: "Drop the feature entirely, since the only way to satisfy a monotone policy is to remove the constrained input." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) a loss penalty is soft and can still be violated; an audit needs a hard guarantee. (c) sorting data does not constrain the learned function. (d) dropping the feature discards signal and is not required.</>}
+        lens={<>A hard, auditable monotone requirement calls for a structural monotone constraint on the feature, enforced in split selection so the risk score provably never decreases as late payments rise &mdash; across the entire input space, not just on training data. A loss penalty only discourages violations and can still produce non-monotone regions, sorting rows changes nothing structural, and dropping the feature throws away a legitimate predictor. The constraint, not the loss, delivers the guarantee.</>}
+        stretch={<>What small accuracy cost might this constraint impose, and why is it usually acceptable here?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="mono-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Insurance claim amounts with many zeros"
+        scenario={<>You model insurance claim cost: most policies have zero claims, a few have large positive amounts. Squared-loss boosting predicts implausible negative costs and fits the mass at zero poorly. A colleague suggests just clipping predictions at zero. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`target: claim cost, many exact zeros + a few large positives
+squared loss: predicts negatives, fits the zero mass poorly
+colleague's plan: clip predictions at zero`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Plug in a Tweedie loss whose gradient suits zero-inflated positive targets; supply its derivatives, code unchanged.", correct: true },
+          { key: "b", text: "Clip predictions at zero, since truncating the negatives is enough to make squared loss fit the zero mass well." },
+          { key: "c", text: "Add a monotone constraint on the target, since constraining the output direction is what handles the zero inflation." },
+          { key: "d", text: "One-hot encode the target into zero-versus-positive, since classification is the only option for zero-inflated data." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) clipping hides negatives but does not change the gradient that mis-fits the zero-inflated distribution. (c) monotone constraints shape feature effects, not the target distribution. (d) you lose the magnitude of positive claims by collapsing to two classes.</>}
+        lens={<>Zero-inflated, non-negative targets like claim cost are exactly what the Tweedie loss is for: it models a point mass at zero plus a positive continuous part, and you wire it in by supplying its gradient and hessian &mdash; the tree code is unchanged. Clipping only masks the symptom of a mismatched loss, a monotone constraint addresses feature shape rather than the target distribution, and collapsing to two classes discards the claim magnitudes. The custom-loss lever, working through derivatives, matches the data.</>}
+        stretch={<>How does the Tweedie power parameter let you tune between a Poisson-like and a gamma-like regime?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="mono-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why only derivatives are needed"
+        scenario={<>A teammate asks why supplying just the gradient and hessian is enough for the booster to optimise an arbitrary loss, with no other change. Pick the correct account of the mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`split gain and leaf weight are computed from summed g and summed h
+the loss appears in the algorithm ONLY through g and h
+question: why is supplying g and h sufficient?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "The split gain and leaf weights are functions only of summed gradients and hessians, so g and h fully specify them.", correct: true },
+          { key: "b", text: "The loss value itself is needed at every split, so supplying g and h alone is actually never sufficient on its own." },
+          { key: "c", text: "The trees memorise the loss formula symbolically, so g and h are only needed to verify that memorised formula." },
+          { key: "d", text: "The hessian replaces the data, so once g and h are supplied the algorithm no longer reads the training features." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the loss value is not needed for the split gain; the second-order objective uses only g and h. (c) trees do not symbolically memorise the loss. (d) the algorithm still uses the features to find splits; h does not replace data.</>}
+        lens={<>In a second-order booster the per-leaf objective is a quadratic whose coefficients are the summed gradient and summed hessian, and the split gain is the difference of those quadratics&rsquo; optima &mdash; so everything the algorithm needs about the loss is captured by g and h at each point. That is why providing those two derivatives fully specifies the optimisation for any differentiable loss, with the tree code untouched. The raw loss value is not required in the split computation.</>}
+        stretch={<>What goes wrong if the supplied hessian is negative or zero for some points?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="mono-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — What a constraint does to accuracy"
+        scenario={<>You add a monotone-increasing constraint on a feature whose true relationship with the target is, in the data, slightly non-monotone (a small dip before rising). A teammate assumes adding a constraint can only help because it injects correct domain knowledge. Predict the non-obvious effect on training fit versus generalisation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`feature x: true effect mostly rising but with a small local dip
+constraint applied: prediction must be non-decreasing in x
+claim: a constraint can only ever help
+question: effect on training fit vs generalisation?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "It lowers training fit by forbidding the dip, but can improve generalisation if that dip was mostly noise.", correct: true },
+          { key: "b", text: "It improves training fit, since constraining the split rule lets the tree match the dip more precisely than before." },
+          { key: "c", text: "It leaves both training fit and generalisation exactly unchanged, since constraints never affect the learned values." },
+          { key: "d", text: "It always worsens generalisation, since any constraint that forbids a real dip must hurt every held-out prediction." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) the constraint forbids the dip, so it cannot fit it better; training fit drops. (c) constraints do change the learned values. (d) if the dip is noise, forbidding it can help, so it is not always harmful.</>}
+        lens={<>A monotone constraint forbids the learned function from dipping, so it cannot fit the small observed dip and training fit necessarily drops a little. But if that dip was largely sampling noise rather than a true effect, removing it acts as regularization and can improve held-out accuracy. So a constraint trades training fit for a shape guarantee, and whether generalisation rises or falls depends on whether the forbidden wiggle was signal or noise &mdash; not the blanket &ldquo;can only help.&rdquo;</>}
+        stretch={<>How would you test whether that dip is real signal before deciding to constrain the feature?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="mono-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — A ranking objective for search"
+        scenario={<>You are training a booster to order search results, and offline you optimise a pairwise ranking metric, not regression error. A colleague proposes training with squared loss on a relevance label and hoping the ordering follows. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`goal: optimise result ordering (a ranking metric)
+colleague's plan: squared loss on relevance labels
+boosting interface: gradient + hessian of any loss`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Plug in a ranking loss whose gradient targets pairwise order; supply its derivatives, tree code unchanged.", correct: true },
+          { key: "b", text: "Train with squared loss on relevance, since minimising squared error on labels always optimises the ranking metric." },
+          { key: "c", text: "Train with squared loss but raise the learning rate, since faster steps make the regression model rank correctly." },
+          { key: "d", text: "Train a classification model on click-or-not, since classification accuracy and ranking quality are the same objective." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) squared error on labels optimises pointwise values, not pairwise order; the ranking metric is not aligned. (c) the learning rate does not change which objective is optimised. (d) classification accuracy is not the same as ranking quality.</>}
+        lens={<>Because boosting consumes any loss&rsquo;s derivatives, the right move for a ranking metric is to plug in a ranking loss (pairwise or listwise) whose gradient pushes correctly-ordered pairs apart &mdash; you supply its gradient and hessian and the tree code is unchanged. Squared loss optimises pointwise relevance values, which need not produce the best ordering, and the learning rate or a click classifier do not align the training objective with the ranking goal.</>}
+        stretch={<>Why can two models with equal squared error on relevance labels still rank quite differently?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="mono-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Editing the loss to force a shape"
+        scenario={<>To make predicted price rise with square footage, an engineer adds a hand-crafted penalty to the squared loss whenever a tree split lets price fall with footage. Training is unstable and some predictions still violate the rule on held-out data. They conclude monotonicity is impossible in boosting. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`attempt: penalty added to the loss for non-monotone splits
+result: unstable training, held-out violations remain
+engineer's claim: monotonicity is impossible in boosting`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Monotonicity belongs in the split-constraint mechanism, not the loss; use the built-in monotone constraint instead.", correct: true },
+          { key: "b", text: "Monotonicity is impossible in boosting, so the engineer is right and the requirement must simply be dropped." },
+          { key: "c", text: "The penalty was too small, so multiplying it by a large factor is all that is needed to remove every violation." },
+          { key: "d", text: "The trees were too shallow, so deepening them is what lets the loss penalty finally enforce the monotone rule." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) monotonicity is fully supported via split constraints; it is not impossible. (c) a bigger soft penalty still cannot guarantee monotonicity everywhere and worsens instability. (d) depth does not turn a soft penalty into a hard guarantee.</>}
+        lens={<>The engineer aimed the wrong mechanism at the problem: monotonicity is a structural property enforced in split selection, not something a loss penalty can guarantee. A soft penalty makes training unstable and still leaves violations on unseen inputs because nothing forbids them structurally. The fix is the built-in monotone constraint, which restricts splits and leaf values so the prediction provably never decreases in the feature &mdash; across the whole input space. Boosting supports monotonicity; the loss was simply the wrong layer.</>}
+        stretch={<>What single test on held-out inputs would have shown the loss-penalty approach was not a hard guarantee?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Gradient_boosting" target="_blank" rel="noopener">
+            <strong>Gradient boosting</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(gradient/hessian interface for custom losses, monotonic constraints via split selection)</span>
+          <br/>Covers how any differentiable loss plugs in through its derivatives and how monotonic constraints are enforced structurally rather than through the loss.
         </li>
       </ul>
     </VIS.Section>

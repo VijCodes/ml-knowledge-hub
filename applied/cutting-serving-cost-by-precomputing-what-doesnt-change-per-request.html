@@ -2167,288 +2167,276 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: CUTTING SERVING COST BY PRECOMPUTING WHAT DOESN'T CHANGE PER REQUEST (Applied / Prime Video).
+// Delta: The decomposition principle — partition the computation by WHAT VARIES PER REQUEST. Anything INVARIANT
+//   across a request (item embeddings, hourly user vectors) is precomputed offline and cached; only the truly
+//   request-SPECIFIC part runs live. The discriminator is the variation axis: a value that does not depend on the
+//   live request inputs can be moved off the request path. The risk: precompute introduces STALENESS, so the knob
+//   is refresh cadence vs freshness need. Distinct from caching identical-query responses and from distillation
+//   (smaller model, not relocated compute). Diagrams show SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="Applied"
+      title="Cutting Serving Cost by Precomputing What Doesn't Change Per Request"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Caching and Precomputation" },
+        { label: "Subtopic", value: "Partition computation by what varies per request: precompute and cache the request-invariant parts offline, run only the truly request-specific part live" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Cut serving cost by partitioning the computation along one axis: what varies per request.</strong>{" "}
+      Anything that does not depend on the live request, item embeddings, batch user vectors, can be computed offline
+      and cached, leaving only the genuinely request&#8209;specific part to run on the hot path. Prime Video
+      precomputes all title embeddings nightly and caches per&#8209;user vectors hourly, so the live request is a fast
+      dot&#8209;product rather than a full forward pass. The test for what can be moved off the path is simple: does
+      this value change with the request's inputs? If not, precompute it. The cost of doing so is staleness, the
+      cached value can lag reality, so the knob is refresh cadence weighed against how fresh the signal must be. The
+      delta to hold onto: the variation axis decides what is precomputed, and refresh cadence trades cost against
+      freshness.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Split by what varies per request">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        Look at each piece of the live computation and ask whether its value depends on the inputs of this specific
+        request. The invariant pieces can be built ahead of time; only the varying piece must run live.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`computation piece            varies per request?    where it can run
+  item embedding (a title)        no (per item)          offline, cached
+  user vector (per user)          slowly (hourly)        batch, cached hourly
+  user-item dot-product           yes (this pair, now)   live, on the path
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+precompute the "no/slow" rows; run the "yes" row live`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Item embeddings do not change with who is asking, and user vectors change only slowly, so both can be cached;
+        the user&#8209;item score for this exact pair is what truly varies and must run live. Decide each piece's
+        variation axis before deciding where it runs.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Why moving invariant work off the path is safe-ish">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`live forward pass per request: expensive
+  embed item + embed user + score  (all live)
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+precomputed split:
+  embed item   -> nightly, cached       (item content stable)
+  embed user   -> hourly batch, cached  (taste shifts slowly)
+  score        -> live dot-product      (cheap)
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+saved cost = the two embeddings, paid once not per request
+risk       = cached value is as stale as its refresh cadence`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        The expensive embedding steps depend on the item or the user, not on the live pairing, so computing them once
+        and caching them removes that cost from every request while a cheap dot&#8209;product runs live. The catch is
+        that a cached value is only as current as its last refresh, so the saving comes with staleness bounded by the
+        cadence. The signal is that cost moves off the path exactly when a value does not vary with the request.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — Precomputation versus its neighbours">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Technique</th><th>What it reuses or moves</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Precompute invariant parts (this concept)</td><td>Moves request-invariant sub-computations offline; runs only varying part live</td></tr>
+          <tr><td>Response caching</td><td>Reuses the whole output for an identical repeated query</td></tr>
+          <tr><td>Distillation</td><td>Shrinks the model; the same compute still runs on the path</td></tr>
+          <tr><td>Quantization</td><td>Lowers precision of live compute; does not relocate it offline</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="The per-request variation axis is the dividing line">
+        Precomputation moves the parts of a computation that do not vary with the request off the hot path and caches
+        them, leaving only the request&#8209;specific part live, with staleness governed by refresh cadence. Response
+        caching reuses a whole output only when the same query repeats, while distillation and quantization make the
+        live computation cheaper without relocating it. Asking whether a sub&#8209;computation depends on this
+        request's inputs is what separates precomputation from its neighbours.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>partition computation by what varies per request,
+        precompute and cache the invariant parts off the path and run only the request-specific part live, with
+        staleness bounded by refresh cadence.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="pc-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What qualifies for precomputation"
+        scenario={<>A teammate says precomputation means caching whatever is slowest, regardless of what it depends on. Pick the statement that correctly frames the criterion.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`criterion for moving work offline: ?
+constraint: result must still be correct live`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "A sub-computation can be precomputed when its value does not depend on this request's specific live inputs.", correct: true },
+          { key: "b", text: "A sub-computation can be precomputed whenever it is the slowest step, even if its value changes with every request.", correct: false },
+          { key: "c", text: "A sub-computation can be precomputed only when the model is small, since large models cannot have any cached parts.", correct: false },
+          { key: "d", text: "A sub-computation can be precomputed whenever memory is plentiful, regardless of whether its value varies per request.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) caching a value that changes every request would serve a wrong result. (c) model size does not decide what is request-invariant. (d) memory availability does not make a varying value cacheable.</>}
+        lens={<>The criterion is the variation axis: a sub&#8209;computation can be precomputed only if its value does not depend on the live request's inputs, because then the cached value is correct for any request. Caching the slowest step regardless of dependency would serve stale or wrong results when that step actually varies, and neither model size nor spare memory changes what is request&#8209;invariant. Dependency on the request decides eligibility, not speed or capacity.</>}
+        stretch={<>Give an example of an expensive step that nonetheless cannot be precomputed, and say why.</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="pc-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — Precomputation versus response caching"
+        scenario={<>A teammate equates precomputing item embeddings with caching whole responses. Pick the statement that correctly separates them.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`precompute: cache an invariant SUB-result, score live
+response cache: reuse the WHOLE output for a repeat query`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Precomputation caches an invariant sub-result and still scores live; response caching reuses the whole repeat output.", correct: true },
+          { key: "b", text: "Precomputation reuses the whole output for a repeat query; response caching stores an invariant sub-result for reuse.", correct: false },
+          { key: "c", text: "Precomputation and response caching are identical, so either one alone serves a brand-new request without computing.", correct: false },
+          { key: "d", text: "Precomputation lowers model precision; response caching removes weights, so both reshape the model rather than reuse it.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) reverses the two. (c) a brand-new request still needs the live score under precomputation. (d) describes quantization and pruning, neither is correct.</>}
+        lens={<>Precomputation caches a request&#8209;invariant sub&#8209;result, such as an item embedding, and still runs the request&#8209;specific score live, so it serves novel requests cheaply. Response caching reuses an entire output only when the identical query repeats, which does not help a new pairing. They are distinct, neither reshapes the model, and only precomputation handles fresh requests by combining cached parts with a live step. The unit reused, a sub&#8209;result versus a whole output, is the distinction.</>}
+        stretch={<>Why does response caching help little when almost every user-item request is unique?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="pc-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Splitting a forward pass to save cost"
+        scenario={<>A live ranker runs a full forward pass per request: embed the user, embed each item, then score. You must cut cost without changing the math. Pick the soundest split.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`per request: embed_user + embed_item + score
+item embedding: same regardless of who asks
+user vector: changes slowly (hourly is fine)`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Precompute item embeddings offline and user vectors hourly, leaving only the live score on the request path.", correct: true },
+          { key: "b", text: "Precompute the final scores for every user-item pair, since enumerating all pairs removes all live computation.", correct: false },
+          { key: "c", text: "Precompute nothing and add hardware, since faster machines cut cost without the complexity of any caching layer.", correct: false },
+          { key: "d", text: "Precompute the user vector live each request, since recomputing it per request keeps it maximally fresh and correct.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) the full user-item pair space is astronomically large and changes constantly; enumeration is infeasible. (c) hardware scales cost linearly, it does not remove invariant work. (d) recomputing per request is the cost you are trying to remove.</>}
+        lens={<>The item embedding does not vary with the requester and the user vector varies only slowly, so both can be cached, item embeddings offline and user vectors hourly, leaving a cheap live score. Precomputing every user&#8209;item score is infeasible because that space is enormous and shifting, adding hardware does not remove the invariant work, and recomputing the user vector live reintroduces the very cost being cut. Splitting by variation axis keeps the math identical while moving the stable work off the path.</>}
+        stretch={<>What changes if the user vector must reflect the click that happened two seconds ago?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="pc-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — A freshness-sensitive signal resists caching"
+        scenario={<>A signal in the ranker is the item's popularity in the last five minutes, which swings sharply during a live sports event. A teammate caches it hourly like the others. Pick the soundest read.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`signal: item popularity in last 5 minutes
+behavior: swings fast during live events
+proposed cache: refresh hourly`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "An hourly cache makes this signal too stale, since it changes within minutes and a fresher path is required.", correct: true },
+          { key: "b", text: "An hourly cache is fine here, since any signal can tolerate an hour of staleness without affecting its usefulness.", correct: false },
+          { key: "c", text: "This signal cannot be cached at any cadence, since popularity is fundamentally impossible to precompute or store.", correct: false },
+          { key: "d", text: "This signal should be dropped entirely, since any value that changes within minutes adds no value to a ranker at all.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) an hour of staleness destroys a five-minute signal. (c) it can be cached at a fast cadence, not never. (d) a fast-moving signal can be very valuable during events; dropping it forfeits that.</>}
+        lens={<>Caching is bounded by staleness, and a signal that swings within minutes cannot tolerate an hourly refresh, so an hourly cache would serve a value that no longer reflects reality during a live event. The fix is not to abandon caching universally but to match the refresh cadence to the signal's volatility, here a near&#8209;real&#8209;time path or a much faster refresh. The judgment is per&#8209;signal: cadence must track how fast each value changes, and a fast&#8209;moving signal is often the most valuable to keep current.</>}
+        stretch={<>How would you mix an hourly-cached user vector with a near-real-time popularity feature in one score?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="pc-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why a cached embedding stays correct"
+        scenario={<>A teammate worries that caching item embeddings will silently corrupt the live score. Pick the correct mechanism explaining when it is safe.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`live score = f(user_vec, item_vec)
+item_vec depends on the item's content, not the request
+cache stores item_vec; score recomputed live`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "The item vector is a function of item content alone, so a cached copy equals a live recompute until the item changes.", correct: true },
+          { key: "b", text: "The item vector depends on the requesting user, so a cached copy is wrong for any user other than the one cached.", correct: false },
+          { key: "c", text: "The item vector is random per request, so caching it always returns a value unrelated to the live computation.", correct: false },
+          { key: "d", text: "The item vector includes the live score, so caching it freezes the final ranking and the score can never update.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the item vector does not depend on the user; that is why it is cacheable. (c) it is deterministic from content, not random. (d) the cache stores the embedding, not the final score.</>}
+        lens={<>The item embedding is computed from the item's own content and does not depend on which user is asking, so a cached copy is identical to a fresh recompute as long as the item's content has not changed; the live score still recombines it with the current user vector. It is therefore neither user&#8209;dependent, nor random, nor the final score itself. Caching is safe precisely because the cached quantity is request&#8209;invariant, and the only correctness condition is invalidating it when the underlying item changes.</>}
+        stretch={<>What event must invalidate a cached item embedding to keep the live score correct?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="pc-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Cache hit rate hides a freshness bug"
+        scenario={<>A team brags that their feature cache has a 99 percent hit rate and concludes the system is healthy. New titles, however, get poor recommendations for hours after launch. Predict the non-obvious connection.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`cache hit rate: 99% (looks great)
+new titles: weak recs for hours post-launch
+cache populated on a slow refresh cycle`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "A high hit rate can mask missing fresh entries, so new items serve stale or default features until the next refresh.", correct: true },
+          { key: "b", text: "A high hit rate guarantees freshness, so the new-title problem must come from an unrelated ranking model regression.", correct: false },
+          { key: "c", text: "A high hit rate means new titles are cached instantly, so any delay must be a network fault between cache and server.", correct: false },
+          { key: "d", text: "A high hit rate is irrelevant to recommendations, since cached features never influence which titles get surfaced.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) hit rate measures coverage of existing keys, not freshness of new ones. (c) a high hit rate does not imply instant population of new items. (d) cached features directly feed the ranker.</>}
+        lens={<>A 99 percent hit rate measures how often requests find an existing cached entry, which is dominated by the large back&#8209;catalog; it says nothing about whether brand&#8209;new titles have fresh entries yet. On a slow refresh cycle, new items either miss or fall back to defaults until the cache catches up, producing weak recommendations for hours despite the flattering aggregate. The non&#8209;obvious link is that hit rate and freshness are different health signals, so a high hit rate can coexist with a staleness bug that only hurts the newest, most time&#8209;sensitive items.</>}
+        stretch={<>What separate metric would have surfaced the new-title staleness that hit rate masked?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="pc-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Choosing a refresh cadence"
+        scenario={<>You must set how often each cached feature is recomputed, balancing cost against staleness. Pick the soundest policy.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`features vary at different rates
+refresh cost rises as cadence shortens
+goal: each feature fresh enough, no more`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Set each feature's cadence to its rate of change, refreshing fast-moving signals often and stable ones rarely.", correct: true },
+          { key: "b", text: "Refresh every feature on the same fast cadence, since a single uniform schedule is simplest and always safe to run.", correct: false },
+          { key: "c", text: "Refresh every feature on the same slow cadence, since minimizing refresh runs is always the cheapest correct policy.", correct: false },
+          { key: "d", text: "Refresh features only when memory fills, since cache pressure is the right trigger for deciding feature freshness.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) a uniform fast cadence wastes cost refreshing stable features needlessly. (c) a uniform slow cadence starves fast-moving signals of freshness. (d) memory pressure is unrelated to how stale a value is.</>}
+        lens={<>Refresh cadence should match each feature's volatility: fast&#8209;moving signals need frequent recomputation to stay fresh, while stable ones can refresh rarely to save cost. A single fast cadence overspends on stable features, a single slow cadence starves volatile ones, and memory pressure is an eviction trigger, not a freshness criterion. Tuning cadence per feature against its rate of change is what balances cost and staleness correctly.</>}
+        stretch={<>How would you detect, from logs, that a feature's cadence is too slow for its actual volatility?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="pc-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Caching a value that secretly varies"
+        scenario={<>To cut cost, a team caches a feature that quietly depends on the time of day. Recommendations look fine in testing but degrade every evening in production. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`cached feature: assumed request-invariant
+reality: depends on time of day
+symptom: evening recommendations degrade`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "The cached value actually varies with time, so a daytime cache served in the evening is stale and misleads the ranker.", correct: true },
+          { key: "b", text: "The cache cannot cause this, since any cached feature is correct at all hours once it has been written one time.", correct: false },
+          { key: "c", text: "The ranker model is overfit to mornings, since a model that fails in evenings must have been trained only on AM data.", correct: false },
+          { key: "d", text: "Evening traffic is simply heavier, since higher load is the only reason recommendations would degrade at a fixed hour.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) a value that varies with time is not correct at all hours from one write. (c) the failure tracks a time-varying cached input, not model capacity. (d) heavier load does not explain a feature being stale by time of day.</>}
+        lens={<>The team treated a time&#8209;dependent feature as request&#8209;invariant and cached it, so a value computed during the day is served unchanged in the evening when the true value differs, misleading the ranker exactly at that hour. The cache is not harmlessly correct from one write, the model is not overfit to mornings, and load does not explain a time&#8209;keyed staleness. The root cause is a mis&#8209;classification on the variation axis: a value that varies was assumed constant, so the fix is to refresh it on a cadence that tracks its time dependence.</>}
+        stretch={<>What audit on each cached feature would catch a hidden dependency like time of day before it ships?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <strong>Feature stores and precomputation in production ML (online/offline feature serving)</strong>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(request-invariant precompute, refresh cadence, staleness)</span>
+          <br/>Covers splitting computation into cached invariant parts and live request-specific parts, and how refresh cadence trades cost against freshness.
         </li>
       </ul>
     </VIS.Section>

@@ -2167,288 +2167,296 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: STOCHASTIC GRADIENT BOOSTING — row and column subsampling.
+// Delta: training each tree on a random SUBSET of rows (subsample < 1) and/or a random subset of columns
+//   (colsample) injects randomness that DECORRELATES the trees and REDUCES VARIANCE, and also speeds training.
+//   Crucially this is a regularizer ADDED ON TOP of boosting's bias reduction — it is a different lever from
+//   shrinkage. Without replacement (unlike bagging's bootstrap). The diagram shows the per-tree subsample
+//   fractions and a before/after val AUC WITHOUT labelling which wins; the candidate must infer that the
+//   randomness reduces variance (not bias) and is distinct from the learning rate.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="Classical"
+      title="Stochastic Gradient Boosting"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Gradient Boosted Trees" },
+        { label: "Subtopic", value: "Training each tree on a random subset of rows and columns injects randomness that decorrelates the trees and reduces variance while speeding training — a regularizer distinct from shrinkage, added on top of boosting's bias reduction" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong><VIS.Term def="Friedman's variant of gradient boosting where each tree is fit on a random fraction of the training rows (and often a random fraction of the features) rather than all of them.">Stochastic gradient boosting</VIS.Term> trains
+      each tree on a random subset of the <VIS.Term def="Drawing a fraction (say 80%) of the training rows without replacement to fit each tree, so every tree sees a slightly different slice of the data.">rows</VIS.Term> and
+      often a random subset of the <VIS.Term def="Restricting each tree (or each split) to consider only a random fraction of the features, which further decorrelates the trees and curbs reliance on any single dominant feature.">columns</VIS.Term>, which
+      decorrelates the trees and reduces variance while speeding training.</strong>{" "}
+      A subsample fraction below one means each tree is fit on, say, eighty percent of the rows; a column-sample
+      fraction does the same for features. The randomness makes successive trees less correlated, so summing them
+      cancels more variance, which usually improves generalisation and, as a bonus, trains faster because each
+      tree sees less data. This is a regularizer layered on top of boosting&rsquo;s bias-reducing residual fit, and
+      it is a different lever from the learning rate &mdash; subsampling attacks variance, shrinkage damps the step
+      size. Unlike bagging&rsquo;s bootstrap, the row sample is typically drawn without replacement. The failure
+      modes: confusing subsampling with shrinkage and tuning the wrong one; expecting subsampling to fix a
+      high-bias underfit; and setting the fraction so low that each tree starves and the model underfits.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Each tree sees a random slice">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        In stochastic gradient boosting, each tree is fit on a random fraction of rows and, optionally, a random
+        fraction of features. Read the per-tree subsample fractions and the before/after validation AUC below, and
+        work out which error component the randomness reduces, and how this lever differs from the learning rate.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <div style={{ margin: "16px 0" }}>
+        <VIS.Equation display tex={"h_m \\text{ fit on a random } s \\cdot N \\text{ rows and } c \\cdot P \\text{ features}, \\qquad 0 < s,\\, c \\le 1"} />
+      </div>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`each tree's data: subsample = 0.8 of rows (drawn without replacement)
+each tree's features: colsample_bytree = 0.8 of columns
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+run A: full data per tree (subsample 1.0, colsample 1.0) -> val AUC 0.904
+run B: subsample 0.8, colsample 0.8                       -> val AUC 0.910
+                                                          -> ~20% faster
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+what error component does the randomness change, and how is this
+different from lowering the learning rate?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Notice the random slice differs from tree to tree and that the fraction is independent of the step-size
+        knob. Decide whether this reduces bias or variance, and why it is a separate dial from shrinkage.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: decorrelation reduces variance">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`full-data trees: each sees all rows -> trees highly correlated
+  -> summing them cancels little variance
+
+subsampled trees: each sees a different 80% of rows
+  -> successive trees less correlated
+  -> summing cancels more variance -> better generalisation
+  -> each tree trains on less data -> ~20% faster
+
+shrinkage (learning rate) is a SEPARATE knob: it scales the step,
+it does not decorrelate the trees`}</pre>
+      <p>
+        When every tree is fit on the full dataset, the trees are highly correlated and adding them cancels little
+        variance. Giving each tree a different random slice of the rows (and features) makes successive trees less
+        correlated, so the additive ensemble cancels more variance and generalisation improves; because each tree
+        also processes less data, training speeds up. This is variance reduction by decorrelation, the same spirit
+        as a random forest&rsquo;s randomness but applied within boosting. It is a distinct lever from the learning
+        rate: shrinkage scales the size of each step, while subsampling changes which data each step is based on.
+        (How the fraction interacts with shrinkage and how aggressive is too aggressive is taken up in the drill
+        lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Subsampling versus shrinkage">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Property</th><th>Subsampling (rows/cols)</th><th>Shrinkage (learning rate)</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>What it changes</td><td>Which data each tree sees</td><td>The size of each tree&rsquo;s step</td></tr>
+          <tr><td>Error component</td><td>Variance (decorrelation)</td><td>Step size / overshoot</td></tr>
+          <tr><td>Side effect</td><td>Faster training</td><td>Needs more trees if lowered</td></tr>
+          <tr><td>Draw scheme</td><td>Usually without replacement</td><td>Not applicable</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="A variance lever distinct from the step size">
+        Stochastic gradient boosting adds a variance-reduction lever on top of boosting&rsquo;s bias reduction:
+        feeding each tree a random subset of rows and features decorrelates the trees, so the sum cancels more
+        variance and generalises better, while training faster. It is not the same as shrinkage &mdash; the learning
+        rate scales each step, subsampling changes the data behind each step. The two are tuned independently. And
+        because it targets variance, subsampling does not cure an underfit; for that you need more rounds, more
+        depth, or more signal.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>row and column subsampling inject randomness that
+        decorrelates the trees and reduces variance (and speeds training); it is a separate lever from shrinkage
+        and does not fix bias.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="sub-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What subsampling does"
+        scenario={<>A teammate says &ldquo;the subsample fraction in boosting is just another name for the learning rate.&rdquo; Pick the statement that correctly characterises subsampling.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`subsample: fraction of rows each tree is fit on
+learning rate: scale applied to each tree's output
+claim: they are the same knob
+question: what does subsample actually do?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It feeds each tree a random data slice, decorrelating the trees to reduce variance and speed training.", correct: true },
+          { key: "b", text: "It scales each tree's output before adding it, so it is exactly the learning rate under a different name." },
+          { key: "c", text: "It sets the per-tree depth, so a smaller fraction grows shallower trees and that is what reduces variance." },
+          { key: "d", text: "It changes nothing in the model and only controls how training progress is logged to the console output." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) the learning rate scales the output; subsampling changes the data, a different mechanism. (c) subsampling does not set depth. (d) it materially changes the fitted model and its variance.</>}
+        lens={<>The subsample fraction controls which random subset of rows each tree is fit on, so successive trees are decorrelated and the additive ensemble cancels more variance, improving generalisation and training faster. The learning rate is a separate knob that scales each tree&rsquo;s contribution. Calling them the same conflates a variance lever with a step-size lever; they target different things and are tuned independently.</>}
+        stretch={<>What does the column-sample fraction add on top of row subsampling?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="sub-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — Which error component it targets"
+        scenario={<>A teammate asks whether subsampling reduces bias or variance. Pick the statement that correctly names what it targets and how.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`mechanism: each tree fit on a different random slice -> less correlated trees
+sum of correlated trees: cancels little variance
+sum of decorrelated trees: cancels more variance
+question: bias or variance?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Variance, by decorrelating the trees so the additive ensemble cancels more of their fluctuation.", correct: true },
+          { key: "b", text: "Bias, by letting each tree fit a cleaner subset of the data so the ensemble's systematic error falls." },
+          { key: "c", text: "Neither, since randomising the data has no effect on either the bias or the variance of the final model." },
+          { key: "d", text: "Both equally, since any randomness applied during training reduces bias and variance by the same amount." },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) subsampling does not reduce systematic error; bias reduction comes from rounds and depth. (c) it does affect variance via decorrelation. (d) it does not reduce bias and variance equally; it targets variance.</>}
+        lens={<>Subsampling reduces variance by decorrelation: because each tree sees a different random slice of rows and features, successive trees are less correlated, and summing less-correlated trees cancels more of their fluctuation. It does not lower bias &mdash; that is the job of adding rounds and using adequate depth. So subsampling is a variance regularizer layered on boosting&rsquo;s bias reduction, not a bias tool.</>}
+        stretch={<>Why does decorrelation specifically help the variance term rather than the bias term?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="sub-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Trying to cure an underfit"
+        scenario={<>A booster underfits: high error on both train and validation. A colleague proposes lowering the subsample fraction to 0.5 to &ldquo;regularize it into shape.&rdquo; Pick the soundest read.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptom: high train AND val error (underfit)
+colleague's plan: drop subsample to 0.5
+levers: subsample, rounds, depth, learning rate`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Subsampling targets variance, not bias; an underfit needs more rounds, more depth, or a higher learning rate.", correct: true },
+          { key: "b", text: "Lowering subsample to 0.5 cures the underfit, since feeding each tree less data lowers the model's bias directly." },
+          { key: "c", text: "Lowering subsample to 0.5 cures the underfit, since more randomness always raises both training and test accuracy." },
+          { key: "d", text: "Lowering subsample to 0.5 cures the underfit, since smaller slices force each tree to fit the signal more tightly." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) subsampling reduces variance, not bias; less data per tree cannot lower bias. (c) more randomness does not raise training accuracy on an underfit; it can worsen it. (d) smaller slices give each tree less to learn from, deepening the underfit.</>}
+        lens={<>High error on both train and validation is an underfit &mdash; a bias problem &mdash; and subsampling is a variance lever, so cutting the fraction will not help and, by starving each tree of data, can make the underfit worse. The remedy for bias is to add rounds, increase depth, or raise the learning rate. Reaching for subsampling here is matching a variance tool to a bias symptom.</>}
+        stretch={<>If after fixing the bias the model then overfits, how would subsampling help?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="sub-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — One feature dominates every split"
+        scenario={<>In a booster, one very strong feature is chosen at the top of nearly every tree, the trees are highly similar, and the model overfits that feature&rsquo;s noise. A colleague wants to lower the learning rate to fix it. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptom: one strong feature tops nearly every tree
+effect: trees highly similar, overfits that feature's noise
+colleague's plan: lower the learning rate`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Use column subsampling so some trees cannot see the dominant feature, decorrelating them and curbing the overfit.", correct: true },
+          { key: "b", text: "Lower the learning rate, since smaller steps stop the dominant feature from being chosen at the top of trees." },
+          { key: "c", text: "Raise the learning rate, since larger steps spread attention across features and break the dominance directly." },
+          { key: "d", text: "Remove all other features, since keeping only the dominant feature is what stops the trees from being too similar." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) the learning rate scales steps; it does not change which feature is chosen at a split. (c) a higher rate does not redistribute feature usage and tends to overfit. (d) removing other features makes the trees more, not less, alike.</>}
+        lens={<>Column subsampling is the targeted fix: by restricting each tree (or split) to a random subset of features, some trees are forced to split without the dominant feature, so the trees become less alike and the ensemble stops over-relying on that one feature&rsquo;s noise. The learning rate only scales step size and does nothing to the feature-selection pattern, and removing other features would make the trees even more correlated. Decorrelation via colsample matches the symptom.</>}
+        stretch={<>How does this mirror the feature-subsampling mechanism that distinguishes a random forest from plain bagging?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="sub-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why decorrelation cuts variance"
+        scenario={<>A teammate asks why making the trees less correlated reduces the ensemble&rsquo;s variance, given that each individual tree is just as variable as before. Pick the correct account of the mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ensemble = sum (or average) of many trees
+variance of a sum depends on the trees' pairwise correlation
+lower correlation -> ?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "The variance of a summed ensemble falls as the trees' pairwise correlation drops, even with each tree unchanged.", correct: true },
+          { key: "b", text: "Each tree's own variance drops when it sees less data, and that per-tree drop is the entire variance reduction." },
+          { key: "c", text: "Decorrelation lowers each tree's bias, and it is that bias reduction that the ensemble inherits as lower variance." },
+          { key: "d", text: "Decorrelation removes the need to sum the trees, so a single decorrelated tree already has the lower variance." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) each tree on less data is actually more variable; the gain is from lower correlation, not lower per-tree variance. (c) decorrelation does not lower bias. (d) the ensemble still sums many trees; one tree is not the mechanism.</>}
+        lens={<>The variance of a sum (or average) of random quantities depends on their pairwise correlation: the more correlated the terms, the less the variance cancels. Decorrelating the trees &mdash; via random row and feature subsets &mdash; lowers those pairwise correlations, so the summed ensemble&rsquo;s variance drops even though each tree on its smaller slice is individually no less variable. The reduction is a property of combining less-correlated terms, not of any single tree improving.</>}
+        stretch={<>What sets the floor on how far this variance reduction can go as the number of trees grows?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="sub-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — How low can the fraction go"
+        scenario={<>An engineer sweeps the subsample fraction from 1.0 down toward 0.05 and tracks validation error. A teammate assumes that since subsampling regularizes, smaller is always better and 0.05 will give the best validation score. Predict the non-obvious shape of the validation-versus-fraction curve.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`sweep: subsample 1.0 -> 0.8 -> 0.5 -> 0.2 -> 0.05
+track: validation error at each fraction
+claim: smaller fraction is always better
+question: what is the shape of the curve?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Validation error dips at a moderate fraction then rises as too-small slices starve each tree into underfitting.", correct: true },
+          { key: "b", text: "Validation error falls monotonically all the way to 0.05, since more randomness always reduces the validation error." },
+          { key: "c", text: "Validation error is flat across all fractions, since the subsample fraction has no measurable effect on validation." },
+          { key: "d", text: "Validation error rises monotonically from 1.0, since any subsampling at all always harms the validation score." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) too-small fractions starve the trees and raise error; it is not monotone down. (c) the fraction does affect validation; it is not flat. (d) moderate subsampling typically helps, so it is not monotone up either.</>}
+        lens={<>Subsampling helps by decorrelating trees, but each tree still needs enough data to fit the signal. So as the fraction falls, validation error improves to a sweet spot (often around 0.5 to 0.8) where decorrelation outweighs the data loss, then worsens as overly small slices leave each tree too little to learn from and the ensemble underfits. The curve is U-shaped, not monotone &mdash; &ldquo;smaller is always better&rdquo; ignores the starvation regime.</>}
+        stretch={<>What would the analogous sweet-spot argument look like for the column-sample fraction?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="sub-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Regularizing and speeding a booster"
+        scenario={<>A booster slightly overfits and trains a little slowly. You want one change that helps both at once. A colleague proposes only lowering the learning rate. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptoms: slight overfit AND slightly slow training
+goal: one change to help both
+colleague's plan: only lower the learning rate`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Add row and column subsampling; it regularizes by decorrelation and trains faster since each tree sees less data.", correct: true },
+          { key: "b", text: "Only lower the learning rate, since a smaller rate both regularizes and reduces the total training time at once." },
+          { key: "c", text: "Only deepen the trees, since deeper trees regularize the overfit and also finish training in less wall-clock time." },
+          { key: "d", text: "Only add more rounds, since extra rounds reduce overfitting and shorten the overall training time together." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) lowering the rate regularizes but needs more trees, increasing training time. (c) deeper trees worsen overfit and slow training. (d) more rounds add time and can overfit, not reduce it.</>}
+        lens={<>Row and column subsampling is the single change that addresses both symptoms: the injected randomness decorrelates the trees to curb the overfit, and because each tree fits on less data, training speeds up. Lowering the learning rate regularizes but demands more rounds (slower); deeper trees and more rounds add capacity and time. Subsampling is the lever that improves generalisation and wall-clock together.</>}
+        stretch={<>If subsampling alone does not fully tame the overfit, which lever would you combine it with next?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="sub-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Subsample set too aggressively"
+        scenario={<>Chasing regularization, a team set subsample to 0.1 and colsample to 0.1. The model now underfits: train and validation error both rose. They conclude subsampling is harmful and disable it entirely. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`change: subsample 0.1, colsample 0.1 (very aggressive)
+result: train AND val error both rose (underfit)
+team's claim: subsampling is harmful, disable it`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Slices this small starve each tree into underfitting; raise the fractions to a moderate range, do not disable.", correct: true },
+          { key: "b", text: "Subsampling is harmful in general, so disabling it entirely is the correct and only way to restore accuracy." },
+          { key: "c", text: "The learning rate is now too high, so lowering it alone will fix the underfit caused by the tiny subsample." },
+          { key: "d", text: "The trees are now too deep, so reducing depth is what compensates for the very small subsample fractions." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) moderate subsampling helps; the failure is the extreme setting, not the technique. (c) the learning rate is not the cause; the tiny slices are. (d) depth is not the cause of this starvation underfit.</>}
+        lens={<>Setting both fractions to 0.1 gives each tree only a tenth of the rows and features, far too little to fit the signal, so the ensemble underfits and both errors rise &mdash; the starvation regime at the wrong end of the U-shaped curve. The fix is to raise the fractions back to a moderate range (commonly 0.5 to 0.9), not to disable subsampling, which at sensible values is a useful variance regularizer. The team over-applied a good tool rather than discovering a bad one.</>}
+        stretch={<>What quick experiment would locate the fraction&rsquo;s sweet spot without a full grid search?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Gradient_boosting#Stochastic_gradient_boosting" target="_blank" rel="noopener">
+            <strong>Stochastic gradient boosting</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(row and column subsampling, decorrelation, variance reduction, speed)</span>
+          <br/>Covers how fitting each tree on a random subset of data decorrelates the trees and reduces variance, distinct from the learning-rate lever.
         </li>
       </ul>
     </VIS.Section>

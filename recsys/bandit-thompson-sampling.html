@@ -2167,288 +2167,283 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: THOMPSON SAMPLING.
+// Delta: maintain a POSTERIOR distribution over each arm's reward (e.g. Beta for a CTR), DRAW one sample from each
+//   arm's posterior, and pick the arm with the highest SAMPLE. This explores in PROPORTION to each arm's probability
+//   of being optimal - a wide posterior occasionally samples high and gets tried, a tight posterior samples near its
+//   mean. It is randomized (unlike UCB's deterministic bonus) and updates Bayesianly. Diagram shows the posteriors
+//   SETUP only - the candidate must reason about overlap, not read off the answer.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="RecSys"
+      title="Thompson Sampling"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Explore vs Exploit" },
+        { label: "Subtopic", value: "Maintain a posterior over each arm's reward, draw one sample per arm, pick the argmax sample; explores in proportion to each arm's probability of being optimal" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Thompson sampling keeps a <VIS.Term def="A probability distribution over an arm's unknown reward that encodes current belief; it tightens as more observations arrive. For a CTR, a Beta distribution is the natural choice.">posterior</VIS.Term> over
+      each arm's reward, draws one sample from each posterior, and picks the arm with the highest sampled value.</strong>{" "}
+      For a click-through rate the posterior is naturally a <VIS.Term def="A distribution over a probability between 0 and 1, parameterized by counts of successes and failures; it is the conjugate prior for a binary (click / no-click) reward.">Beta distribution</VIS.Term> updated
+      by clicks and non-clicks. Because the choice is the argmax of one random draw per arm, the algorithm explores an
+      arm exactly in proportion to its <em>probability of being the best</em>: an arm with a wide posterior occasionally
+      samples high and gets tried, while an arm with a tight posterior samples close to its mean every time. This
+      randomized, Bayesian rule contrasts with UCB's deterministic optimism bonus, yet achieves comparably strong regret
+      and is often simpler to run at scale. The failure modes: collapsing the posterior to a point estimate so
+      exploration dies, using a mismatched likelihood so the posterior is wrong, and never updating the posterior so
+      old beliefs persist under drift.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Sampling from beliefs">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        Two arms have Beta posteriors over their CTR. The readout gives each posterior's shape. Work out why the
+        algorithm sometimes picks the arm with the lower mean, by reasoning about how often a draw from one posterior
+        exceeds a draw from the other &mdash; the diagram shows the beliefs, not the chosen arm.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`rule: draw one sample from each arm's posterior, pick argmax
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+arm A: Beta(20, 80)  -> mean 0.20, NARROW (well measured)
+arm B: Beta(2, 6)    -> mean 0.25, WIDE (barely measured)
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+each decision: sample sA ~ A, sB ~ B; show whichever is larger`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Reason about the overlap of these two posteriors: A is tightly concentrated near 0.20, while B is broad and
+        could sample anywhere from low to high. Derive why B is chosen on a meaningful fraction of decisions even though
+        both means are close, and what happens to B's posterior as it accrues data.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: probability of being best">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`A ~ Beta(20,80): samples cluster tightly around 0.20
+B ~ Beta(2,6):   samples spread widely around 0.25
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+because B is wide, a draw from B exceeds a draw from A
+on a sizable share of decisions -> B is explored
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+update rule (Bayesian):
+   click   on B -> Beta(alpha+1, beta)
+   no-click on B -> Beta(alpha, beta+1)
+
+as B gathers data its posterior narrows ->
+its sampling settles toward its true CTR`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Exploration here is emergent, not bolted on: a wide posterior naturally produces occasional high samples, so an
+        under-measured arm is tried in proportion to how plausibly it could be best. There is no explicit bonus and no
+        epsilon &mdash; the randomness of the draw does the exploring. Each observation updates the Beta posterior, which
+        narrows it, so over time the sampling for that arm concentrates near its true rate and exploration of it fades.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What Thompson sampling buys you">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Property</th><th>Consequence</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Posterior per arm</td><td>Encodes full uncertainty, not just a mean and a count</td></tr>
+          <tr><td>Sample-then-argmax</td><td>Explores each arm in proportion to its probability of being best</td></tr>
+          <tr><td>Randomized choice</td><td>Naturally spreads load and avoids UCB's deterministic ties</td></tr>
+          <tr><td>Bayesian update</td><td>Each observation narrows the posterior, tapering exploration</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Explore in proportion to the chance of being best">
+        Thompson sampling turns exploration into a single elegant move: act according to a belief drawn at random from
+        your current uncertainty. An arm that might be best &mdash; because its posterior is wide &mdash; occasionally
+        produces a winning sample and gets explored, while a confidently-mediocre arm rarely does. This proportional
+        exploration emerges from the randomness of the draw, with no explicit bonus or rate to tune, and the Bayesian
+        update automatically narrows beliefs as data arrives. It matches UCB's strong regret while often being simpler
+        and more robust to run in production.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>Thompson sampling draws one sample per arm from its posterior
+        and picks the argmax, exploring each arm in proportion to its probability of being best.</strong>{" "}
+        Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="ts-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What Thompson sampling does each step"
+        scenario={<>A teammate says "Thompson sampling picks the arm with the highest posterior mean." Pick the statement that correctly describes the rule.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`for each arm: draw ONE sample from its posterior
+pick the arm whose SAMPLE is highest (not whose mean is highest)`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It draws one random sample from each arm's posterior and picks the arm with the highest sampled value.", correct: true },
+          { key: "b", text: "It picks the arm with the highest posterior mean, so the random draw never affects which arm is chosen." },
+          { key: "c", text: "It adds a deterministic bonus to each arm's mean and picks the maximum, exactly like the UCB rule does." },
+          { key: "d", text: "It picks a uniformly random arm a fixed fraction of the time, exactly like epsilon-greedy with a tuned rate." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
-      />
-
-      <VIS.TrapProblem
-        id="bart-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
-        options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
-        ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) picking the mean removes the exploration; the sample, not the mean, is the choice. (c) describes UCB's deterministic bonus. (d) describes epsilon-greedy.</>}
+        lens={<>Thompson sampling draws one sample from each arm's posterior and selects the arm whose sample is largest, so the random draw is exactly what drives the choice and the exploration. Picking the posterior mean would strip out all exploration; a deterministic additive bonus is UCB; and a fixed random fraction is epsilon-greedy. The defining move is sample-then-argmax, which makes exploration proportional to each arm's probability of being best.</>}
+        stretch={<>How does this randomized rule still achieve regret comparable to UCB?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="ts-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Two posteriors, close means"
+        scenario={<>Arm A is Beta(20,80) (mean 0.20, tight); arm B is Beta(2,6) (mean 0.25, wide). A teammate insists B will be picked nearly every decision because its mean is higher. Pick the soundest expectation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`A: Beta(20,80) tight around 0.20
+B: Beta(2,6)   wide around 0.25
+choice = which posterior's draw is larger this time`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "B is picked on a sizable but minority share of draws, since its wide posterior overlaps A's despite a higher mean.", correct: true },
+          { key: "b", text: "B is picked on nearly every decision, since the arm with the higher posterior mean almost always wins the draw." },
+          { key: "c", text: "A is picked on every decision, since a tighter posterior always produces larger samples than a wider one." },
+          { key: "d", text: "Each arm is picked exactly half the time, since Thompson sampling always splits draws evenly between two arms." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) a higher mean does not mean near-certain selection; the wide posterior overlaps A heavily. (c) a tight posterior samples near its mean, not necessarily higher than a wide one. (d) the split reflects overlap, not a fixed 50/50.</>}
+        lens={<>The selection share is the probability that a draw from B exceeds a draw from A, and because B's posterior is wide and overlaps A's, B wins on a meaningful but minority fraction of decisions &mdash; not nearly all of them, despite its higher mean. A tighter posterior samples near its own mean rather than reliably beating a wide one, and the split is governed by posterior overlap, not a fixed even share. The whole point is proportional exploration: B is tried about as often as it is plausibly best, which its uncertainty makes only sometimes.</>}
+        stretch={<>How does B's selection share change after it gathers 100 more observations?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
-        difficulty="hard"
+        id="ts-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Choosing the likelihood for the reward"
+        scenario={<>You model a binary click / no-click reward and a teammate proposes a Gaussian posterior over the CTR with no bounds. Pick the soundest modeling choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`reward: click (1) or no-click (0), CTR in [0, 1]
+proposal: unbounded Gaussian posterior over CTR
+issue: Gaussian can sample CTR < 0 or > 1`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Use a Beta posterior, the conjugate for binary rewards, so samples stay in the valid 0 to 1 range.", correct: true },
+          { key: "b", text: "Use an unbounded Gaussian posterior, since a Gaussian models any reward and the out-of-range samples are harmless." },
+          { key: "c", text: "Use a single point estimate of the CTR, since a fixed value avoids the need for any posterior distribution at all." },
+          { key: "d", text: "Use a uniform posterior fixed forever, since a flat belief over 0 to 1 never needs updating as data arrives." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) a Gaussian can sample impossible CTRs below 0 or above 1 and is not conjugate. (c) a point estimate kills exploration entirely. (d) a fixed uniform posterior never learns from data.</>}
+        lens={<>For a binary click reward the natural posterior is Beta, the conjugate prior for the Bernoulli likelihood, so updates are simple count increments and every sample lies in the valid 0 to 1 range. An unbounded Gaussian can sample impossible CTRs and is not conjugate, complicating both correctness and updates; a point estimate removes the uncertainty that exploration depends on; and a fixed uniform posterior never incorporates data. Matching the likelihood to the reward type is what keeps Thompson sampling both valid and self-tapering.</>}
+        stretch={<>What posterior would you use for a continuous reward like watch-time?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="ts-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why a wide posterior explores more"
+        scenario={<>A teammate cannot see how randomness alone produces targeted exploration, expecting it to behave like uniform random selection. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wide posterior: occasionally samples a high value
+tight posterior: samples cluster near its mean
+argmax of samples -> wide arm wins when it samples high`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "A wide posterior sometimes draws a high sample and wins the argmax, so uncertain arms are tried more, not uniformly.", correct: true },
+          { key: "b", text: "Randomness makes every arm equally likely each step, so Thompson sampling explores uniformly just like a coin flip." },
+          { key: "c", text: "Only the widest arm is ever explored, since a wide posterior always produces the single highest sample every time." },
+          { key: "d", text: "The posterior width has no effect on selection, since the argmax depends solely on the posterior means." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the draw is not uniform; it is shaped by each posterior. (c) a wide posterior wins sometimes, not always. (d) width strongly affects how often an arm's sample is largest.</>}
+        lens={<>Exploration is targeted because the draw is shaped by each arm's posterior: a wide posterior occasionally produces a high sample that wins the argmax, so an uncertain arm is selected in proportion to how plausibly it could be best &mdash; far from uniform. It is not equally likely per arm (that would be a coin flip), the widest arm wins only sometimes rather than always, and the posterior width clearly matters because it changes how often that arm's sample tops the others. The randomness plus the posterior shape together yield exploration concentrated where uncertainty is, with no explicit bonus.</>}
+        stretch={<>How does this proportional-to-best-probability behavior connect to the regret guarantee?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ts-c2"
+        difficulty="medium"
+        axis="Mechanism"
+        title="C2 — The Bayesian update"
+        scenario={<>A teammate is unsure how a Beta posterior changes after observing one click on an arm. Pick the correct update.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`prior: Beta(alpha, beta)
+observe a CLICK (success)
+Beta is conjugate to Bernoulli`}</pre>}
+        options={[
+          { key: "a", text: "The posterior becomes Beta(alpha+1, beta), incrementing the success count and narrowing the belief over time.", correct: true },
+          { key: "b", text: "The posterior becomes Beta(alpha, beta+1), since a click increments the failure parameter of the distribution." },
+          { key: "c", text: "The posterior stays Beta(alpha, beta), since a single observation is too small to change a Beta distribution." },
+          { key: "d", text: "The posterior resets to Beta(1, 1), since each new observation restarts the belief from a uniform prior." },
+        ]}
+        trap={<>(b) increments the wrong parameter; a click is a success (alpha), not a failure (beta). (c) every observation updates a conjugate posterior. (d) updates accumulate; they do not reset.</>}
+        lens={<>Beta is conjugate to the Bernoulli click likelihood, so observing a click increments the success parameter: Beta(alpha, beta) becomes Beta(alpha+1, beta), and a non-click would instead increment beta. Each observation shifts and narrows the posterior, which is how exploration tapers as data accrues. A click increments alpha, not beta; a single observation does update the posterior (that is the whole mechanism); and updates accumulate rather than resetting to a uniform prior. These trivial count updates are what make Beta-Bernoulli Thompson sampling so cheap to run.</>}
+        stretch={<>How do alpha and beta priors encode an initial optimism or pessimism about a new arm?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="ts-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Batched delayed feedback"
+        scenario={<>Rewards arrive in hourly batches, so within an hour the posteriors are not updated between decisions. A teammate expects Thompson sampling to behave exactly as in the instant-feedback case. Predict the non-obvious consequence.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`feedback batched hourly -> posteriors frozen within the hour
+all decisions in the hour sample from the SAME posteriors
+re-randomized draw each decision, but beliefs unchanged`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Because beliefs are frozen within a batch, the re-drawn samples still spread choices, preserving exploration per batch.", correct: true },
+          { key: "b", text: "Exploration collapses entirely within a batch, since frozen posteriors force every decision to pick the same single arm." },
+          { key: "c", text: "The posteriors silently update mid-batch anyway, since Thompson sampling cannot operate without instant feedback." },
+          { key: "d", text: "Every decision in the batch is identical, since drawing from an unchanged posterior always yields the same sample." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) frozen posteriors still get a fresh random draw each decision, so choices still spread. (c) the posteriors do not magically update; feedback is genuinely delayed. (d) each draw is independent, so samples differ even from the same posterior.</>}
+        lens={<>Even with posteriors frozen within an hourly batch, Thompson sampling re-draws a fresh independent sample from each posterior on every decision, so the choices still spread across arms in proportion to their probability of being best &mdash; exploration is preserved within the batch despite no belief updates. The posteriors do not collapse selection to one arm, they do not secretly update mid-batch, and independent draws from the same posterior differ from one another. This natural robustness to delayed, batched feedback is a practical reason Thompson sampling is popular at scale, where instant updates are rarely available.</>}
+        stretch={<>Why is this batch robustness harder to replicate with deterministic UCB?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="ts-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Logging propensities under randomized choice"
+        scenario={<>You want off-policy evaluation, but a teammate says Thompson sampling has no fixed action probability to log, so off-policy methods cannot apply. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`Thompson choice is random -> P(arm chosen) is well defined
+it equals the arm's posterior probability of being best
+that probability can be computed or estimated per decision`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Log the arm's probability of being best, which is its well-defined selection probability for off-policy estimators.", correct: true },
+          { key: "b", text: "Give up on off-policy evaluation, since a randomized policy has no action probability that can ever be logged." },
+          { key: "c", text: "Log only the chosen arm, since the realized choice alone is sufficient for any off-policy estimator to work." },
+          { key: "d", text: "Treat each choice as deterministic, since recording the argmax sample makes the propensity exactly one every time." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) Thompson sampling does have a well-defined selection probability, even if it must be computed or sampled. (c) the chosen arm alone lacks the propensity needed for reweighting. (d) the choice is genuinely randomized; calling it deterministic gives a wrong propensity of 1.</>}
+        lens={<>A randomized policy still has a well-defined action probability: under Thompson sampling, the chance an arm is chosen equals its posterior probability of being the best arm, which can be computed in closed form for simple cases or estimated by sampling. Logging that propensity lets off-policy estimators reweight outcomes correctly. The chosen arm alone is insufficient, and treating the realized argmax as deterministic with propensity one is simply wrong and biases the estimate. The randomness does not preclude off-policy evaluation; it just makes the propensity a probability you must compute.</>}
+        stretch={<>How would you estimate the per-arm selection probability by Monte Carlo over posteriors?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="ts-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Posterior collapsed to a point"
+        scenario={<>To "simplify," a teammate replaces each arm's posterior with its mean and samples from a near-zero-variance distribution. Exploration vanishes and the system locks onto an early leader. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`posterior variance forced to ~0 (point estimate)
+every draw ~= the mean -> argmax always the early leader
+no high samples from under-measured arms`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Collapsing the posterior to a point removes the variance that drives exploration, so the system greedily locks in.", correct: true },
+          { key: "b", text: "The collapse is harmless, since sampling from a point estimate still explores arms in proportion to being best." },
+          { key: "c", text: "The lock-in proves the priors were wrong, since a correct prior would keep exploration alive even at zero variance." },
+          { key: "d", text: "The fix is to add an epsilon-random branch, since Thompson sampling inherently cannot explore without one." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) a point estimate has no variance, so it cannot produce the high samples that explore. (c) priors are not the issue; the variance was destroyed. (d) Thompson sampling explores via posterior variance, not an epsilon branch.</>}
+        lens={<>Thompson sampling explores precisely because the posterior has variance: a wide posterior occasionally samples high and wins the argmax. Collapsing each posterior to its mean (near-zero variance) destroys that mechanism, so every draw equals the mean and the system greedily exploits whatever arm led early &mdash; exploration vanishes. The cause is the lost variance, not a bad prior, and the cure is to restore the full posterior, not to graft on an epsilon-random branch (which would be reverting to a different, blunter algorithm). The uncertainty in the posterior is the engine of exploration; remove it and you have plain greedy selection.</>}
+        stretch={<>Why does keeping even a small floor on posterior variance preserve some exploration?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Thompson_sampling" target="_blank" rel="noopener">
+            <strong>Thompson sampling</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(posterior sampling, Beta-Bernoulli updates, probability of being best)</span>
+          <br/>Covers the sample-then-argmax rule, why exploration is proportional to the chance of being optimal, and
+          why the randomized Bayesian approach is robust and scalable.
         </li>
       </ul>
     </VIS.Section>

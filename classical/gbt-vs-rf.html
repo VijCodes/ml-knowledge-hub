@@ -2167,288 +2167,290 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: GBT vs RANDOM FOREST — bias-focused sequential vs variance-focused parallel.
+// Delta: GBT is sequential, fits shallow trees to residuals (attacks BIAS), usually wins peak accuracy on
+//   tabular data but needs careful tuning of MANY coupled knobs (rate, rounds, depth, regularization). RF is
+//   parallel, averages deep low-bias high-variance trees (attacks VARIANCE), is more robust out-of-the-box and
+//   has few knobs, but tends to a slightly lower ceiling. The diagram shows two methods' tree-building style,
+//   knob counts, and a held-out AUC for each WITHOUT labelling a winner; the candidate must infer the
+//   accuracy-vs-robustness/tuning tradeoff and which to pick given a constraint.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="Classical"
+      title="GBT vs Random Forest"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Gradient Boosted Trees" },
+        { label: "Subtopic", value: "GBT is sequential and bias-focused (shallow trees on residuals) with a higher accuracy ceiling but many coupled knobs; RF is parallel and variance-focused (deep trees averaged), more robust out-of-the-box with few knobs" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Gradient boosting builds shallow trees <VIS.Term def="One tree at a time, each fit to the errors the running ensemble still makes, so the trees depend on each other and cannot be trained in parallel.">sequentially</VIS.Term> on
+      residuals to drive <VIS.Term def="The systematic error from a model too simple to capture the pattern. Boosting reduces it by adding corrective trees; it is the error component boosting targets.">bias</VIS.Term> down,
+      while a random forest averages deep <VIS.Term def="Trees that overfit individually (low bias, high variance); a random forest averages many of them, and the averaging cancels their variance.">high-variance</VIS.Term> trees in parallel to drive variance down.</strong>{" "}
+      The consequence is a tradeoff. Boosting usually reaches a higher accuracy ceiling on tabular data because it
+      keeps correcting its own mistakes, but it has many coupled knobs &mdash; learning rate, number of rounds,
+      tree depth, regularization &mdash; that must be tuned together, and it overfits if the round count is not
+      controlled. A random forest has few knobs, is hard to overfit by adding trees, and works well out of the
+      box, but its averaged ensemble typically tops out a little below a well-tuned booster. The failure modes:
+      assuming a forest will beat an untuned booster and concluding boosting is worse; trying to fix a
+      high-variance forest by adding rounds (a boosting idea); and tuning boosting&rsquo;s knobs independently
+      when they interact.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Two philosophies, two budgets">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        Below are the two methods&rsquo; tree-building styles, the rough number of knobs each needs, and a held-out
+        AUC for each on the same tabular task. Read them and work out what the AUC gap and the knob counts together
+        say about the accuracy-versus-robustness tradeoff, and when you would still choose the lower-AUC method.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <div style={{ margin: "16px 0" }}>
+        <VIS.Equation display tex={"\\text{GBT: } F = \\sum_m \\eta\\, h_m \\ (\\text{sequential, bias}\\downarrow) \\qquad \\text{RF: } F = \\tfrac{1}{T}\\sum_t h_t \\ (\\text{parallel, variance}\\downarrow)"} />
+      </div>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GBT: shallow trees, fit sequentially to residuals; ~8 coupled knobs
+     held-out AUC 0.91 (after careful tuning)
+RF:  deep trees, fit in parallel, then averaged; ~3 knobs
+     held-out AUC 0.88 (near-default settings)
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+what does the AUC gap vs the knob-count gap imply about the tradeoff?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Notice the higher-AUC method also carries far more knobs and the tuning that comes with them. Decide what
+        that means for projects where tuning time or robustness matters more than the last point of AUC.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: ceiling versus robustness">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GBT path: many small corrective trees -> low bias -> high ceiling
+  but: rate x rounds x depth x reg interact; overfits if rounds unchecked
+  needs a validation set + early stopping + a tuning budget
+
+RF path: average many deep trees -> variance cancels -> robust
+  few knobs (n_estimators, max_features, min_samples)
+  extra trees rarely hurt; little tuning to get a solid result
+
+same data: tuned GBT edges out RF, RF reaches strong AUC for free`}</pre>
+      <p>
+        Boosting&rsquo;s sequential residual fitting gives it the higher ceiling: it keeps reducing systematic
+        error, so a carefully tuned booster usually wins on tabular data. The cost is that its knobs are coupled
+        and it overfits without round control, so it demands a validation set and a tuning budget. A random forest
+        averages deep, individually overfit trees; the averaging cancels their variance, so it lands at a strong
+        AUC with almost no tuning and is hard to break by adding trees &mdash; but its ceiling is typically a notch
+        below a tuned booster. The right choice depends on whether peak accuracy or robustness-per-effort matters
+        more. (How their parallelism and inference costs differ is taken up in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — GBT versus random forest">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Property</th><th>Gradient boosting</th><th>Random forest</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Tree training</td><td>Sequential, on residuals</td><td>Parallel, independent</td></tr>
+          <tr><td>Error targeted</td><td>Bias (shallow trees)</td><td>Variance (deep trees, averaged)</td></tr>
+          <tr><td>Tuning effort</td><td>High; many coupled knobs</td><td>Low; few knobs</td></tr>
+          <tr><td>Adding more trees</td><td>Can overfit</td><td>Rarely hurts</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Accuracy ceiling versus robustness-per-effort">
+        The choice between boosting and a forest is a tradeoff, not a ranking. Boosting&rsquo;s sequential, bias-cutting
+        residual fitting gives a higher accuracy ceiling on tabular data but only after tuning coupled knobs and
+        controlling the round count to avoid overfitting. A forest&rsquo;s parallel averaging of deep trees gives
+        robustness almost for free &mdash; few knobs, hard to overfit with more trees &mdash; at a slightly lower
+        ceiling. Pick boosting when you can invest in tuning for peak accuracy; pick a forest when robustness,
+        simplicity, or parallel training matters more.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>GBT is sequential and bias-focused with a higher
+        ceiling but many coupled knobs and overfit-by-rounds risk; RF is parallel, variance-focused, robust, and
+        easy to tune at a slightly lower ceiling.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="gbtrf-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — The core contrast"
+        scenario={<>A teammate says &ldquo;boosting and random forests are both tree ensembles, so they behave the same; pick whichever.&rdquo; Pick the statement that correctly characterises the contrast.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`both: ensembles of decision trees
+claim: they behave the same
+question: how do they actually differ?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "GBT trains shallow trees sequentially to cut bias; RF averages deep trees in parallel to cut variance.", correct: true },
+          { key: "b", text: "GBT averages deep trees in parallel to cut variance; RF trains shallow trees sequentially to cut bias." },
+          { key: "c", text: "Both train trees sequentially on residuals, so the only real difference between them is the tree depth used." },
+          { key: "d", text: "Both average independent trees in parallel, so the only real difference between them is the number of trees." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) inverts the two: GBT is the sequential bias method, RF the parallel variance method. (c) RF does not train on residuals; it is parallel. (d) GBT is not parallel and independent; it is sequential.</>}
+        lens={<>Gradient boosting builds shallow trees one after another, each fit to the running ensemble&rsquo;s residuals, so it attacks bias. A random forest builds deep, independent trees in parallel and averages them, so it attacks variance. They target different error components by different mechanisms, which is why they behave differently and suit different situations &mdash; not interchangeable despite both being tree ensembles.</>}
+        stretch={<>Which of the two can be trained across many machines simultaneously, and why?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="gbtrf-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — Tuning burden"
+        scenario={<>A teammate asks which of the two usually needs more careful hyperparameter tuning and why. Pick the statement that correctly names the difference.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`GBT knobs: rate, rounds, depth, regularization, subsampling, ...
+RF knobs: trees, features-per-split, min-samples
+question: which needs more careful tuning?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "GBT needs more careful tuning, because its many knobs interact and the round count must be controlled.", correct: true },
+          { key: "b", text: "RF needs more careful tuning, because adding trees to it steadily overfits and must be tightly bounded." },
+          { key: "c", text: "Both need identical tuning effort, because they share the same hyperparameters under different names only." },
+          { key: "d", text: "Neither needs tuning, because tree ensembles always reach their best accuracy at their default settings." },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) RF rarely overfits by adding trees; it is the low-tuning method. (c) they do not share the same knobs; GBT has more and they interact. (d) defaults are rarely optimal, especially for GBT.</>}
+        lens={<>Boosting has many knobs &mdash; learning rate, number of rounds, depth, regularization, subsampling &mdash; that interact, and it overfits if the rounds are not capped, so it needs careful joint tuning and a validation set. A random forest has a handful of largely independent knobs and is hard to overfit by adding trees, so it gives a strong result near defaults. That difference in tuning burden is a central practical distinction.</>}
+        stretch={<>For a random forest, why does increasing the number of trees rarely hurt validation performance?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="gbtrf-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — A quick robust baseline"
+        scenario={<>You need a solid tabular baseline by end of day, with no time to tune coupled hyperparameters or babysit a round count. A colleague insists on hand-tuning a booster because it has the higher ceiling. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`constraint: solid baseline today, no tuning budget
+options: random forest (few knobs) or tuned booster (many knobs)
+colleague's view: booster has the higher ceiling`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Use a random forest near defaults now; it is robust with little tuning, then explore a booster if time allows.", correct: true },
+          { key: "b", text: "Hand-tune a booster today, since its higher ceiling is reachable with default knobs and no validation budget." },
+          { key: "c", text: "Use a single deep decision tree, since one tree trains fastest and matches a forest's robustness on tabular data." },
+          { key: "d", text: "Use a booster with the rounds set very high and no early stopping, since more rounds guarantee a strong baseline." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) the booster&rsquo;s ceiling needs tuning and a validation budget you do not have. (c) a single tree is high-variance and far less robust than a forest. (d) high rounds without early stopping overfits.</>}
+        lens={<>With no tuning budget, the random forest is the right baseline: a handful of near-default knobs deliver a strong, robust result and extra trees do not hurt, so you avoid the coupled-knob tuning and round-count babysitting a booster demands. The booster&rsquo;s higher ceiling is real but only realised with careful tuning and early stopping, which the constraint rules out today. Match the method to the effort available, then revisit the booster later.</>}
+        stretch={<>Once you have time, what single boosting setup most reliably exceeds the forest baseline?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="gbtrf-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Squeezing the last point of accuracy"
+        scenario={<>A well-tuned random forest is at its ceiling, but the product needs a small further AUC gain and you have a validation set and a tuning budget. A colleague proposes simply adding far more trees to the forest. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`current: tuned RF at its ceiling
+need: a small further AUC gain
+available: validation set + tuning budget
+colleague's plan: add many more trees to the forest`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Move to a tuned booster with early stopping; its bias-cutting residual fitting reaches a higher ceiling.", correct: true },
+          { key: "b", text: "Add far more trees to the forest, since a forest's accuracy keeps climbing without limit as trees are added." },
+          { key: "c", text: "Deepen the forest's trees further, since deeper trees in a forest always raise its accuracy ceiling materially." },
+          { key: "d", text: "Reduce the forest's features-per-split to one, since maximal randomness always lifts a forest above a booster." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) a forest&rsquo;s AUC plateaus with more trees; it does not climb without limit. (c) deeper trees mostly add variance the average already cancels; the ceiling barely moves. (d) over-randomising features tends to lower, not raise, accuracy.</>}
+        lens={<>A forest at its ceiling will not gain meaningfully from more or deeper trees &mdash; averaging has already cancelled the variance, and the bias floor remains. To push past it you need the method that attacks bias: a tuned gradient booster with early stopping, whose sequential residual fitting reaches a higher ceiling on tabular data. Spend the tuning budget on the booster, not on enlarging a forest that has already converged.</>}
+        stretch={<>What validation signal tells you the booster has actually surpassed the forest rather than overfit?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="gbtrf-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why the ceilings differ"
+        scenario={<>A teammate asks why a tuned booster typically reaches a higher accuracy ceiling than a forest on tabular data. Pick the correct account of the mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`RF: averages deep trees -> cancels variance, bias unchanged
+GBT: adds trees fit to residuals -> reduces bias each round
+question: which error floor does each leave standing?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Averaging cancels variance but leaves the bias floor; boosting actively reduces that bias, lifting the ceiling.", correct: true },
+          { key: "b", text: "Averaging reduces both bias and variance, so a forest's ceiling is only limited by how many trees you can afford." },
+          { key: "c", text: "Boosting reduces variance faster than averaging does, and it is that variance reduction that raises its ceiling." },
+          { key: "d", text: "Both methods reduce the same error component, so the ceiling difference is purely an artefact of random seeds." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) averaging does not reduce bias; the bias floor remains. (c) boosting&rsquo;s edge is bias reduction, not faster variance reduction. (d) the difference is mechanistic, not a seed artefact.</>}
+        lens={<>A random forest averages deep trees, which cancels their variance but leaves their shared bias untouched &mdash; so its accuracy is capped by that bias floor no matter how many trees it averages. Boosting fits each tree to the residual, actively shaving bias down round by round, so it can push below the forest&rsquo;s floor and reach a higher ceiling on tabular data. The two methods address different error components, which is exactly why their ceilings differ.</>}
+        stretch={<>Under what data conditions might the forest&rsquo;s variance reduction matter more than boosting&rsquo;s bias reduction?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="gbtrf-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Same tree count, opposite reaction"
+        scenario={<>Two models are trained to 5000 trees with no early stopping on a noisy tabular set: a random forest and a gradient booster. A teammate assumes that since both grow to 5000 trees, both must overfit similarly by the last tree. Predict the non-obvious difference in how their validation error reacts to the final thousands of trees.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`both grown to 5000 trees, no early stopping, noisy data
+model R: random forest (parallel average)
+model G: gradient booster (sequential residuals)
+question: how does each one's val error react to the late trees?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "The forest's val error plateaus with late trees; the booster's can rise as late trees fit residual noise.", correct: true },
+          { key: "b", text: "The booster's val error plateaus with late trees; the forest's rises as averaging more trees compounds the noise." },
+          { key: "c", text: "Both val errors plateau identically, because growing to the same 5000 trees fixes the overfitting behaviour." },
+          { key: "d", text: "Both val errors rise sharply, because any ensemble of 5000 trees is guaranteed to memorise the noisy data." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) inverts it: averaging (forest) plateaus; sequential residual fitting (booster) can climb. (c) equal tree count does not equalise overfitting dynamics. (d) the forest&rsquo;s averaged ensemble does not overfit more with more trees.</>}
+        lens={<>Each added forest tree is just another independent vote in the average, so once enough trees are in, the validation error plateaus and the extras are harmless. Each added booster tree, by contrast, keeps fitting the remaining residual, and on noisy data the late residual is mostly noise, so the booster&rsquo;s validation error can fall to an optimum and then rise. Same 5000 trees, opposite reaction &mdash; which is why boosting needs early stopping and a forest largely does not.</>}
+        stretch={<>Given this, why is &ldquo;just use more trees&rdquo; safe advice for a forest but dangerous for a booster?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="gbtrf-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Training under a parallel cluster"
+        scenario={<>You have a large idle CPU cluster and want to train an ensemble as fast as wall-clock allows on a dataset where both methods perform comparably. A colleague proposes a booster to exploit the cluster&rsquo;s parallelism across trees. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`resource: large idle CPU cluster
+goal: fastest wall-clock training, comparable accuracy either way
+colleague's plan: booster, to parallelise across trees`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Use a random forest; its independent trees train fully in parallel, so the cluster cuts wall-clock directly.", correct: true },
+          { key: "b", text: "Use a booster to parallelise across trees, since boosting trees train independently across the cluster nodes." },
+          { key: "c", text: "Use a single deep tree, since one tree on a big cluster trains faster than any ensemble of trees does." },
+          { key: "d", text: "Use a booster with the rounds set low, since few rounds let boosting trees be distributed one per node." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) boosting trees are sequential and cannot be parallelised across trees. (c) a single tree underuses the cluster and is high-variance. (d) low rounds underfits, and the trees still cannot be split across nodes.</>}
+        lens={<>When accuracy is comparable either way, the parallel cluster favours the random forest: its trees are independent and train simultaneously, so adding machines reduces wall-clock almost linearly. Boosting trees depend on their predecessors and cannot be distributed across trees, so a cluster cannot parallelise them the same way &mdash; its speedups come only from within-tree split parallelism. Match the method to the resource: parallel trees for a parallel cluster.</>}
+        stretch={<>What part of a booster&rsquo;s computation can still use the cluster, even though trees are sequential?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="gbtrf-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Declaring boosting worse than it is"
+        scenario={<>A team compares an untuned booster at default rate and rounds against a near-default random forest, finds the forest wins, and concludes boosting is simply worse for their data. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`booster: default learning rate and rounds, no tuning, no early stopping
+forest: near-default settings
+result: forest wins
+team's claim: boosting is worse for this data`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "An untuned booster underuses its ceiling; with tuned rate, rounds, and early stopping it usually overtakes the forest.", correct: true },
+          { key: "b", text: "Boosting is genuinely worse here, since a fair default-versus-default comparison settles the ranking for this data." },
+          { key: "c", text: "The forest must have overfit to win, so reducing its tree count is what will let the booster show its true ranking." },
+          { key: "d", text: "The metric is wrong, so only changing the evaluation metric, not the booster's tuning, can reverse this result." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) defaults are not a fair test for a method whose ceiling needs tuning. (c) the forest did not overfit by winning at defaults; cutting its trees does not help. (d) the metric is not implicated; tuning is the gap.</>}
+        lens={<>Boosting&rsquo;s advantage is its ceiling, which only appears after tuning the coupled knobs (rate, rounds, depth, regularization) with early stopping; at raw defaults it underfits or overfits and loses to a forest that is near-optimal out of the box. So a default-versus-default comparison is unfair to boosting. The honest conclusion is to tune the booster &mdash; it typically overtakes the forest &mdash; not to declare it worse from an untuned run.</>}
+        stretch={<>What minimal tuning sweep gives the booster a fair chance against the forest baseline?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Gradient_boosting" target="_blank" rel="noopener">
+            <strong>Gradient boosting</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(sequential bias reduction versus a random forest&rsquo;s parallel variance reduction)</span>
+          <br/>Covers why boosting reaches a higher tabular ceiling through residual fitting while a forest is more robust and easier to tune.
         </li>
       </ul>
     </VIS.Section>

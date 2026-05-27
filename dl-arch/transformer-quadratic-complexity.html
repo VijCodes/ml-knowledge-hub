@@ -2167,288 +2167,276 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: O(n^2) ATTENTION COST.
+// Delta: self-attention forms an n x n score matrix (every query against every key), so BOTH compute and MEMORY scale
+//   quadratically with sequence length n -- independent of the model width d for the score matrix itself. This is what
+//   dominates cost at long context and motivates flash/sparse/linear variants. Common confusions: thinking cost is linear
+//   in n, thinking the d-dependence is the quadratic term, thinking only compute (not memory) blows up, and thinking
+//   doubling n doubles cost (it 4x's it). Diagram shows the n x n SETUP only; it never prints the 64x / "memory bound" result.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="DL"
+      title="O(n squared) Attention Cost"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Transformers" },
+        { label: "Subtopic", value: "Self-attention forms an n-by-n score matrix, so both compute and memory scale quadratically with sequence length; this dominates cost at long context and motivates flash, sparse, and linear attention variants" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Self-attention compares every query against every key, forming an n-by-n <VIS.Term def="The matrix of attention logits: row i, column j holds the dot product of query i with key j. It has one entry for every ordered pair of positions, hence n-by-n.">score matrix</VIS.Term>,
+      so both compute and memory scale as <VIS.Term def="Cost grows with the square of the sequence length n. Doubling n roughly quadruples the attention cost, not doubles it.">O(n squared)</VIS.Term> in
+      the sequence length n.</strong>{" "}
+      The quadratic term comes from the number of position pairs, not from the model width d, so even at modest d the score
+      matrix dominates once n is large. It is not only compute that explodes: the n-by-n matrix must be materialized, so{" "}
+      <strong>memory is quadratic too</strong>, which is often the binding constraint at long context. This is exactly what{" "}
+      <VIS.Term def="Attention variants that avoid the full n-by-n materialization: FlashAttention (IO-aware tiling, never stores the full matrix), sparse attention (only some pairs), linear attention (kernel feature maps, O(n)).">flash, sparse, and linear attention</VIS.Term> were
+      built to relieve. The failure modes: thinking attention is linear in n, blaming the model width d for the blow-up,
+      assuming only compute (not memory) scales quadratically, and thinking doubling the context merely doubles the cost.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 -- Why long context gets expensive fast">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate wants to grow a model's context from 512 to 4096 tokens and budgets "about 8x more attention cost, since
+        the sequence is 8x longer." They are surprised when the model runs out of memory entirely. Before reading on, work
+        out what the n-by-n score matrix does to both compute and memory as n grows.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`self-attention: scores[i][j] = dot(query_i, key_j) for every pair (i, j)
+so the score matrix has n * n entries
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+n: 512 -> 4096 (8x longer)
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+how does the number of score entries change?  by 8x?  more?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Consider that the matrix has one entry per ordered pair of positions. Derive how the entry count &mdash; and hence
+        both the FLOPs and the memory to hold it &mdash; scales as n grows.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 -- Worked example: counting score-matrix entries">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`entries in the score matrix = n * n, per head
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+n = 512:   512 * 512   = 262,144 entries        (~0.26M)
+n = 4096:  4096 * 4096  = 16,777,216 entries     (~16.8M)
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+ratio = (4096/512)^2 = 8^2 = 64
+
+compute to fill it AND memory to store it both scale with n*n`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Going from 512 to 4096 tokens is an 8x longer sequence, but the n-by-n score matrix grows by 8 squared = 64x, per
+        head. That 64x hits both the FLOPs to compute the scores and softmax and the memory to materialize the matrix &mdash;
+        which is why the naive estimate of "8x" is off by an order of magnitude and why long context can exhaust memory
+        before it exhausts compute. (Why FlashAttention can dodge the memory part while keeping the compute is unpacked in
+        the drill lenses.)
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 -- Quadratic cost: what is and is not true">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of attention's cost</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Source of the quadratic</td><td>The n-by-n score matrix &mdash; one entry per position pair</td></tr>
+          <tr><td>Compute scaling</td><td>O(n squared) in sequence length</td></tr>
+          <tr><td>Memory scaling</td><td>Also O(n squared) &mdash; the matrix must be materialized</td></tr>
+          <tr><td>Effect of doubling n</td><td>Roughly 4x the cost, not 2x</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="One entry per pair of positions">
+        The cost is quadratic because attention scores every ordered pair of positions, giving n-by-n entries. That count
+        drives both the compute to fill the matrix and the memory to store it, so long context strains memory as much as
+        FLOPs. Doubling the context quadruples the work. Flash, sparse, and linear attention each attack this n-by-n term
+        &mdash; by never materializing it, by skipping pairs, or by reformulating attention to O(n).
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill -- trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>attention forms an n-by-n score matrix, so both compute and
+        memory scale as O(n squared) in sequence length; doubling n roughly quadruples cost, which is what flash/sparse/
+        linear variants relieve.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="quad-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 -- Where the quadratic comes from"
+        scenario={<>A teammate says "attention is expensive because the model dimension d is large, and that is what makes it quadratic." Pick the statement that correctly identifies the source of the quadratic cost.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`scores[i][j] for every pair (i, j) of positions
+matrix size: n x n
+where does n^2 come from?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "From the n-by-n score matrix: every query is compared with every key, so cost grows with n squared.", correct: true },
+          { key: "b", text: "From the model dimension d being large, which is the term that makes the attention cost quadratic.", correct: false },
+          { key: "c", text: "From the number of attention heads, since each head squares the cost of the head before it in the stack.", correct: false },
+          { key: "d", text: "From the depth of the network, since stacking L layers multiplies the per-layer cost by L squared.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) d enters linearly; the quadratic is in n. (c) heads add a constant factor, not a squaring. (d) depth multiplies by L (linear), not L squared.</>}
+        lens={<>The quadratic comes from comparing every query with every key, which produces an n-by-n score matrix with n squared entries. The model width d multiplies that cost linearly (each entry is a length-d dot product), heads add a constant factor, and depth scales linearly with the number of layers. None of those is the source of the squaring; only the all-pairs score matrix is, which is why long sequences, not wide models, are what make attention blow up.</>}
+        stretch={<>If d only enters linearly, what does that imply about widening the model versus lengthening the context for cost?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="quad-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 -- Compute only, or memory too"
+        scenario={<>A teammate says "attention's quadratic cost is purely a compute issue; memory use stays linear in the sequence length." Pick the statement that correctly describes the scaling.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`the n x n score matrix is computed
+it is also stored to apply softmax and weight the values
+what scales quadratically?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Both compute and memory scale as n squared, since the n-by-n matrix must be materialized as well as computed.", correct: true },
+          { key: "b", text: "Only compute scales as n squared; memory stays linear in n because the matrix is never actually stored.", correct: false },
+          { key: "c", text: "Only memory scales as n squared; compute stays linear because the dot products are cheap to evaluate.", correct: false },
+          { key: "d", text: "Neither scales as n squared in practice, since hardware caching collapses the matrix back to linear cost.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) the naive implementation does materialize the matrix, so memory is quadratic too. (c) compute is also quadratic; filling n^2 entries is not linear. (d) caching does not change the asymptotic scaling.</>}
+        lens={<>Naive attention both computes and stores the n-by-n score matrix to run the softmax and weight the values, so memory is quadratic as well as compute. At long context the memory term is often the first to bind, which is precisely the gap FlashAttention closes by tiling the computation and never materializing the full matrix. Treating it as compute-only underestimates the real constraint and explains why models hit out-of-memory before they hit a FLOP wall.</>}
+        stretch={<>Given memory is the binding term, which attention variant reduces memory without changing the math of the result?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="quad-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 -- Cost of doubling the context"
+        scenario={<>A teammate plans to double the context from 2048 to 4096 tokens and budgets "twice the attention cost." Pick the soundest estimate of the change in attention cost.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`n: 2048 -> 4096 (2x longer)
+attention cost ~ n^2
+ratio = (4096/2048)^2 = ?`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "About 4x the attention cost, since cost grows with n squared and doubling n squares to four.", correct: true },
+          { key: "b", text: "About 2x the attention cost, since the sequence is twice as long and cost grows linearly with it.", correct: false },
+          { key: "c", text: "About the same cost, since the per-token attention work is fixed regardless of total sequence length.", correct: false },
+          { key: "d", text: "About 8x the attention cost, since doubling the context cubes rather than squares the underlying work.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) treats attention as linear; it is quadratic. (c) per-token work grows with n because each token attends to all others. (d) the exponent is 2, not 3; doubling squares, not cubes.</>}
+        lens={<>Attention cost scales with n squared, so doubling n from 2048 to 4096 multiplies the attention cost by 2 squared = 4, not 2. The linear estimate ignores that each additional token also adds a column to every existing query's score row, so the all-pairs count grows quadratically. It is not cubic either; the score matrix is two-dimensional. Budgeting 2x would underestimate the real attention cost by roughly half.</>}
+        stretch={<>If the rest of the model (FFN, projections) scales linearly with n, at what context length does attention start to dominate the total?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="quad-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 -- Long-context model runs out of memory"
+        scenario={<>A model handles 2k context fine but runs out of memory at 32k, and profiling shows the attention score matrix dominates memory. A teammate proposes simply buying GPUs with more memory. Pick the soundest first move.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`2k context: fine
+32k context: out of memory
+profile: n x n score matrix dominates memory`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Adopt FlashAttention or a sparse/linear variant, since the n-by-n materialization is the quadratic culprit.", correct: true },
+          { key: "b", text: "Buy GPUs with more memory, since the quadratic growth is unavoidable and only more hardware can absorb it.", correct: false },
+          { key: "c", text: "Reduce the model width d, since shrinking d directly removes the quadratic term in the attention cost.", correct: false },
+          { key: "d", text: "Lower the batch size to one, since the score matrix size depends mainly on how many sequences run at once.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) more memory delays but never removes a 16x-per-doubling growth. (c) d is the linear factor, not the quadratic one; shrinking it barely helps. (d) batch size is a linear multiplier; the per-sequence n^2 term remains.</>}
+        lens={<>The dominant cost is the n-by-n score matrix, so the leverage is to stop materializing it: FlashAttention tiles the computation to avoid storing the full matrix, while sparse or linear attention reduce the asymptotic term itself. More memory only buys a constant factor against quadratic growth, shrinking d attacks the linear factor, and lowering batch size removes a linear multiplier while leaving the per-sequence n squared intact. Attacking the n-by-n term is the principled fix.</>}
+        stretch={<>FlashAttention keeps the cost O(n squared) in compute yet fixes the memory -- how is that possible?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="quad-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 -- Why FlashAttention is still O(n squared) compute"
+        scenario={<>A teammate believes FlashAttention makes attention linear in compute because it avoids storing the full matrix. Pick the correct explanation of what it does and does not change.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`FlashAttention tiles Q, K, V into blocks
+computes attention block by block, never storing the full n x n
+recomputes as needed`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "It keeps O(n squared) compute but cuts memory to about linear by tiling and never storing the full matrix.", correct: true },
+          { key: "b", text: "It makes both compute and memory linear in n, since tiling fundamentally removes the all-pairs comparison.", correct: false },
+          { key: "c", text: "It makes compute quadratic and memory quadratic still, offering only a constant-factor speedup over the naive code.", correct: false },
+          { key: "d", text: "It changes the attention math to an approximation, trading a small accuracy loss for the linear memory it gains.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the all-pairs work remains; only the materialization is avoided, so compute stays quadratic. (c) memory is reduced to about linear, not left quadratic. (d) FlashAttention is exact, not an approximation.</>}
+        lens={<>FlashAttention still performs the full all-pairs computation, so its compute remains O(n squared); what it changes is memory. By tiling Q, K, V into blocks and computing the softmax-weighted output block by block with running statistics, it never materializes the full n-by-n matrix, cutting attention memory to roughly linear. It is exact, not an approximation, so it relieves the binding memory constraint without altering the result &mdash; unlike sparse/linear variants, which change the math.</>}
+        stretch={<>Since FlashAttention does not reduce compute, what kind of attention variant would you reach for to cut FLOPs at very long n?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="quad-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 -- Where the quadratic starts to bite"
+        scenario={<>A block's FFN cost scales linearly with n while attention scales as n squared. At short context the FFN dominates total cost. A teammate assumes that ordering holds at all lengths. Predict the non-obvious crossover behavior.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`FFN cost ~ linear in n
+attention cost ~ n^2
+short n: FFN is the larger term`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Beyond some context length attention overtakes the FFN, since a quadratic term eventually passes any linear one.", correct: true },
+          { key: "b", text: "The FFN stays the dominant cost at every length, since it has more parameters than the attention projections.", correct: false },
+          { key: "c", text: "The two costs stay in fixed proportion at all lengths, since both ultimately scale with the same sequence n.", correct: false },
+          { key: "d", text: "Attention is always the dominant cost, even at short context, because all-pairs comparison is intrinsically heavy.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) parameter count does not set runtime scaling; the quadratic term grows faster. (c) linear and quadratic do not stay in fixed proportion as n grows. (d) at short n the linear FFN term can genuinely dominate.</>}
+        lens={<>A quadratic term eventually exceeds any linear one, so although the linear FFN dominates at short context, there is a crossover length beyond which the n-by-n attention term takes over and grows much faster. The FFN's larger parameter count sets its constant factor, not its scaling, so it cannot keep pace as n grows. This crossover is exactly why long-context work focuses optimization effort on attention rather than the FFN.</>}
+        stretch={<>How does using a flash/sparse/linear variant move or remove that crossover point?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="quad-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 -- Estimating the score matrix size"
+        scenario={<>You must estimate per-head attention score-matrix entries for a planned 16k-token context to size memory. Pick the soundest estimate.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`context n = 16384 tokens
+score matrix is n x n per head
+how many entries per head?`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "About 268 million entries per head, since the matrix is 16384 times 16384 for all position pairs.", correct: true },
+          { key: "b", text: "About 16 thousand entries per head, since there is one score entry per token in the sequence.", correct: false },
+          { key: "c", text: "About 16 thousand times the model width, since each token stores one score per feature dimension.", correct: false },
+          { key: "d", text: "About 32 thousand entries per head, since the matrix holds two scores per token, forward and backward.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) that is the diagonal count (one per token), not the all-pairs n^2. (c) the score matrix has no d dimension; scores are scalars per pair. (d) there is one entry per ordered pair, not two per token.</>}
+        lens={<>The score matrix is n-by-n, so 16384 squared is about 268 million entries per head &mdash; the count of ordered position pairs. It is not one entry per token (that is just the diagonal), it has no model-width dimension because each entry is a scalar dot product, and it is not two-per-token. Multiplying by heads and the bytes per entry then gives the memory, which makes the quadratic blow-up concrete when planning long context.</>}
+        stretch={<>Multiply that by 32 heads and 2 bytes per entry -- does the full score-matrix memory alone already threaten a single GPU?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="quad-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 -- Misattributing the long-context blow-up"
+        scenario={<>A team's long-context training keeps hitting out-of-memory and they spend weeks shrinking the model width d, with little improvement. They conclude the model is fundamentally too big. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`effort: shrink model width d
+result: out-of-memory barely improves at long context
+overlooked: the n x n attention term`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "The n-by-n attention term dominates at long context, so shrinking d (a linear factor) barely helps.", correct: true },
+          { key: "b", text: "The model is fundamentally too big, so only reducing its total parameter count can resolve the memory issue.", correct: false },
+          { key: "c", text: "The embedding table is the memory bottleneck, so trimming the vocabulary is what would free the most memory.", correct: false },
+          { key: "d", text: "Gradient accumulation is misconfigured, so fixing the accumulation steps will eliminate the out-of-memory error.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) parameter count is not where the long-context memory goes; the score matrix is. (c) the embedding table does not scale with context length. (d) accumulation affects batch memory, not the per-sequence n^2 term.</>}
+        lens={<>At long context the n-by-n score matrix dominates memory, and the model width d is only a linear factor on top of it, so weeks of shrinking d move the needle very little. The model is not fundamentally too big; the team targeted the wrong term. The effective levers are flash/sparse/linear attention, which attack the quadratic n-by-n cost directly. The lesson is to attribute long-context memory to the score matrix, not the parameter count.</>}
+        stretch={<>What single profiling measurement would have pointed the team at the score matrix instead of d immediately?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">
+            <strong>Attention Is All You Need</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(per-layer complexity table; self-attention vs recurrent/conv cost)</span>
+          <br/>Tabulates self-attention's O(n squared d) per-layer complexity against recurrent and convolutional layers, the basis for the long-context efficiency literature.
         </li>
       </ul>
     </VIS.Section>

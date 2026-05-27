@@ -2167,288 +2167,290 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: FEATURE EXTRACTION vs FULL FINE-TUNING.
+// Delta: Two ways to use a pretrained encoder downstream. FEATURE-BASED (frozen): freeze ALL encoder weights, run inputs
+//   through it once to get fixed representations, and train ONLY a small task head on top. Cheap (encoder needs no
+//   gradients, features can be cached/precomputed), but the representation cannot adapt to the task, so accuracy is
+//   usually a bit lower. FULL FINE-TUNING: let gradients flow through the WHOLE encoder, updating all weights to the task.
+//   Costlier (full backward pass, a fresh copy of all params per task) but usually more accurate because the features
+//   reshape to the task. The decision is a compute/accuracy tradeoff that depends on data volume, how far the target
+//   domain is from pretraining, and serving constraints. Trap surface: thinking frozen = no learning at all (the head
+//   still learns), thinking fine-tuning is always strictly better regardless of data size, thinking frozen features can
+//   be cached AND adapted, and thinking full FT shares one param set across tasks. Diagram shows which weights get
+//   gradients only; never prints the verdict.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
       pill="NLP"
-      title="BART Denoising Autoencoder"
+      title="Feature Extraction vs Full Fine-tuning"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Pretraining & Finetuning" },
+        { label: "Subtopic", value: "Feature-based use freezes the encoder and trains only a head (cheap, less adaptive); full fine-tuning updates all weights to the task (costlier, usually more accurate) — a compute-versus-accuracy tradeoff" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>There are two ways to put a pretrained encoder to work: <VIS.Term def="Feature-based / frozen use: keep all pretrained encoder weights fixed, extract their representations, and train only a small task head on top.">feature extraction</VIS.Term> freezes
+      the encoder and trains only a head, while <VIS.Term def="Full fine-tuning: let gradients update every weight in the pretrained encoder so its features reshape to the target task.">full fine-tuning</VIS.Term> updates
+      every weight.</strong>{" "}
+      Frozen use is cheap: the encoder needs no backward pass, so its outputs can be precomputed and cached, and only the
+      small head trains, but the representation cannot adapt, so accuracy is usually a little lower. Full fine-tuning lets
+      gradients flow through the whole encoder, reshaping its features to the task for usually better accuracy, at the cost
+      of a full backward pass and a separate copy of all parameters per task. Which wins depends on labeled-data volume, how
+      far the target domain sits from pretraining, and serving limits. The failure modes: thinking frozen means no learning
+      at all (the head still learns), thinking fine-tuning always wins regardless of data, thinking frozen features can be
+      both cached and adapted, and thinking full fine-tuning shares one parameter set across tasks.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Which weights receive gradients">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate says &quot;freezing the encoder means nothing learns, so it is pointless; and fine-tuning is always the
+        right call.&quot; The gradient flow for each option is shown below. Work out what actually trains in the frozen setup
+        and what distinguishes the two.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`feature-based (frozen):
+   [pretrained encoder]  <- NO gradients (weights fixed)
+          |  fixed features
+        [small head]     <- gradients flow HERE (head trains)
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+full fine-tuning:
+   [pretrained encoder]  <- gradients flow (all weights update)
+          |
+        [small head]     <- gradients flow
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+what learns in the frozen case, and which costs more compute?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        One reading says the frozen setup learns nothing. Another says only the head learns while the encoder stays put.
+        Decide which, and which option pays a larger compute and storage cost.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: frozen-BERT head vs full fine-tune">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`feature-based (frozen BERT + logistic head):
+   trainable params : ~thousands (head only)
+   backward pass    : head only -> cheap
+   features         : can be precomputed once and cached
+   accuracy         : ~88%   (representation can't adapt)
+
+full fine-tuning (all 110M params):
+   trainable params : ~110M (whole encoder + head)
+   backward pass    : through the whole encoder -> costly
+   storage          : a full 110M-param copy PER task
+   accuracy         : ~92%   (features reshape to the task)
+
+tradeoff: ~4 points of accuracy for far more compute + storage`}</pre>
+      <p>
+        With the encoder frozen, only a small head trains, the encoder outputs can be cached, and the cost is tiny, but
+        accuracy is a bit lower because the representation is fixed. Full fine-tuning updates all 110M parameters, reshaping
+        features to the task for higher accuracy, but pays a full backward pass and stores a separate copy of every weight
+        per task. Neither is universally right; the gap and the cost both depend on the situation. (When each wins is
+        unpacked in the drills.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — What each option actually does">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>Frozen (feature-based) vs Full fine-tune</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Encoder weights</td><td>Frozen: unchanged | Full FT: all updated</td></tr>
+          <tr><td>What trains</td><td>Frozen: head only | Full FT: encoder plus head</td></tr>
+          <tr><td>Compute</td><td>Frozen: cheap, cacheable features | Full FT: costly backward pass</td></tr>
+          <tr><td>Storage per task</td><td>Frozen: tiny head | Full FT: a full param copy each</td></tr>
+          <tr><td>Accuracy</td><td>Frozen: usually a bit lower | Full FT: usually higher</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="A compute-versus-accuracy dial, not a right answer">
+        Feature extraction and full fine-tuning sit at two ends of an adaptivity dial: freezing buys cheap, cacheable,
+        share-the-backbone economy at some accuracy cost, while full fine-tuning spends compute and per-task storage to
+        reshape features for more accuracy. The right end depends on data, domain gap, and serving constraints.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>frozen feature-based use trains only a head (cheap, cacheable,
+        less adaptive); full fine-tuning updates all encoder weights (costlier, per-task storage, usually more
+        accurate).</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="fvf-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What trains when the encoder is frozen"
+        scenario={<>A teammate says &quot;if you freeze the encoder, the model cannot learn anything, so feature-based use is useless.&quot; Pick the statement that correctly describes the frozen setup.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`frozen encoder -> fixed features -> [head]  (trainable?)
+question: does anything learn here?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "The encoder stays fixed but a small task head trains on top of its features, so the model does learn the task.", correct: true },
+          { key: "b", text: "Nothing learns at all, because freezing the encoder also freezes the head, leaving the model entirely static.", correct: false },
+          { key: "c", text: "The encoder secretly keeps updating through a hidden path, so freezing has no real effect on its weights.", correct: false },
+          { key: "d", text: "Only the input embeddings update while the head stays fixed, so the task mapping is never actually learned.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) freezing the encoder does not freeze the head; the head still trains. (c) frozen means no gradients reach the encoder; there is no hidden update path. (d) it is the head that learns the task mapping, not the embeddings alone.</>}
+        lens={<>In feature-based use the encoder is frozen and produces fixed representations, but a small head trains on those features, so the model genuinely learns the task, just without adapting the encoder. The head is not frozen, the encoder does not secretly update, and the task mapping lives in the trainable head. Frozen does not mean inert; it means the costly part is held fixed while a light head adapts.</>}
+        stretch={<>Why does keeping the encoder frozen let you precompute and cache its outputs across training epochs?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="fvf-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — What full fine-tuning changes"
+        scenario={<>A teammate claims &quot;full fine-tuning and feature extraction differ only in learning rate; both update the same weights.&quot; Pick the statement that correctly distinguishes them.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`frozen:    gradients reach the head only
+full FT:   gradients reach encoder + head
+difference: which weights move?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Full fine-tuning updates all encoder weights plus the head; feature extraction updates only the head.", correct: true },
+          { key: "b", text: "They update identical weights and differ solely in the learning rate applied to the same parameter set.", correct: false },
+          { key: "c", text: "Full fine-tuning updates only the head, while feature extraction is what updates the entire encoder stack.", correct: false },
+          { key: "d", text: "Both freeze the encoder; the only difference is that fine-tuning adds a second head on top of the first.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) the difference is which weights move, not just the learning rate; frozen never updates the encoder. (c) this reverses the two; feature extraction freezes the encoder. (d) full fine-tuning does not freeze the encoder, and the distinction is not about stacking heads.</>}
+        lens={<>Full fine-tuning lets gradients update the entire encoder and the head, reshaping the pretrained features to the task, whereas feature extraction freezes the encoder and trains only the head. They do not touch the same weights at a different learning rate, the roles are not reversed, and full fine-tuning does not freeze the encoder. The defining difference is the scope of the weights that move.</>}
+        stretch={<>Why does updating the encoder usually raise accuracy but also raise overfitting risk on small datasets?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="fvf-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Very small labeled set, far domain"
+        scenario={<>You have only 800 labeled examples in a domain close to the pretraining text, and you fear overfitting. A teammate insists full fine-tuning of all 110M params is always best. Pick the soundest choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`labels: 800   (tiny)
+params if full FT: 110M   (huge vs labels)
+risk: overfitting the encoder to 800 examples`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Lean toward frozen features with a small head, since 800 labels can overfit a fully unfrozen 110M encoder.", correct: true },
+          { key: "b", text: "Always fully fine-tune all 110M params, since more trainable weights are strictly better regardless of data.", correct: false },
+          { key: "c", text: "Fully fine-tune but on the 800 examples repeated many epochs, since repetition removes any overfitting risk.", correct: false },
+          { key: "d", text: "Discard the pretrained model and train a 110M encoder from scratch on the 800 labeled examples instead.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) more trainable params are not strictly better; 800 labels cannot constrain 110M weights well. (c) repeating tiny data many epochs worsens, not removes, overfitting. (d) training 110M params from scratch on 800 labels is hopeless.</>}
+        lens={<>With only 800 labels, fully unfreezing a 110M-param encoder risks overfitting because the data cannot constrain so many weights, so freezing the encoder and training a small head (few parameters) is the safer default here. Full fine-tuning is not always best, repeating tiny data inflates overfitting, and from-scratch training is worse still. The data-to-parameter ratio is what tips this case toward frozen features.</>}
+        stretch={<>As labeled data grows from hundreds to hundreds of thousands, why does the balance shift toward full fine-tuning?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="fvf-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Many tasks, one shared backbone in memory"
+        scenario={<>You must serve fifty classification tasks on one GPU and cannot afford fifty full encoder copies in memory. A teammate proposes full fine-tuning each task independently. Pick the soundest setup.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`50 tasks; full FT -> 50 separate 110M-param copies
+frozen -> 1 shared encoder + 50 tiny heads
+constraint: limited GPU memory`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Freeze one shared encoder and train fifty small heads, so only the tiny heads differ across the tasks.", correct: true },
+          { key: "b", text: "Fully fine-tune each task into its own 110M-param model, accepting fifty full copies resident in memory.", correct: false },
+          { key: "c", text: "Fully fine-tune one model on all fifty tasks merged, then serve it as if it were fifty separate models.", correct: false },
+          { key: "d", text: "Skip the pretrained encoder and train fifty small from-scratch models, one per task, to save memory entirely.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) fifty full copies is exactly the memory blowup the constraint forbids. (c) merging tasks into one fine-tune does not yield fifty per-task models and can hurt each. (d) from-scratch tiny models forgo the pretrained quality.</>}
+        lens={<>Under tight memory with many tasks, the feature-based route shines: freeze one shared encoder in memory and attach a tiny head per task, so the fifty tasks share the heavy backbone and differ only by small heads. Fifty full fine-tuned copies blow the memory budget, a single merged fine-tune is not fifty per-task models, and from-scratch models drop pretrained quality. Sharing the frozen backbone is what makes fifty tasks fit.</>}
+        stretch={<>How does parameter-efficient fine-tuning offer a middle ground between fully shared frozen features and full copies?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="fvf-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why frozen features can be cached"
+        scenario={<>A teammate is surprised that frozen feature extraction can precompute encoder outputs once and reuse them every epoch, but full fine-tuning cannot. Pick the correct account of why.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`frozen: encoder output for an input never changes -> cache once
+full FT: encoder weights change each step -> output changes -> recompute`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Frozen encoder weights make each input's features constant, so they are computed once and reused every epoch.", correct: true },
+          { key: "b", text: "Caching works for both equally, since the encoder output for an input is fixed no matter how weights change.", correct: false },
+          { key: "c", text: "Full fine-tuning caches features too, because gradients only touch the head and leave encoder outputs fixed.", correct: false },
+          { key: "d", text: "Frozen caching only works if the head is also frozen, otherwise the cached features become invalid each step.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) when weights change (full FT), the same input produces different features, so caching breaks. (c) full fine-tuning updates the encoder, so its outputs change; only the frozen case caches. (d) the head training does not change encoder outputs; the cache stays valid as long as the encoder is frozen.</>}
+        lens={<>Because a frozen encoder's weights never change, the representation it produces for a given input is constant, so you can compute it once and reuse it across all epochs while only the head trains. Under full fine-tuning the encoder weights move every step, so the same input yields different features and the cache is invalid. Caching is valid for the frozen case and tied to the encoder, not the head, being fixed.</>}
+        stretch={<>How much wall-clock training time can feature caching save when the encoder dominates the forward cost?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="fvf-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Why fine-tuning usually wins on accuracy"
+        scenario={<>A teammate cannot see why unfreezing the encoder typically gains accuracy, given that the frozen features were already pretrained well. Predict the non-obvious reason.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pretrained features: general, not task-shaped
+full FT: gradients bend the features toward THIS task
+frozen: features stay general, head must cope as-is`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Fine-tuning reshapes the general features toward the task, which a frozen head cannot do on its own.", correct: true },
+          { key: "b", text: "Fine-tuning adds more layers to the encoder, and the extra depth, not the weight updates, raises accuracy.", correct: false },
+          { key: "c", text: "Frozen features are random until a head reads them, so any movement of encoder weights is what makes them useful.", correct: false },
+          { key: "d", text: "Accuracy rises only because fine-tuning uses more data; with equal data the two approaches always tie exactly.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) fine-tuning updates existing weights; it does not add layers. (c) pretrained features are already meaningful, not random. (d) given equal data, fine-tuning still usually wins by adapting features, so they do not always tie.</>}
+        lens={<>Full fine-tuning typically wins because it bends the general pretrained features toward the specific task, capturing task-relevant distinctions a frozen head must accept as-is. It does not add layers, the pretrained features are not random, and the gain is not purely a data-size artifact since adaptation helps even at equal data. Reshaping the representation, not depth or data alone, is the mechanism behind the accuracy edge.</>}
+        stretch={<>When the target domain is very far from pretraining, why does the fine-tuning accuracy advantage tend to grow?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="fvf-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Latency-bound serving with shared compute"
+        scenario={<>You serve many tasks and want to amortize the encoder forward pass across them in one request. A teammate suggests fully fine-tuning each task so each has its own encoder. Pick the soundest setup.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`goal: run the encoder ONCE, feed many task heads
+frozen: shared encoder pass -> N cheap heads
+full FT: each task has a different encoder -> N full passes`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Freeze a shared encoder and run it once per input, then route its features to each task's small head.", correct: true },
+          { key: "b", text: "Fully fine-tune each task so each runs its own encoder pass, accepting N full passes per input at serving.", correct: false },
+          { key: "c", text: "Fully fine-tune one model and have every task read the same single output logit as its prediction directly.", correct: false },
+          { key: "d", text: "Drop the encoder at serving and let each head read raw token ids, since the encoder pass is too slow to share.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) per-task encoders force N full forward passes, defeating amortization. (c) one shared output logit cannot serve different tasks with different label spaces. (d) reading raw token ids discards the representation the heads need.</>}
+        lens={<>To amortize the costly encoder pass across many tasks, freeze a shared encoder so one forward pass per input feeds every task's small head. Fully fine-tuning per task gives each its own encoder, forcing many full passes, a single shared logit cannot express different tasks, and feeding raw ids skips the representation. A frozen shared backbone is what lets one encoder pass serve many heads.</>}
+        stretch={<>Why does sharing the encoder forward pass matter more as the number of co-served tasks grows?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="fvf-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Cached features but expecting adaptation"
+        scenario={<>An engineer precomputes and caches frozen encoder features for speed, but also expects the encoder to adapt to the task during training. Accuracy plateaus below full fine-tuning and a teammate blames the head size. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`setup: features cached once (encoder frozen)
+expectation: encoder also adapts to the task
+observed: accuracy below full fine-tuning`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Caching requires a frozen encoder, so it cannot adapt; unfreeze and recompute to fine-tune, or accept frozen.", correct: true },
+          { key: "b", text: "The head is too small, and enlarging it will make the cached frozen features adapt to the task after all.", correct: false },
+          { key: "c", text: "The cache is stale, and refreshing it each epoch will let the still-frozen encoder adapt without unfreezing.", correct: false },
+          { key: "d", text: "The learning rate is too low, and raising it will let gradients reach the encoder through the cached features.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) a bigger head cannot make a frozen encoder adapt; adaptation requires updating encoder weights. (c) refreshing the cache without unfreezing changes nothing, since frozen outputs do not move. (d) no learning rate sends gradients into a frozen encoder through cached features.</>}
+        lens={<>The contradiction is structural: caching features only works because the encoder is frozen, and a frozen encoder by definition does not adapt, so you cannot have both cheap cached features and an adapting encoder. The fix is to choose: unfreeze and recompute features each step to fine-tune, or accept the frozen ceiling. Head size, cache freshness, and learning rate cannot route gradients into frozen weights. Caching and adaptation are mutually exclusive by design.</>}
+        stretch={<>What hybrid lets you adapt only part of the encoder while still caching the lower, unchanged layers?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://arxiv.org/abs/1903.05987" target="_blank" rel="noopener">
+            <strong>To Tune or Not to Tune? (Peters, Ruder, Smith, 2019)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(an empirical study of feature extraction vs fine-tuning)</span>
+          <br/>Compares frozen feature extraction against full fine-tuning across tasks and shows which approach wins depends on the task and the distance from the pretraining objective.
         </li>
       </ul>
     </VIS.Section>

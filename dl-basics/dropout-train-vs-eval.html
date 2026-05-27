@@ -2167,288 +2167,294 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: DROPOUT ACTIVE ONLY IN TRAINING.
+// Delta: Dropout is ON in train mode and OFF in eval mode. With INVERTED dropout (the standard) NO rescaling is needed at
+//   inference, because the 1/(1-p) scale was applied to survivors during training -- so eval is just: all units active,
+//   no mask, no scale. The classic operational bug is forgetting to switch to eval mode (e.g. model.eval()): dropout stays
+//   on, so each forward pass randomly zeroes ~p of the units and the SAME input yields DIFFERENT logits run-to-run, AND
+//   accuracy is degraded/noisy because you are evaluating random subnetworks instead of the full ensemble. The trap:
+//   thinking dropout should stay on at eval to 'regularize' predictions (no -- eval must be deterministic and use the full
+//   network), thinking you must manually rescale at eval (inverted dropout already did it), or thinking turning off
+//   gradients (no_grad/inference_mode) also turns off dropout (it does NOT -- train/eval is a separate flag). Diagram
+//   shows the train-on / eval-off contrast SETUP only -- it does NOT name the run-to-run bug as the answer.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="DL"
+      title="Dropout Active Only in Training"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Regularization" },
+        { label: "Subtopic", value: "Dropout is on in train mode and off in eval; with inverted dropout no rescaling is needed at inference. Leaving it on at eval adds noise -- the same input yields different logits run-to-run and accuracy degrades" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Dropout is on in training mode and off in evaluation mode. With inverted dropout (the standard), inference
+      needs no rescaling, because the 1/(1&minus;p) scale was already applied to the survivors during training &mdash; so
+      eval is simply all units active, no mask, no scale.</strong>{" "}
+      The classic operational bug is forgetting to switch the model to{" "}
+      <VIS.Term def="The flag that tells the model to behave as at inference: dropout off, BatchNorm using running statistics. In PyTorch this is model.eval().">eval mode</VIS.Term>:
+      dropout stays on, so each forward pass randomly zeroes about p of the units and the same input yields different
+      logits run&#8209;to&#8209;run &mdash; and accuracy is degraded and noisy because you are evaluating random subnetworks rather
+      than the full network. The failure modes: thinking dropout should stay on at eval to "regularize" predictions
+      (no &mdash; eval must be deterministic and use the full network), thinking you must manually rescale at eval (inverted
+      dropout already did it), and thinking that turning off gradient tracking (a{" "}
+      <VIS.Term def="A context like torch.no_grad() or inference_mode() that disables gradient computation to save memory and speed up inference. It does not change the train/eval behavior of layers.">no&#8209;grad context</VIS.Term>) also
+      turns off dropout &mdash; it does not; train/eval is a separate flag.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — When is dropout active?">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate says "dropout runs the same way in training and inference, and you must halve the activations at test
+        time to compensate." Work out which phases dropout is active in and what inverted dropout means for the eval pass.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`train mode:
+   dropout ON -> fresh mask each pass, survivors scaled 1/(1-p)
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+eval mode:
+   dropout OFF -> all units active, NO mask, NO rescaling
+   (inverted dropout already balanced the expectation in training)
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
+separate flag:
+   turning off gradients (no_grad / inference_mode) does NOT
+   turn dropout off; the train/eval mode flag is independent
 
-who reads the corrupted input, and who emits the target?`}</pre>
+question: is dropout on at eval, and is any manual rescaling
+          needed there?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Reason about what happens to a fixed input's output if dropout is accidentally left on at eval, and why disabling
+        gradients is not the same as switching to eval mode.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: forgetting eval mode">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`correct eval (dropout off):
+   same input -> same logits every call (deterministic)
+   full network -> best accuracy
+
+forgot to switch to eval mode (dropout still on):
+   same input, call 1 -> logits A   (one random subnetwork)
+   same input, call 2 -> logits B   (a different subnetwork)
+   class prob swings, e.g. 0.6 <-> 0.8 run-to-run
+   accuracy degraded + noisy (evaluating random subnets)
+
+note: wrapping the call in no_grad does NOT fix this --
+      it disables gradients, not dropout.`}</pre>
+      <p>
+        In correct eval mode dropout is off, so a fixed input gives the same logits every call and the full network yields
+        the best accuracy. If eval mode is forgotten, dropout stays on and each call samples a different random subnetwork,
+        so the same input produces different logits run&#8209;to&#8209;run (a class probability might swing between 0.6 and 0.8) and
+        accuracy is both lower and noisy. Wrapping the call in a no&#8209;grad context does not fix it &mdash; that disables
+        gradient tracking, not dropout; only switching the train/eval flag does.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Train vs eval at a glance">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Question</th><th>Answer</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Dropout active at eval?</td><td>No &mdash; off; all units active</td></tr>
+          <tr><td>Manual rescale at eval?</td><td>No &mdash; inverted dropout handled it in training</td></tr>
+          <tr><td>Does no-grad disable dropout?</td><td>No &mdash; train/eval is a separate flag</td></tr>
+          <tr><td>Symptom of leaving it on</td><td>Same input -> different logits; degraded, noisy accuracy</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Eval must be deterministic and use the full network">
+        Dropout exists to perturb training; at evaluation you want the full, deterministic network, which is why eval mode
+        turns it off and (with inverted dropout) needs no rescaling. Leaving it on evaluates random subnetworks, so a fixed
+        input gives different answers each call and accuracy suffers. Disabling gradients is unrelated &mdash; switch the
+        train/eval flag explicitly.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>dropout is on in train, off in eval; inverted dropout needs no
+        eval rescaling; leaving it on makes a fixed input give different logits run&#8209;to&#8209;run and degrades
+        accuracy.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="dropte-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — Is dropout on at inference?"
+        scenario={<>A teammate says "dropout runs identically in training and at inference." Pick the statement that correctly describes dropout across the two phases.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`phases: train mode and eval mode
+question: is dropout active in both, or only one?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "Dropout is active only in training and is turned off in eval, where all units stay active and unscaled.", correct: true },
+          { key: "b", text: "Dropout is active in both training and eval, applying the same random mask in each phase to keep them consistent.", correct: false },
+          { key: "c", text: "Dropout is active only in eval and is turned off in training, where every unit is always kept on each forward pass.", correct: false },
+          { key: "d", text: "Dropout is active in neither phase by default, so it must be manually enabled on each forward pass to have any effect.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) dropout is off at eval, not applied in both. (c) reverses it: dropout is a training operation. (d) dropout is controlled by the train/eval flag, not enabled per pass manually.</>}
+        lens={<>Dropout is active only in training and off in eval, where all units are active and unscaled (inverted dropout balanced the scale in training). It is not applied in both phases, not an eval&#8209;only operation, and not off&#8209;by&#8209;default needing per&#8209;pass enabling. The train/eval flag governs it.</>}
+        stretch={<>With inverted dropout, what manual rescaling must you do to the activations at eval?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="dropte-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — Does no-grad turn off dropout?"
+        scenario={<>A teammate claims "wrapping inference in a no&#8209;gradient context automatically turns dropout off." Pick the statement that correctly describes the relationship.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`two controls: gradient tracking (no_grad), and train/eval mode flag
+question: does disabling gradients also disable dropout?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Disabling gradients does not disable dropout, since the train and eval behavior is set by a separate mode flag.", correct: true },
+          { key: "b", text: "Disabling gradients also disables dropout, since dropout only operates while the gradients are being tracked anyway.", correct: false },
+          { key: "c", text: "Disabling gradients also disables dropout, since both are controlled by the very same underlying inference setting.", correct: false },
+          { key: "d", text: "Disabling gradients disables dropout but keeps BatchNorm in training mode, so only dropout is affected by no-grad.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) dropout operates regardless of gradient tracking. (c) they are controlled by different settings, not the same one. (d) no-grad affects neither dropout nor BN's mode; that is the eval flag's job.</>}
+        lens={<>Gradient tracking and train/eval mode are independent controls: disabling gradients (for speed/memory) does not turn dropout off &mdash; only switching to eval mode does. Dropout is not tied to gradient tracking, the two are not the same setting, and no&#8209;grad does not selectively change dropout or BN. Set eval mode explicitly.</>}
+        stretch={<>What happens to a fixed input's logits if you run inference under no-grad but forget to set eval mode?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="dropte-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Making predictions deterministic"
+        scenario={<>Your served model with dropout layers must return the same logits for the same input every time. A teammate proposes averaging many stochastic forward passes instead. Pick the soundest way to get determinism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`requirement: same input -> same logits every call
+model has dropout layers
+question: what gives deterministic predictions?`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Switch the model to eval mode, which turns dropout off so a fixed input yields identical logits on every call.", correct: true },
+          { key: "b", text: "Keep dropout on and average many forward passes, since averaging enough stochastic passes makes the output deterministic.", correct: false },
+          { key: "c", text: "Keep dropout on but fix the random seed once, since a single fixed seed makes every later forward pass identical too.", correct: false },
+          { key: "d", text: "Keep dropout on and lower the rate to a tiny value, since a small enough rate removes all randomness from the output.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) averaging stochastic passes reduces but does not eliminate variance; it is also wasteful versus just turning dropout off. (c) a single fixed seed does not make independent later passes identical; each draws a new mask. (d) a tiny but nonzero rate still injects randomness.</>}
+        lens={<>Switching to eval mode turns dropout off, so a fixed input yields identical logits every call &mdash; the direct, correct way to get determinism and the full network. Averaging stochastic passes is noisy and wasteful, a single seed does not make independent passes identical, and a tiny nonzero rate still randomizes. Use eval mode.</>}
+        stretch={<>Why is the full-network eval prediction generally better than averaging stochastic dropout passes anyway?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="dropte-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Where the inference rescaling lives"
+        scenario={<>A teammate moving a model to production with inverted dropout asks where to put the 1/(1&minus;p) compensation at inference. Pick the soundest answer.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`inverted dropout: survivors scaled by 1/(1-p) DURING training
+question: where does the inference-time compensation go?`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "No inference compensation is needed, since inverted dropout applied the scaling during training already.", correct: true },
+          { key: "b", text: "Multiply the inference logits by the keep probability, since eval must undo the training-time survivor scaling itself.", correct: false },
+          { key: "c", text: "Multiply the inference activations by one over the keep probability, since eval must re-apply the survivor scaling again.", correct: false },
+          { key: "d", text: "Re-apply the dropout mask at inference once, since the model was trained to expect a fraction of its units to be off.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) multiplying by the keep probability is the old non-inverted test-time rule. (c) re-applying 1/(1-p) at eval double-counts the training scale. (d) dropout is off at eval; re-applying the mask injects noise.</>}
+        lens={<>With inverted dropout, the 1/(1&minus;p) scaling was applied to survivors during training, so inference needs no compensation at all &mdash; just eval mode with all units active. Multiplying by the keep probability is the old non&#8209;inverted rule, re&#8209;applying 1/(1&minus;p) double&#8209;counts, and re&#8209;applying the mask turns dropout back on. The eval pass is clean.</>}
+        stretch={<>Under classic (non-inverted) dropout, what would the correct inference-time scaling have been?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="dropte-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why a fixed input varies with dropout on"
+        scenario={<>A teammate asks mechanically why, with dropout left on, the exact same input produces different logits on repeated calls. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`dropout on, same input, repeated calls
+question: what differs between calls to change the logits?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Each call draws a fresh random mask, so a different subnetwork computes the output and the logits change call to call.", correct: true },
+          { key: "b", text: "Each call updates the weights slightly, so the model keeps learning between calls and the logits drift over the calls.", correct: false },
+          { key: "c", text: "Each call rounds the activations differently, so floating-point error alone is what shifts the logits between the calls.", correct: false },
+          { key: "d", text: "Each call reorders the input features randomly, so the permutation of the inputs is what changes the output each time.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) inference does not update weights; the variation is from the mask. (c) floating-point error is far smaller than dropout-induced swings. (d) dropout does not permute inputs; it zeroes units.</>}
+        lens={<>With dropout on, each call samples a fresh random mask, so a different subnetwork computes the output and the logits change &mdash; that is the run&#8209;to&#8209;run variation. Weights are not updated at inference, floating&#8209;point error is negligible by comparison, and inputs are not permuted. The mask is the source; eval mode removes it.</>}
+        stretch={<>Why does evaluating these random subnetworks also lower accuracy versus the full network?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="dropte-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Keeping dropout on at eval to 'regularize'"
+        scenario={<>A teammate argues that leaving dropout on during evaluation will "regularize the predictions and make them more robust." Predict the non&#8209;obvious effect on the reported accuracy and its stability.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`proposal: leave dropout ON during evaluation
+question: what happens to accuracy and its run-to-run stability?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Accuracy drops and becomes noisy, since eval then scores random subnetworks instead of the full trained network.", correct: true },
+          { key: "b", text: "Accuracy improves and becomes more stable, since the extra eval-time noise regularizes the predictions as claimed.", correct: false },
+          { key: "c", text: "Accuracy is unchanged but becomes more stable, since dropout at eval only averages out noise without shifting accuracy.", correct: false },
+          { key: "d", text: "Accuracy improves but becomes noisier, since the regularization helps while the randomness adds harmless variation.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) eval-time dropout does not regularize a trained model; it degrades it. (c) it does not stabilize; it adds run-to-run variance. (d) accuracy does not improve; regularization belongs in training, not eval.</>}
+        lens={<>Leaving dropout on at eval scores random subnetworks rather than the full network, so accuracy drops and becomes noisy &mdash; the opposite of the claimed benefit. Regularization belongs in training; at eval it neither improves nor stabilizes accuracy. The full, deterministic network is what you want at evaluation.</>}
+        stretch={<>In what specific technique is running dropout at inference actually intentional, and what is it measuring?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="dropte-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Setting up the eval loop"
+        scenario={<>You are writing the evaluation loop for a model with dropout and BatchNorm. A teammate wraps the loop in a no&#8209;grad context and calls it done. Pick the soundest practice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`eval loop, model has dropout + BatchNorm
+teammate wrapped it in no_grad only
+question: what else is required for a correct eval?`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Also switch the model to eval mode, which turns dropout off and makes BatchNorm use its running statistics.", correct: true },
+          { key: "b", text: "Nothing else is required, since the no-grad context already places both dropout and BatchNorm into eval behavior.", correct: false },
+          { key: "c", text: "Also manually rescale every activation by the keep probability, since the no-grad context omits the eval scaling step.", correct: false },
+          { key: "d", text: "Also lower the batch size to one, since evaluating one example at a time is what disables dropout during the eval loop.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) no-grad does not set eval behavior for dropout or BN. (c) inverted dropout needs no manual rescale; the missing piece is eval mode. (d) batch size does not control dropout; the eval flag does.</>}
+        lens={<>You must also switch the model to eval mode, which turns dropout off and makes BatchNorm use its running statistics &mdash; no&#8209;grad alone only disables gradient tracking. No manual rescaling is needed with inverted dropout, and batch size does not control dropout. Set both no&#8209;grad (for speed) and eval mode (for correctness).</>}
+        stretch={<>Beyond dropout, what does forgetting eval mode do specifically to BatchNorm's behavior?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="dropte-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Validation accuracy lower than expected and unstable"
+        scenario={<>A model's validation accuracy is several points below its training trend and changes slightly each time the validation set is re&#8209;scored. The eval code disables gradients but never calls the eval&#8209;mode switch. A teammate suspects a corrupted validation set. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`eval code: gradients disabled, eval-mode switch NEVER called
+symptom: val accuracy low + changes slightly each re-score
+question: most likely cause?`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Dropout is still on because eval mode was never set, so each re-score samples different subnetworks and varies accuracy.", correct: true },
+          { key: "b", text: "The validation set is corrupted, so the low and shifting accuracy is unrelated to the missing eval-mode switch entirely.", correct: false },
+          { key: "c", text: "The model overfit the training set, so its validation accuracy is simply low; the re-score variation is just rounding noise.", correct: false },
+          { key: "d", text: "The learning rate was too high during training, so the saved weights are poor and re-scoring them varies the accuracy.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) a corrupted set would give a stable wrong number, not one that shifts on re-scoring. (c) overfitting gives stable low accuracy; the re-score variation points to dropout. (d) a bad learning rate gives fixed weights and a stable score, not run-to-run variation.</>}
+        lens={<>Disabling gradients without setting eval mode leaves dropout on, so each re&#8209;score evaluates different random subnetworks &mdash; explaining both the depressed accuracy and the run&#8209;to&#8209;run variation. A corrupted set or overfitting would give a stable wrong number, and a bad learning rate gives fixed weights. The re&#8209;score instability is the tell; the fix is to call eval mode.</>}
+        stretch={<>What single one-line change would both raise the accuracy and make the re-scores identical?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://cs231n.github.io/neural-networks-2/#reg" target="_blank" rel="noopener">
+            <strong>CS231n notes — Dropout at train vs test time</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(inverted dropout, why test time needs no scaling)</span>
+          <br/>Explains why dropout is a training&#8209;only operation and how inverted dropout makes the test pass unscaled.
+        </li>
+        <li>
+          <a href="https://pytorch.org/docs/stable/generated/torch.nn.Dropout.html" target="_blank" rel="noopener">
+            <strong>torch.nn.Dropout (PyTorch docs)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(train/eval mode controls dropout; no_grad is separate)</span>
+          <br/>Documents that dropout follows the module's train/eval mode &mdash; independent of gradient&#8209;tracking contexts.
         </li>
       </ul>
     </VIS.Section>

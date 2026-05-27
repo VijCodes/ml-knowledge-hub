@@ -2167,288 +2167,282 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: PRODUCT QUANTIZATION (PQ).
+// Delta: split each D-dim vector into m contiguous subvectors; learn a small codebook (e.g. 256 centroids = 8 bits)
+//   per subspace by k-means; store each vector as m bytes of codebook IDs instead of D floats. Distance to a query is
+//   approximated by summing per-subspace lookup-table distances (asymmetric distance computation), so it is both
+//   ~10-30x smaller in memory AND fast. The cost is quantization error -> some recall loss. PQ is a COMPRESSION /
+//   distance-approximation scheme, orthogonal to the partition (IVF) or graph (HNSW) used to avoid the full scan.
+//   Diagram shows the split + codebook SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="RecSys"
+      title="Product Quantization (PQ)"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Embeddings & Approximate Nearest Neighbor" },
+        { label: "Subtopic", value: "Split each vector into m subvectors, quantize each to a small codebook, store compact codes; approximate distance by summing per-subspace lookup tables, trading memory and speed for recall" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>PQ splits each vector into <VIS.Term def="The number of contiguous slices a D-dimensional vector is cut into; each slice is quantized independently against its own codebook.">m subvectors</VIS.Term>, learns a tiny
+      codebook per slice, and stores each vector as m small codebook IDs instead of D floats.</strong>{" "}
+      Within each subspace, k-means learns (typically) 256 centroids, so one subvector becomes a single byte (an
+      8-bit code). A 128-dimensional float vector (512 bytes) cut into 8 subvectors becomes 8 bytes, about 64x smaller.
+      Distance from a query to a stored vector is approximated by precomputing, for the query, a small table of
+      distances to every centroid in each subspace, then summing the table lookups for that vector's codes &mdash; the
+      <VIS.Term def="Asymmetric distance computation: the query stays full-precision and only the stored vectors are quantized, which keeps more accuracy than quantizing both.">asymmetric distance computation</VIS.Term>. So
+      PQ buys both memory and speed, at the price of quantization error and some recall loss. The failure modes:
+      assuming PQ by itself avoids the full scan (it does not &mdash; it still touches every code unless paired with
+      IVF), choosing m that does not divide D, and forgetting that the codebooks were trained on a sample and drift.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — From floats to codes">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        You have 1,000,000,000 vectors and they will not fit in RAM as raw floats. The readout shows the PQ recipe: cut
+        each vector into m slices, quantize each slice against a per-subspace codebook, and store the codes. Work out how
+        much memory one vector now takes and why distances can still be computed quickly.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`vector dim D = 128 (float32 = 512 bytes)
+split into m = 8 subvectors of 16 dims each
+each subspace codebook = 256 centroids (k-means)
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+code for one subvector = 1 byte (8 bits, picks 1 of 256)
+code for one full vector = m bytes = 8 bytes`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Derive the compression ratio from 512 bytes to 8 bytes, and explain why storing a centroid ID per subspace lets
+        you approximate the original vector without keeping any of its floats.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: codes and table lookups">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`step 1 - memory per vector:
+   512 bytes raw -> 8 bytes coded = 64x smaller
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+step 2 - billion-vector footprint:
+   1e9 * 8 bytes = 8 GB codes (vs 512 GB raw)
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+step 3 - query distance (asymmetric):
+   for each of 8 subspaces, precompute query-to-256-centroid
+   distance table (one time per query)
+   distance(query, vector) ~= sum over 8 subspaces of
+                              table[ vector.code[s] ]`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        The codes shrink memory 64x; the per-query distance tables turn each distance into 8 cheap lookups and adds
+        instead of a 128-dimensional dot product. The price is that the summed table distances are an approximation of
+        the true distance &mdash; the centroid stands in for the real subvector &mdash; so the ranking has some error,
+        which shows up as recall loss.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What each PQ choice buys you">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Choice</th><th>Why it matters</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>More subvectors m</td><td>Finer quantization and lower error, but more bytes per code and bigger tables</td></tr>
+          <tr><td>Bigger codebook</td><td>More centroids per subspace cut error but cost more bits per subvector</td></tr>
+          <tr><td>Asymmetric distance</td><td>Keep the query full-precision so only stored vectors are approximated</td></tr>
+          <tr><td>Pair with IVF</td><td>IVF prunes which codes to scan; PQ alone still touches every code</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="PQ compresses vectors and approximates distance; it does not prune the search">
+        Product quantization is a memory-and-distance trick, not a search-pruning trick. It replaces each vector with a
+        handful of codebook IDs, so a billion vectors fit in RAM, and it replaces the full distance with a sum of
+        per-subspace table lookups, so each comparison is cheap. But it still compares the query to every code unless
+        you layer it on a partition (IVF) or graph (HNSW). That is why the workhorse at extreme scale is IVF-PQ: IVF
+        decides which cells to look in, PQ makes the vectors inside them tiny and fast to score.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>PQ stores each vector as m codebook IDs and approximates
+        distance by summing per-subspace lookup tables; it compresses and speeds scoring but does not prune the
+        search.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="pq-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What PQ stores and computes"
+        scenario={<>A teammate says "PQ speeds search by clustering all vectors into cells and only scanning the nearest cells." Pick the statement that correctly describes PQ.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`vector -> split into m subvectors
+       -> each subvector -> nearest codebook centroid ID
+       -> store m IDs (bytes), not floats`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It slices each vector into subvectors, replaces each with a codebook ID, and sums per-subspace table lookups.", correct: true },
+          { key: "b", text: "It clusters all vectors into k-means cells and at query time scans only the cells nearest the query vector." },
+          { key: "c", text: "It builds a navigable graph over the vectors and walks greedily from an entry point toward the query each time." },
+          { key: "d", text: "It projects every vector to a single low bit-width hash so identical hashes collide into one exact bucket." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
-      />
-
-      <VIS.TrapProblem
-        id="bart-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
-        options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
-        ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) describes IVF, a partition scheme PQ is usually combined with, not PQ itself. (c) describes HNSW. (d) describes LSH.</>}
+        lens={<>PQ is a compression and distance-approximation method: each vector is cut into m subvectors, each subvector is replaced by the ID of its nearest codebook centroid, and distance is approximated by summing precomputed per-subspace lookup tables. Clustering into cells and scanning the nearest ones is IVF; a navigable graph is HNSW; a single collision bucket is LSH. PQ is orthogonal to all of these &mdash; it shrinks the vectors, while the others decide which vectors to look at.</>}
+        stretch={<>Why is IVF-PQ such a common pairing rather than either alone?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="pq-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — PQ alone is still too slow"
+        scenario={<>You compress 200,000,000 vectors with PQ to fit RAM, but query latency is still high because each query scores every code. A teammate wants a bigger codebook to fix speed. Pick the soundest move.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`200M codes in RAM, fits fine
+query still sums tables over all 200M codes
+latency too high`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Add an IVF partition so each query scores only the codes in a few cells instead of all 200M codes.", correct: true },
+          { key: "b", text: "Enlarge the codebook to 4096 centroids per subspace, since a bigger codebook makes the per-query scan faster." },
+          { key: "c", text: "Reduce m to 2 subvectors, since fewer subvectors mean fewer table lookups and that alone meets the latency target." },
+          { key: "d", text: "Move the codes to disk, since reading codes from disk is faster than summing distance tables in memory." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) a bigger codebook lowers error but does not reduce how many vectors are scanned. (c) fewer subvectors slightly cheapens each lookup but you still touch all 200M codes and recall craters. (d) disk is slower, not faster.</>}
+        lens={<>PQ shrinks memory and cheapens each comparison, but it does not prune the search: a flat PQ index still sums a table for every one of the 200M codes, so latency stays high. The fix is to add a coarse quantizer &mdash; an IVF partition &mdash; so the query only scores the codes in its nprobe nearest cells. That is exactly IVF-PQ. A bigger codebook changes accuracy not scan count; fewer subvectors hurt recall while still scanning everything; and disk is slower than RAM. Speed at scale comes from pruning which codes you score, which PQ alone does not provide.</>}
+        stretch={<>How do nprobe and the PQ codebook size interact to set the recall/latency frontier?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
-        difficulty="hard"
+        id="pq-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Choosing m for a 100-dim vector"
+        scenario={<>You want to PQ-encode 100-dimensional vectors and a teammate proposes m=8 subvectors. Pick the soundest choice given the dimension.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`D = 100
+proposal: m = 8  ->  100 / 8 = 12.5 dims per subvector (not integer)
+codebooks require equal-size, contiguous subspaces`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Pick an m that divides 100 evenly, such as 10 or 20, so every subvector spans an equal integer slice.", correct: true },
+          { key: "b", text: "Keep m=8 and let the last subvector absorb the leftover dimensions, since uneven subspaces train codebooks fine." },
+          { key: "c", text: "Pick m=100 so each dimension is its own subvector, which guarantees zero quantization error on every vector." },
+          { key: "d", text: "Pick m=1 so the whole vector uses one codebook, since a single codebook is the most accurate possible encoding." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) uneven subspaces complicate the table layout and most implementations require m to divide D. (c) m=D is scalar quantization with D bytes per vector, defeating compression. (d) m=1 needs an astronomically large codebook to cover the whole space.</>}
+        lens={<>PQ slices a vector into m equal, contiguous subspaces, so m must divide D; for D=100 that means m in {10, 20, 25, 50}, and m=8 leaves a fractional 12.5 dims per slice that standard implementations reject. Setting m=D turns PQ into per-dimension scalar quantization with D bytes per vector, which is not compression; setting m=1 needs an impossibly large single codebook to represent the full 100-dim space at low error. The art is choosing m large enough to control error but small enough that the codes stay compact, subject to m dividing D.</>}
+        stretch={<>If D is prime, how would you make PQ applicable at all?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="pq-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why asymmetric distance keeps accuracy"
+        scenario={<>A teammate proposes quantizing the query into codes too, then comparing code-to-code, arguing it is symmetric and simpler. Pick the correct explanation of why the standard approach keeps the query full-precision.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`asymmetric: full-precision query vs quantized stored vector
+symmetric:  quantized query vs quantized stored vector
+both use per-subspace lookup tables`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Keeping the query exact adds only the stored vector's quantization error, while quantizing both compounds error twice.", correct: true },
+          { key: "b", text: "Quantizing the query is impossible, since the codebooks are defined only for stored vectors and not for queries." },
+          { key: "c", text: "Symmetric comparison is always more accurate, so the standard approach quantizes the query to maximize recall." },
+          { key: "d", text: "The query must be quantized to the same code as its nearest neighbor, or no distance can be computed at all." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the same codebooks apply to any vector including the query. (c) inverts the truth; symmetric adds more error. (d) distance is computed via tables regardless of which code the query maps to.</>}
+        lens={<>In the asymmetric distance computation the query stays full-precision and only the stored vector is approximated by its centroid, so the only error is the stored vector's quantization. Quantizing the query too (symmetric) replaces the query with its own centroid as well, adding a second source of error that compounds the first and worsens ranking accuracy. The codebooks apply to any vector, so quantizing the query is possible &mdash; it is just less accurate, which is why production PQ uses the asymmetric form. The query never needs to share a code with its neighbor; the lookup tables handle arbitrary query positions.</>}
+        stretch={<>When might symmetric distance still be preferred despite the accuracy loss?</>}
+      />
+
+      <VIS.TrapProblem
+        id="pq-c2"
+        difficulty="medium"
+        axis="Mechanism"
+        title="C2 — Why the codes are lossy"
+        scenario={<>A teammate assumes PQ codes can reconstruct each original vector exactly, so the approximated distances should match the true distances. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`subvector -> nearest of 256 codebook centroids
+stored = centroid ID (not the original subvector)
+reconstruction = the centroid, which is only nearby`}</pre>}
+        options={[
+          { key: "a", text: "Each subvector is replaced by its nearest centroid, so reconstruction is approximate and distances carry that error.", correct: true },
+          { key: "b", text: "Codes reconstruct the original vector exactly, so PQ distances equal true distances and recall is never lost." },
+          { key: "c", text: "Codes store the residual after subtracting the centroid, so the original is recovered exactly on demand." },
+          { key: "d", text: "Codes encode the full float subvector losslessly, since 8 bits is enough to represent any 16-dimensional slice." },
+        ]}
+        trap={<>(b) contradicts the recall loss PQ is known for. (c) plain PQ stores only the centroid ID, not a residual. (d) 8 bits cannot losslessly encode a 16-dim float slice.</>}
+        lens={<>PQ stores only the ID of the nearest codebook centroid for each subvector, so reconstructing a vector returns the centroid, which is merely close to the original subvector, not equal to it. That gap is the quantization error, and it propagates into the summed lookup-table distance, which is why PQ recall is below exhaustive. Plain PQ keeps no residual to recover the original, and 8 bits (256 codes) cannot losslessly represent a 16-dimensional float slice. The lossiness is the price paid for the 64x memory shrink, and it is exactly what the rerank step exists to mitigate.</>}
+        stretch={<>How does storing a residual codebook (as in residual quantization) shrink this error?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="pq-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Doubling m versus doubling codebook bits"
+        scenario={<>You can spend one extra byte per code either by doubling m (more subvectors) or by widening each existing code from 8 to 16 bits. A teammate says both reduce error identically since both add the same bytes. Predict the non-obvious distinction.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`option A: more subvectors m (finer spatial split)
+option B: wider codes (256 -> 65536 centroids per subspace)
+both cost about the same extra storage`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "They cut error differently: more subvectors refine the spatial split, wider codes pack more centroids per subspace.", correct: true },
+          { key: "b", text: "They are exactly equivalent, since error depends only on total bytes and both options add the same number of bytes." },
+          { key: "c", text: "Wider codes always win, since more centroids per subspace strictly dominate any change to the number of subvectors." },
+          { key: "d", text: "More subvectors always win, since splitting the vector more finely can never raise the quantization error." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) is the trap: equal bytes do not mean equal error reduction. (c) and (d) overclaim a universal winner; the better axis is data-dependent.</>}
+        lens={<>The two knobs attack error along different axes. Adding subvectors slices the space into finer independent pieces, helping when error is spread across many dimensions; widening codes packs more centroids into each existing subspace, helping when a few subspaces carry most of the variance. They are not equivalent even at equal byte cost, and which wins depends on how the vector's variance is distributed across dimensions. Treating them as interchangeable because the storage matches ignores where the quantization error actually lives, which is the whole point of tuning a PQ codec.</>}
+        stretch={<>How does rotating the data first (OPQ) change which knob matters more?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="pq-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Reranking to recover lost recall"
+        scenario={<>Your IVF-PQ index hits the memory target but top-10 recall is 0.85, a bit low. You can afford to keep full vectors for a tiny shortlist. A teammate says PQ recall is fixed and cannot be improved without abandoning PQ. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`PQ recall@10 = 0.85 (approximate distances)
+budget: can store full vectors for a small shortlist
+goal: higher final recall`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Retrieve a larger PQ candidate set, then rerank the top few hundred with exact distances on the full vectors.", correct: true },
+          { key: "b", text: "Accept 0.85 as final, since PQ approximation error is fixed and no post-step can recover the missed neighbors." },
+          { key: "c", text: "Halve the number of subvectors so codes are smaller, since smaller codes always raise the final recall directly." },
+          { key: "d", text: "Switch the metric from dot product to cosine at query time only, since changing the metric repairs quantization error." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) ignores the standard rerank step that exists precisely to recover PQ recall. (c) fewer subvectors raise error, lowering recall. (d) a metric mismatch creates a new bug, not a fix.</>}
+        lens={<>The standard pattern is retrieve-then-rerank: use PQ to pull a generous candidate set cheaply, then recompute exact distances on the full (or higher-precision) vectors for just the top few hundred and re-sort. This recovers most of the recall PQ's approximation lost, at the cost of keeping a small set of full vectors or a second precise pass. PQ recall is not fixed; the rerank stage is designed exactly to claw it back. Cutting subvectors raises error, and switching metrics arbitrarily introduces a train/serve mismatch rather than fixing quantization.</>}
+        stretch={<>How large should the rerank shortlist be relative to k?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="pq-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Codebooks trained on a stale sample"
+        scenario={<>PQ codebooks were trained on a sample of last year's catalog. The catalog has since shifted toward a new content domain, and recall on new items is poor while old items are fine. A teammate blames the ANN partition. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`codebooks fit on last year's vector sample
+catalog shifted to a new domain (new vector regions)
+new-item subvectors land far from any trained centroid`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "New-domain subvectors fall far from the trained centroids, so their codes are coarse and their distances inaccurate.", correct: true },
+          { key: "b", text: "The partition is broken, since PQ codebooks never affect recall once the index has been constructed." },
+          { key: "c", text: "The query embeddings changed, since PQ codes are immune to any shift in the distribution of stored vectors." },
+          { key: "d", text: "The metric was misconfigured, since codebook staleness can only ever manifest as a uniform recall drop everywhere." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) codebooks directly set quantization accuracy and thus recall. (c) blames queries when the stored-vector distribution moved. (d) staleness shows up exactly as a domain-specific drop, not a uniform one.</>}
+        lens={<>PQ codebooks are k-means centroids fit on whatever sample they saw. When the catalog shifts into a region the codebooks never covered, new-domain subvectors are far from every trained centroid, so they get coarse codes and their approximated distances are unreliable &mdash; recall drops for exactly those new items while old items, which the centroids still cover, stay fine. The fix is to retrain the codebooks on a current sample, not to blame the IVF partition or the queries. The domain-specific pattern of the regression is the tell that the codebooks, not the partition, are stale.</>}
+        stretch={<>What lightweight monitor would catch codebook drift before recall on new items collapses?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Nearest_neighbor_search" target="_blank" rel="noopener">
+            <strong>Product quantization for nearest-neighbor search</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(codebooks, asymmetric distance, IVF-PQ)</span>
+          <br/>Covers how subvector codebooks compress vectors, how lookup tables approximate distance, and why PQ is
+          paired with a coarse quantizer like IVF for billion-scale retrieval.
         </li>
       </ul>
     </VIS.Section>

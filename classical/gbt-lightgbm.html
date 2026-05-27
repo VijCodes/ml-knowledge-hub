@@ -2167,288 +2167,291 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: LIGHTGBM — histogram binning + leaf-wise growth.
+// Delta vs level-wise GBT (e.g. classic XGBoost growth): LightGBM (a) buckets continuous features into a small
+//   number of HISTOGRAM BINS so split search is over bins not raw values -> much faster on big data; (b) grows
+//   trees LEAF-WISE (best-first: split the single leaf with max loss reduction) rather than LEVEL-WISE, which
+//   finds lower loss per leaf added but produces deep, unbalanced trees that OVERFIT unless capped. Controls:
+//   num_leaves (primary capacity knob) and max_depth. The diagram shows the binning step and a leaf-wise vs
+//   level-wise growth contrast only; the candidate must infer the speed/overfit tradeoff and the right knob.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="Classical"
+      title="LightGBM: Histogram + Leaf-Wise"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Gradient Boosted Trees" },
+        { label: "Subtopic", value: "LightGBM bins features into histograms so split search is over buckets not raw values, and grows trees leaf-wise (best-gain leaf first) — fast on large data but prone to deep unbalanced trees that overfit unless num_leaves is capped" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>LightGBM bins continuous features into a small number of <VIS.Term def="Pre-bucketing each feature's values into a fixed number of ranges (often 255) so the split finder evaluates candidate thresholds at bin edges rather than at every distinct value, cutting the work per split dramatically.">histogram bins</VIS.Term> and
+      grows trees <VIS.Term def="Best-first growth: at each step the single leaf whose split most reduces the loss is expanded, regardless of its depth — unlike level-wise growth, which expands every leaf at the current depth before going deeper.">leaf-wise</VIS.Term> rather
+      than level-wise.</strong>{" "}
+      Binning turns split search from a scan over every distinct feature value into a scan over a few hundred
+      bucket boundaries, which is what makes LightGBM fast on millions of rows. Leaf-wise growth then expands,
+      at each step, the single leaf that most reduces the loss &mdash; a best-first strategy that reaches lower
+      loss per node added than level-wise growth, but produces deep, unbalanced trees that overfit on smaller or
+      noisier data unless constrained. The primary capacity knob is num_leaves; max_depth is a secondary cap.
+      The failure modes: leaving num_leaves at a large default and overfitting; assuming leaf-wise growth is
+      always better than level-wise regardless of data size; and conflating the binning approximation with the
+      growth strategy when reasoning about why a model overfit.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Bin the features, grow best-leaf first">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        LightGBM first buckets each continuous feature into bins, then builds each tree by repeatedly splitting
+        whichever current leaf yields the largest loss reduction. Read the binning step and the leaf-wise versus
+        level-wise growth sketch below, and work out what each choice buys and costs, and which knob controls the
+        resulting capacity.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <div style={{ margin: "16px 0" }}>
+        <VIS.Equation display tex={"\\text{split search: } O(\\#\\text{bins}) \\text{ per feature, not } O(\\#\\text{distinct values}); \\qquad \\text{grow: } \\arg\\max_{\\text{leaf}} \\Delta \\mathcal{L}"} />
+      </div>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`step 1 (binning): continuous feature -> ~255 bins; gains summed per bin
+step 2 (growth):
+  level-wise: split every leaf at the current depth, then go deeper
+  leaf-wise:  split only the single leaf with the largest gain, anywhere
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+knobs: num_leaves (capacity), max_depth (cap)
+what does each step buy, and what does leaf-wise risk?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Notice that leaf-wise growth ignores depth and chases the best gain anywhere in the tree. Decide why that
+        lowers loss faster but can produce a lopsided, overfit tree, and which knob reins it in.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: speed and the lopsided tree">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`binning: split finder scans ~255 bin edges per feature
+  -> on 10M rows this is far cheaper than scanning all values
+
+leaf-wise growth on the same node budget:
+  picks the highest-gain leaf each time, wherever it is
+  -> the tree grows deep along the most informative path
+  -> lower training loss per leaf, but lopsided and deep
+
+cap with num_leaves (and max_depth) or it fits noise`}</pre>
+      <p>
+        The histogram step is the speed story: scanning a couple hundred bin edges per feature is dramatically
+        cheaper than scanning every distinct value, so LightGBM trains large datasets quickly. Leaf-wise growth is
+        the accuracy-and-risk story: by always splitting the single highest-gain leaf, the tree drives training
+        loss down faster than level-wise growth for the same number of leaves, but it grows deep along a few paths
+        and becomes lopsided, which overfits unless you cap num_leaves (the primary capacity control) and, as a
+        guard, max_depth. (How this compares with CatBoost&rsquo;s symmetric trees and XGBoost&rsquo;s level-wise
+        default is taken up in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — LightGBM versus level-wise boosting">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>LightGBM</th><th>Level-wise boosting</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Split search</td><td>Over histogram bins</td><td>Often over raw values</td></tr>
+          <tr><td>Growth strategy</td><td>Leaf-wise (best gain first)</td><td>Level-wise (depth by depth)</td></tr>
+          <tr><td>Loss per leaf added</td><td>Lower (best-first)</td><td>Higher (balanced)</td></tr>
+          <tr><td>Overfit risk</td><td>Higher; cap num_leaves</td><td>Lower; more balanced trees</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Two independent levers: binning for speed, leaf-wise for depth-of-fit">
+        LightGBM&rsquo;s speed comes from histogram binning &mdash; searching splits over a few hundred buckets
+        instead of every value &mdash; while its accuracy-and-overfit behaviour comes from leaf-wise growth, which
+        expands the single best-gain leaf and so reaches lower loss per leaf but builds deep, unbalanced trees.
+        These are separate mechanisms: binning is an approximation that speeds search, leaf-wise is a growth
+        policy that shapes the tree. Reining in overfitting means controlling num_leaves (and max_depth), the
+        growth lever &mdash; not the number of bins.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>LightGBM bins features into histograms for fast split
+        search and grows leaf-wise (best-gain leaf first), which lowers loss per leaf but overfits via deep
+        unbalanced trees unless num_leaves is capped.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="lgbm-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What LightGBM does differently"
+        scenario={<>A teammate says &ldquo;LightGBM is the same as level-wise boosting; it just runs on more cores.&rdquo; Pick the statement that correctly characterises its two defining choices.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`baseline: level-wise boosting over raw feature values
+claim: LightGBM differs only in core count
+question: what are LightGBM's defining choices?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It bins features into histograms for fast split search and grows trees leaf-wise by largest gain anywhere.", correct: true },
+          { key: "b", text: "It scans every raw feature value as usual and grows level-wise, differing from the baseline only in threading." },
+          { key: "c", text: "It bins features into histograms but still grows strictly level-wise, depth by depth, like the baseline does." },
+          { key: "d", text: "It abandons trees for linear base learners, so the speedup comes from skipping split search entirely." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) it does not scan raw values; it bins, and it grows leaf-wise, not level-wise. (c) it grows leaf-wise, not level-wise. (d) LightGBM boosts trees; it does not switch to linear learners by default.</>}
+        lens={<>LightGBM&rsquo;s two defining choices are histogram binning &mdash; searching splits over a few hundred buckets instead of every value &mdash; and leaf-wise growth, which always splits the single highest-gain leaf regardless of depth. Together they make it fast and accurate on large data but more prone to overfit. Describing it as &ldquo;the same, more cores&rdquo; misses both the binning approximation and the growth policy.</>}
+        stretch={<>Which of these two choices is responsible for the speed, and which for the overfit risk?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="lgbm-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — Leaf-wise versus level-wise"
+        scenario={<>A teammate is unsure how leaf-wise growth differs from level-wise growth. Pick the statement that correctly names the difference.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`growth A: expand the single leaf with the largest gain, anywhere
+growth B: expand every leaf at the current depth, then descend
+question: which is leaf-wise, and what does it produce?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Leaf-wise expands the single best-gain leaf anywhere, producing deeper, less balanced trees than level-wise.", correct: true },
+          { key: "b", text: "Leaf-wise expands every leaf at the current depth first, producing more balanced trees than level-wise growth." },
+          { key: "c", text: "Leaf-wise expands leaves at random, producing trees of unpredictable shape unrelated to the loss reduction." },
+          { key: "d", text: "Leaf-wise expands the leaf with the fewest samples first, producing wide, shallow, perfectly balanced trees." },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) describes level-wise growth, not leaf-wise. (c) leaf-wise is best-first by gain, not random. (d) leaf-wise selects by gain, not sample count, and yields unbalanced trees.</>}
+        lens={<>Leaf-wise (best-first) growth expands the single leaf whose split most reduces the loss, wherever it sits in the tree, so the tree grows deep along the most informative paths and becomes unbalanced. Level-wise growth expands all leaves at a depth before going deeper, giving balanced trees. Leaf-wise reaches lower loss per leaf but is the one that risks overfitting, which is why num_leaves must be controlled.</>}
+        stretch={<>For the same number of leaves, which strategy tends to reach the lower training loss, and why?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="lgbm-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Overfitting out of the box"
+        scenario={<>A LightGBM model trained on a modest 30k-row dataset overfits badly with the default num_leaves of 31. A colleague proposes lowering the number of histogram bins to fix it. Pick the soundest read.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`data: 30k rows
+num_leaves: default 31, model overfits
+colleague's plan: reduce the number of histogram bins`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Lower num_leaves (and cap max_depth); the leaf-wise growth, not the bin count, is driving the overfit here.", correct: true },
+          { key: "b", text: "Lower the number of histogram bins, since the bin count is the capacity knob that controls leaf-wise overfit." },
+          { key: "c", text: "Raise num_leaves, since more leaves let the leaf-wise growth balance itself and stop overfitting the small data." },
+          { key: "d", text: "Remove the validation set, since evaluating on it is what makes the leaf-wise tree overfit the training rows." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) bins are an approximation for speed, not the capacity control; lowering them barely touches overfit. (c) more leaves add capacity and worsen overfit. (d) the validation set does not cause overfitting.</>}
+        lens={<>Overfitting from leaf-wise growth on a small dataset is controlled by the growth lever, num_leaves, with max_depth as a guard. Lowering num_leaves limits how deep and lopsided the best-first tree can get, directly curbing the overfit. The histogram bin count is a speed-versus-resolution approximation, not a capacity knob, so reducing it does little for overfitting. Matching the fix to the mechanism &mdash; growth, not binning &mdash; is the point.</>}
+        stretch={<>What relationship between num_leaves and max_depth keeps a leaf-wise tree from contradicting its depth cap?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="lgbm-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Picking the tool for ten million rows"
+        scenario={<>You must train a boosting model on 10M rows under a tight wall-clock budget, and an exact-split, level-wise trainer is too slow. A colleague wants to subsample to 500k rows to use the slow trainer. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`data: 10M rows, tight time budget
+exact level-wise trainer: too slow at full size
+colleague's plan: subsample to 500k and use the slow trainer`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Use LightGBM's histogram binning on the full 10M rows; bin-based search keeps split finding fast at that scale.", correct: true },
+          { key: "b", text: "Subsample to 500k rows for the slow exact trainer, since fewer rows always beat a binning approximation on accuracy." },
+          { key: "c", text: "Keep the slow exact trainer on all 10M rows, since exact splits are required and binning makes the model unusable." },
+          { key: "d", text: "Subsample to 500k rows and also reduce features, since only shrinking the data can meet a tight time budget." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) discarding 95% of the data to keep exact splits usually loses more than binning&rsquo;s small approximation. (c) the exact trainer is stated to be too slow at full size. (d) shrinking data is not the only option; binning scales to full size.</>}
+        lens={<>Histogram binning is precisely the mechanism for this scale: by searching splits over a few hundred bins instead of every value, LightGBM trains the full 10M rows within the time budget, and the small loss from binning is usually far less harmful than throwing away 95% of the data. Subsampling to fit a slow exact trainer trades a large data loss for a tiny accuracy gain in split precision &mdash; the wrong trade at this scale.</>}
+        stretch={<>How does increasing the number of bins trade training speed against split-threshold resolution?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="lgbm-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why leaf-wise lowers loss faster"
+        scenario={<>A teammate asks why leaf-wise growth reaches a lower training loss than level-wise growth for the same number of leaves. Pick the correct account of the mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`budget: a fixed number of leaves to add
+level-wise: spends some leaves on low-gain splits to stay balanced
+leaf-wise: spends every leaf on the current highest-gain split`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Leaf-wise spends each leaf on the highest available gain, so a fixed leaf budget buys more total loss reduction.", correct: true },
+          { key: "b", text: "Leaf-wise uses more histogram bins per split, so the extra split resolution is what lowers the training loss." },
+          { key: "c", text: "Leaf-wise averages several candidate splits per leaf, so the averaging is what reduces the training loss faster." },
+          { key: "d", text: "Leaf-wise trains on more rows per leaf, so the larger sample per node is what drives the lower training loss." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) bin count is independent of the growth strategy; it is not why leaf-wise wins. (c) leaf-wise picks one split per leaf, it does not average. (d) leaf-wise does not use more rows per leaf.</>}
+        lens={<>With a fixed budget of leaves, leaf-wise growth allocates each one to the split with the largest current loss reduction anywhere in the tree, whereas level-wise growth must also spend leaves on lower-gain splits to keep every depth filled. Concentrating the budget on the best gains buys more total loss reduction for the same leaf count &mdash; which is exactly why it both fits better and overfits more readily. The bin count and sample size are separate matters.</>}
+        stretch={<>Given this, why does leaf-wise growth need num_leaves capped more carefully than level-wise needs max_depth?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="lgbm-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Same num_leaves, two datasets"
+        scenario={<>The same LightGBM config (num_leaves fixed) is trained on a 50k-row dataset and a 20M-row dataset. A teammate assumes that since num_leaves is identical, the overfitting risk is identical too. Predict the non-obvious difference in how prone each run is to overfit.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`config: identical num_leaves on both runs
+run S: 50k rows
+run L: 20M rows
+question: which run is more prone to overfit at this num_leaves?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "The 50k-row run is more prone, because the same leaf budget isolates far fewer rows per leaf on small data.", correct: true },
+          { key: "b", text: "The 20M-row run is more prone, because more rows give the leaf-wise tree more chances to memorise the data." },
+          { key: "c", text: "Both runs are equally prone, because overfitting depends only on num_leaves, which is identical for the two." },
+          { key: "d", text: "Neither run can overfit, because a fixed num_leaves caps capacity enough to prevent overfitting on any dataset." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) more rows make memorisation harder per leaf, not easier; the large run overfits less at the same leaf count. (c) the same num_leaves means very different rows-per-leaf across dataset sizes. (d) a fixed num_leaves does not guarantee no overfitting on small data.</>}
+        lens={<>The same number of leaves carves the small dataset into tiny, lightly-supported leaves &mdash; each isolating only a handful of rows &mdash; so the leaf-wise tree can fit noise, while on 20M rows each leaf still holds many rows and generalises better. Identical num_leaves therefore does not mean identical overfit risk; the capacity per row scales with dataset size, so smaller data needs a smaller num_leaves. This is why the right num_leaves depends on the data, not just the algorithm.</>}
+        stretch={<>What complementary constraint would directly forbid the tiny, lightly-supported leaves this run produces?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="lgbm-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — A safe starting configuration"
+        scenario={<>You are configuring LightGBM on a medium dataset and want a starting point that resists overfitting before fine-tuning. A colleague proposes maximising num_leaves up front for best accuracy. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: medium dataset, want an overfit-resistant start
+colleague's plan: maximise num_leaves immediately
+levers available: num_leaves, max_depth, min_data_in_leaf`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Start with a modest num_leaves and a max_depth cap, then raise them while watching validation for overfit.", correct: true },
+          { key: "b", text: "Maximise num_leaves immediately, since a larger leaf budget always generalises better on medium datasets." },
+          { key: "c", text: "Maximise num_leaves but reduce the histogram bins, since fewer bins offset the overfit from many leaves." },
+          { key: "d", text: "Maximise num_leaves and disable max_depth, since depth caps only slow training without affecting overfit." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) maximising num_leaves on medium data overfits; it does not always generalise better. (c) bins are a speed approximation and barely offset leaf-driven overfit. (d) max_depth is a genuine guard against deep lopsided trees.</>}
+        lens={<>Because leaf-wise growth overfits when given too many leaves, the safe start is a modest num_leaves with a max_depth cap and a minimum-data-per-leaf floor, then increasing capacity while watching validation. Maximising num_leaves up front invites the deep, lopsided trees that overfit. The histogram bin count does not substitute for the capacity controls, and removing the depth cap removes a useful guard.</>}
+        stretch={<>How does setting min_data_in_leaf interact with num_leaves to bound the effective tree complexity?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="lgbm-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Blaming binning for an overfit"
+        scenario={<>A LightGBM model overfits on a small dataset. The team raises the number of histogram bins from 255 to 1024 hoping for a better fit, but generalisation gets worse. They conclude binning is the problem. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptom: overfit on small data
+change: histogram bins 255 -> 1024
+result: generalisation got worse
+team's claim: binning is the problem`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "More bins add split resolution that feeds leaf-wise overfit; the real lever is num_leaves, not the bin count.", correct: true },
+          { key: "b", text: "Binning is the root cause, so removing it entirely and scanning raw values would resolve the overfitting fully." },
+          { key: "c", text: "The bins were too few at 255, so pushing them far higher than 1024 is what will finally fix the generalisation." },
+          { key: "d", text: "The learning rate is irrelevant here, so only changing the bin count can ever affect this model's overfit." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) raw-value scanning would not curb the leaf-wise overfit and only slows training. (c) yet more bins add resolution that worsens, not fixes, the overfit. (d) the learning rate and num_leaves are both relevant; binning is not the lever.</>}
+        lens={<>Raising the bin count gives the split finder finer thresholds, which lets leaf-wise growth carve the small dataset even more aggressively &mdash; so generalisation worsens, the opposite of the intended fix. Binning was never the overfit lever; it is a speed-versus-resolution approximation. The actual control for leaf-wise overfit is num_leaves (plus max_depth and min-data-per-leaf and shrinkage). The team changed the wrong knob in the wrong direction.</>}
+        stretch={<>Why does increasing bin resolution have the same directional effect on overfit as increasing num_leaves?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/LightGBM" target="_blank" rel="noopener">
+            <strong>LightGBM</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(histogram-based split finding, leaf-wise growth, num_leaves and max_depth controls)</span>
+          <br/>Covers how binning accelerates split search and why best-first leaf-wise growth is fast and accurate but must be capped to avoid overfitting.
         </li>
       </ul>
     </VIS.Section>

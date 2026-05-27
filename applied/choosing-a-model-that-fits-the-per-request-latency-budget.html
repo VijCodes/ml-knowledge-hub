@@ -2167,288 +2167,275 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: CHOOSING A MODEL THAT FITS THE PER-REQUEST LATENCY BUDGET (Applied / Prime Video).
+// Delta: The LATENCY BUDGET is a HARD CONSTRAINT that picks the model FAMILY before accuracy is even compared. A
+//   millisecond budget at catalog scale rules out scoring a heavy cross-encoder over all items and forces a
+//   retrieval + light-rerank shape. The discriminator: latency is per-request and scales with #items x model cost,
+//   so the binding number is (candidates to score) x (cost per score) vs the budget — NOT raw model accuracy.
+//   Distinct from accuracy-first selection and from throughput/QPS. Diagrams show SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="Applied"
+      title="Choosing a Model That Fits the Per-Request Latency Budget"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Model Selection Under Constraints" },
+        { label: "Subtopic", value: "The tightest serving constraint usually picks the model family first; a millisecond budget rules out heavy cross-encoders and favors retrieval plus light reranking" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>The per-request latency budget is a hard constraint that selects the model family before accuracy is
+      compared at all.</strong>{" "}
+      Serving cost is roughly the number of items you must score times the cost per score, and that product has to
+      fit under the budget for a single request. With a homepage budget around 150ms and a catalog of millions, you
+      cannot run a heavy cross&#8209;encoder over every item, so the budget forces a two&#8209;tower retriever with
+      precomputed item vectors plus a small reranker on the shortlist. The binding number is items&#8209;to&#8209;score
+      multiplied by per&#8209;score cost versus the budget, not the raw accuracy of any model in isolation. The delta
+      to hold onto: the latency budget rules architectures out first, and accuracy is a tiebreaker only among the
+      families that already fit.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — The budget is a wall, not a preference">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A request has a fixed time budget. Whatever model you choose must finish scoring within it for the number of
+        items that request touches. Read the budget against the per&#8209;request work, not against a model's offline
+        score.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`homepage request budget: ~150 ms (hard wall)
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+option A: deep cross-encoder over ALL items
+  items to score: ~10,000,000   cost/score: high
+  product: far over budget
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+option B: ANN retrieve ~500, then light rerank
+  items to score: ~500          cost/score: small
+  product: comfortably under budget`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Both options could be accurate; only one fits the wall. The decisive quantity is items&#8209;to&#8209;score
+        times per&#8209;score cost against the budget. Decide what survives the wall before ranking by accuracy.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Why the budget picks the family first">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`model family       per-request cost driver        fits 150 ms?
+  cross-encoder/all    items x heavy joint score       no
+  cross-encoder/500    500 x heavy joint score          marginal
+  two-tower + rerank   precomputed vecs + 500 light     yes
+
+the budget eliminates families regardless of how
+accurate the eliminated family is offline`}</pre>
+      <p>
+        Scoring every item with a heavy joint model blows the budget no matter how accurate that model is, so the
+        budget eliminates whole families up front. What survives is the set of shapes whose per&#8209;request work
+        fits; accuracy then chooses among those. The signal is that the constraint, not the leaderboard, draws the
+        first line.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Latency-budget selection versus its neighbours">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Selection criterion</th><th>What it optimizes</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Latency budget (this concept)</td><td>Picks the family whose per-request work fits a hard time wall</td></tr>
+          <tr><td>Accuracy-first</td><td>Picks the highest offline score, ignoring whether it can serve in time</td></tr>
+          <tr><td>Throughput / QPS</td><td>Aggregate requests per second; a different axis from one request's latency</td></tr>
+          <tr><td>Memory footprint</td><td>Fits the model in RAM/VRAM; says nothing about per-request time</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="The per-request product against the wall is the dividing line">
+        Latency&#8209;budget selection asks whether items&#8209;to&#8209;score times per&#8209;score cost fits a hard
+        per&#8209;request wall, and eliminates families that cannot, before accuracy is consulted. Accuracy&#8209;first
+        ignores the wall, throughput is an aggregate axis that a fast model can satisfy while still missing the
+        single&#8209;request budget, and memory is yet another constraint. Asking which families survive the wall is
+        what separates this criterion from its neighbours.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>the per-request latency budget is a hard wall that picks
+        the model family first, the binding quantity is items-to-score times per-score cost, and accuracy is a
+        tiebreaker only among families that already fit.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="lb-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What the latency budget decides"
+        scenario={<>A teammate says the latency budget is "just one more thing to optimize after we pick the most accurate model." Pick the statement that correctly frames it.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`budget: hard per-request time wall
+question: when does it enter the decision?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It is a hard constraint that eliminates model families up front, before accuracy is used to break the tie.", correct: true },
+          { key: "b", text: "It is a soft preference applied last, after accuracy, so the most accurate model is chosen and then sped up later.", correct: false },
+          { key: "c", text: "It is a property of the offline data only, so it changes which split is used but never which model family is viable.", correct: false },
+          { key: "d", text: "It is a measure of training time, so it limits how long fitting may run rather than how long a request may take.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) treats the wall as optional; an over-budget model cannot serve. (c) latency is a serving constraint, not a data-split issue. (d) confuses serving latency with training time.</>}
+        lens={<>A latency budget is a hard serving constraint that rules out entire model families whose per&#8209;request work cannot fit the wall, so it is applied first; accuracy then chooses among the survivors. Treating it as a late soft preference assumes any model can be sped up enough, which is false for scoring millions of items with a heavy model. It is about request time, not training time or data splits, which is why it draws the first line.</>}
+        stretch={<>Name a case where the most accurate model is simply not an option, regardless of engineering effort.</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="lb-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — Latency versus throughput"
+        scenario={<>A teammate reports the system handles plenty of requests per second and concludes the latency budget is met. Pick the statement that correctly separates the two.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`throughput: requests served per second (aggregate)
+latency: time for ONE request to finish`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Latency is one request's finish time; throughput is aggregate rate, so high throughput need not meet the budget.", correct: true },
+          { key: "b", text: "Latency and throughput are the same number, so meeting one automatically guarantees the other is also satisfied.", correct: false },
+          { key: "c", text: "Latency is the aggregate rate; throughput is one request's time, so a high request rate proves each one is fast.", correct: false },
+          { key: "d", text: "Latency measures memory use; throughput measures accuracy, so neither relates to the per-request time budget at all.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) they are distinct; batching can raise throughput while raising per-request latency. (c) reverses the definitions. (d) misdefines both.</>}
+        lens={<>Latency is the time a single request takes end to end, while throughput is how many requests the system clears per second; large batches can lift throughput yet make each request wait longer, so high throughput does not certify the per&#8209;request budget. Conflating them, reversing them, or tying them to memory and accuracy all miss that the budget constrains one request's finish time. The wall is per request, not per second.</>}
+        stretch={<>How can a batching strategy raise throughput while violating the per-request latency budget?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="lb-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Picking a shape for a 150ms budget"
+        scenario={<>Homepage ranking has roughly 150ms per request over a catalog of millions. A teammate wants a deep cross-encoder for accuracy. Pick the soundest architecture.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`budget: ~150 ms/request   catalog: millions
+cross-encoder over all items: far over budget
+need: a shape whose per-request work fits`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Retrieve a few hundred candidates with precomputed vectors, then rerank only those with a small live model.", correct: true },
+          { key: "b", text: "Score the full catalog with the deep cross-encoder each request, since its higher accuracy justifies the extra time.", correct: false },
+          { key: "c", text: "Score the full catalog with the deep cross-encoder but cap each score's compute, since clipping work fits the budget.", correct: false },
+          { key: "d", text: "Score the full catalog on a faster machine each request, since more hardware removes the budget as a real constraint.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) scoring millions with a heavy model cannot fit 150ms. (c) clipping per-score compute breaks the model without fixing the item count. (d) hardware shifts but does not erase a millions-times-heavy product.</>}
+        lens={<>At millions of items and a 150ms wall, the only shape whose per&#8209;request work fits is to retrieve a small shortlist using precomputed vectors, then run the expensive model on just those candidates. Scoring the whole catalog with a heavy model, clipping its compute, or adding hardware all leave the items&#8209;times&#8209;cost product over budget, because the dominant term is the item count. Two&#8209;stage retrieve&#8209;then&#8209;rerank is what makes a rich model affordable under the wall.</>}
+        stretch={<>Why does precomputing item vectors move most of the cross-encoder's cost off the request path?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="lb-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — A loosened budget changes the answer"
+        scenario={<>An offline batch job re-ranks a few hundred saved items per user nightly, with no real-time wall. A teammate copies the homepage's two-tower-plus-light-rerank design. Pick the soundest read.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`setting: nightly batch, no per-request wall
+items per user: a few hundred (already shortlisted)
+homepage design assumed a tight live budget`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Without a tight wall, the heavy cross-encoder on the shortlist is now affordable and likely the better choice.", correct: true },
+          { key: "b", text: "The homepage design must be copied exactly, since the right architecture never depends on the latency budget at all.", correct: false },
+          { key: "c", text: "The batch job needs an even lighter model, since offline settings always demand the cheapest possible scorer used.", correct: false },
+          { key: "d", text: "The batch job should score the full catalog per user, since removing the wall means item count no longer matters.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) the right shape depends on the budget, which changed. (c) offline does not imply cheaper; it relaxes the constraint that forced cheap. (d) the shortlist is already a few hundred; scoring the full catalog is needless work.</>}
+        lens={<>The latency budget is what forced the light reranker; remove the real&#8209;time wall and the binding constraint is gone, so the heavy cross&#8209;encoder over an already&#8209;short candidate set becomes affordable and usually more accurate. Copying the homepage design blindly assumes the wall still applies, going lighter inverts the logic, and re&#8209;scoring the full catalog reintroduces an item&#8209;count cost that the shortlist already removed. The architecture follows the constraint, and the constraint changed.</>}
+        stretch={<>What constraint, if any, replaces latency as the binding one in a large nightly batch job?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="lb-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why a cross-encoder cannot be precomputed"
+        scenario={<>A teammate asks why a two-tower model can precompute item vectors but a cross-encoder cannot, for the same catalog. Pick the correct mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`two-tower: user vec and item vec scored independently
+cross-encoder: scores the user-item PAIR jointly
+question: what can be computed before the request`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "A two-tower item vector ignores the user, so it precomputes; a cross-encoder needs the pair, so it must run live.", correct: true },
+          { key: "b", text: "A cross-encoder ignores the user too, so it could precompute every item vector exactly like a two-tower model does.", correct: false },
+          { key: "c", text: "A two-tower model also needs the pair jointly, so neither can precompute and both must score every item at request.", correct: false },
+          { key: "d", text: "A cross-encoder is simply smaller, so it precomputes faster, and the difference is speed rather than what it depends on.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) a cross-encoder's score depends on the user, so it cannot be precomputed per item. (c) a two-tower item vector is user-independent and is precomputable. (d) the difference is dependency, not size.</>}
+        lens={<>A two&#8209;tower model computes an item vector that does not depend on the user, so every item vector can be built offline and only a cheap dot&#8209;product runs live. A cross&#8209;encoder scores the user&#8209;item pair jointly, so its output depends on the user and cannot be precomputed per item; it must run at request time for each candidate. This dependency, not model size, is why the budget forces retrieval first and reserves the joint scorer for a small shortlist.</>}
+        stretch={<>Why does the joint scoring that makes a cross-encoder accurate also make it un-precomputable?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="lb-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — p99 versus average latency"
+        scenario={<>A model's average request takes 60ms, well under the 150ms budget, yet user complaints about slow loads persist. The team only ever checks the mean. Predict the non-obvious cause.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`mean latency: 60 ms (under budget)
+budget set at: p99 = 150 ms
+some requests fan out to many slow candidates`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "The tail breaches the budget while the mean hides it, so a small fraction of slow requests drives the complaints.", correct: true },
+          { key: "b", text: "The mean being under budget guarantees every request is fast, so the complaints must come from client-side rendering.", correct: false },
+          { key: "c", text: "The mean and the tail always move together, so a 60ms mean proves the p99 is also far under the 150ms budget set.", correct: false },
+          { key: "d", text: "Latency percentiles are irrelevant to user experience, since only the average request time affects perceived speed.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) a low mean does not bound the tail. (c) mean and tail can diverge sharply under skewed fan-out. (d) users feel the tail, so percentiles matter most.</>}
+        lens={<>A budget at the latency tail, p99, is breached by the slowest few percent of requests even when the average is comfortable, because a skewed distribution lets a small fraction fan out to many slow candidates and blow past the wall. The mean hides exactly those requests, so checking only the average misses the experience users actually report. The non&#8209;obvious point is that the per&#8209;request budget is usually a tail guarantee, so the tail, not the mean, is the number to defend.</>}
+        stretch={<>What design change would tighten the tail without necessarily improving the average?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="lb-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Verifying a model fits the budget"
+        scenario={<>Before shipping a new ranker, you must certify it meets the per-request budget under production conditions. Pick the soundest verification.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`goal: certify the per-request budget is met
+artifacts: production-like load, candidate counts
+target: the budget percentile (e.g. p99)`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Load-test at production candidate counts and confirm the budget percentile, not just the mean, stays under the wall.", correct: true },
+          { key: "b", text: "Confirm the offline accuracy is high enough, since a more accurate model is by definition fast enough to serve live.", correct: false },
+          { key: "c", text: "Time a single request once on an idle box, since one measurement under no load represents production latency exactly.", correct: false },
+          { key: "d", text: "Check the model file size fits in memory, since a model that loads into RAM is guaranteed to meet the time budget.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) accuracy says nothing about latency. (c) one idle measurement misses load effects and the tail. (d) fitting in memory does not bound request time.</>}
+        lens={<>Certifying the budget means measuring the relevant latency percentile, usually the tail, under production&#8209;like load and realistic candidate counts, because that is what the wall actually guards. Offline accuracy, a single idle&#8209;box timing, and memory fit each measure something other than per&#8209;request time under load and can all pass while the budget is violated in production. The verification must match the constraint: tail latency at real load.</>}
+        stretch={<>Why must the load test use realistic per-request candidate counts rather than a fixed small input?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="lb-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Shipping the most accurate model anyway"
+        scenario={<>A team ships the highest-offline-accuracy ranker that scores the full catalog. In production, requests time out and the system falls back to a default row for many users. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`chosen model: best offline accuracy, scores all items
+production: frequent timeouts -> default fallback row
+budget was never the selection gate`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Accuracy was optimized past the latency wall, so the model exceeds the budget and times out instead of serving.", correct: true },
+          { key: "b", text: "The fallback is the bug, since the chosen model is fine and only the default-row logic is incorrectly triggering.", correct: false },
+          { key: "c", text: "The model is underfit, since any model that times out in production must have too little capacity to be accurate.", correct: false },
+          { key: "d", text: "Production traffic is simply heavier, since real load is always slower and no architecture change could have helped.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) the fallback fires because the model is over budget; it is a symptom, not the cause. (c) timeouts are a latency problem, not a capacity one. (d) the over-budget product, not generic "heavier traffic," causes the timeouts.</>}
+        lens={<>Selecting purely on offline accuracy ignored the hard latency wall, so a model that scores the entire catalog exceeds the per&#8209;request budget and times out, triggering the default&#8209;row fallback for many users. The fallback is the symptom; the cause is choosing a family the budget should have eliminated. The fix is to apply the constraint first, retrieve then rerank, so the per&#8209;request product fits, rather than blaming the fallback, the model's capacity, or generic load. Latency had to gate selection.</>}
+        stretch={<>What lightweight guardrail in the rollout would have caught this before users saw the fallback?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <strong>Designing Machine Learning Systems (Chip Huyen) &mdash; model serving and latency</strong>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(latency budgets, two-stage retrieval, tail latency)</span>
+          <br/>Covers how serving constraints shape architecture and why a per-request budget rules out heavy joint scoring over large item sets.
         </li>
       </ul>
     </VIS.Section>

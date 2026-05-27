@@ -2167,288 +2167,272 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: Embedding training objectives for retrieval.
+// Delta: retrieval embeddings are trained with CONTRASTIVE losses (InfoNCE / triplet) that PULL (query, positive)
+//   together and PUSH negatives apart. HARD negatives (semantically-near non-matches) sharpen the decision boundary
+//   far more than random negatives. The objective is RELATIVE (positive above negatives), not absolute label regression.
+//   Diagram shows the pull/push geometry + the InfoNCE structure + negative types only; never prints the answer.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="IR"
+      title="Embedding training objectives for retrieval"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Query Embeddings & ANN" },
+        { label: "Subtopic", value: "Retrieval embeddings are trained with contrastive losses that pull a query and its positive together and push negatives apart; hard negatives sharpen the boundary more than random ones" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Retrieval embeddings are trained with <VIS.Term def="A training objective that pulls matching pairs close in vector space and pushes non-matching pairs apart, optimizing relative similarity rather than absolute labels.">contrastive losses</VIS.Term> such
+      as <VIS.Term def="A contrastive loss that maximizes the softmax probability of the true positive among the query's positive and a set of negatives, scaled by a temperature.">InfoNCE</VIS.Term> or
+      a <VIS.Term def="A loss that requires the query-positive distance to be smaller than the query-negative distance by at least a fixed margin.">triplet</VIS.Term> loss:
+      they pull a query and its positive document together and push negatives apart.</strong>{" "}
+      The objective is relative, raising the similarity of the matching pair above that of non-matching pairs, rather than
+      regressing an absolute relevance value. <VIS.Term def="Negatives that are semantically near the query but not actually relevant, lying close to the decision boundary.">Hard negatives</VIS.Term> are
+      non-matches that sit close to the query in meaning, and training against them sharpens the decision boundary far more
+      than random negatives, which are usually so far away that the model already separates them trivially. InfoNCE in
+      particular treats one positive against many negatives as a softmax classification over which item is the true match,
+      tuned by a temperature. The failure modes: training embeddings as absolute relevance regression instead of contrastive,
+      relying only on random negatives so the boundary stays loose, and setting the temperature so the loss ignores the hard
+      cases that matter.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Pull the positive close, push negatives away">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A contrastive objective takes a query, one positive (a true match), and a set of negatives (non-matches). It increases
+        the query-positive similarity and decreases the query-negative similarities, so in the learned space the positive ends
+        up nearer the query than the negatives. The loss cares about relative order, not absolute distance values.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`InfoNCE for query q, positive p, negatives n_1..n_k, temperature tau:
+  loss = -log(  exp(sim(q,p)/tau)
+              / [ exp(sim(q,p)/tau) + sum_j exp(sim(q,n_j)/tau) ] )
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+triplet: require  sim(q, p)  >  sim(q, n) + margin
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+goal: positive ranks above negatives (relative), not match an absolute label`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Both forms reward the positive being more similar than the negatives. Which negatives you choose decides how tight the
+        resulting boundary is, because the loss only learns to separate the negatives it actually sees.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example">
+      <p>An InfoNCE step with one positive and many in-batch negatives, plus hard-negative mining:</p>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`batch: 1 positive + many in-batch negatives, temperature tau small
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+random in-batch negatives: mostly unrelated, easy to separate
+hard negatives (mined):     BM25-top non-relevant docs, look similar to q
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+the loss treats picking the positive among all of them as a softmax;
+hard negatives force the model to resolve close-but-wrong cases`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Random negatives teach the easy contrast; the mined hard negatives sit near the query and force the model to learn the
+        fine distinction between a true match and a plausible look-alike, which is where retrieval quality is won.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — Relative objective, and the role of negatives">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What the training does</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Objective</td><td>Contrastive: positive above negatives (relative)</td></tr>
+          <tr><td>Not</td><td>Absolute relevance regression on a label value</td></tr>
+          <tr><td>Random negatives</td><td>Far away, easy, loose boundary</td></tr>
+          <tr><td>Hard negatives</td><td>Semantically near, sharpen the boundary</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="The boundary is only as tight as the negatives">
+        A contrastive model learns to push apart whatever negatives it is shown, so random negatives that are already far away
+        teach little, while hard negatives near the query force the model to carve a precise boundary. This is why hard-negative
+        mining, not a bigger pile of random negatives, is the lever that improves retrieval embeddings.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>retrieval embeddings are trained contrastively (InfoNCE, triplet)
+        to pull the query-positive pair together and push negatives apart, a relative objective, and hard negatives sharpen the
+        boundary far more than random ones.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="eto-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What a contrastive objective optimizes"
+        scenario={<>A teammate frames retrieval embedding training as regressing each query-document pair to its absolute relevance score. Pick the statement that correctly describes the contrastive objective.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pull (query, positive) together; push negatives apart
+question: is the target an absolute score or a relative order?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { text: "It raises the query-positive similarity above the query-negative similarities, optimizing relative order, not a label.", correct: true },
+          { text: "It regresses each pair to its absolute relevance value, so the loss is the squared error against a numeric label.", correct: false },
+          { text: "It classifies each document independently as relevant or not, with no comparison between the positive and negatives.", correct: false },
+          { text: "It maximizes the raw norm of every document vector, so longer vectors are treated as the more relevant matches.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>Contrastive training is not absolute-score regression, not per-document independent classification, and certainly not norm maximization; it is a relative comparison of positive versus negatives.</>}
+        lens={<>A contrastive loss pulls the query and its positive closer while pushing negatives away, so it raises the matching pair's similarity above the non-matching ones, which is a relative objective over the contrast set. It is not regressing an absolute relevance number, classifying documents in isolation, or maximizing norms. The decoys all replace the relative pull-push structure with an absolute or per-item criterion that contrastive training does not use.</>}
+        stretch={<>Why does a relative objective fit retrieval better than absolute relevance regression?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="eto-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — What makes a negative a hard negative"
+        scenario={<>A teammate calls any randomly sampled non-matching document a hard negative. Pick the statement that correctly defines a hard negative.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`negatives near the query in meaning vs negatives far away
+question: which kind is the hard negative?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { text: "A hard negative is a non-match that sits close to the query in meaning, so the model must work to separate it.", correct: true },
+          { text: "A hard negative is any randomly sampled non-match, since all negatives are equally informative to the contrastive loss.", correct: false },
+          { text: "A hard negative is the true positive itself, included twice so the loss anchors the query firmly to its real match.", correct: false },
+          { text: "A hard negative is a document with an unusually large vector norm, regardless of how related its meaning is to the query.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>Random negatives are usually easy, not hard; the positive is never a negative; and norm has nothing to do with hardness, which is about semantic proximity.</>}
+        lens={<>A hard negative is a document that is not relevant yet lies close to the query in the embedding space, so it is easy to confuse with a true match and the model must learn to push it away. Random negatives are typically far off and already separable, so they are easy, not hard, and a positive is by definition not a negative. Hardness is about semantic proximity to the query, which is what makes such negatives the ones that sharpen the boundary.</>}
+        stretch={<>How might you mine hard negatives in practice for a retrieval task?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="eto-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Good on easy queries, weak on near-duplicates"
+        scenario={<>A retrieval model trained only on random negatives separates obviously unrelated documents well but confuses near-duplicate look-alikes for the true match. A teammate proposes simply adding more random negatives. Pick the soundest fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`training negatives: random only
+behavior: separates unrelated docs, confuses near-duplicates
+proposed: add more random negatives`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { text: "Mine hard negatives near the query, since the boundary stays loose until the model sees close-but-wrong examples.", correct: true },
+          { text: "Add many more random negatives, since a larger random pool eventually teaches the fine near-duplicate distinction.", correct: false },
+          { text: "Switch to absolute relevance regression, since predicting exact scores resolves near-duplicate confusion directly.", correct: false },
+          { text: "Increase the embedding dimension, since more dimensions automatically separate near-duplicates without new negatives.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>More random negatives stay far away and do not teach the near-duplicate distinction; absolute regression abandons the contrastive setup; and dimension does not substitute for informative negatives.</>}
+        lens={<>The model is weak exactly where it never trained: random negatives are far from the query, so they teach the easy contrast but leave the boundary loose near plausible look-alikes. Mining hard negatives, non-relevant documents that sit close to the query, forces the model to carve a precise boundary in that region, which is the targeted fix. Piling on more far-away random negatives, switching to regression, or growing the dimension all fail to confront the close-but-wrong cases that cause the confusion.</>}
+        stretch={<>What risk arises if mined hard negatives are actually unlabeled true positives?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
-        difficulty="hard"
+        id="eto-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Choosing an objective to train a retriever"
+        scenario={<>You must train query and document embeddings for retrieval and have many positive pairs but no absolute relevance scores. A teammate proposes training a regressor to predict a relevance number. Pick the soundest choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`data: many (query, positive) pairs, no absolute scores
+goal: embeddings whose similarity ranks the positive on top
+options: contrastive loss, or absolute-score regression`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { text: "Train with a contrastive loss using positives and negatives, since the goal is relative similarity, not absolute scores.", correct: true },
+          { text: "Train a regressor to predict a relevance number, since absolute scores are required to rank the positive above others.", correct: false },
+          { text: "Train a per-document binary classifier, since judging each document alone is enough to order them within a query.", correct: false },
+          { text: "Train to maximize each vector's norm, since larger norms make positives rank above negatives at retrieval time.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>There are no absolute scores to regress; per-document classification ignores the relative contrast; and norm maximization does not encode relevance. Only contrastive training fits the data and goal.</>}
+        lens={<>You have matching pairs and want similarity to rank the positive above other documents, which is exactly what a contrastive loss optimizes by pulling the positive close and pushing negatives away, with no need for absolute relevance scores. Regression cannot run without those scores, per-document classification drops the within-query comparison, and norm maximization does not capture relevance. The relative objective matches both the available data and the retrieval goal.</>}
+        stretch={<>Where would the negatives come from if you only have positive pairs?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="eto-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — How InfoNCE uses many negatives"
+        scenario={<>A teammate cannot see how InfoNCE turns one positive and many negatives into a single loss. Pick the explanation of the InfoNCE mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`one positive p, negatives n_1..n_k, similarities scaled by temperature
+question: how are they combined into one objective?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { text: "It is a softmax over the positive and all negatives, maximizing the probability mass assigned to the true positive.", correct: true },
+          { text: "It averages the query-negative distances and ignores the positive, so only the negatives influence the loss value.", correct: false },
+          { text: "It compares the positive to a single random negative at a time, so the many negatives never enter one loss term.", correct: false },
+          { text: "It regresses the positive's similarity to a fixed target value, so the negatives play no role in the objective at all.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>InfoNCE does not ignore the positive, does not reduce to one negative at a time, and is not a regression to a target; it is a softmax classification including all negatives.</>}
+        lens={<>InfoNCE forms a softmax over the similarities of the positive and all the negatives, then maximizes the probability assigned to the true positive, which simultaneously raises its similarity and lowers the negatives'. So all negatives enter one loss term, and harder negatives, being more similar to the query, compete more strongly in the softmax and contribute larger gradients. The decoys drop the positive, the multi-negative structure, or the contrastive nature that defines InfoNCE.</>}
+        stretch={<>How does the temperature change the influence of the hardest negatives in the softmax?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="eto-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Adding more negatives barely helped"
+        scenario={<>A team multiplies the number of random negatives per query tenfold and sees retrieval quality on confusable cases barely move, while training got slower. A teammate expected a large gain. Predict the non-obvious reason.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`random negatives per query: x10
+quality on confusable cases: barely changed
+training time: up`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { text: "Extra random negatives are mostly far away and already separated, so they add little gradient on the hard boundary.", correct: true },
+          { text: "More negatives always scale quality linearly, so a flat result proves the loss or the data pipeline is broken.", correct: false },
+          { text: "Random negatives are the hardest possible, so adding them is the most efficient way to sharpen any decision boundary.", correct: false },
+          { text: "Negative count has no effect on quality at all, so the flat result is expected and hard negatives would not help either.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>Quality does not scale linearly with negative count, random negatives are usually the easiest, and negatives do matter; the flat result is about negative informativeness, not a broken pipeline.</>}
+        lens={<>Random negatives are typically far from the query, so the model already separates them and they contribute tiny gradients near the decision boundary, which is why tenfold more of them barely moves quality on confusable cases while still costing compute. The boundary only sharpens when the model sees negatives close to the query, so the informative move is hard-negative mining, not a larger random pool. The counterintuitive lesson is that negative quality, not quantity, drives the improvement.</>}
+        stretch={<>Why do hard negatives produce larger gradients than far-away random ones?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="eto-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Mined hard negatives that are really positives"
+        scenario={<>A team mines hard negatives by taking the top BM25 results that are not labeled relevant, but many of those are actually relevant and just unlabeled. Training quality drops. Pick the soundest operational reading.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`hard-neg mining: top BM25 non-labeled docs
+many are actually relevant but unlabeled
+effect: training quality dropped`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { text: "False negatives push true matches apart, so mined negatives must be filtered to avoid penalizing real positives.", correct: true },
+          { text: "Mislabeled negatives cannot hurt, since the contrastive loss automatically detects and ignores actual positives.", correct: false },
+          { text: "The drop proves hard negatives are always harmful, so reverting to random negatives is the correct long-term fix.", correct: false },
+          { text: "Unlabeled relevant documents are irrelevant to training, since only explicitly labeled pairs ever affect the loss.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>The loss does not auto-detect mislabeled positives, hard negatives are not inherently harmful, and unlabeled relevant docs used as negatives very much affect training by being pushed away.</>}
+        lens={<>When a mined hard negative is actually a relevant document, the contrastive loss pushes a true match away from the query, directly teaching the wrong thing and degrading quality, a false-negative problem. The fix is to filter mined negatives, for example by removing those too similar to the positive or using a threshold, so true matches are not penalized, rather than abandoning hard negatives entirely. Hard negatives remain the right tool; they just need denoising.</>}
+        stretch={<>What filter would reduce the chance a mined negative is an unlabeled positive?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="eto-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Training the retriever as absolute regression"
+        scenario={<>A team trains retrieval embeddings by regressing a single absolute relevance score per pair, then finds the similarity ordering of documents within a query is poor. A teammate insists lower regression error must mean better ranking. Pick the soundest diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`training: regress an absolute relevance score per pair
+result: within-query similarity ordering is poor
+claim: "lower regression error = better ranking"`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { text: "Absolute regression does not optimize relative order, so a contrastive loss that ranks positives over negatives is needed.", correct: true },
+          { text: "Lower regression error guarantees better ranking, so the poor ordering must be a bug in the similarity computation.", correct: false },
+          { text: "Regression already optimizes ranking, so the fix is simply to add more training data at the same absolute objective.", correct: false },
+          { text: "Ranking quality is independent of the training objective, so any loss yields the same ordering once it converges.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>Lower regression error does not guarantee ranking quality, regression does not optimize relative order, and the objective absolutely shapes the ranking; the choice of loss is the issue.</>}
+        lens={<>Regressing an absolute relevance value optimizes closeness to a number, not the relative order of documents within a query, so a model can have low regression error yet rank the true positive below confusable negatives. Retrieval needs a contrastive loss that explicitly raises the positive's similarity above the negatives', which is what shapes the ordering the product depends on. Insisting that lower regression error implies better ranking conflates two different objectives, the core failure here.</>}
+        stretch={<>Which contrastive loss would you switch to, and what would you use as negatives?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://lilianweng.github.io/posts/2021-05-31-contrastive/" target="_blank" rel="noopener">
+            <strong>Contrastive representation learning</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(InfoNCE, triplet, and the role of negatives)</span>
+          <br/>Surveys contrastive objectives and why negative selection, especially hard negatives, drives representation quality.
         </li>
       </ul>
     </VIS.Section>

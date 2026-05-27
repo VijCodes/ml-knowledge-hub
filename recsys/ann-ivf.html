@@ -2167,288 +2167,283 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: IVF (INVERTED FILE) ANN INDEX.
+// Delta: cluster the vector set into nlist centroids with k-means once; at query time embed the query, find its
+//   nprobe nearest centroids, and scan ONLY the vectors in those cells instead of all N. nprobe is the single
+//   recall/speed knob: more cells probed = higher recall, more vectors scanned. It is memory-light (stores raw
+//   vectors + a centroid table) but a query near a cell boundary can miss true neighbors that fell in an unprobed
+//   neighbouring cell. Diagram shows the cell counts and the nprobe SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="RecSys"
+      title="IVF (Inverted File) Index"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Embeddings & Approximate Nearest Neighbor" },
+        { label: "Subtopic", value: "Partition vectors into nlist k-means cells once; at query time scan only the nprobe nearest cells, trading recall for the number of vectors touched" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>IVF clusters the whole vector set into <VIS.Term def="The number of k-means cells the vectors are partitioned into at build time; each vector is assigned to its nearest centroid.">nlist</VIS.Term> cells
+      with k-means, then at query time scans only the <VIS.Term def="The number of nearest cells the query is compared against; the single knob that trades recall for vectors scanned.">nprobe</VIS.Term> cells whose centroids are nearest the query.</strong>{" "}
+      Instead of comparing the query against all N vectors, you compare it against nlist centroids (cheap), pick the
+      nprobe closest cells, and brute-force only the vectors living in those cells. nprobe is the one tunable knob:
+      raising it scans more cells and lifts recall toward exhaustive search but costs more per query; lowering it is
+      faster but misses more true neighbors. IVF stores the raw vectors plus a small centroid table, so it is far
+      lighter on memory than a graph index. The failure modes: setting nprobe to 1 so a query near a cell boundary
+      misses neighbors that fell into the adjacent unprobed cell, choosing nlist wildly out of proportion to N so cells
+      are either huge or nearly empty, and forgetting that the centroids were fit on the original data and drift as the
+      catalog changes.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Why probe only some cells">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        You have 2,000,000 item vectors and need top-10 neighbors per query in about a millisecond. Exhaustively
+        comparing the query to all 2M vectors is too slow. The readout below shows an IVF index already built: the
+        vectors are partitioned into nlist cells, and you control how many cells each query scans. Work out how nprobe
+        changes both the cost and the recall.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`N = 2,000,000 vectors
+nlist = 4096 cells (k-means)  ->  ~500 vectors per cell
+query: compare to 4096 centroids, pick nprobe nearest cells
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+nprobe = 1   ->  scan ~500 vectors
+nprobe = 32  ->  scan ~16,000 vectors
+exhaustive   ->  scan 2,000,000 vectors`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Derive why scanning 16,000 of 2,000,000 vectors is roughly a 125x speedup, and what could make the nprobe=1
+        result miss a true nearest neighbor even though its cell exists in the index.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the nprobe knob">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`step 1 - vectors per cell:
+   2,000,000 / 4096 ~= 488 per cell
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+step 2 - vectors scanned at nprobe = 32:
+   32 cells * 488 ~= 15,600 vectors
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+step 3 - speedup vs exhaustive:
+   2,000,000 / 15,600 ~= 128x fewer distance computations
+
+step 4 - recall: a true neighbor in the 33rd-nearest cell is
+   NOT scanned -> recall@10 ~= 0.94, not 1.0`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        The speedup comes entirely from scanning a small fraction of cells; the recall gap comes from true neighbors
+        that landed in cells just outside the nprobe set. Raising nprobe shrinks that gap (toward exhaustive recall) at
+        linear extra cost, so nprobe is the dial you turn to buy recall with latency. The centroid comparison itself is
+        negligible (4096 dot products) next to the per-cell scan.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What each IVF choice buys you">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Choice</th><th>Why it matters</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Raise nprobe</td><td>Scans more cells, so recall climbs toward exhaustive at proportional latency cost</td></tr>
+          <tr><td>Raise nlist</td><td>Smaller cells mean less to scan per cell, but the query must rank more centroids first</td></tr>
+          <tr><td>Store raw vectors</td><td>IVF keeps full vectors, so memory is close to the raw set, far below a graph index</td></tr>
+          <tr><td>Refit centroids</td><td>k-means cells were fit on the old data and drift as the catalog grows</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="One knob, nprobe, trades recall against vectors scanned">
+        IVF turns nearest-neighbor search into "find the right neighborhoods, then look only there." nprobe is the
+        single knob: it sets how many neighborhoods you inspect, and therefore both how many vectors you touch and how
+        likely you are to catch a neighbor that sits near a cell boundary. nlist sets the granularity of the
+        neighborhoods. Unlike HNSW, IVF stores the raw vectors and a centroid table, so it is memory-light, which is
+        why IVF (often combined with product quantization) is the standard for very large catalogs.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>IVF scans only the nprobe nearest k-means cells, so nprobe
+        trades recall against the number of vectors scanned, and boundary neighbors in unprobed cells are missed.</strong>{" "}
+        Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="ivf-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What IVF actually does at query time"
+        scenario={<>A teammate says "IVF speeds up search by compressing each vector into a short code so distances are cheaper." Pick the statement that correctly describes the IVF mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`query -> rank nlist centroids
+      -> scan vectors in nprobe nearest cells
+      -> return top-k from those`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It partitions vectors into k-means cells and scans only the few cells nearest the query, skipping all others.", correct: true },
+          { key: "b", text: "It compresses every vector into a short quantized code so each individual distance computation becomes cheaper." },
+          { key: "c", text: "It builds a multi-layer proximity graph and walks greedily from an entry node toward the query each time." },
+          { key: "d", text: "It sorts all vectors by a single learned hash so the query lands in one bucket of exact neighbors." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
-      />
-
-      <VIS.TrapProblem
-        id="bart-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
-        options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
-        ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) describes product quantization, a different idea that IVF is often combined with. (c) describes HNSW, a graph index. (d) describes locality-sensitive hashing, not IVF.</>}
+        lens={<>IVF is a partition-and-prune scheme: k-means splits the vectors into nlist cells, and a query is compared first to the centroids, then exhaustively only to the vectors inside its nprobe nearest cells. The speedup comes from skipping most cells, not from cheaper per-vector distances. Compressing vectors into codes is product quantization (often stacked on top as IVF-PQ); a navigable graph is HNSW; a single hash bucket is LSH. Each is a distinct way to avoid the full scan.</>}
+        stretch={<>What changes about memory if you add product quantization on top of IVF?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="ivf-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Recall is too low in production"
+        scenario={<>Your IVF index runs at nprobe=1 and recall@10 is only 0.78, below target. Latency has comfortable headroom. A teammate wants to rebuild the index from scratch with a new algorithm. Pick the soundest first move.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`nprobe = 1, recall@10 = 0.78
+latency budget: lots of headroom
+target recall@10 >= 0.94`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Raise nprobe so each query scans more cells, spending the spare latency budget to recover the missed neighbors.", correct: true },
+          { key: "b", text: "Rebuild the index with a graph algorithm immediately, since IVF cannot reach high recall regardless of its settings." },
+          { key: "c", text: "Lower nlist so there are fewer, larger cells, since fewer cells will automatically improve the recall at fixed nprobe." },
+          { key: "d", text: "Shrink the embedding dimension so distances are computed faster, freeing budget that will raise recall on its own." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) abandons a tunable index before turning its main knob. (c) fewer cells helps coverage but loses IVF's speed and is not the direct recall lever. (d) faster distances do not address missed cells at all.</>}
+        lens={<>nprobe is the recall knob and you have latency headroom, so the direct fix is to raise nprobe: scanning more cells per query catches the boundary neighbors that nprobe=1 skipped, lifting recall toward exhaustive. Swapping to a graph index is a heavier change you have not justified yet. Lowering nlist makes cells bigger, which raises coverage per cell but undercuts the speedup and is not the first lever. Shrinking the dimension changes distance cost, not which cells are probed, so it does nothing for the missed-neighbor problem.</>}
+        stretch={<>At what point does raising nprobe stop being worthwhile compared with switching index types?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="ivf-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Choosing nlist for a new catalog"
+        scenario={<>You are building an IVF index for 1,000,000 vectors and must pick nlist. A teammate proposes nlist=20, reasoning that fewer cells keep the centroid ranking trivially cheap. Pick the soundest choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`N = 1,000,000
+proposal: nlist = 20  ->  ~50,000 vectors per cell
+rule of thumb: nlist on the order of sqrt(N)`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Pick nlist near the square root of N so cells are moderate, keeping each cell scan small without too many centroids.", correct: true },
+          { key: "b", text: "Keep nlist=20 so the centroid ranking stays cheap, since the cost of ranking centroids dominates total query time." },
+          { key: "c", text: "Set nlist equal to N so each vector is its own cell, which makes every per-cell scan as small as possible." },
+          { key: "d", text: "Set nlist to exactly the number of CPU cores so each core ranks one centroid in perfect parallel on every query." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) 20 cells means ~50k vectors per cell, so even nprobe=1 scans a huge slice. (c) one vector per cell defeats clustering and makes centroid ranking equal to the full scan. (d) tying nlist to core count is unrelated to the recall/speed tradeoff.</>}
+        lens={<>The standard heuristic is nlist on the order of the square root of N, here roughly 1000, so each cell holds about 1000 vectors. With nlist=20 each cell holds ~50,000 vectors, so probing even one cell scans 5% of the catalog and you lose most of IVF's benefit. Setting nlist=N makes the centroid ranking itself an exhaustive scan, and tying nlist to core count confuses parallelism with the partition granularity. The granularity must be chosen so a single cell is small relative to N.</>}
+        stretch={<>How does the right nlist shift if you expect the catalog to grow tenfold?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="ivf-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why a true neighbor gets missed"
+        scenario={<>At nprobe=1, a query misses a vector that is genuinely its 2nd-nearest neighbor. A teammate concludes the distance computation is buggy. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`query sits near a boundary between cell 7 and cell 12
+nprobe = 1 -> only cell 7 is scanned
+true 2nd-nearest neighbor lives in cell 12`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "The neighbor fell in an adjacent cell the query did not probe, so a correct scan of one cell simply never saw it.", correct: true },
+          { key: "b", text: "The distance computation is wrong, since a correct implementation would always return every true nearest neighbor." },
+          { key: "c", text: "The neighbor was deleted from the index, since IVF cannot retain vectors that sit close to a cell boundary." },
+          { key: "d", text: "The query embedding is corrupted, since a valid query vector would always be assigned to the same cell as its neighbors." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) treats an approximate index as if it were exact. (c) boundary vectors are stored normally, not dropped. (d) nearby points routinely fall in different cells; that is the whole boundary effect.</>}
+        lens={<>IVF is approximate by construction: it only scans the nprobe nearest cells, so a true neighbor that happens to lie just across a cell boundary in an unprobed cell is invisible to the query even with flawless distance code. This is the boundary effect, not a bug, and it is exactly what raising nprobe mitigates by scanning the neighbouring cells too. The neighbor is still in the index; it just was not in a probed cell. Expecting exact recall from nprobe=1 misunderstands the method.</>}
+        stretch={<>Why does the boundary effect get worse in higher dimensions?</>}
+      />
+
+      <VIS.TrapProblem
+        id="ivf-c2"
+        difficulty="medium"
+        axis="Mechanism"
+        title="C2 — Why the centroid step is cheap"
+        scenario={<>A teammate worries IVF is slow because every query must compare against all nlist centroids before it can pick cells. Pick the correct explanation of where the query cost actually lives.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`centroid ranking: nlist = 4096 dot products
+per-cell scan: nprobe * (N / nlist) vectors
+N = 2,000,000, nprobe = 32`}</pre>}
+        options={[
+          { key: "a", text: "Ranking 4096 centroids is tiny next to scanning ~16k cell vectors, so the per-cell scan dominates query cost.", correct: true },
+          { key: "b", text: "Ranking the centroids dominates, since comparing against every centroid is the same work as scanning every vector." },
+          { key: "c", text: "Both steps cost the same by construction, since IVF always sets nlist equal to the vectors scanned per query." },
+          { key: "d", text: "Neither step matters, since IVF precomputes the entire query-to-vector distance matrix offline before serving." },
+        ]}
+        trap={<>(b) 4096 centroids is far fewer than the ~16k vectors scanned, let alone all 2M. (c) nlist and scanned-count are not tied together. (d) distances to arbitrary live queries cannot be precomputed.</>}
+        lens={<>A query first ranks the nlist centroids (here 4096 dot products) to choose cells, then scans the vectors in its nprobe cells (here about 16,000). The centroid step is small relative to the per-cell scan, which is where the real cost lives, and both are vastly cheaper than the 2,000,000 exhaustive comparisons. nlist is not tied to the scanned count, and distances to live queries cannot be precomputed because the query is only known at request time. Understanding that the scan dominates is what tells you nprobe is the latency lever.</>}
+        stretch={<>At what nlist does ranking the centroids start to rival the cell scan?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="ivf-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Doubling nlist at fixed nprobe"
+        scenario={<>An index uses nlist=2048, nprobe=16. A teammate doubles nlist to 4096 but leaves nprobe at 16, expecting recall to stay the same because nprobe is unchanged. Predict the non-obvious consequence.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`before: nlist=2048, nprobe=16  -> scans 16/2048 of cells
+after:  nlist=4096, nprobe=16  -> scans 16/4096 of cells
+total vectors N unchanged`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Recall tends to drop, because at fixed nprobe each query now covers a smaller fraction of the vector space.", correct: true },
+          { key: "b", text: "Recall stays identical, because nprobe is unchanged and nprobe is the only quantity that determines recall." },
+          { key: "c", text: "Recall rises sharply, because more cells always mean finer partitioning and finer partitioning always means higher recall." },
+          { key: "d", text: "Recall is unaffected and latency doubles, because doubling nlist doubles the number of vectors that must be scanned." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) is the trap: recall depends on the FRACTION of space probed, not nprobe alone. (c) finer cells without more probes shrinks coverage. (d) latency actually drops since each cell is smaller.</>}
+        lens={<>Recall depends on what fraction of the vector space the probed cells cover, which is roughly nprobe divided by nlist. Doubling nlist while holding nprobe fixed halves that fraction, so each query now inspects a smaller slice of space and recall tends to fall. The fix is to raise nprobe in step with nlist to hold the probed fraction constant. Latency per query actually drops because each of the 16 cells is now smaller, which is the opposite of (d). nprobe alone never determines recall; it is always nprobe relative to nlist.</>}
+        stretch={<>What nprobe at nlist=4096 restores the original coverage fraction?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="ivf-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Memory budget at a billion vectors"
+        scenario={<>You must index 1 billion vectors and a graph index would not fit in RAM. A teammate insists any ANN index at this scale needs the same memory as the raw vectors. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`1,000,000,000 vectors, 128d float = 512 GB raw
+graph index overhead: 2-3x raw -> will not fit
+goal: fit in available RAM`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Use IVF with product quantization, which stores compact codes so a billion vectors fit in a fraction of the raw size.", correct: true },
+          { key: "b", text: "Use a graph index anyway, since every ANN index needs roughly the same memory as the raw vectors regardless." },
+          { key: "c", text: "Store all vectors on disk and scan them exhaustively per query, since disk capacity removes the recall problem entirely." },
+          { key: "d", text: "Drop half the vectors at random so the raw set fits, since a smaller catalog is the only way to cut index memory." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) graph indexes carry 2-3x overhead and do not fit. (c) exhaustive disk scan blows any latency budget. (d) randomly deleting half the catalog destroys recall by removing real items.</>}
+        lens={<>IVF stores raw vectors plus a small centroid table, but its real advantage at billion-scale is that it composes with product quantization: IVF-PQ keeps short codes instead of full vectors, shrinking memory roughly 10-60x so a billion vectors fit in RAM at modest recall loss. Graph indexes carry multiplicative overhead and do not fit; exhaustive disk scanning is far too slow per query; and deleting vectors throws away the very items you must retrieve. The partition structure of IVF is what makes the PQ combination practical at scale.</>}
+        stretch={<>What recall cost does adding PQ typically impose, and how do you claw some back?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="ivf-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Recall decays as the catalog grows"
+        scenario={<>An IVF index built six months ago on 500k vectors now holds 5,000,000, and recall has quietly fallen. The nprobe and nlist settings were never changed. A teammate blames a data-quality regression. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`centroids fit once on the original 500k vectors
+catalog grew to 5,000,000 (10x)
+cells now hold ~10x more vectors; centroids never refit`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "The centroids were fit on the old data, so as the catalog grew the cells became unbalanced and need refitting.", correct: true },
+          { key: "b", text: "The data quality regressed, since IVF recall is independent of catalog size once the index has been built." },
+          { key: "c", text: "The embedding model silently changed, since a stable IVF index cannot lose recall unless the vectors themselves change." },
+          { key: "d", text: "The query traffic shifted to rarer items, since IVF only ever loses recall when the query distribution changes." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) IVF recall absolutely depends on how well the centroids fit the current data. (c) assumes vectors changed when only the count did. (d) blames queries when the index structure is the cause.</>}
+        lens={<>IVF centroids are fit once by k-means on the data present at build time. As the catalog grows tenfold the original 500k centroids no longer partition the 5M vectors well: cells become overloaded and unbalanced, so a fixed nprobe now covers a smaller and less representative fraction of the data, and recall decays. The cure is to refit the centroids (and likely raise nlist) on the current set, not to hunt a data-quality bug. The vectors and queries may be fine; it is the stale partition that rotted. This is why IVF indexes are periodically retrained as the corpus grows.</>}
+        stretch={<>How would you detect centroid drift automatically before recall visibly degrades?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://github.com/facebookresearch/faiss/wiki/Faiss-indexes" target="_blank" rel="noopener">
+            <strong>FAISS indexes — IVF and IVF-PQ</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(nlist, nprobe, and composing IVF with product quantization)</span>
+          <br/>Covers how the inverted-file partition works, how nprobe trades recall for speed, and why IVF is the
+          standard base for billion-scale indexes when combined with quantization.
         </li>
       </ul>
     </VIS.Section>

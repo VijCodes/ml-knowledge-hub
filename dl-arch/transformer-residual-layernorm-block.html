@@ -2167,288 +2167,277 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: RESIDUAL CONNECTIONS + LAYERNORM around each Transformer sub-layer.
+// Delta: every sub-layer (attention, FFN) is wrapped in (1) a RESIDUAL ADD that lets the input bypass the sub-layer,
+//   keeping a gradient path of slope ~1 through dozens of layers, and (2) a LAYERNORM that rescales each token's
+//   activation vector to stable statistics. Together they make deep stacks trainable. Pre-LN (norm inside the residual,
+//   x + Sublayer(LN(x))) vs post-LN (norm after the add, LN(x + Sublayer(x))) differ in WHERE the norm sits, which
+//   controls training stability/warmup. Diagram shows the wiring SETUP only; it never prints the gradient-flow conclusion.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="DL"
+      title="Residual Connections + LayerNorm"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Transformers" },
+        { label: "Subtopic", value: "Every sub-layer is wrapped in a residual add (keeps gradients flowing through dozens of layers) and a LayerNorm (rescales each token's activations to stable statistics); together they make deep Transformer stacks trainable" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Each sub-layer &mdash; attention and FFN &mdash; is wrapped in a <VIS.Term def="A connection that adds the sub-layer's input back to its output, so the layer learns a residual correction and the input has a direct path forward.">residual add</VIS.Term> and
+      a <VIS.Term def="Layer normalization: for each token, normalize its activation vector to zero mean and unit variance across the feature dimension, then apply a learned scale and shift. Normalizes per token, not across the batch.">LayerNorm</VIS.Term>.</strong>{" "}
+      The residual gives every sub-layer a bypass path with gradient slope near 1, so signal and gradients survive through
+      dozens of stacked layers instead of vanishing; the LayerNorm keeps each token's activation statistics stable so
+      training does not blow up. The two placements differ only in <em>where</em> the norm sits:{" "}
+      <VIS.Term def="Post-LayerNorm: out = LN(x + Sublayer(x)). The norm is applied after the residual add. The original Transformer; needs learning-rate warmup to train stably.">post-LN</VIS.Term> applies
+      the norm after the add, while <VIS.Term def="Pre-LayerNorm: out = x + Sublayer(LN(x)). The norm is applied to the sub-layer input, inside the residual. More stable at depth; often trains without warmup. Used by most modern LLMs.">pre-LN</VIS.Term> applies
+      it to the sub-layer input. The failure modes: thinking the residual is decorative rather than the gradient highway,
+      thinking LayerNorm normalizes across the batch (it is per token), conflating pre-LN and post-LN, and assuming a deep
+      stack would train fine without either.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 -- Why a deep stack stalls without help">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate stacks 24 attention+FFN sub-layers with no residual connections and no normalization, and finds the deep
+        model trains worse than a shallow one and often diverges. They blame the learning rate alone. Before reading on, work
+        out the two structural problems a plain deep stack faces.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`plain deep stack: x -> sublayer -> sublayer -> ... (24 deep), no skips, no norm
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+problem 1: gradients shrink/grow as they pass back through many sub-layers
+problem 2: activation scales drift layer to layer
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+what wrapping addresses each?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Consider what a direct bypass path does to the backward gradient, and separately what rescaling each token's
+        activation vector does to the forward signal. Derive why both are needed for depth.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 -- Worked example: wrapping one sub-layer two ways">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`one sub-layer S (attention or FFN), input x
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+post-LN (original):  out = LayerNorm( x + S(x) )
+pre-LN  (modern):    out = x + S( LayerNorm(x) )
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+the residual add (x + ...) gives a path whose local gradient is ~1
+LayerNorm rescales each TOKEN's vector across its features
+
+which formula leaves a clean, un-normalized residual highway end to end?`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        In post-LN the norm sits on the residual path itself, so the bypass is normalized at every layer and deep stacks
+        need learning-rate warmup to stay stable. In pre-LN the norm is applied only to the sub-layer input, leaving the
+        residual highway clean from input to output, which is why pre-LN trains stably at depth and often without warmup.
+        Either way the residual provides the gradient path and the LayerNorm provides scale control. (Why the placement
+        changes warmup needs is unpacked in the drill lenses.)
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 -- What each piece does">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of the residual + LayerNorm block</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Residual add</td><td>Bypass path with gradient ~1; sub-layer learns a correction</td></tr>
+          <tr><td>LayerNorm axis</td><td>Per token, across the feature dimension &mdash; not across the batch</td></tr>
+          <tr><td>Post-LN vs pre-LN</td><td>Norm after the add vs norm on the sub-layer input</td></tr>
+          <tr><td>Why it matters</td><td>Together they make dozens of stacked layers trainable</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="A highway plus a thermostat">
+        The residual connection is the gradient highway: it gives every sub-layer a direct path so the signal does not
+        vanish across depth, and the sub-layer only has to learn a correction. LayerNorm is the thermostat: it keeps each
+        token's activation statistics in a stable range so the forward pass does not drift or explode. Remove the residual
+        and deep stacks stop training; remove the norm and they destabilize. Pre-LN vs post-LN just changes where the
+        thermostat sits relative to the highway.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill -- trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>each sub-layer is wrapped in a residual add (gradient highway,
+        slope ~1) and a LayerNorm (per-token rescaling), and pre-LN vs post-LN differ only in where the norm sits, which
+        controls deep-stack stability.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="rln-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 -- What the residual add does"
+        scenario={<>A teammate calls the residual connection "a cosmetic skip that mostly helps readability of the diagram." Pick the statement that correctly describes its role.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`out = x + Sublayer(x)
+the x term bypasses the sub-layer
+what does that bypass do for training?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It gives a direct path with gradient near 1, so signal survives across many stacked sub-layers.", correct: true },
+          { key: "b", text: "It is a cosmetic skip that aids diagram readability but does not affect how the model trains at depth.", correct: false },
+          { key: "c", text: "It averages the input with the output to smooth predictions, acting as a lightweight ensemble per layer.", correct: false },
+          { key: "d", text: "It replaces the sub-layer output entirely when the sub-layer's activation magnitude is too small.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) the residual is structural, not cosmetic; without it deep stacks fail. (c) it adds, it does not average, and it is not an ensemble. (d) it always adds the input; it does not conditionally replace.</>}
+        lens={<>The residual adds the sub-layer's input back to its output, creating a bypass whose local gradient is about 1. That lets gradients flow back through dozens of layers without vanishing, and means each sub-layer only learns a correction to its input rather than a full transformation. Far from cosmetic, it is the structural reason deep Transformers train at all; removing it collapses the gradient signal across depth.</>}
+        stretch={<>If each sub-layer learns a correction to its input, what does that imply about how much any single layer must change the representation?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="rln-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 -- What axis LayerNorm normalizes"
+        scenario={<>A teammate says "LayerNorm normalizes each feature across the batch, just like BatchNorm with a different name." Pick the statement that correctly describes LayerNorm.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`activation tensor: [batch, tokens, features]
+LayerNorm computes statistics over which axis?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "It normalizes each token's vector across its feature dimension, independent of other examples in the batch.", correct: true },
+          { key: "b", text: "It normalizes each feature across the batch dimension, identical in effect to BatchNorm under a new name.", correct: false },
+          { key: "c", text: "It normalizes across the token (sequence) dimension, mixing statistics from every position in the input.", correct: false },
+          { key: "d", text: "It normalizes across all three axes at once, producing a single global mean and variance per minibatch.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) that is BatchNorm; LayerNorm is batch-independent. (c) LayerNorm does not pool across positions. (d) it does not compute one global statistic over everything.</>}
+        lens={<>LayerNorm computes mean and variance over the feature dimension for each token separately, then applies a learned scale and shift. It is independent of the batch, which is exactly why it suits variable-length sequences and small or size-1 batches where BatchNorm's cross-example statistics are unreliable. It does not pool across positions or across the batch; each token vector is normalized on its own.</>}
+        stretch={<>Why does this batch-independence make LayerNorm preferable to BatchNorm for autoregressive decoding one token at a time?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="rln-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 -- Reading a residual+norm formula"
+        scenario={<>You see a block implemented as out = x + Sublayer(LayerNorm(x)). A teammate labels it post-LN. Pick the soundest classification.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`out = x + Sublayer(LayerNorm(x))
+norm sits inside the residual, on the sub-layer input
+post-LN or pre-LN?`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Pre-LN, since the norm is applied to the sub-layer input and the residual path stays un-normalized.", correct: true },
+          { key: "b", text: "Post-LN, since a normalization appears in the formula and post-LN is the more common default name.", correct: false },
+          { key: "c", text: "Neither, since a valid block must normalize both the input and the output to qualify as either variant.", correct: false },
+          { key: "d", text: "Both at once, since the single LayerNorm here serves the pre-LN and post-LN roles simultaneously.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) the presence of a norm does not make it post-LN; placement does. (c) one norm per sub-layer is the standard; both is not required. (d) a single norm cannot be in two positions at once.</>}
+        lens={<>The defining question is where the norm sits. Here it wraps the sub-layer input (Sublayer(LayerNorm(x))) and the residual x is added un-normalized, which is pre-LN. Post-LN would be LayerNorm(x + Sublayer(x)), with the norm after the add. The distinction is not whether a norm exists but its position relative to the residual add, and that position is what changes deep-stack stability and warmup behavior.</>}
+        stretch={<>Given this is pre-LN, would you expect it to need learning-rate warmup more or less than the post-LN form?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="rln-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 -- Stabilizing a deep post-LN model"
+        scenario={<>A 48-layer post-LN Transformer diverges in the first few hundred steps at a high constant learning rate. A teammate proposes simply lowering the final learning rate for the whole run. Pick the soundest fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`48 layers, post-LN, high constant LR
+diverges in the first few hundred steps
+options touch LR schedule or norm placement`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Add learning-rate warmup (or switch to pre-LN), since post-LN is unstable early at depth without warmup.", correct: true },
+          { key: "b", text: "Lower the final learning rate for the entire run, since a smaller constant LR alone cures the early divergence.", correct: false },
+          { key: "c", text: "Remove the residual connections, since the skip paths are what amplify the activations and cause divergence.", correct: false },
+          { key: "d", text: "Switch LayerNorm to BatchNorm, since batch statistics are more stable than per-token statistics at depth.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) a low constant LR slows everything and may still be unstable early; warmup targets the early phase. (c) removing residuals destroys the gradient highway and makes depth untrainable. (d) BatchNorm is ill-suited to sequences and does not fix the placement issue.</>}
+        lens={<>Post-LN puts the norm on the residual path, which makes the early-training dynamics of deep stacks fragile, so the standard remedies are a learning-rate warmup that ramps the LR gently at the start, or moving to pre-LN where the residual highway stays clean and warmup is often unnecessary. Lowering the constant LR everywhere just slows learning without fixing the early instability, and removing residuals or swapping to BatchNorm attacks the wrong component.</>}
+        stretch={<>Why does pre-LN tend to make the warmup unnecessary that post-LN requires?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="rln-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 -- Why residuals keep gradients alive"
+        scenario={<>A teammate asks how a residual connection actually prevents the vanishing gradients that plague a plain deep stack. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`out = x + S(x)
+gradient of out w.r.t. x = 1 + (gradient of S w.r.t. x)
+many such layers stacked`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "The add contributes a constant 1 to the local gradient, so the product across layers does not collapse to zero.", correct: true },
+          { key: "b", text: "The add scales the gradient up by a learned factor at each layer, deliberately amplifying it to avoid vanishing.", correct: false },
+          { key: "c", text: "The LayerNorm inside the residual rescales the gradient to unit norm, which is what actually prevents vanishing.", correct: false },
+          { key: "d", text: "The residual zeroes out the sub-layer whenever its gradient is small, bypassing layers that would shrink it.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the 1 is a constant from the identity path, not a learned amplifier. (c) the norm controls activation scale, not the gradient-survival mechanism itself. (d) the residual always adds; it does not conditionally zero sub-layers.</>}
+        lens={<>Differentiating out = x + S(x) gives 1 + dS/dx, so the local gradient always carries an additive 1 from the identity path. Across many layers the backward signal is a product of such terms, and the constant 1 keeps that product from collapsing toward zero the way a product of small sub-layer Jacobians would. The residual does not amplify by a learned factor and does not zero sub-layers; it simply guarantees a gradient route of slope about 1 at every depth.</>}
+        stretch={<>If the identity path guarantees a gradient of ~1, what role is left for LayerNorm in keeping training stable?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="rln-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 -- Initializing sub-layers near zero"
+        scenario={<>A teammate initializes each sub-layer so it outputs near zero at the start of training, inside residual blocks. They worry the model will be unable to learn anything. Predict the non-obvious early-training behavior.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`out = x + S(x), with S(x) ~ 0 at init
+so out ~ x at every block initially
+deep stack of such blocks`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "The deep stack starts close to an identity map, which stabilizes early training rather than preventing learning.", correct: true },
+          { key: "b", text: "The model cannot learn, since every block outputs its input unchanged and no gradient ever reaches the weights.", correct: false },
+          { key: "c", text: "The model immediately overfits, since starting near identity memorizes the inputs before any real training.", correct: false },
+          { key: "d", text: "Training diverges at once, since stacking many near-zero sub-layers makes activations shrink toward zero fast.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) gradients still flow through the identity path and into S; the weights do learn. (c) an identity start does not memorize anything. (d) the residual carries x forward, so activations do not shrink to zero.</>}
+        lens={<>With sub-layers near zero at init, each residual block computes out about equal to x, so the whole deep stack begins close to an identity mapping. That is a stable, well-conditioned starting point: gradients still flow back through the identity path into the sub-layer weights, which gradually learn nonzero corrections. Far from preventing learning, near-identity initialization (the idea behind schemes like ReZero/SkipInit) is a deliberate way to train very deep residual stacks stably.</>}
+        stretch={<>Why is an identity-like starting point easier to optimize than a deep stack initialized to a large random transform?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="rln-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 -- Wrapping the two sub-layers"
+        scenario={<>You are assembling one Transformer block from an attention sub-layer and an FFN sub-layer. Pick the soundest way to apply residuals and LayerNorm.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`block has two sub-layers: attention, then FFN
+where do residual adds and LayerNorms go?`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Wrap attention and FFN each in its own residual add and LayerNorm, so the block has two of each.", correct: true },
+          { key: "b", text: "Use one residual add and one LayerNorm around the whole block, spanning both sub-layers together.", correct: false },
+          { key: "c", text: "Add a residual only around attention and a LayerNorm only around the FFN, to avoid duplicating components.", correct: false },
+          { key: "d", text: "Place a single LayerNorm at the block output and skip residuals, since the norm alone stabilizes the block.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) one residual over both sub-layers loses a clean per-sub-layer correction path. (c) each sub-layer needs both a residual and a norm; splitting them breaks the pattern. (d) skipping residuals removes the gradient highway.</>}
+        lens={<>Each sub-layer gets its own residual add and its own LayerNorm: attention is wrapped, then the FFN is wrapped, giving two of each per block. That ensures both sub-layers have a clean bypass path and stable activation statistics. Sharing one residual across both, splitting the residual and norm between sub-layers, or dropping residuals all break the per-sub-layer highway-plus-thermostat structure that makes deep stacks trainable.</>}
+        stretch={<>In a pre-LN block, where exactly do those two LayerNorms sit relative to the two residual adds?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="rln-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 -- Deep model trains worse than shallow"
+        scenario={<>A teammate removes all residual connections "to simplify the block," keeps LayerNorm, and finds a 30-layer model now trains worse than a 6-layer one. They conclude deep Transformers simply do not help. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`change: removed residual connections, kept LayerNorm
+result: 30-layer model worse than 6-layer model
+conclusion drawn: "depth does not help"`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Without residuals the gradient path collapses across depth; restoring them lets the deep model train.", correct: true },
+          { key: "b", text: "Depth genuinely does not help Transformers, so the 30-layer result confirms shallow is always better.", correct: false },
+          { key: "c", text: "LayerNorm alone cannot normalize 30 layers, so adding more LayerNorms per layer would fix the gap.", correct: false },
+          { key: "d", text: "The 30-layer model just needs many more epochs, since deeper models always converge more slowly here.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) the premise is false; depth helps once residuals are present. (c) more norms do not substitute for the missing gradient highway. (d) more epochs will not fix a collapsed gradient path.</>}
+        lens={<>Removing residuals deletes the identity gradient path, so backward signal must pass through 30 sub-layer Jacobians and collapses, which is the classic degradation that makes a plain deep stack train worse than a shallow one. LayerNorm controls activation scale but does not supply that gradient highway. Restoring the residual connections is the fix; the conclusion that depth does not help is an artifact of removing the very mechanism that makes depth trainable.</>}
+        stretch={<>This is the same degradation ResNets solved in vision -- what is the shared mechanism across both cases?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">
+            <strong>Attention Is All You Need</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(Add &amp; Norm sub-layers, post-LN block structure)</span>
+          <br/>Introduces the residual add and LayerNorm wrapping around each attention and FFN sub-layer; pre-LN vs post-LN placement is analyzed in the on-layer-normalization follow-up literature.
         </li>
       </ul>
     </VIS.Section>

@@ -2167,288 +2167,290 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: CATASTROPHIC FORGETTING.
+// Delta: When a pretrained model is fine-tuned aggressively on a NARROW task, the gradient updates OVERWRITE the shared
+//   weights that encoded GENERAL pretrained knowledge, so performance on the original broad abilities collapses even
+//   though the new task improves. The cause is interference in shared parameters, not lack of new-task data. Mitigations
+//   all aim to LIMIT how far weights move from the pretrained init: low/small learning rate, DISCRIMINATIVE learning
+//   rates (smaller LR for lower/general layers, larger for the task head), adapters/LoRA (freeze base, learn a small
+//   delta), and rehearsal/mixing in some original-distribution data. Trap surface: thinking forgetting is caused by too
+//   LITTLE target data (it is caused by too-aggressive updates), thinking more epochs on the narrow task fixes it (it
+//   worsens it), thinking the fix is a bigger model (capacity is not the issue), and thinking it is the same as ordinary
+//   overfitting to the train set (it is loss of OLD knowledge, measured on the OLD distribution). Diagram shows the
+//   before/after general-vs-narrow accuracy and the weight-drift mechanism only; never prints the verdict.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
       pill="NLP"
-      title="BART Denoising Autoencoder"
+      title="Catastrophic Forgetting"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Pretraining & Finetuning" },
+        { label: "Subtopic", value: "Aggressive fine-tuning on a narrow task overwrites the shared weights that held general pretrained knowledge, collapsing broad abilities; mitigations all limit how far weights drift from the pretrained init" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong><VIS.Term def="Catastrophic forgetting: the loss of previously learned general abilities when a model is fine-tuned hard on a new, narrow task that overwrites shared weights.">Catastrophic forgetting</VIS.Term> is
+      when aggressive fine-tuning on a narrow task overwrites the shared weights that encoded general pretrained knowledge,
+      collapsing the model's broad abilities even as the new task improves.</strong>{" "}
+      The cause is <VIS.Term def="Interference: when gradient updates for a new task move shared parameters in directions that degrade what those parameters encoded for old tasks.">interference</VIS.Term> in
+      shared parameters, not a shortage of new-task data: the same weights serve both old and new abilities, and
+      large updates pull them away from where the general knowledge lived. Mitigations all limit how far weights drift from
+      the pretrained starting point: a low learning rate, <VIS.Term def="Discriminative learning rates: using a smaller learning rate for lower, general layers and a larger one for the task head, so general features move less.">discriminative
+      learning rates</VIS.Term> (smaller for general layers, larger for the head), adapters or LoRA that freeze the base and
+      learn a small delta, and rehearsing some original-distribution data. The failure modes: thinking forgetting comes from
+      too little target data (it comes from too-aggressive updates), thinking more epochs on the narrow task fix it (they
+      worsen it), thinking a bigger model fixes it (capacity is not the issue), and conflating it with ordinary overfitting
+      to the train set (this is loss of OLD knowledge, measured on the OLD distribution).
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — What forgetting actually measures">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate fine-tunes a general chat model hard on legal text and sees the new task improve, but reports that
+        general question-answering accuracy fell. They conclude the legal set was too small. The before/after numbers are
+        below. Work out what caused the drop and what it is measured against.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`fine-tune: aggressive (high LR, many epochs) on NARROW legal text
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+                       before FT     after FT
+   legal task          weak          strong   (improved)
+   general QA          80%           60%       (collapsed)
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+the general-QA drop is measured on the ORIGINAL distribution.
+cause: too little legal data, or weights pulled off the pretrained init?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        One reading blames insufficient legal data. Another says the aggressive updates moved shared weights away from where
+        general knowledge lived. Decide which, and note that the loss is in OLD abilities, not the new train set.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the drift mechanism and mitigations">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`shared weights encode BOTH general and (after FT) the narrow task.
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+aggressive updates:
+   large LR x many epochs -> weights drift far from pretrained init
+   -> directions that held general knowledge get overwritten
+   -> general accuracy collapses (forgetting)
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+mitigations (all REDUCE drift from the pretrained init):
+   low learning rate        : small steps, weights stay near init
+   discriminative LRs        : tiny LR on general layers, larger on head
+   adapters / LoRA           : freeze base, learn a small added delta
+   rehearsal / data mixing   : interleave original-distribution examples`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        The same parameters serve both the old general abilities and the newly learned task, so large updates that pull them
+        far from the pretrained init overwrite the directions general knowledge occupied, and broad accuracy collapses. Every
+        standard mitigation keeps weights closer to where they started: smaller steps, smaller steps specifically on the
+        general layers, a frozen base with a tiny learnable delta, or mixing in original-distribution data so its gradients
+        push back. The disease is excessive drift, so the cures all constrain drift. (Why more epochs and bigger models do
+        not help is unpacked in the drills.)
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What catastrophic forgetting actually is">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>How forgetting behaves</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Cause</td><td>Aggressive updates pull shared weights off the pretrained init</td></tr>
+          <tr><td>Measured on</td><td>The ORIGINAL distribution (old abilities), not the new train set</td></tr>
+          <tr><td>Effect of more epochs</td><td>Worse: more drift, more forgetting</td></tr>
+          <tr><td>Mitigations</td><td>Low LR, discriminative LRs, adapters/LoRA, data rehearsal</td></tr>
+          <tr><td>Not fixed by</td><td>More target data alone or a bigger model</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Overwriting shared knowledge, not under-training the new task">
+        Catastrophic forgetting is the erosion of old general abilities when shared weights drift too far during narrow
+        fine-tuning. Its signature is that the new task improves while old performance collapses, and every cure works by
+        keeping the fine-tuned weights near their pretrained values.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>forgetting is loss of OLD general abilities caused by weights
+        drifting too far during aggressive narrow fine-tuning; cures limit that drift (low/discriminative LR, adapters,
+        rehearsal).</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="cf-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What forgetting measures"
+        scenario={<>A teammate says &quot;catastrophic forgetting just means the model overfits its training set, so check train versus validation gap.&quot; Pick the statement that correctly describes what forgetting is.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`new task: improves
+old general abilities: collapse, measured on the ORIGINAL distribution
+is this a train/val gap, or loss of prior knowledge?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It is the loss of previously learned general abilities, measured on the original distribution, after fine-tuning.", correct: true },
+          { key: "b", text: "It is ordinary overfitting, where the train accuracy outruns validation accuracy on the same new task.", correct: false },
+          { key: "c", text: "It is underfitting of the new task, where the model never reaches good accuracy on the fine-tuning data.", correct: false },
+          { key: "d", text: "It is a data-loading bug, where the original pretraining examples are accidentally deleted from disk first.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) overfitting is a train/val gap on the same task; forgetting is degradation on a different, old distribution. (c) the new task actually improves under forgetting, so it is not underfitting. (d) no data is deleted; the knowledge is overwritten in the weights.</>}
+        lens={<>Catastrophic forgetting is the collapse of prior general abilities, evaluated on the original distribution, that accompanies aggressive fine-tuning on a narrow task. It is not the same as overfitting (a train/val gap on one task), not underfitting (the new task improves), and not a data deletion bug. The defining signature is that old performance falls while new performance rises, so it must be measured on the old distribution.</>}
+        stretch={<>Why must you keep an evaluation set from the original distribution to even detect forgetting?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="cf-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — The root cause"
+        scenario={<>A teammate insists &quot;forgetting happens because the fine-tuning dataset was too small, so collect more of it.&quot; Pick the statement that correctly names the cause.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`shared weights hold general + new-task knowledge
+aggressive updates pull weights far from pretrained init
+candidate cause: too little new data, or too-large drift?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Aggressive updates pull shared weights far from the pretrained init, overwriting the general knowledge stored there.", correct: true },
+          { key: "b", text: "The fine-tuning dataset is too small, so collecting more narrow-task data is what removes the forgetting.", correct: false },
+          { key: "c", text: "The model lacks capacity, so the general and new knowledge physically cannot fit in the parameters at once.", correct: false },
+          { key: "d", text: "The tokenizer changed between pretraining and fine-tuning, so the old tokens stopped mapping to old features.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) more narrow-task data can deepen the same overwriting; the cause is drift, not scarcity. (c) capacity is not the issue; even large models forget when updated aggressively. (d) the tokenizer is unchanged in standard fine-tuning; the cause is weight drift.</>}
+        lens={<>Forgetting is caused by gradient updates pulling shared weights far from their pretrained values, which overwrites the directions that encoded general knowledge. It is not caused by too little narrow data (more can worsen it), not by lack of capacity, and not by a tokenizer change. Because the cause is excessive drift in shared parameters, the cures constrain that drift rather than adding data.</>}
+        stretch={<>Why can adding more narrow-task data sometimes deepen forgetting rather than relieve it?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="cf-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Keeping general ability during domain adaptation"
+        scenario={<>You must adapt a general assistant to medical text but must retain its everyday reasoning. A teammate proposes training at a high learning rate for many epochs to lock in the medical skill. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`goal: gain medical skill, KEEP general reasoning
+high LR + many epochs -> large drift -> general skill erodes
+options: limit drift, or push harder?`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Use a low learning rate, adapters, and some general-data rehearsal so weights stay near the pretrained init.", correct: true },
+          { key: "b", text: "Train at a high learning rate for many epochs, since stronger updates always preserve more prior ability.", correct: false },
+          { key: "c", text: "Fine-tune only on medical text with no general data, since mixing distributions always hurts the new domain.", correct: false },
+          { key: "d", text: "Reinitialize the lower layers randomly before training, so the medical task can rebuild them from scratch.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) high LR and many epochs maximize drift and thus forgetting, the opposite of preservation. (c) excluding general data removes the rehearsal signal that protects prior ability. (d) reinitializing layers discards the pretrained general knowledge outright.</>}
+        lens={<>Retaining general ability means limiting weight drift, so a low learning rate, adapters that freeze the base, and rehearsing some general data together keep the model close to its pretrained state while it learns medicine. Aggressive high-LR many-epoch training maximizes drift and forgetting, dropping all general data removes the protective rehearsal, and reinitializing layers throws away the very knowledge you want to keep. Constrain drift to preserve the old skill.</>}
+        stretch={<>How does the proportion of rehearsed general data trade off against speed of acquiring the new domain?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="cf-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Choosing where to apply small learning rates"
+        scenario={<>You will fine-tune a model and want the general lower layers to barely move while the task head adapts freely. A teammate proposes one global learning rate for all layers. Pick the soundest setup.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`lower layers: general features (should move little)
+task head: task-specific (can move freely)
+options: one global LR, or smaller LR for lower layers?`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Use discriminative learning rates, tiny for the general lower layers and larger for the task-specific head.", correct: true },
+          { key: "b", text: "Use one global learning rate for every layer, since per-layer rates cannot affect how much each layer drifts.", correct: false },
+          { key: "c", text: "Use a larger learning rate on the lower layers, since the general features need the most aggressive updating.", correct: false },
+          { key: "d", text: "Freeze the head and train only the lower layers, since the head was already correct from pretraining anyway.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) per-layer rates directly control per-layer drift; a single global rate cannot protect the general layers selectively. (c) larger LR on general layers maximizes their drift, worsening forgetting. (d) a fresh task head is randomly initialized and must train; freezing it learns no task.</>}
+        lens={<>Discriminative learning rates apply a tiny rate to the general lower layers so they barely move while a larger rate lets the task head adapt, directly targeting where forgetting originates. A single global rate cannot selectively protect general layers, a larger rate on lower layers accelerates their drift, and freezing the head prevents learning the new task. Match the learning rate to each layer's role to limit drift where it matters.</>}
+        stretch={<>Why are the lowest layers, which encode the most general features, the ones you most want to keep still?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="cf-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why adapters resist forgetting"
+        scenario={<>A teammate cannot see why freezing the base and training a small adapter avoids forgetting, when full fine-tuning of the same model forgets badly. Pick the correct account.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`full FT: gradients move ALL shared weights -> general dirs overwritten
+adapter: base FROZEN; learn a small added delta -> general weights intact`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "The frozen base keeps general weights unchanged, so the new task lives in the added delta without overwriting them.", correct: true },
+          { key: "b", text: "Adapters forget just as much, because freezing the base still lets its weights drift through the adapter path.", correct: false },
+          { key: "c", text: "Adapters work only because they use a higher learning rate that finishes training before any forgetting starts.", correct: false },
+          { key: "d", text: "Adapters delete the old knowledge first and relearn a compressed copy, which merely looks like preservation.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) a frozen base does not drift; that is the point, so adapters do not forget like full FT. (c) the protection comes from frozen weights, not from finishing fast. (d) adapters add a delta on top; they do not delete and relearn the base.</>}
+        lens={<>Adapters and LoRA freeze the base, so the general weights stay exactly where pretraining left them and the new task is captured in a small added delta, which means the directions holding general knowledge are never overwritten. Frozen weights do not drift, the protection is structural rather than a learning-rate race, and the base knowledge is preserved, not deleted and relearned. Freezing the shared weights is the mechanism that prevents forgetting.</>}
+        stretch={<>How does the size of the adapter trade off between new-task capacity and the risk of indirectly disturbing general behavior?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="cf-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Why more epochs make it worse"
+        scenario={<>A teammate, seeing general accuracy slip, proposes training many more epochs on the narrow task to stabilize the model. Predict the non-obvious direction this pushes general accuracy.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`each extra epoch on the narrow task -> more weight drift
+general dirs continue to be overwritten
+question: does more narrow training help or hurt general skill?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "More narrow epochs increase weight drift, so general accuracy falls further rather than stabilizing.", correct: true },
+          { key: "b", text: "More narrow epochs restore general accuracy, since extended training rebuilds the overwritten general skills.", correct: false },
+          { key: "c", text: "More narrow epochs leave general accuracy unchanged, since only the first epoch can ever cause any forgetting.", correct: false },
+          { key: "d", text: "More narrow epochs improve general accuracy because the model memorizes broad facts from the narrow data too.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) narrow-task training cannot rebuild general skill it lacks examples for; it overwrites further. (c) forgetting accumulates across epochs; it is not confined to the first. (d) narrow data does not contain the broad facts, so extra epochs only deepen overwriting.</>}
+        lens={<>Training more epochs on the narrow task pulls the shared weights still further from the pretrained init, so the general directions are overwritten more, and general accuracy falls further rather than stabilizing. Extended narrow training cannot rebuild general skills it has no examples for, forgetting accumulates rather than stopping after one epoch, and narrow data does not supply broad facts. The cure is fewer or gentler updates, not more narrow training.</>}
+        stretch={<>Why does early stopping on an original-distribution validation set help cap forgetting?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="cf-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Detecting forgetting during a run"
+        scenario={<>You are fine-tuning and want to catch forgetting before shipping. A teammate proposes monitoring only the narrow-task validation accuracy. Pick the soundest monitoring setup.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`narrow-task val: rising (looks great)
+general ability: unmeasured here
+what should you also track to see forgetting?`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Also evaluate a held-out original-distribution suite each checkpoint, so a drop in general ability is visible.", correct: true },
+          { key: "b", text: "Track only the narrow-task validation accuracy, since if it rises the model cannot be forgetting anything else.", correct: false },
+          { key: "c", text: "Track only the training loss on the narrow task, since a falling loss guarantees general ability is preserved.", correct: false },
+          { key: "d", text: "Track GPU memory usage over the run, since forgetting shows up as a change in the model's memory footprint.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) a rising narrow-task accuracy is exactly what coexists with forgetting; it cannot reveal it. (c) narrow-task training loss says nothing about old abilities. (d) memory footprint is unrelated to whether knowledge was overwritten.</>}
+        lens={<>To detect forgetting you must evaluate a held-out suite from the original distribution at each checkpoint, because forgetting shows up precisely as a fall in general ability while the narrow task improves. Watching only narrow-task accuracy or loss is blind to the old distribution, and GPU memory has nothing to do with overwritten knowledge. Always measure the old abilities you intend to preserve.</>}
+        stretch={<>How would you choose which original-distribution capabilities to include in the monitoring suite?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="cf-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Reaching for a bigger model"
+        scenario={<>After a chat model forgets general QA when fine-tuned on legal text, an engineer swaps in a much larger base and fine-tunes it just as aggressively. It still forgets. A teammate blames insufficient model size. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`change: bigger base model, SAME aggressive fine-tuning
+observed: general QA still collapses
+is the cause capacity, or the aggressive updates?`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Aggressive updates still drift the larger model's weights too, so limit the updates rather than grow the model.", correct: true },
+          { key: "b", text: "The model is still too small, and an even larger base trained the same way will finally stop forgetting.", correct: false },
+          { key: "c", text: "The dataset is too small, and adding more legal text to the same aggressive run will restore general QA.", correct: false },
+          { key: "d", text: "The optimizer is broken, since a correctly trained larger model can never exhibit catastrophic forgetting.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) capacity is not the cause; a bigger model trained aggressively still drifts and forgets. (c) more narrow data under the same aggressive regime deepens overwriting. (d) forgetting is a normal consequence of aggressive updates, not an optimizer bug, and larger models are not immune.</>}
+        lens={<>The root cause is the aggressive update regime, not model size: a larger base fine-tuned just as hard still drifts far from its pretrained init and overwrites general knowledge, so general QA collapses again. The fix is to constrain the updates, with low or discriminative learning rates, adapters, and rehearsal, not to enlarge the model. More size, more narrow data, and optimizer-blaming all miss that drift, not capacity, is the disease.</>}
+        stretch={<>Why might a larger model actually need even more careful drift control rather than less?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://arxiv.org/abs/1612.00796" target="_blank" rel="noopener">
+            <strong>Overcoming Catastrophic Forgetting in Neural Networks (Kirkpatrick et al., 2017)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(elastic weight consolidation against forgetting)</span>
+          <br/>Frames forgetting as overwriting of important weights and proposes penalizing movement of parameters that mattered for prior tasks, a principled way to constrain drift.
         </li>
       </ul>
     </VIS.Section>

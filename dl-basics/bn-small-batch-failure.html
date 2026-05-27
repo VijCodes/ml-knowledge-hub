@@ -2167,288 +2167,299 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: BATCHNORM FAILS AT SMALL BATCH SIZE.
+// Delta: BatchNorm estimates per-feature mean/variance FROM THE CURRENT MINI-BATCH. When the batch is tiny (<=4 per
+//   device), those batch statistics are noisy and biased estimators of the true population statistics, so the
+//   normalization is unstable across steps and accuracy degrades. The fix is a normalizer whose statistics do NOT depend
+//   on batch size: GroupNorm (per-example, splits channels into groups) or synchronized BN (pool stats across all GPUs to
+//   recover an effectively larger batch). This is exactly why detection/segmentation pipelines -- which run batch 1-2 per
+//   GPU because each image is huge -- standardly use GroupNorm or SyncBN, not vanilla BN. The trap: thinking small-batch
+//   BN failure is fixed by a smaller learning rate (it is a statistics problem, not an optimization problem), thinking
+//   LayerNorm and GroupNorm are the same thing, or thinking freezing BN stats is free (it just uses stale/ImageNet stats).
+//   Diagram shows the batch-statistics SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="DL"
+      title="BatchNorm Fails at Small Batch Size"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Normalization" },
+        { label: "Subtopic", value: "BN estimates mean/variance from the current mini-batch; at batch <=4 those estimates are noisy and biased, degrading accuracy. GroupNorm (batch-independent) or synchronized BN fixes it -- why detection/segmentation at batch 2 use GroupNorm" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>BatchNorm normalizes each feature using the mean and variance computed across the examples in the current
+      mini&#8209;batch. When that batch is tiny (about 4 or fewer), those statistics are noisy, biased estimates of the true
+      population values, so the normalization swings from step to step and accuracy degrades.</strong>{" "}
+      The failure is a <VIS.Term def="Estimating a population mean/variance from very few samples gives a high-variance, biased estimate. BN's per-feature stats over N=2 examples are far noisier than over N=256.">statistics problem</VIS.Term>, not
+      an optimization problem, so lowering the learning rate does not fix it. The fix is a normalizer whose statistics do
+      not depend on batch size: <VIS.Term def="GroupNorm splits a layer's channels into G groups and normalizes within each group, per single example -- no dependence on the batch.">GroupNorm</VIS.Term> (per&#8209;example,
+      channels split into groups) or <VIS.Term def="Synchronized BatchNorm pools the per-feature sum and sum-of-squares across all GPUs/devices before normalizing, recovering an effectively larger batch.">synchronized BN</VIS.Term> (pool
+      statistics across all devices to recover an effectively larger batch). This is precisely why detection and
+      segmentation models &mdash; which run batch 1&ndash;2 per GPU because each image is huge &mdash; standardly use
+      GroupNorm or SyncBN. The failure modes: blaming the learning rate, conflating GroupNorm with LayerNorm, and assuming
+      freezing BN is free when it just substitutes stale statistics.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Where do BN's statistics come from?">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate moving a model from batch 256 to batch 2 per GPU (for memory) says "BatchNorm is just a fixed
+        per&#8209;feature rescaling, so the batch size cannot matter." Work out what BN actually computes each step and how
+        that quantity behaves as the batch shrinks.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BatchNorm, per feature c, each training step:
+   mu_c   = mean over the N examples in THIS batch
+   var_c  = variance over the N examples in THIS batch
+   y      = gamma * (x - mu_c) / sqrt(var_c + eps) + beta
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+N = 256  ->  mu_c, var_c estimated from 256 values
+N = 2    ->  mu_c, var_c estimated from 2 values
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+question: how do the estimated mu_c, var_c behave as N -> 2?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Reason about whether mu_c and var_c are stable, population&#8209;representative numbers at N=2, and whether the
+        cause of any instability lives in the optimizer or in the estimator.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: batch 2 detector, BN vs GroupNorm">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`Mask R-CNN, batch = 2 images / GPU (each image is large):
+
+   vanilla BN:  mu_c, var_c over just 2 examples
+      -> noisy step-to-step, biased variance
+      -> normalization unstable, lower final AP
+
+   GroupNorm (32 groups), per single image:
+      -> statistics independent of batch size
+      -> stable at batch 2, recovers ~1-2 AP
+
+   SyncBN: pool sum, sum-of-sq across all GPUs
+      -> effective batch = 2 * num_GPUs, stats stabilize
+
+note: lowering lr does NOT restore the lost AP -- the
+      estimator is the problem, not the step size.`}</pre>
+      <p>
+        At batch 2 the per&#8209;feature mean and variance are estimated from two values, so they jump around and the
+        variance estimate is biased &mdash; the normalization the network sees is inconsistent across steps. GroupNorm
+        sidesteps this by normalizing within channel groups of a single example, so its statistics never depend on the
+        batch; SyncBN instead pools statistics across GPUs to rebuild a large effective batch. Either recovers the accuracy
+        that small&#8209;batch BN gives up. Lowering the learning rate cannot help, because the instability is in the
+        estimator, not the optimizer.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — small-batch fixes at a glance">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Option</th><th>Behavior at batch 2</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Vanilla BN</td><td>Stats from 2 examples &mdash; noisy/biased, accuracy degrades</td></tr>
+          <tr><td>GroupNorm</td><td>Per-example, channel groups &mdash; batch-independent, stable</td></tr>
+          <tr><td>SyncBN</td><td>Pools stats across GPUs &mdash; large effective batch, stable</td></tr>
+          <tr><td>Lower learning rate</td><td>No help &mdash; the estimator, not the step size, is the issue</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="A statistics failure, not an optimization failure">
+        Small&#8209;batch BN degrades because the per&#8209;feature mean and variance computed from a handful of examples are
+        poor estimates of the population values, so the normalization itself is unstable. The remedy is to make the
+        statistics independent of batch size (GroupNorm) or to enlarge the effective batch (SyncBN) &mdash; not to tune the
+        optimizer, which never touches how mu and var are estimated.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>BN's per&#8209;feature statistics come from the current batch, so
+        at tiny batch sizes they are noisy/biased and accuracy drops; batch&#8209;independent normalizers (GroupNorm) or
+        pooled statistics (SyncBN) fix it, and the learning rate does not.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="bnsb-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — Why batch size matters for BN"
+        scenario={<>A teammate says "BatchNorm is just a fixed learned per&#8209;feature rescaling, so the batch size cannot affect it." Pick the statement that correctly describes where BN's normalization statistics come from.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BN normalizes each feature using mu_c, var_c
+question: what are mu_c and var_c computed over?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "Each feature is normalized by a mean and variance estimated from the examples in the current mini-batch.", correct: true },
+          { key: "b", text: "Each feature is normalized by a fixed mean and variance that are frozen constants set once before any training.", correct: false },
+          { key: "c", text: "Each feature is normalized by a mean and variance computed across the feature dimension of one single example.", correct: false },
+          { key: "d", text: "Each feature is normalized by a mean and variance carried over unchanged from the immediately preceding layer.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) the learned shift and scale are parameters, but the mean and variance are recomputed from the batch each step. (c) normalizing across features per example is LayerNorm, not BN. (d) BN does not inherit statistics from the previous layer.</>}
+        lens={<>BN estimates each feature's mean and variance from the examples in the current mini&#8209;batch, so the batch composition and size directly affect them. They are not frozen constants (those are only used at eval), not per&#8209;example feature&#8209;axis statistics (that is LayerNorm), and not inherited from the previous layer. Because the statistics are batch&#8209;derived, a tiny batch makes them unreliable.</>}
+        stretch={<>If the statistics are batch-derived, what goes wrong with them specifically when the batch has only 2 examples?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="bnsb-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — What goes wrong at batch 2"
+        scenario={<>A teammate runs BN at batch 2 per GPU and sees unstable training and lower accuracy. Pick the statement that correctly names the underlying cause.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`batch = 2: mu_c, var_c estimated from 2 values per feature
+question: what kind of estimate is that, step to step?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "The mean and variance estimated from two examples are noisy and biased, so the normalization is unstable.", correct: true },
+          { key: "b", text: "The learned shift and scale parameters shrink toward zero at small batches, so the layer stops passing signal.", correct: false },
+          { key: "c", text: "The gradient through the normalization grows without bound at small batches, so the optimizer diverges outright.", correct: false },
+          { key: "d", text: "The eval-time running averages are used during training at small batches, so the live batch is effectively ignored.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) gamma and beta are not driven to zero by small batches. (c) the failure is unstable normalization, not unbounded gradients by construction. (d) running averages are used at eval, not substituted into training because the batch is small.</>}
+        lens={<>With only two examples per feature, the estimated mean and (especially) variance are high&#8209;variance, biased estimates of the population values, so the normalization the network applies swings step to step &mdash; that is the degradation. It is not the learned parameters collapsing, not guaranteed unbounded gradients, and not eval statistics leaking into training. The root issue is the quality of the batch statistics.</>}
+        stretch={<>Name a normalizer whose statistics would not change at all if you dropped the batch from 256 to 2.</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="bnsb-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Normalizer for a batch-2 detector"
+        scenario={<>You are training a detection model where each image is large, so only 2 images fit per GPU. Vanilla BN gives unstable training. A teammate suggests just lowering the learning rate. Pick the soundest fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`detection, 2 images / GPU, BN unstable
+goal: stable normalization at this batch size
+question: which change addresses the actual cause?`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Replace BN with GroupNorm, whose per-example group statistics do not depend on the batch size at all.", correct: true },
+          { key: "b", text: "Keep BN but lower the learning rate sharply, since a smaller step size will steady the batch statistics over time.", correct: false },
+          { key: "c", text: "Keep BN but raise the dropout rate sharply, since stronger regularization will compensate for the noisy batch statistics.", correct: false },
+          { key: "d", text: "Keep BN but freeze its statistics to ImageNet values, since fixed stats are always preferable to any batch estimate.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) the learning rate never changes how mu/var are estimated, so it cannot fix a statistics problem. (c) dropout regularizes weights, not the normalization estimates. (d) freezing to ImageNet stats can help a little but substitutes stale, dataset-mismatched values rather than fixing the estimator.</>}
+        lens={<>GroupNorm computes statistics within channel groups of a single example, so they are completely independent of batch size &mdash; the standard fix for batch&#8209;2 detection/segmentation (SyncBN is the other). Lowering the learning rate and raising dropout both touch the optimizer/regularization, not the estimator that is actually failing. Freezing to ImageNet stats is a stopgap that uses stale values, not a true fix.</>}
+        stretch={<>How does SyncBN solve the same problem without abandoning batch statistics entirely?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="bnsb-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Eight GPUs, batch 2 each"
+        scenario={<>You have 8 GPUs each holding 2 images and want to keep BN's cross&#8209;example normalization rather than switch normalizer. A teammate says "per&#8209;GPU batch is 2, so BN is hopeless here." Pick the soundest option.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`8 GPUs x 2 images = 16 images total, split across devices
+default BN: stats computed per GPU (over 2)
+question: how do you make BN see a larger effective batch?`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Use synchronized BN to pool the per-feature statistics across all GPUs, giving an effective batch of sixteen.", correct: true },
+          { key: "b", text: "Use default per-GPU BN unchanged, since gradient all-reduce already shares the batch statistics across the GPUs.", correct: false },
+          { key: "c", text: "Use default per-GPU BN but accumulate gradients over steps, since accumulation enlarges the statistics batch too.", correct: false },
+          { key: "d", text: "Use default per-GPU BN at higher precision, since float64 statistics remove the small-batch instability entirely.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) gradient all-reduce averages gradients, not the BN statistics; each GPU still normalizes over its own 2 examples. (c) gradient accumulation enlarges the effective optimization batch but each forward pass still has 2 examples for BN. (d) precision is not the issue; 2 samples is too few at any precision.</>}
+        lens={<>SyncBN explicitly pools the per&#8209;feature sum and sum&#8209;of&#8209;squares across all GPUs before normalizing, so the statistics are computed over all 16 images &mdash; recovering a usable batch. Plain gradient all&#8209;reduce shares gradients, not statistics; gradient accumulation enlarges the optimization batch but not the per&#8209;forward BN batch; and higher precision cannot manufacture information from only 2 samples.</>}
+        stretch={<>Why does gradient accumulation help the optimizer but not BN's per-step statistics?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="bnsb-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why lowering the learning rate can't fix it"
+        scenario={<>A teammate insists the batch&#8209;2 BN instability is an optimization issue and that a small enough learning rate must fix it. Pick the explanation for why it cannot.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`learning rate scales the parameter update step
+BN's mu_c, var_c are estimated from the batch, pre-update
+question: does the step size change how mu_c, var_c are estimated?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "The learning rate scales the update step but never changes how the batch mean and variance are estimated.", correct: true },
+          { key: "b", text: "The learning rate directly rescales the batch mean and variance, so a smaller value steadies them at small batch.", correct: false },
+          { key: "c", text: "The learning rate sets how many examples enter each batch, so a smaller value enlarges the statistics sample.", correct: false },
+          { key: "d", text: "The learning rate controls the running-average momentum, so a smaller value fixes the live batch statistics used.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the learning rate scales gradients, not the forward-pass statistics. (c) the learning rate has nothing to do with batch size. (d) BN momentum is a separate hyperparameter and governs eval-time running averages, not the live small-batch estimates.</>}
+        lens={<>The mean and variance are computed in the forward pass from the batch's examples, before any gradient or step&#8209;size enters; the learning rate only scales the subsequent parameter update. So a smaller learning rate cannot improve a statistic estimated from two samples. It does not rescale the statistics, does not change the batch size, and is unrelated to the running&#8209;average momentum used at eval.</>}
+        stretch={<>Which hyperparameter does govern how the eval-time running mean/variance are accumulated?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="bnsb-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Same net, two batch sizes, one normalizer swap"
+        scenario={<>Two runs of the same network: run X uses BN at batch 256 and trains well; run Y uses BN at batch 2 and is unstable. A teammate predicts that switching run Y to GroupNorm will hurt it relative to run X's BN "because BN is the stronger normalizer." Predict the non&#8209;obvious outcome.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`run X: BN @ batch 256  -> stable
+run Y: BN @ batch 2    -> unstable
+proposed: run Y -> GroupNorm @ batch 2
+question: where does GroupNorm @ batch 2 land vs BN @ batch 2?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "GroupNorm at batch 2 is batch-independent, so it trains stably and beats BN at batch 2 despite BN's batch-256 edge.", correct: true },
+          { key: "b", text: "GroupNorm at batch 2 inherits BN's small-batch instability, so run Y stays unstable and matches BN at batch 2 exactly.", correct: false },
+          { key: "c", text: "GroupNorm at batch 2 needs an even larger batch than BN to be stable, so shrinking to 2 makes run Y strictly worse.", correct: false },
+          { key: "d", text: "GroupNorm at batch 2 is identical math to BN at batch 256, so run Y will exactly reproduce run X's stable curve.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) GroupNorm's statistics do not come from the batch, so it does not inherit BN's small-batch problem. (c) GroupNorm needs no batch at all; it works at batch 1. (d) GroupNorm and large-batch BN are different computations, not identical.</>}
+        lens={<>Because GroupNorm computes statistics within channel groups of a single example, batch size is irrelevant to it &mdash; so at batch 2 it trains stably and outperforms batch&#8209;2 BN, even though BN at batch 256 was excellent. The "BN is stronger" intuition holds only when BN has a large batch to estimate from. GroupNorm does not inherit the instability, does not need a bigger batch, and is not identical to large&#8209;batch BN.</>}
+        stretch={<>At a large batch where BN is healthy, why might BN still edge out GroupNorm?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="bnsb-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Choosing a normalizer for segmentation"
+        scenario={<>You are setting up a segmentation model that, due to image size, will train at batch 1&ndash;2 per GPU on a single device. You must pick the normalization layer before training. Pick the soundest default.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`single GPU, batch 1-2, large images
+no cross-GPU pooling available
+question: which normalizer is robust at this batch size?`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Use GroupNorm, since its per-example group statistics stay stable at batch 1 to 2 on a single device with no pooling.", correct: true },
+          { key: "b", text: "Use vanilla BN, since its batch statistics are the most accurate normalizer regardless of how small the batch gets.", correct: false },
+          { key: "c", text: "Use SyncBN, since pooling statistics across devices is the right fix even when training runs on one single GPU.", correct: false },
+          { key: "d", text: "Use no normalization, since any normalizer is unreliable at batch 1 to 2 and is safest left out of the network.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) vanilla BN is exactly what fails at batch 1-2. (c) SyncBN needs multiple devices to pool across; on one GPU it reduces to small-batch BN. (d) dropping normalization forfeits its training benefits; GroupNorm is available and robust.</>}
+        lens={<>On a single GPU at batch 1&ndash;2 with no cross&#8209;device pooling, GroupNorm is the robust default because its statistics are per&#8209;example and batch&#8209;independent. Vanilla BN is the thing that fails here; SyncBN has no other devices to pool across so it degenerates to small&#8209;batch BN; and removing normalization throws away its real benefits when a working alternative exists.</>}
+        stretch={<>If a second through eighth GPU became available, when might you switch from GroupNorm to SyncBN?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="bnsb-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Accuracy drops only after a batch-size cut"
+        scenario={<>A model that trained well suddenly loses accuracy after the team halves the per&#8209;GPU batch from 32 to 2 to fit a bigger backbone. A teammate blames the new backbone. The only other change was the batch size. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`change log: backbone swapped, per-GPU batch 32 -> 2
+symptom: accuracy down, training less stable
+uses: vanilla BatchNorm
+question: which change most likely caused the regression?`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "The batch cut to 2 made BN's statistics noisy and biased, destabilizing normalization and lowering accuracy.", correct: true },
+          { key: "b", text: "The new backbone is fundamentally incompatible with the dataset, so accuracy fell independently of the batch size.", correct: false },
+          { key: "c", text: "The batch cut raised the effective learning rate sharply, so the optimizer began overshooting and lost accuracy.", correct: false },
+          { key: "d", text: "The batch cut increased weight decay implicitly, so the model was over-regularized and underfit the training data.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) blaming the backbone ignores the simultaneous batch change interacting with BN. (c) a smaller batch does not raise the learning rate; this misattributes a statistics issue to the optimizer. (d) batch size does not change the weight-decay coefficient.</>}
+        lens={<>Halving the batch to 2 left BN estimating each feature's mean and variance from two examples, making the normalization noisy and unstable &mdash; the most likely cause given that batch size was the relevant change for a BN network. It is not the backbone in isolation, not a hidden learning&#8209;rate increase, and not implicit extra weight decay. Switching to GroupNorm or SyncBN at the new batch size is the fix.</>}
+        stretch={<>What single experiment would confirm BN's batch statistics are the culprit rather than the backbone?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://arxiv.org/abs/1803.08494" target="_blank" rel="noopener">
+            <strong>Group Normalization (Wu &amp; He, 2018)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(BN's error rises sharply as batch size shrinks; GroupNorm is flat)</span>
+          <br/>The paper that quantifies BN's small&#8209;batch degradation and proposes the batch&#8209;independent GroupNorm fix.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/1502.03167" target="_blank" rel="noopener">
+            <strong>Batch Normalization (Ioffe &amp; Szegedy, 2015)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(the original BN, defining the batch-derived statistics)</span>
+          <br/>Introduces normalizing by per&#8209;feature batch statistics &mdash; the dependence that breaks at tiny batch sizes.
         </li>
       </ul>
     </VIS.Section>

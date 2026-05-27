@@ -2167,288 +2167,271 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: Approximate Nearest Neighbor (ANN) search.
+// Delta: ANN trades EXACT recall for SUBLINEAR latency by probing only a small fraction of the N vectors using
+//   structure (HNSW graphs, IVF cells, PQ codes) instead of scanning all of them. There is a single recall/latency
+//   knob (efSearch, nprobe) that you turn to buy recall with latency. The result is not guaranteed to be the true NN.
+//   Diagram shows brute-force cost vs the probed-fraction mechanism + the knob only; never prints the chosen setting.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="IR"
+      title="Approximate Nearest Neighbor (ANN) search"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Query Embeddings & ANN" },
+        { label: "Subtopic", value: "ANN gives sublinear-latency retrieval by probing a small fraction of N vectors with index structure, trading guaranteed exactness for speed via a single recall-latency knob" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong><VIS.Term def="A search that returns vectors close to a query but not guaranteed to be the exact nearest, using an index structure to avoid scanning every vector.">Approximate Nearest Neighbor search</VIS.Term> trades
+      guaranteed-exact results for sublinear latency: instead of an <VIS.Equation tex={"O(N\\cdot d)"} /> scan of all N vectors,
+      a structure such as an HNSW graph, IVF cells, or PQ codes probes only a small fraction of them.</strong>{" "}
+      Brute-force exact search compares the query to every vector, which is correct but linear in the number of vectors. ANN
+      builds an index so a query touches a tiny subset, returning the top results far faster while possibly missing a few true
+      neighbors. The trade is governed by one knob, such as <VIS.Term def="The HNSW query-time parameter controlling how many candidate nodes the search explores; higher means higher recall and higher latency.">efSearch</VIS.Term> or
+      <VIS.Term def="The IVF query-time parameter giving how many Voronoi cells to scan; higher means higher recall and higher latency.">nprobe</VIS.Term>:
+      turning it up probes more of the data, raising recall toward exact at the cost of latency. The failure modes: assuming
+      ANN returns the exact nearest neighbor, treating the recall as fixed rather than a tunable knob, and reporting latency
+      without the recall it was measured at.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Probe a fraction, do not scan all">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        Exact search computes the distance to every vector, which is accurate but scales linearly with the number of vectors
+        times the dimension. ANN indexes the vectors so a query explores only a small, query-dependent subset, giving roughly
+        sublinear work per query at the price of occasionally missing a true neighbor.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`EXACT:  compare query to all N vectors -> O(N * d) work, guaranteed top-k
+ANN:    probe a small subset via index   -> sublinear work, approximate top-k
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+knob:   efSearch (HNSW) / nprobe (IVF)
+        higher knob -> more vectors probed -> higher recall, higher latency`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        The index converts a full scan into a guided probe of a fraction of the data, and the knob sets how large that fraction
+        is, which is the lever that buys recall with latency.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example">
+      <p>The cost gap between brute force and an indexed probe on a million-vector store:</p>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`N = 1,000,000 vectors, d = 128
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+BRUTE FORCE: distance to all N -> ~128M multiply-adds per query
+ANN (HNSW):  visit ~a couple thousand nodes per query instead of a million
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+knob efSearch sets how many nodes the walk explores; raising it
+visits more nodes and recovers more of the true neighbors`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Brute force touches every vector; the indexed probe touches a small number of them, returning a high-recall top-k far
+        faster. The exact result is not guaranteed, which is what the recall measurement reports.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What you trade and what you tune">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>Exact (brute force)</th><th>ANN (indexed)</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Work per query</td><td>Linear in N times d</td><td>Sublinear, probes a fraction</td></tr>
+          <tr><td>Result</td><td>Guaranteed true top-k</td><td>Approximate top-k</td></tr>
+          <tr><td>Tunable knob</td><td>None</td><td>efSearch or nprobe</td></tr>
+          <tr><td>Knob effect</td><td>Not applicable</td><td>Higher recall costs more latency</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Recall is a dial, not a property">
+        ANN does not have one fixed recall; it has a knob. Turning efSearch or nprobe up probes more of the data and pushes
+        recall toward exact while latency rises, and turning it down does the reverse. Any ANN latency number is meaningless
+        without the recall it was measured at, because the two move together along that dial.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>ANN buys sublinear latency by probing a small fraction of the
+        vectors with index structure, gives approximate not exact results, and exposes one recall-latency knob (efSearch,
+        nprobe) you turn to hit a recall target.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="ann-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What ANN trades for speed"
+        scenario={<>A teammate states that ANN returns the same exact top-k as brute force, just computed faster on the same hardware. Pick the statement that correctly describes what ANN gives up.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`brute force: scans all N, guaranteed top-k
+ANN: probes a subset via index
+question: what does the speedup cost?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { text: "ANN trades guaranteed exactness for sublinear latency, so it may miss some true neighbors while running far faster.", correct: true },
+          { text: "ANN returns the identical exact top-k as brute force, paying nothing in accuracy because the index is lossless overall.", correct: false },
+          { text: "ANN trades memory for speed only, returning the exact top-k while using a larger index that never affects recall.", correct: false },
+          { text: "ANN trades dimension for speed, projecting vectors down so the returned top-k is always the true nearest neighbor.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>The whole point of ANN is approximation, so claims that it returns the exact top-k are wrong; the trade is recall, not merely memory or dimension with exactness preserved.</>}
+        lens={<>ANN gives up the guarantee of the true top-k in exchange for probing only a fraction of the vectors, which makes it sublinear but means it can miss some genuine neighbors. That missed fraction is exactly what recall measures. The decoys all preserve exactness, which contradicts the defining trade: ANN is approximate by design, and its speed comes from not examining every vector.</>}
+        stretch={<>What single number quantifies how much of the true top-k ANN actually returns?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="ann-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — The knob that governs the trade"
+        scenario={<>A teammate believes ANN recall is a fixed property of the index that cannot be changed once built. Pick the statement that correctly describes the recall-latency control.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`query-time params: efSearch (HNSW), nprobe (IVF)
+question: what happens to recall and latency as they rise?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { text: "A query-time knob like efSearch or nprobe sets how much is probed, so raising it raises recall and latency together.", correct: true },
+          { text: "Recall is fixed at build time and cannot move, so the only way to change it is to rebuild the entire index from scratch.", correct: false },
+          { text: "The knob trades recall against memory footprint, so raising it shrinks the index while leaving query latency unchanged.", correct: false },
+          { text: "The knob controls only the embedding dimension, so raising it changes vector size but never the recall of the search.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>Recall is not frozen at build time; a query-time knob moves it. The knob trades recall against latency, not memory, and does not change embedding dimension.</>}
+        lens={<>ANN exposes a query-time knob, efSearch for graphs and nprobe for cells, that sets how many candidates the search explores, so turning it up probes more vectors and lifts recall while latency rises, and turning it down does the reverse. Recall is therefore a dial you operate at query time, not a fixed property of the built index. The decoys misattribute the knob to memory or dimension or claim recall is immutable.</>}
+        stretch={<>Why must any reported ANN latency be paired with the recall it achieved?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="ann-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — A latency win without a recall number"
+        scenario={<>A teammate reports that switching to ANN cut p99 latency from fifty milliseconds to one millisecond and declares the migration a success. No recall figure is given. Pick the soundest reaction.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`reported: p99 latency 50ms -> 1ms
+not reported: recall@k of the ANN setting used
+knob efSearch/nprobe was set to some value`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { text: "Latency is meaningless without the recall it bought, since a tiny knob gives near-zero latency at unusable recall.", correct: true },
+          { text: "The latency win alone proves success, since ANN latency and recall are independent and a fast index is always good.", correct: false },
+          { text: "The latency drop guarantees recall stayed high, since ANN structures preserve recall regardless of the knob setting.", correct: false },
+          { text: "Recall is irrelevant once latency improves, since users only perceive speed and never notice missing true neighbors.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>ANN latency and recall are not independent; they move together on the knob. A fast setting can have terrible recall, so a latency win with no recall is not a success and users do feel missing results as worse relevance.</>}
+        lens={<>Because the knob trades recall against latency, an extremely low latency can simply mean the knob was set so low that the search barely probes the data and recall collapsed. A latency number with no recall is therefore uninterpretable, since the same index can be made arbitrarily fast at the cost of returning the wrong neighbors. The right reaction is to ask for the recall at that latency and compare on a recall-latency curve, not a single speed figure.</>}
+        stretch={<>What plot lets you compare two ANN configurations fairly across the trade?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
-        difficulty="hard"
+        id="ann-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Serving exact search that no longer fits the latency budget"
+        scenario={<>Your exact nearest-neighbor service met the latency budget at a hundred thousand vectors but now violates p99 at tens of millions, because cost grows with the vector count. Pick the soundest change.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exact search cost grows with the number of vectors
+N grew 100k -> tens of millions
+p99 now exceeds budget; relevance must stay high`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { text: "Move to an ANN index and tune the knob to a recall target, since probing a fraction restores sublinear query cost.", correct: true },
+          { text: "Keep exact search but add more replicas, since horizontal scaling removes the linear dependence on the vector count.", correct: false },
+          { text: "Keep exact search and lower the embedding dimension, since fewer dimensions make a full scan sublinear in vectors.", correct: false },
+          { text: "Keep exact search but cache every query, since a cache turns the linear scan into constant time for all future queries.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>Replicas split throughput but each query still scans all vectors; lowering dimension reduces per-comparison cost but the scan is still linear in N; caching only helps repeated queries, not the tail of fresh ones.</>}
+        lens={<>Exact search is linear in the number of vectors, so growing N by orders of magnitude is what broke the budget, and none of the exact-search patches remove that linear factor: replicas reduce concurrency pressure but not per-query work, smaller dimension shrinks a constant, and caching only covers repeats. An ANN index makes per-query work sublinear by probing a fraction of the data, and the knob lets you hit a recall target within the latency budget. That is the structural fix for a count-driven latency violation.</>}
+        stretch={<>How would you pick the knob value to satisfy both the latency budget and a recall floor?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="ann-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why probing a fraction yields sublinear cost"
+        scenario={<>A teammate cannot see how ANN avoids scanning every vector yet still finds good neighbors. Pick the explanation of how the structure produces sublinear work.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`index organizes vectors by proximity (graph edges, cells, codes)
+a query follows the structure toward its neighborhood
+question: why does this touch only a fraction of N?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { text: "The structure routes the query to its local neighborhood, so it scores only nearby candidates, not the full set.", correct: true },
+          { text: "The structure compresses every vector to one bit, so the query can compare against all N in constant total time.", correct: false },
+          { text: "The structure sorts all vectors once, so each query binary-searches the single global order to find its neighbors.", correct: false },
+          { text: "The structure replicates the data across cores, so every vector is still scanned but the wall-clock time is hidden.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>ANN is not one-bit compression scanning all N, not a single global sort (no total order exists in high-d), and not replication that still scans everything; the savings come from touching a local subset.</>}
+        lens={<>An ANN index arranges vectors so that proximity is navigable, through graph edges, Voronoi cells, or quantization codes, and a query follows that structure into its own neighborhood, scoring only the nearby candidates rather than all N. Because the explored region is a small fraction of the data, per-query work is sublinear even though the index holds every vector. The decoys describe full scans in disguise or a global ordering that does not exist for high-dimensional vectors.</>}
+        stretch={<>Which knob expands the explored neighborhood to recover more true neighbors?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="ann-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Diminishing returns on the recall knob"
+        scenario={<>A teammate doubles efSearch from a high value and sees recall rise only a hair while latency nearly doubles, then concludes the index is broken. Predict the non-obvious reason this is expected behavior.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`efSearch doubled from an already-high value
+recall: rose only slightly
+latency: nearly doubled
+the index is built and queried correctly`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { text: "Recall versus knob is concave near the top, so extra probing mostly rechecks found neighbors, adding latency not recall.", correct: true },
+          { text: "Doubling the knob must double recall, so a small rise proves the index is corrupted and needs a full rebuild.", correct: false },
+          { text: "Recall and latency are unrelated to the knob, so any change in either after doubling it indicates a measurement bug.", correct: false },
+          { text: "Higher efSearch always lowers recall, so the small rise is noise and the index is regressing as the knob increases.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>Recall does not scale linearly with the knob, the two are not unrelated to it, and higher efSearch does not lower recall; the curve simply flattens near the top.</>}
+        lens={<>The recall-versus-knob curve is concave and saturates: once most true neighbors are already found, additional probing mostly revisits the same neighborhood and rescoring candidates already seen, so recall inches up while latency keeps climbing roughly with the extra work. A near-doubling of latency for a sliver of recall near the top is therefore the expected shape, not a defect. The intuition is that the marginal recall per unit latency falls as you approach exact, which is why operating points are chosen on the knee of the curve.</>}
+        stretch={<>Where on the recall-latency curve is the most cost-efficient operating point?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="ann-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Measuring ANN recall without ground truth"
+        scenario={<>A team wants to report ANN recall@10 but has no labels. A teammate proposes treating the ANN output itself as the target. Pick the soundest way to measure recall.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`goal: recall@10 of the ANN setting
+no human relevance labels available
+question: what is the ground truth for ANN recall?`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { text: "Compute exact top-k by brute force on a query sample and measure overlap with the ANN result for those queries.", correct: true },
+          { text: "Treat the ANN output as its own ground truth, since comparing the index to itself yields the recall by definition.", correct: false },
+          { text: "Use click logs as ground truth, since user clicks define the true nearest neighbors for any embedding space.", correct: false },
+          { text: "Skip measurement and trust the default knob, since vendor defaults guarantee a fixed recall on every dataset.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>Comparing ANN to itself trivially yields perfect overlap and measures nothing; clicks measure relevance, not vector nearest-neighborness; defaults do not guarantee a fixed recall across datasets.</>}
+        lens={<>ANN recall is defined against the exact nearest neighbors, so the ground truth is the brute-force top-k, which you can afford to compute on a sampled subset of queries even when it is too slow for production. Measuring overlap between the ANN result and that exact set on the sample gives recall@k. Self-comparison is circular, clicks answer a different question, and vendor defaults vary by data, so none of those produce a valid recall number.</>}
+        stretch={<>Why is a query sample sufficient even though production cannot run brute force live?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="ann-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Blaming the embedding for an ANN recall drop"
+        scenario={<>After shrinking the knob to meet a tighter latency target, end-to-end relevance falls. A teammate concludes the embedding model degraded and schedules a retrain. Pick the soundest diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`change: lowered efSearch/nprobe for lower latency
+effect: end-to-end relevance dropped
+claim: "the embedding model must have degraded"`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { text: "Lowering the knob cut ANN recall, dropping true neighbors before ranking, so the embedding is likely unchanged.", correct: true },
+          { text: "Relevance falling proves the embedding degraded, so retraining the model is the correct and only available fix.", correct: false },
+          { text: "The knob cannot affect end-to-end relevance, so the drop must come entirely from a change in the embedding weights.", correct: false },
+          { text: "ANN recall is fixed, so a relevance drop after a knob change is impossible and the metric must be miscomputed.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>The knob directly controls recall, so a relevance drop right after lowering it points at retrieval, not the unchanged embedding; ANN recall is not fixed and the metric is not miscomputed.</>}
+        lens={<>Shrinking the knob to hit a latency target reduces how much of the data ANN probes, which lowers recall and discards true neighbors before the ranker ever sees them, so end-to-end relevance falls even with an unchanged embedding. The likely fix is to restore enough recall, by raising the knob back or choosing a faster index that holds recall, rather than retraining a model that did not change. Attributing a knob-induced recall drop to the embedding is a misdiagnosis that wastes a retrain.</>}
+        stretch={<>What experiment isolates whether the regression is from retrieval recall or the embedding?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Nearest_neighbor_search" target="_blank" rel="noopener">
+            <strong>Nearest neighbor search</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(exact versus approximate, and the speed-accuracy trade)</span>
+          <br/>Frames why high-dimensional exact search is costly and how approximate methods buy sublinear latency.
         </li>
       </ul>
     </VIS.Section>

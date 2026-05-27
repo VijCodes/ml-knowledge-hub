@@ -2167,288 +2167,287 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: POPULARITY / FREQUENCY NEGATIVE SAMPLING.
+// Delta: sample negatives PROPORTIONAL TO POPULARITY (commonly p^0.75 smoothing) so frequent items appear as negatives
+//   often enough that the model learns to push them down for users who did NOT engage them. This COUNTERS the
+//   popularity bias that UNIFORM negative sampling lets through: under uniform sampling a head item is almost never a
+//   negative, so the model is never taught it is wrong for most users, and over-recommends it. The 0.75 exponent is a
+//   compromise - between uniform (exponent 0, ignores popularity) and proportional (exponent 1, over-penalizes tail).
+//   Diagram shows the sampling-distribution SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="RecSys"
+      title="Popularity / Frequency Negatives"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Negative Sampling" },
+        { label: "Subtopic", value: "Sample negatives proportional to popularity (often p^0.75) so frequent items appear as negatives, countering the popularity bias that uniform sampling lets through" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Popularity-based negative sampling draws negatives in proportion to item popularity &mdash; commonly with
+      a <VIS.Term def="Raising each item's frequency to the power 0.75 before normalizing into a sampling distribution; it dampens the dominance of head items relative to sampling exactly proportional to frequency.">0.75 exponent</VIS.Term> &mdash; so
+      frequent items show up as negatives often enough that the model learns to push them down for users who did not
+      engage them.</strong>{" "}
+      The problem it solves is the popularity bias that <VIS.Term def="Drawing each negative item with equal probability regardless of how popular it is; a head item is then almost never selected as a negative.">uniform negative sampling</VIS.Term> lets
+      through: under uniform sampling a head item that is positive for many users is almost never drawn as a negative,
+      so the model is never taught that the head item is a <em>wrong</em> answer for the majority who did not engage it,
+      and it over-recommends that head item to everyone. Sampling negatives by popularity forces frequent items into
+      the negative set, so the model learns to suppress them where they do not belong. The 0.75 exponent is a
+      compromise between uniform (exponent 0, ignores popularity) and exactly proportional (exponent 1, which
+      over-penalizes the tail). The failure modes: assuming uniform sampling is unbiased, setting the exponent to 1 and
+      crushing tail items, and confusing this with hard-negative mining.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Who shows up as a negative">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        You train a retrieval model with sampled negatives. The readout compares two sampling distributions over the
+        same catalog, where one item is a head item and the rest are tail. Work out how often the head item is drawn as
+        a negative under each scheme, and what the model fails to learn when it almost never is.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`catalog: 1 head item (10% of all plays) + many tail items
+2,000,000 items total
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+uniform negatives: P(head as negative) = 1 / 2,000,000  (tiny)
+popularity^1 negatives: P(head as negative) ~= 0.10       (its play share)
+popularity^0.75 negatives: P(head as negative) ~= 0.056   (dampened)`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Derive why, under uniform sampling, the head item is essentially never a negative, and what the model is
+        therefore never taught about that head item for the users who did not engage it.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the 0.75 compromise">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`head item frequency share p = 0.10
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+exponent 0 (uniform): weight ~ p^0 = 1 for every item
+   -> head treated like any single tail item -> rarely a negative
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+exponent 1 (proportional): weight ~ p^1 = 0.10
+   -> head is a negative ~10% of the time -> strong push-down
+   -> but tail items get almost no negative signal
+
+exponent 0.75: weight ~ p^0.75
+   head: 0.10^0.75 ~= 0.178 (relative)
+   tail items get a relatively larger share than under exponent 1
+   -> head still penalized, tail not starved`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        The exponent dials how much popularity drives the negative distribution. At 0 it is uniform and head items
+        escape negative signal; at 1 head items are heavily penalized but tail items barely appear as negatives, so the
+        model under-trains on them. The 0.75 exponent keeps strong push-down on head items while leaving the tail enough
+        negative signal &mdash; the same word2vec-style smoothing reused throughout retrieval.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What the exponent buys you">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Sampling</th><th>Effect on the model</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Uniform (exp 0)</td><td>Head items rarely sampled as negatives, so popularity bias survives</td></tr>
+          <tr><td>Proportional (exp 1)</td><td>Head items heavily penalized, but tail starved of negative signal</td></tr>
+          <tr><td>Smoothed (exp 0.75)</td><td>Strong push-down on head items while the tail still gets negatives</td></tr>
+          <tr><td>Goal</td><td>Teach the model where popular items do not belong without crushing the tail</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Negatives must include the popular items, or bias survives">
+        The negative distribution decides what the model is taught to push down. Uniform sampling almost never draws a
+        head item as a negative, so the model never learns that the popular item is wrong for the many users who did not
+        engage it &mdash; and it over-recommends it. Sampling negatives by popularity fixes this by forcing frequent
+        items into the negative set, and the 0.75 exponent balances penalizing head items against keeping enough
+        negative signal on the tail. Choosing the negative distribution is therefore a modeling decision about bias, not
+        a neutral implementation detail.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>popularity-based negative sampling draws frequent items as
+        negatives (often with a 0.75 exponent) to counter the popularity bias that uniform sampling leaves in.</strong>{" "}
+        Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="np-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What popularity negatives sample"
+        scenario={<>A teammate says "popularity negative sampling means we sample the popular items as the positives more often." Pick the statement that correctly describes it.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`positives: the items the user actually engaged
+negatives: sampled items the user did NOT engage
+popularity sampling shapes the NEGATIVE distribution`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It draws negatives in proportion to item popularity, so frequent items appear as negatives more often.", correct: true },
+          { key: "b", text: "It draws positives in proportion to item popularity, so frequent items are treated as labels more often." },
+          { key: "c", text: "It removes popular items from training entirely, so the model never sees frequent items in any role." },
+          { key: "d", text: "It samples negatives uniformly at random, so every item is equally likely to be a negative regardless of popularity." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
-      />
-
-      <VIS.TrapProblem
-        id="bart-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
-        options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
-        ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) it shapes negatives, not positives; positives come from actual engagement. (c) popular items are not removed; they are added to the negatives. (d) uniform sampling is exactly what this scheme replaces.</>}
+        lens={<>Popularity-based negative sampling shapes the negative distribution, drawing items in proportion to their popularity so frequent items appear as negatives more often. Positives always come from the user's actual engagement and are not resampled by popularity; popular items are not removed from training but rather deliberately added to the negative set; and uniform negative sampling is precisely the alternative this scheme is designed to replace. The whole point is to ensure the model is taught to push popular items down where they do not belong.</>}
+        stretch={<>Why is shaping negatives, not positives, the right lever for popularity bias?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="np-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — The model over-recommends a blockbuster"
+        scenario={<>Your retrieval model, trained with uniform negatives, recommends one blockbuster to almost everyone, even users with clearly different tastes. A teammate wants to manually down-rank that one title. Pick the soundest fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`training: uniform negatives
+blockbuster: positive for many users, rarely a negative
+symptom: recommended to nearly everyone`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Switch to popularity-based negatives so the blockbuster is sampled as a negative and learns where it does not fit.", correct: true },
+          { key: "b", text: "Manually down-rank the one blockbuster, since hard-coding a penalty for it is the cleanest fix for the over-recommendation." },
+          { key: "c", text: "Add more uniform negatives, since simply increasing the negative count makes the blockbuster appear as a negative enough." },
+          { key: "d", text: "Remove the blockbuster from the catalog, since an item recommended too widely should be withheld from retrieval." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) a manual penalty patches one item and does not fix the systemic bias for the next popular item. (c) more uniform negatives still almost never draw the head item. (d) removing a genuinely popular item harms users who do want it.</>}
+        lens={<>The over-recommendation is the signature of uniform negatives: the blockbuster is positive for many users but almost never sampled as a negative, so the model never learns it is wrong for users with other tastes. Switching to popularity-based negatives forces the blockbuster into the negative set, teaching the model where it does not belong &mdash; a systemic fix that also handles the next popular title. A manual down-rank patches one item only; adding more uniform negatives still rarely draws the head item; and removing it punishes users who genuinely want it. The right lever is the negative distribution.</>}
+        stretch={<>How would you verify the fix worked without hurting the blockbuster's true fans?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
-        difficulty="hard"
+        id="np-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Choosing the exponent"
+        scenario={<>You adopt popularity negatives and a teammate proposes exponent 1 (exactly proportional) to maximally penalize head items. Tail coverage matters for your product. Pick the soundest choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`exponent 0: uniform (popularity bias survives)
+exponent 1: proportional (tail gets almost no negatives)
+exponent 0.75: word2vec-style compromise`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Use an exponent around 0.75 so head items are penalized while tail items still receive enough negative signal.", correct: true },
+          { key: "b", text: "Use exponent 1 for maximal head penalty, since sampling exactly proportional to frequency is always the strongest choice." },
+          { key: "c", text: "Use exponent 0 (uniform), since uniform sampling is the only unbiased way to draw negatives across the catalog." },
+          { key: "d", text: "Use a negative exponent so rare items are sampled most, since penalizing the tail hardest improves head coverage." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) exponent 1 starves the tail of negative signal, hurting tail coverage. (c) uniform is not unbiased; it lets popularity bias survive. (d) a negative exponent over-samples the tail and makes the head problem worse.</>}
+        lens={<>The exponent trades head penalty against tail signal: exponent 1 penalizes head items hardest but leaves tail items almost never sampled as negatives, undertraining them, while exponent 0 is uniform and lets the original popularity bias survive. The widely-used 0.75 is the compromise that keeps strong push-down on head items while still giving the tail enough negative signal, which matters when tail coverage is a product goal. Uniform is not unbiased, and a negative exponent over-samples the tail and worsens the head problem. The exponent is a deliberate bias-versus-coverage knob.</>}
+        stretch={<>How would you tune the exponent empirically for your catalog's popularity skew?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="np-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why uniform negatives leave popularity bias"
+        scenario={<>A teammate insists uniform negative sampling is the unbiased default and cannot introduce any recommendation bias. Pick the correct explanation of why it does.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`uniform: each item equally likely as a negative
+head item: 1 of millions -> almost never a negative
+so the model is never told the head item is wrong for non-engagers`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Uniform sampling almost never draws a head item as a negative, so the model never learns to push it down.", correct: true },
+          { key: "b", text: "Uniform sampling is fully unbiased, so it cannot cause the model to over-recommend any item under any circumstances." },
+          { key: "c", text: "Uniform sampling over-penalizes head items, since equal probability means head items become negatives too often." },
+          { key: "d", text: "Uniform sampling ignores positives, since drawing negatives uniformly also changes which items count as positives." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) is the misconception; uniform sampling does cause popularity bias. (c) inverts it; uniform makes head items rarely negatives, not too often. (d) negative sampling does not change the positives.</>}
+        lens={<>Uniform negative sampling gives every item an equal, tiny chance of being a negative, so a head item &mdash; one of millions &mdash; is almost never drawn as a negative even though it is the wrong answer for the many users who did not engage it. The model therefore never receives the signal to push the head item down for those users and over-recommends it: that is a real bias, not the unbiased default the teammate assumes. Uniform does not over-penalize head items (the opposite), and negative sampling does not alter the positives. The cure is to sample negatives by popularity so head items enter the negative set.</>}
+        stretch={<>How does this connect to the sampled-softmax correction for popularity?</>}
+      />
+
+      <VIS.TrapProblem
+        id="np-c2"
+        difficulty="medium"
+        axis="Mechanism"
+        title="C2 — What the 0.75 smoothing does to the distribution"
+        scenario={<>A teammate thinks raising frequencies to the 0.75 power makes head items more dominant in the negative distribution than raw proportional sampling. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`raw proportional: weight ~ p
+0.75 smoothing:   weight ~ p^0.75
+for p < 1, p^0.75 > p  -> small items lifted relatively`}</pre>}
+        options={[
+          { key: "a", text: "The 0.75 power compresses the gap, lifting tail items relatively so head items are less dominant than at exponent 1.", correct: true },
+          { key: "b", text: "The 0.75 power makes head items more dominant, since any exponent above zero amplifies the most frequent items further." },
+          { key: "c", text: "The 0.75 power leaves the distribution unchanged, since raising every frequency to a power preserves the exact ratios." },
+          { key: "d", text: "The 0.75 power removes head items from the negatives, since exponents below one zero out the most frequent items." },
+        ]}
+        trap={<>(b) inverts it; an exponent below 1 dampens the head, not amplifies it. (c) a power transform does change the ratios for unequal frequencies. (d) it dampens head items, it does not remove them.</>}
+        lens={<>Raising frequencies to the 0.75 power compresses the dynamic range: for fractional frequencies, p^0.75 is larger than p, so tail items are lifted relative to head items and the head becomes less dominant than under exactly proportional (exponent 1) sampling. It does not amplify the head, does not preserve the exact ratios (a power transform changes them whenever frequencies differ), and does not remove head items. This gentle dampening is exactly the word2vec smoothing reused in recommendation negative sampling to penalize head items without starving the tail.</>}
+        stretch={<>What does the exponent approach as you demand ever more tail signal?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="np-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — A genuinely universal item"
+        scenario={<>One head item is genuinely a good recommendation for almost everyone. After switching to popularity negatives, a teammate expects its recommendation rate to be unaffected since it is truly popular. Predict the non-obvious consequence.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`item is positive for most users AND sampled as a negative often
+positive signal pulls it up for engagers
+negative signal pushes it down for the few non-engagers`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Its rank is pushed down somewhat for non-engagers, so a truly universal item is still moderated, not left untouched.", correct: true },
+          { key: "b", text: "Its recommendation rate is completely unaffected, since a genuinely popular item is immune to negative sampling." },
+          { key: "c", text: "It is removed from almost everyone's results, since popularity negatives always eliminate the most frequent item." },
+          { key: "d", text: "Its rank rises further for everyone, since being sampled as a negative paradoxically reinforces a popular item's score." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) even a universal item now gets some negative signal for non-engagers. (c) popularity negatives moderate, they do not eliminate. (d) negative signal pushes down, it does not raise the score.</>}
+        lens={<>Even a genuinely universal item is now sampled as a negative for the users who did not engage it, so it receives some downward signal for non-engagers and its rank is moderated rather than left untouched &mdash; the positive signal from its many engagers still keeps it high where it belongs. The effect is moderation, not immunity (b) and not elimination (c); and negative signal pushes a score down, never up (d). The intuition that a truly popular item is unaffected misses that popularity negatives apply some correction to every frequent item, which is usually a healthy counterweight against runaway over-recommendation.</>}
+        stretch={<>How do you tell healthy moderation from over-correction for a universal item?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="np-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Building the sampling distribution at scale"
+        scenario={<>You must sample popularity-weighted negatives over 2,000,000 items every training step. A teammate proposes recomputing the full normalized distribution from scratch on every single draw. Pick the soundest implementation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`negative draws: millions per epoch
+proposal: renormalize p^0.75 over 2M items per draw
+need O(1) sampling from a fixed distribution`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Precompute the smoothed distribution once and use an alias table so each draw is constant time, not a full renormalize.", correct: true },
+          { key: "b", text: "Renormalize the full distribution on every draw, since recomputing from scratch each time guarantees the freshest weights." },
+          { key: "c", text: "Sample uniformly instead, since an O(1) uniform draw is the only way to sample fast enough at this scale." },
+          { key: "d", text: "Sort all items by popularity every draw, since a fresh sort is required before any weighted sample can be taken." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) renormalizing 2M items per draw is hopelessly slow for millions of draws. (c) reverting to uniform reintroduces the popularity bias you are fixing. (d) sorting per draw is also far too slow and unnecessary.</>}
+        lens={<>The smoothed popularity distribution is fixed for an epoch, so you precompute it once and draw from it in constant time using an alias method (or a cumulative-sum binary search), avoiding any per-draw renormalization. Recomputing the full normalized distribution on every one of millions of draws is hopelessly slow; reverting to uniform sampling reintroduces exactly the popularity bias you adopted this scheme to fix; and sorting per draw is both slow and unnecessary. Efficient weighted sampling from a precomputed table is the standard implementation, identical to how word2vec draws its negatives.</>}
+        stretch={<>How often should you refresh the distribution as item popularities drift during training?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="np-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Confusing popularity negatives with hard negatives"
+        scenario={<>A teammate claims popularity-based and hard-negative sampling are the same thing because both choose negatives non-uniformly. Pick the correct distinction.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`popularity negatives: chosen by item FREQUENCY (popularity)
+hard negatives: chosen by current MODEL SCORE (near boundary)
+different selection criteria -> different purpose`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Popularity negatives are chosen by frequency; hard negatives by the model's current high score, a different criterion.", correct: true },
+          { key: "b", text: "They are identical, since both pick negatives non-uniformly and therefore serve exactly the same training purpose." },
+          { key: "c", text: "Popularity negatives are chosen by model score, while hard negatives are chosen by item frequency, the reverse mapping." },
+          { key: "d", text: "Hard negatives are chosen uniformly, so they are just popularity negatives under a different name and exponent." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) non-uniform is not the same criterion; frequency and model score differ. (c) swaps the two definitions. (d) hard negatives are not uniform; they are the highest-scoring non-positives.</>}
+        lens={<>Popularity-based and hard-negative sampling both deviate from uniform but on different criteria and for different purposes. Popularity negatives are selected by item frequency to counter popularity bias, ensuring head items appear as negatives. Hard negatives are selected by the model's current high scores &mdash; items the model wrongly ranks near the top &mdash; to sharpen the decision boundary. They are not identical, the definitions are not reversed, and hard negatives are certainly not uniform. Treating them as the same conflates a bias correction with a gradient-sharpening technique, which leads to choosing the wrong tool for the problem at hand.</>}
+        stretch={<>When would you combine popularity and hard negatives in one sampler?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Word2vec#Negative_sampling" target="_blank" rel="noopener">
+            <strong>Negative sampling and the 0.75 smoothing</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(popularity-weighted negatives, uniform-vs-proportional tradeoff)</span>
+          <br/>Covers why the negative distribution shapes what the model suppresses, the word2vec 0.75 exponent, and
+          how popularity-weighted negatives counter the bias uniform sampling leaves in.
         </li>
       </ul>
     </VIS.Section>

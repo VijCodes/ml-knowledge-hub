@@ -2167,288 +2167,289 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: SIDE-FEATURE WARM START.
+// Delta: models that consume SIDE FEATURES (two-tower with metadata towers, factorization machines) can score a
+//   never-seen user or item from features ALONE, because the tower/FM maps features -> embedding rather than looking
+//   up a per-ID embedding row. This DISSOLVES cold start into ordinary generalization: a brand-new item with 0 plays
+//   still gets a sensible vector from [genre, cast, year] and enters retrieval immediately. Contrast with pure ID-based
+//   MF, where a new ID has an untrained row and no features to fall back on. Diagram shows the feature->embedding path
+//   SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="RecSys"
+      title="Side-Feature Warm Start"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Cold Start" },
+        { label: "Subtopic", value: "Models that consume side features (two-tower with metadata, factorization machines) score never-seen users or items from features alone, turning cold start into ordinary generalization" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Models that consume <VIS.Term def="Attributes describing a user or item beyond their ID and interaction history: genre, cast, release year, device, region. The model reads these as inputs.">side features</VIS.Term> can
+      score a never-seen user or item from features alone, because the model maps features to an embedding instead of
+      looking up a per-ID row.</strong>{" "}
+      In pure ID-based matrix factorization, an item is a row in an embedding table indexed by its ID, so a brand-new ID
+      has an untrained row and nothing to fall back on. But a two-tower model with a metadata tower, or a
+      <VIS.Term def="Factorization machine: models all pairwise feature interactions with shared latent vectors, so it can score a feature combination it has never seen by composing learned feature embeddings.">factorization machine</VIS.Term>, computes
+      the embedding as a function of features &mdash; genre, cast, release year, region &mdash; so a never-seen item
+      still gets a sensible vector from its features and enters retrieval immediately. This dissolves cold start into
+      ordinary generalization: scoring a new item is just the model generalizing from feature combinations it learned
+      during training. The failure modes: assuming any model handles cold start when a pure-ID model does not, relying
+      on features that are themselves missing for new items, and forgetting that feature generalization is only as good
+      as the feature coverage in training.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Feature path versus ID lookup">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A brand-new item with zero plays must be scored. The readout contrasts two model designs: one looks up an
+        embedding by item ID, the other computes the embedding from the item's features. Work out which design can score
+        the new item at all, and why.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`new item: 0 plays, features = [genre, cast-embed, year]
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+design A (pure ID-MF):
+   item_vector = EmbeddingTable[item_id]
+   new id -> untrained row -> no usable vector
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+design B (two-tower w/ metadata tower):
+   item_vector = ItemTower([genre, cast-embed, year])
+   new id -> features still present -> usable vector`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Derive why design A cannot place the new item while design B can, and what makes design B's vector meaningful
+        even though this exact item was never in training.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: cold start as generalization">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`training: the item tower learns to map
+   [genre, cast, year] -> a useful embedding
+   across thousands of items it DID see
+
+new item (never seen):
+   features [sci-fi, cast={A,B}, 2026]
+   tower applies the SAME learned mapping
+   -> a vector near other sci-fi titles with those traits
+
+result:
+   item enters retrieval immediately, no plays required
+   cold start has become a generalization query`}</pre>
+      <p>
+        The item tower is a function from features to embedding, fit on many items during training. A never-seen item
+        is simply a new input to that function: the tower applies the same learned mapping and produces a vector that
+        sits near items with similar features. There is no untrained ID row to wait on, so the item is retrievable
+        immediately. Cold start stops being a special case and becomes the model generalizing to a new feature
+        combination &mdash; exactly what it was trained to do.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — What side features buy you">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Design</th><th>Cold-start behavior</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Pure ID-based MF</td><td>New ID = untrained row; cannot score without interactions</td></tr>
+          <tr><td>Two-tower + metadata</td><td>New ID still has features; tower maps them to a usable vector</td></tr>
+          <tr><td>Factorization machine</td><td>Composes feature embeddings, scoring unseen feature combinations</td></tr>
+          <tr><td>Feature coverage</td><td>Generalization is only as good as the feature variety seen in training</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Map features to embeddings and cold start becomes generalization">
+        The key shift is from looking up an embedding by ID to computing it from features. A pure-ID model has no answer
+        for an ID it never trained on, but a model whose embedding is a function of features can score any user or item
+        whose features are known, including brand-new ones &mdash; the new entity is just a fresh input to a learned
+        function. This turns cold start into ordinary generalization, which is why side-feature models (two-tower with
+        metadata, factorization machines) are the structural cure rather than a bolt-on bootstrap. The catch is that the
+        cure only works as far as the features are informative and present.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>side-feature models compute embeddings from features rather
+        than ID lookups, so a never-seen user or item is scored by generalization, dissolving cold start.</strong>{" "}
+        Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="cfw-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — Why side features beat ID lookup at cold start"
+        scenario={<>A teammate says "all embedding models handle cold start the same, since they all produce a vector per item." Pick the statement that correctly distinguishes them.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`ID-MF:        vector = table[id]        (needs a trained row)
+feature model: vector = tower(features)  (needs only features)`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "A feature model computes the vector from features, so it scores a new entity that an ID-lookup model cannot.", correct: true },
+          { key: "b", text: "All embedding models behave identically, since each one ultimately produces a single vector per item or user." },
+          { key: "c", text: "ID-lookup models handle cold start better, since a dedicated per-ID row is more expressive than a feature mapping." },
+          { key: "d", text: "Feature models are worse at cold start, since computing from features adds noise that a clean ID row avoids." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
-      />
-
-      <VIS.TrapProblem
-        id="bart-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
-        options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
-        ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) producing a vector is not the same as being able to produce one for a new ID. (c) a per-ID row does not exist for a new ID, so it cannot help cold start. (d) the feature mapping is exactly what enables cold-start scoring.</>}
+        lens={<>The distinction is where the embedding comes from. An ID-lookup model reads a row from a table indexed by ID, so a new ID with no trained row cannot be scored. A feature model computes the embedding as a function of features, so a new entity with known features is just a new input and gets a usable vector immediately. Producing a vector per item is not the same capability as producing one for an unseen item; the per-ID row is precisely what is missing in cold start; and the feature mapping is the cure, not a source of noise.</>}
+        stretch={<>How do hybrid models keep an ID embedding AND a feature path together?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="cfw-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Choosing a model to avoid a forced-exposure scramble"
+        scenario={<>Your catalog adds thousands of items weekly, each needing immediate retrievability. A teammate wants to keep pure ID-MF and bolt on a forced-exposure job for every new item. Pick the soundest design.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`new items/week: thousands, must be retrievable day 0
+option A: pure ID-MF + forced-exposure job per item
+option B: two-tower item tower over metadata`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Use a metadata item tower so every new item is retrievable from features immediately, no per-item exposure scramble.", correct: true },
+          { key: "b", text: "Keep pure ID-MF and rely entirely on forced exposure, since exposure alone makes any new item retrievable at once." },
+          { key: "c", text: "Keep pure ID-MF and retrain the full model nightly, since nightly retraining gives each new ID a trained row by morning." },
+          { key: "d", text: "Drop new items into the catalog without retrieval, since items should only appear after they organically gain clicks." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) forced exposure makes items shown, not embedded; ID-MF still has no day-0 vector. (c) nightly retraining still has no interactions for the new IDs to fit a row from. (d) withholding retrieval starves new items entirely.</>}
+        lens={<>A metadata item tower computes each item's vector from its features, so thousands of new items become retrievable the instant they are added &mdash; cold start is dissolved structurally, with no per-item exposure machinery. Bolting forced exposure onto pure ID-MF only controls what is shown; the ID row is still untrained and the item has no day-0 vector. Nightly retraining cannot fit a row for an ID with no interactions, and withholding retrieval starves new items. When the catalog churns fast, a feature-based model is the right structural choice.</>}
+        stretch={<>What do you still gain from forced exposure even with a feature tower?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
-        difficulty="hard"
+        id="cfw-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — A new user with only signup attributes"
+        scenario={<>A brand-new user has only region and device known. A teammate says a side-feature model cannot personalize them because they have no interaction history. Pick the soundest assessment.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`new user: region, device known; 0 interactions
+user tower input: [region, device, ...]
+output: a user vector from features alone`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "The user tower maps the known attributes to a vector, so the new user gets a feature-based personalization at once.", correct: true },
+          { key: "b", text: "No personalization is possible, since a side-feature user tower still requires interaction history to output a vector." },
+          { key: "c", text: "Only items can be warm-started this way, since user towers cannot consume attributes the way item towers consume metadata." },
+          { key: "d", text: "The user must be assigned the global average vector, since attributes alone never differentiate one new user from another." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) a feature tower outputs a vector from features, not history. (c) user towers consume side features symmetrically to item towers. (d) attributes do differentiate users; that is the point of feature warm start.</>}
+        lens={<>A side-feature user tower maps known attributes &mdash; region, device, signup context &mdash; to a user vector with no interaction history required, so the new user gets a feature-based personalization immediately. The tower works on users exactly as it does on items: embedding is a function of features, not a lookup that needs history. Attributes do differentiate new users (two users with different regions get different vectors), so they are not all collapsed to a global average. Warm start applies symmetrically to both sides of the model.</>}
+        stretch={<>How does this feature-based user vector blend with behavior as the first clicks arrive?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="cfw-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — How an FM scores an unseen feature combination"
+        scenario={<>A teammate believes a factorization machine memorizes a weight for each exact user-item pair, so an unseen pair cannot be scored. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`FM score ~ sum over feature pairs of <v_i, v_j>
+each feature has a shared latent vector v
+unseen pair = new combination of seen features`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "An FM learns a latent vector per feature and composes them, so a new combination of seen features is still scorable.", correct: true },
+          { key: "b", text: "An FM stores one weight per exact pair, so any pair it never saw in training has no weight and cannot be scored." },
+          { key: "c", text: "An FM ignores feature interactions entirely, so it can only score items by their individual feature averages." },
+          { key: "d", text: "An FM requires every feature combination to appear in training, so unseen combinations always return a zero score." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) describes a pure memorization model, not an FM. (c) FMs are defined by their pairwise interactions. (d) the whole FM design generalizes to unseen combinations.</>}
+        lens={<>A factorization machine assigns a shared latent vector to each feature and scores a pair by the dot product of their vectors, summed over feature interactions. Because the vectors are per-feature, not per-pair, an unseen combination of features it has individually learned is still scorable &mdash; the model composes the learned feature embeddings. That is exactly what lets an FM generalize to new users and items: it never needed to see the specific pair, only the constituent features. A per-pair weight table would fail on unseen pairs, but that is not how an FM works, and FMs are defined precisely by modeling interactions.</>}
+        stretch={<>Why does this make FMs strong on sparse, high-cardinality categorical data?</>}
+      />
+
+      <VIS.TrapProblem
+        id="cfw-c2"
+        difficulty="medium"
+        axis="Mechanism"
+        title="C2 — Why this is generalization, not a separate cold-start module"
+        scenario={<>A teammate wants to add a dedicated cold-start subsystem on top of a feature-based model. Pick the correct explanation of why it is largely redundant.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`feature tower already maps features -> vector
+new entity = a new input to the SAME function
+no separate code path is invoked for it`}</pre>}
+        options={[
+          { key: "a", text: "A new entity is just a fresh input to the same learned function, so scoring it needs no separate cold-start path.", correct: true },
+          { key: "b", text: "A dedicated cold-start module is essential, since feature models invoke entirely different logic for unseen entities." },
+          { key: "c", text: "Cold start cannot be handled in-model, since any unseen entity must be routed to a separate popularity service." },
+          { key: "d", text: "The feature tower switches to a backup network for new entities, since the main network only accepts seen IDs." },
+        ]}
+        trap={<>(b) the model uses the same forward path for seen and unseen entities. (c) the feature model handles it directly, no separate service required. (d) there is no backup network; the same tower runs.</>}
+        lens={<>In a feature-based model the embedding is computed by a single learned function of features, and a never-seen entity is simply a new input to that same function &mdash; the identical forward pass runs whether the entity was in training or not. There is no separate code path, backup network, or external service triggered for unseen entities, which is exactly why cold start collapses into ordinary generalization. A dedicated cold-start module is largely redundant because the generalization is already happening inside the model; the remaining concern is feature quality, not a missing subsystem.</>}
+        stretch={<>What residual cold-start risk survives even in a fully feature-based model?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="cfw-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — A new item with a brand-new feature value"
+        scenario={<>A feature-based model warm-starts new items well. Then an item arrives whose genre value never appeared in training. A teammate expects warm start to work as usual. Predict the non-obvious consequence.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`usual new item: known feature values, new combination -> fine
+this item: a feature VALUE never seen in training (new genre)
+the model has no learned embedding for that value`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Warm start degrades, because the unseen feature value has no learned embedding, unlike a new mix of seen values.", correct: true },
+          { key: "b", text: "Warm start works identically, since a feature model handles any feature value whether or not it was seen in training." },
+          { key: "c", text: "Warm start improves, since a novel feature value gives the model strictly more information than a familiar one." },
+          { key: "d", text: "Warm start is unaffected, since feature values are interchangeable and the model treats every genre the same way." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) confuses an unseen VALUE with an unseen combination; the former has no learned embedding. (c) novelty is not extra information when the value is unlearned. (d) feature values are not interchangeable; each has its own embedding.</>}
+        lens={<>Warm start relies on the constituent feature values having learned embeddings; a new combination of seen values works because each value is known. But a feature value that never appeared in training has no learned embedding, so the model has nothing to compose and warm start degrades &mdash; the item falls back to whatever default the unknown-value handling provides. This is the subtle boundary of feature-based cold start: it dissolves the new-entity problem only when the entity's features are themselves in-vocabulary. A genuinely novel feature value reintroduces a cold-start-like gap at the feature level.</>}
+        stretch={<>How would hashing or a content-derived embedding cover an unseen categorical value?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="cfw-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Feature availability at serving time"
+        scenario={<>Your item tower depends on a cast-embedding feature, but for some brand-new items the cast metadata is not yet populated in the feature store. A teammate assumes the tower will handle it gracefully. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`item tower input: [genre, cast-embed, year]
+new item: cast-embed MISSING in feature store
+warm start depends on the features being present`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Ensure missing features have a defined fallback, since warm start fails when the very features it relies on are absent.", correct: true },
+          { key: "b", text: "Assume the tower handles it, since a feature-based model always produces a sensible vector regardless of missing inputs." },
+          { key: "c", text: "Skip the item until its features arrive, since serving any item with one missing feature is never acceptable." },
+          { key: "d", text: "Replace the missing feature with a random vector, since random noise lets the tower proceed without affecting output." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) missing features are exactly when warm start breaks; the tower cannot conjure absent inputs. (c) skipping starves the item just like cold start. (d) random noise produces a meaningless, possibly harmful vector.</>}
+        lens={<>Feature-based warm start works only if the features are actually present at serving time, so the operational requirement is a defined fallback for missing features &mdash; a default embedding, an imputed value, or a partial-feature path &mdash; rather than assuming the tower copes on its own. Missing the very inputs the tower depends on is precisely when warm start fails. Skipping the item reintroduces cold-start starvation, and a random fill produces a meaningless vector that can mis-place the item. The cure dissolves cold start only when feature coverage is engineered to be reliable.</>}
+        stretch={<>How would you monitor feature-store coverage for newly inserted items?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="cfw-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Over-trusting weak features"
+        scenario={<>A feature-based model warm-starts every new item, but its only features are release year and a coarse top-level category. New items get nearly identical vectors and recommendations feel generic. A teammate concludes warm start does not work. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`features: [year, top-level category] only
+many new items share the same year + category
+-> their feature vectors are nearly identical`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "The features are too coarse to distinguish items, so warm start works but produces near-duplicate generic vectors.", correct: true },
+          { key: "b", text: "Warm start is fundamentally broken, since feature-based models cannot place new items no matter what features exist." },
+          { key: "c", text: "The ID embedding table is corrupt, since identical vectors can only come from a damaged per-ID lookup table." },
+          { key: "d", text: "The catalog is too large, since generic vectors always appear once the number of items crosses a threshold." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) warm start is functioning; the limitation is feature quality. (c) a feature model is not using an ID table for these new items. (d) catalog size does not cause generic vectors; weak features do.</>}
+        lens={<>Warm start is working exactly as designed &mdash; it maps features to vectors &mdash; but the features are too coarse to separate items, so many new items with the same year and broad category collapse to nearly identical vectors and indistinguishable recommendations. The fix is richer features (cast, synopsis embeddings, fine-grained tags), not abandoning warm start. The model is not using a corrupt ID table for these items, and catalog size is irrelevant. This is the central caveat of feature warm start: it dissolves cold start only as far as the features are discriminative, so feature quality, not the mechanism, is the lever.</>}
+        stretch={<>What feature would most cheaply restore discrimination among these items?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Factorization_machine" target="_blank" rel="noopener">
+            <strong>Factorization machines and feature-based warm start</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(per-feature latent vectors, generalizing to unseen entities)</span>
+          <br/>Covers how composing per-feature embeddings lets a model score never-seen users and items, turning cold
+          start into a generalization problem bounded by feature coverage.
         </li>
       </ul>
     </VIS.Section>

@@ -2167,288 +2167,285 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: HARD NEGATIVE MINING.
+// Delta: mine negatives the CURRENT MODEL scores HIGH (near the decision boundary) - e.g. retrieve top-K by the model
+//   and label the non-clicked ones as negatives. These yield LARGE, INFORMATIVE gradients because the model is most
+//   wrong about them, so they sharpen the TOP of the ranking far faster than easy random negatives. The danger: a
+//   high-scoring non-clicked item may be a FALSE NEGATIVE (a true positive the user simply has not seen yet), so too
+//   aggressive mining trains the model against actual positives. Contrast: random/popularity negatives are easy and
+//   stabilizing; hard negatives are sharp but risky. Diagram shows the mined-candidates SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="RecSys"
+      title="Hard Negative Mining"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Negative Sampling" },
+        { label: "Subtopic", value: "Mine negatives the model currently scores high (near the boundary); they yield large, informative gradients and sharpen the top of the ranking, but risk false negatives" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Hard negative mining selects negatives that the <em>current model</em> scores highly &mdash; items near
+      the decision boundary &mdash; for example by retrieving the model's top-K and labeling the non-clicked ones as
+      negatives.</strong>{" "}
+      These are the items the model is most wrong about, so they produce <VIS.Term def="The size of the parameter update an example induces; examples the model already classifies correctly produce tiny gradients, while examples it gets badly wrong produce large ones.">large, informative gradients</VIS.Term> and
+      sharpen the <em>top</em> of the ranking far faster than easy random negatives, which the model already scores
+      correctly and learns little from. The danger is the <VIS.Term def="An item labeled as a negative that is actually a true positive the user simply has not encountered yet; training against it teaches the model to suppress something the user would have liked.">false negative</VIS.Term>:
+      a high-scoring non-clicked item may be a genuine positive the user has not seen yet, so mining too aggressively
+      trains the model against real positives and degrades quality. Random and popularity negatives are easy and
+      stabilizing; hard negatives are sharp but risky, so they are usually mixed in moderation. The failure modes:
+      mining so aggressively that false negatives dominate, treating every non-click as a true negative, and using only
+      hard negatives so training becomes unstable.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Easy versus hard negatives">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        You train a retrieval model with sampled negatives. The readout contrasts a random negative with a hard negative
+        mined from the model's own top results. Work out which one teaches the model more per example, and why the same
+        property that makes it informative also makes it risky.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`positive: an item the user clicked
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+random negative R: model already scores it LOW
+   -> model is already right -> tiny gradient
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+hard negative H: model scores it HIGH (top-K), user did not click
+   -> model is wrong here -> large gradient
+   -> but: did the user dislike H, or just not see it yet?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Derive why the hard negative produces a larger gradient than the random one, and why a high model score for a
+        non-clicked item is exactly the situation where a false negative is most likely.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: sharp gradient, real risk">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`mine negatives: retrieve top-100 by the current model
+   keep the non-clicked ones as hard negatives
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+effect on ranking:
+   random negatives -> recall@10 ~ 0.31 (slow learning at the top)
+   add hard negatives -> recall@10 ~ 0.40 (top sharpened)
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+the catch:
+   a top-100 non-clicked item is often something the user
+   would like but has not been shown -> a FALSE negative
+   too aggressive -> model pushes down true positives`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Mining the model's own top results and treating the non-clicked ones as negatives directly attacks the items the
+        model confuses for positives, which is why it lifts top-of-ranking recall. But that same set is where false
+        negatives concentrate: a high-scoring item the user did not click may simply be unseen, not disliked. Mining in
+        moderation captures the gradient benefit; mining too hard trains the model against items it should be promoting.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What hard negatives buy you and cost you">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Property</th><th>Consequence</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Near-boundary selection</td><td>Targets items the model is most wrong about, sharpening the top</td></tr>
+          <tr><td>Large gradients</td><td>Each hard negative teaches more than an easy random one</td></tr>
+          <tr><td>False-negative risk</td><td>High-scoring non-clicks may be unseen true positives</td></tr>
+          <tr><td>Mix in moderation</td><td>Blend with random/popularity negatives for stability</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Informative because the model is wrong; risky for the same reason">
+        Hard negatives are valuable precisely because the model scores them highly and is therefore wrong about them,
+        producing the large gradients that sharpen the top of the ranking where it matters most. But the very items the
+        model ranks highly and the user did not click are also the most likely to be false negatives &mdash; positives
+        the user simply has not seen. So the strength and the danger share a root cause, which is why hard negatives are
+        mined in moderation and blended with easy negatives rather than used alone. Random and popularity negatives
+        stabilize; hard negatives sharpen.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>hard negatives are items the current model scores high, which
+        gives large gradients that sharpen the top but risks false negatives from unseen true positives.</strong>{" "}
+        Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="nh-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What makes a negative hard"
+        scenario={<>A teammate says "hard negatives are just the most popular items, since those are hardest to rank." Pick the statement that correctly defines a hard negative.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`hard negative = scored HIGH by the CURRENT model, not clicked
+selection criterion = model score, not raw popularity`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "A negative the current model scores highly but the user did not engage, so it sits near the decision boundary.", correct: true },
+          { key: "b", text: "The most popular items in the catalog, since popularity alone is what determines how hard an item is to rank." },
+          { key: "c", text: "A negative drawn uniformly at random, since random draws are by definition the hardest examples to classify." },
+          { key: "d", text: "Any item the user explicitly rated as disliked, since only an explicit dislike makes a negative genuinely hard." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
-      />
-
-      <VIS.TrapProblem
-        id="bart-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
-        options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
-        ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) hardness is by model score, not raw popularity (though popular items can score high). (c) random negatives are usually easy, not hard. (d) hard negatives come from model confusion, not explicit dislikes.</>}
+        lens={<>A hard negative is an item the current model scores highly &mdash; ranks near the top &mdash; yet the user did not engage, so it sits near the decision boundary where the model is most wrong. The selection criterion is the model's own score, not raw popularity (a popular item only qualifies if the model scores it high), not a uniform random draw (those are typically easy), and not an explicit dislike (hard negatives arise from model confusion on implicit data). This score-based definition is what makes hard negatives informative and is the key distinction from popularity or random negatives.</>}
+        stretch={<>Why does the hardness of a negative change as the model trains?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="nh-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Top of the ranking is weak"
+        scenario={<>Your model has good recall deep in the list but the top-10 is mediocre, and it was trained only on random negatives. A teammate wants to simply train for more epochs. Pick the soundest change.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`trained on random negatives only
+random negatives: model already scores them low -> tiny gradients
+symptom: weak top-10, decent deep recall`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Add hard negatives mined from the model's top results, since their large gradients sharpen the top of the ranking.", correct: true },
+          { key: "b", text: "Train for more epochs on random negatives, since more passes over easy negatives eventually sharpens the top-10." },
+          { key: "c", text: "Remove negatives entirely and train on positives only, since positive-only training focuses the model on the top." },
+          { key: "d", text: "Switch to a larger embedding dimension, since more capacity alone fixes a weak top-of-ranking without new negatives." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) random negatives give tiny gradients; more epochs on easy examples barely sharpens the boundary. (c) positive-only training has no contrast and collapses. (d) capacity does not supply the boundary signal that hard negatives do.</>}
+        lens={<>A weak top with strong deep recall is the signature of easy-only negatives: the model already scores random negatives low, so they produce tiny gradients and never teach it to separate the genuinely confusable items near the top. Adding hard negatives mined from the model's own top results supplies large, boundary-sharpening gradients exactly where the ranking is weak. More epochs on easy negatives barely helps because the gradients are already near zero; positive-only training has no contrastive signal and collapses; and extra capacity does not provide the discriminative signal that hard negatives do. The fix is the negative set, not the schedule or the size.</>}
+        stretch={<>How would you schedule when to start mining hard negatives during training?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
-        difficulty="hard"
+        id="nh-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — How aggressively to mine"
+        scenario={<>A teammate proposes training exclusively on the hardest mined negatives to maximize gradient signal. Your data is implicit (clicks only). Pick the soundest policy.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`implicit data: non-click != confirmed dislike
+hardest negatives = highest model score, not clicked
+these are the most likely false negatives`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Blend a moderate share of hard negatives with easy ones, since the hardest non-clicks are the most likely false negatives.", correct: true },
+          { key: "b", text: "Train exclusively on the hardest negatives, since maximizing gradient signal always maximizes final ranking quality." },
+          { key: "c", text: "Train exclusively on the easiest negatives, since easy negatives carry the most reliable signal for implicit data." },
+          { key: "d", text: "Treat every non-clicked item as an equally hard negative, since on implicit data all non-clicks are confirmed dislikes." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) the hardest non-clicks are exactly where false negatives concentrate, so pure-hard training poisons the model. (c) easy-only negatives reintroduce the weak-top problem. (d) on implicit data a non-click is not a confirmed dislike.</>}
+        lens={<>On implicit data a non-click is not a confirmed dislike, and the highest-scoring non-clicked items &mdash; the hardest negatives &mdash; are precisely where false negatives concentrate, so training exclusively on them teaches the model to suppress items the user would actually like. The sound policy blends a moderate share of hard negatives (for the sharpening gradients) with easy random or popularity negatives (for stability), capturing the benefit without letting false negatives dominate. Easy-only training brings back the weak top, and treating every non-click as a confirmed dislike is the false-negative fallacy. Moderation is the operative principle.</>}
+        stretch={<>What signal could help distinguish a true hard negative from a false one?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="nh-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why hard negatives give larger gradients"
+        scenario={<>A teammate cannot see why a hard negative trains the model more than a random one, assuming all negatives contribute equally. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss gradient is large when the model is confidently WRONG
+random negative: scored low -> already correct -> small gradient
+hard negative: scored high -> wrong -> large gradient`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "A hard negative is scored high and thus wrong, producing a large gradient, while an easy one yields almost none.", correct: true },
+          { key: "b", text: "All negatives contribute equally, since the gradient from a negative does not depend on the model's current score." },
+          { key: "c", text: "Random negatives give the larger gradient, since the model is least certain about items it has scored low." },
+          { key: "d", text: "Hard negatives give a zero gradient, since an item the model already ranks high needs no further correction." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the gradient depends strongly on the model's current prediction. (c) inverts it; the model is most wrong about high-scored non-clicks, not low-scored ones. (d) a high-scored negative is wrong, so it has a large gradient, not zero.</>}
+        lens={<>The gradient of a ranking or classification loss is large exactly when the model is confidently wrong, and a hard negative is an item the model scored high but the user did not engage &mdash; a confident error &mdash; so it produces a large corrective gradient. A random negative the model already scores low is essentially correct, so its gradient is near zero and it teaches little. The gradient does depend on the current score (so negatives are not equal), the model is most wrong about high-scored non-clicks not low-scored ones, and a high-scored negative needs a big correction rather than none. This gradient asymmetry is the entire mechanism behind hard negative mining.</>}
+        stretch={<>How does this relate to the idea behind focal loss reweighting easy examples?</>}
+      />
+
+      <VIS.TrapProblem
+        id="nh-c2"
+        difficulty="medium"
+        axis="Mechanism"
+        title="C2 — Why false negatives concentrate among hard ones"
+        scenario={<>A teammate is surprised that false negatives are most common precisely in the mined hard-negative set. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`hard negative = model scores it HIGH, user did not click
+model scores it high because it RESEMBLES the user's positives
+resembling positives = likely a true positive the user hasn't seen`}</pre>}
+        options={[
+          { key: "a", text: "The model scores them high because they resemble true positives, so an unseen one is itself likely a true positive.", correct: true },
+          { key: "b", text: "False negatives are random, so they are equally likely among easy negatives as among the mined hard ones." },
+          { key: "c", text: "Easy negatives hold the most false negatives, since low-scored items are the ones the user is most likely to want." },
+          { key: "d", text: "Hard negatives can never be false negatives, since a high model score guarantees the user has already seen the item." },
+        ]}
+        trap={<>(b) false negatives are not uniform; they cluster where items resemble positives. (c) inverts it; low-scored items are unlike the user's positives, so less likely to be false negatives. (d) a high score says nothing about whether the user saw the item.</>}
+        lens={<>A hard negative is scored high because the model finds it similar to the user's true positives, and an item that closely resembles what a user likes &mdash; but which they have not clicked &mdash; is disproportionately likely to be a positive they simply have not seen yet. So false negatives concentrate exactly in the hard-negative set. They are not uniformly distributed, easy low-scored negatives are unlike the user's tastes and thus less likely to be false positives in disguise, and a high model score implies similarity, not that the item was seen. This shared root &mdash; resemblance to positives &mdash; is why hard mining is both powerful and dangerous.</>}
+        stretch={<>How would exposure logs let you screen out likely false negatives before mining?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="nh-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Mining harder as the model improves"
+        scenario={<>As the model trains and improves, a teammate keeps mining the top-K non-clicked items as hard negatives without changing K. They expect the false-negative rate among mined negatives to stay constant. Predict the non-obvious consequence.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`early model: top-K mixes some genuinely bad items in
+improved model: top-K is now almost all plausible positives
+mining criterion (top-K non-clicked) unchanged`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "The false-negative rate rises, since an improved model's top-K is increasingly filled with genuine likely positives.", correct: true },
+          { key: "b", text: "The false-negative rate stays constant, since mining the same top-K always yields the same mix of true and false negatives." },
+          { key: "c", text: "The false-negative rate falls, since a better model places fewer true positives in its own top-K results." },
+          { key: "d", text: "The false-negative rate is irrelevant, since an improving model makes every mined negative a confirmed true negative." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) the composition of top-K shifts as the model improves; it does not stay fixed. (c) inverts it; a better model puts MORE plausible positives in top-K. (d) improvement does not confirm any non-click as a true dislike.</>}
+        lens={<>As the model improves, its top-K becomes populated with increasingly plausible items, so a larger fraction of the non-clicked items there are actually positives the user has not seen &mdash; the false-negative rate among mined hard negatives rises over training, even with K fixed. The composition of the top-K is not static (so the rate does not stay constant), a better model places more true positives near the top, not fewer, and improvement never converts a non-click into a confirmed dislike. This is why aggressive hard mining grows riskier exactly as the model gets good, motivating schedules that ease off or filter mined negatives over time.</>}
+        stretch={<>How would you adapt the mining depth K as the model's precision climbs?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="nh-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Refreshing mined negatives"
+        scenario={<>You mined a fixed set of hard negatives once at the start of training and reuse it every epoch. A teammate says this is fine because hard negatives are hard. Pick the soundest practice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`hard = scored high by the CURRENT model
+model changes every epoch -> what is hard changes too
+fixed initial set goes stale as the model learns`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Periodically re-mine against the current model, since which items are hard shifts as the model's scores evolve.", correct: true },
+          { key: "b", text: "Reuse the initial mined set every epoch, since an item that was hard once remains hard for the entire training run." },
+          { key: "c", text: "Mine once and never again, since re-mining wastes compute and the hardest items are fixed for any given dataset." },
+          { key: "d", text: "Discard mining and use only random negatives after the first epoch, since hard negatives are useful only at the very start." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) hardness is defined relative to the current model, which changes; the set goes stale. (c) the hardest items are model-dependent, not dataset-fixed. (d) hard negatives remain useful throughout, especially as the boundary refines.</>}
+        lens={<>Hardness is defined relative to the current model's scores, and those scores change every epoch as the model learns, so a set mined once goes stale &mdash; items that were hard early become easy, and newly confusable items are missed. The standard practice is to periodically re-mine against the up-to-date model so the negatives keep targeting the current decision boundary. The hardest items are model-dependent rather than fixed by the dataset, and hard negatives stay valuable throughout training, not only at the start. Re-mining is the operational counterpart to the fact that the boundary keeps moving.</>}
+        stretch={<>What cadence of re-mining trades compute cost against staleness?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="nh-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Recall collapses after aggressive mining"
+        scenario={<>After switching to aggressive hard-negative-only training, top-line recall first rose then collapsed, and the model now suppresses items users clearly want. A teammate blames the learning rate. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`aggressive hard-only mining on implicit data
+top-K non-clicks treated as hard negatives
+many of those were true positives -> trained against them`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "False negatives dominated the mined set, so the model was trained to push down items that were actually positives.", correct: true },
+          { key: "b", text: "The learning rate is too high, since only an oversized step size can make recall collapse after it initially rose." },
+          { key: "c", text: "The embedding dimension is too small, since limited capacity is the sole cause of any late collapse in recall." },
+          { key: "d", text: "The positives were mislabeled, since a correctly labeled positive set makes aggressive hard mining completely safe." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) the learning rate does not explain why the model suppresses wanted items; the negatives do. (c) capacity does not cause the model to train against true positives. (d) the positives may be fine; the problem is false negatives in the MINED set.</>}
+        lens={<>Aggressive hard-only mining on implicit data fills the negative set with the model's highest-scoring non-clicks, which are disproportionately false negatives &mdash; true positives the user had not seen &mdash; so the model is literally trained to push down items users want, and recall collapses after an initial gain. The learning rate and embedding dimension do not explain the model actively suppressing desirable items, and the positives can be perfectly labeled while the mined negatives are poisoned. The cure is to mine in moderation, blend in easy negatives, and screen mined negatives against exposure logs so confirmed-unseen positives are not used as negatives.</>}
+        stretch={<>How would mixing in popularity negatives have softened this collapse?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Learning_to_rank" target="_blank" rel="noopener">
+            <strong>Hard negative mining in learning-to-rank and retrieval</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(boundary negatives, gradient informativeness, false-negative risk)</span>
+          <br/>Covers why model-scored hard negatives sharpen the top of the ranking, why they carry false-negative
+          risk on implicit data, and why they are blended with easy negatives in practice.
         </li>
       </ul>
     </VIS.Section>

@@ -2167,288 +2167,280 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: SELF-ATTENTION vs CONVOLUTION -- global, input-dependent mixing vs local, fixed-weight mixing.
+// Delta: a conv mixes a FIXED local window with SHARED, INPUT-INDEPENDENT weights (the filter is the same regardless of
+//   what the input is); self-attention mixes ALL positions with INPUT-DEPENDENT weights (the attention weights are computed
+//   from the data), giving a FULL receptive field in ONE layer -- but at O(n^2) cost. So attention's edge is long-range
+//   dependencies reached in one layer; conv's edge is cheap, local, strong inductive bias. Confusions: thinking conv weights
+//   adapt to input, thinking attention is cheap, thinking a single conv layer is global, thinking attention has no locality
+//   bias issue. Diagram shows the two mixing SETUPS only; it never prints the "~100 convs vs 1 attention" conclusion.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="DL"
+      title="Attention vs Conv: Global vs Local"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Transformers" },
+        { label: "Subtopic", value: "A conv mixes a fixed local window with shared input-independent weights; self-attention mixes all positions with input-dependent weights, giving a full receptive field in one layer at O(n-squared) cost -- its core advantage on long-range dependencies" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>A convolution mixes a <VIS.Term def="The conv filter touches only a small neighborhood (e.g. 3 positions) around each location, so one layer sees only nearby tokens.">fixed local window</VIS.Term> using <VIS.Term def="The same filter weights are used at every position and do not depend on the input values; the filter is learned once and applied everywhere unchanged.">shared, input-independent weights</VIS.Term>;
+      self-attention mixes <em>all</em> positions using <VIS.Term def="The attention weights are computed from the data (query-key similarity) at run time, so how strongly two tokens interact depends on their content, not just their distance.">input-dependent weights</VIS.Term>,
+      giving a full receptive field in a single layer.</strong>{" "}
+      That global reach is attention's core advantage: a dependency between tokens far apart is captured in one attention
+      layer, whereas a conv must stack many layers for its receptive field to grow that wide. The price is{" "}
+      <VIS.Term def="Self-attention compares every pair of positions, so compute and memory scale with the square of the sequence length, unlike a conv's linear cost.">O(n squared) cost</VIS.Term>.
+      Conv's edge is the opposite: cheap, local, and a strong locality inductive bias. The failure modes: thinking conv
+      weights adapt to the input (they do not), thinking attention is cheap, thinking one conv layer is already global, and
+      forgetting that attention's lack of built-in locality is what makes it data-hungry.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 -- Reaching a long-range dependency">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate must model a dependency between tokens 200 positions apart and proposes a stack of 3x3 convolutions,
+        reasoning "convs are efficient, so just add a few layers." Before reading on, work out how many conv layers it takes
+        for the receptive field to span 200 positions, and how attention compares.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`conv (3x3): each layer extends the receptive field by ~2 positions
+self-attention: each token attends to every position in one layer
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+target: connect two tokens 200 positions apart
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+conv layers needed?   attention layers needed?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Consider how a conv's receptive field grows with depth versus attention's one-layer full reach. Derive the contrast
+        in layers required, and the cost each pays for that reach.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 -- Worked example: receptive field and weight source">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`conv 3x3 receptive field growth: +2 positions per layer
+  to span 200 positions: ~100 stacked layers
+  weights: the SAME filter at every position, fixed regardless of input
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+self-attention:
+  one layer: every token attends to all n positions (full receptive field)
+  weights: computed from query-key similarity -> depend on the input
+  cost: an n x n score matrix -> O(n^2)
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+which reaches token-200 in one layer?  which uses data-dependent weights?`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        A 3x3 conv grows its receptive field by about 2 positions per layer, so spanning 200 positions needs on the order of
+        100 stacked layers, all using the same fixed filter everywhere. Self-attention reaches every position in one layer
+        with weights computed from the data, so how strongly two tokens interact depends on their content. The trade is that
+        attention's all-pairs comparison costs O(n squared). (Why this also makes attention more data-hungry is unpacked in
+        the drill lenses.)
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 -- Conv vs attention, side by side">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>Conv vs self-attention</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Mixing scope</td><td>Conv: fixed local window. Attention: all positions</td></tr>
+          <tr><td>Weight source</td><td>Conv: shared, input-independent. Attention: input-dependent</td></tr>
+          <tr><td>Receptive field</td><td>Conv: grows with depth. Attention: full in one layer</td></tr>
+          <tr><td>Cost / bias</td><td>Conv: linear, strong locality bias. Attention: O(n squared), weak bias</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Fixed-local-shared vs global-data-dependent">
+        The two primitives differ on two axes at once. Scope: a conv touches a small fixed window while attention touches
+        every position. Weights: a conv reuses one input-independent filter while attention computes weights from the data.
+        Together these give attention a full receptive field in one layer &mdash; its long-range advantage &mdash; at
+        O(n squared) cost, while conv stays cheap and local with a strong locality prior that attention lacks.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill -- trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>conv mixes a fixed local window with shared input-independent
+        weights; attention mixes all positions with input-dependent weights, giving a full receptive field in one layer at
+        O(n squared) cost.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="avc-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 -- How the mixing weights are set"
+        scenario={<>A teammate says "both conv and attention learn fixed weights during training and then apply those same weights to every input." Pick the statement that correctly contrasts the two.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`conv: weights = the learned filter
+attention: weights = softmax(query . key)
+which set of weights depends on the input at run time?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "Conv weights are fixed and input-independent; attention weights are computed from the data at run time.", correct: true },
+          { key: "b", text: "Both use fixed weights at run time; attention merely learns more of them than a small conv filter does.", correct: false },
+          { key: "c", text: "Conv weights adapt to each input while attention weights are fixed after training, the reverse of the usual claim.", correct: false },
+          { key: "d", text: "Both compute their weights from the input at run time; the only difference is conv's smaller window size.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) attention weights are not fixed; they are recomputed per input. (c) reverses reality; conv is the fixed one. (d) conv weights are not computed from the input; the filter is fixed.</>}
+        lens={<>A conv applies the same learned filter to every input, so its weights are fixed and input-independent. Self-attention computes its weights from query-key similarity at run time, so how strongly two tokens interact depends on their content. This data-dependence is a qualitative difference, not just a matter of how many weights are learned, and it is the reason attention can route information dynamically while a conv always mixes the same fixed neighborhood the same way.</>}
+        stretch={<>If attention weights depend on content, can two tokens at the same distance interact differently? Why does that matter?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="avc-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 -- Reach of a single layer"
+        scenario={<>A teammate claims "a single 3x3 conv layer already lets every token influence every other token in the sequence." Pick the statement that correctly describes one layer's reach.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`one conv 3x3 layer: each output mixes ~3 neighbors
+one self-attention layer: each output mixes all n positions
+which is global in a single layer?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "One conv layer mixes only a local window, while one attention layer mixes all positions globally.", correct: true },
+          { key: "b", text: "One conv layer is already global, since the shared filter is conceptually applied across the whole input.", correct: false },
+          { key: "c", text: "One attention layer is local like a conv, since attention also only meaningfully weights nearby tokens.", correct: false },
+          { key: "d", text: "Both are global in one layer, since each output position ultimately sees the entire sequence either way.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) sharing a filter across positions is not the same as each output seeing all positions; one conv output sees only its window. (c) attention has no built-in locality; one layer attends to all positions. (d) only attention is global in one layer.</>}
+        lens={<>A single conv layer mixes only the small window the filter covers, so distant tokens cannot influence each other until many layers stack the receptive field wide. A single self-attention layer mixes all positions at once, giving a full receptive field immediately. Sharing the conv filter across positions does not make any one output global; it is still local. That one-layer global reach is precisely attention's structural advantage for long-range dependencies.</>}
+        stretch={<>How many 3x3 conv layers would it take to match the reach one attention layer gives over a 200-token span?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="avc-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 -- Picking the primitive for long range"
+        scenario={<>A task hinges on relating tokens hundreds of positions apart, and compute is not the binding constraint. A teammate insists on a deep stack of small convs out of habit. Pick the soundest primitive.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`requirement: relate tokens ~300 positions apart
+constraint: compute is not the bottleneck here
+options: deep conv stack vs self-attention`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Use self-attention, since one layer gives the full-range reach the dependency needs without a deep stack.", correct: true },
+          { key: "b", text: "Use a deep stack of small convs, since convs always generalize better than attention regardless of range.", correct: false },
+          { key: "c", text: "Use a single small conv layer, since its shared filter already connects tokens at any distance in one pass.", correct: false },
+          { key: "d", text: "Use a single small conv with a larger learning rate, since faster training compensates for the limited reach.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) convs are not universally better; for long range they need impractical depth. (c) one small conv is local, not global. (d) learning rate does not extend a conv's receptive field.</>}
+        lens={<>When the dependency spans hundreds of positions and compute is not the limit, self-attention is the natural choice: a single layer reaches the full range with data-dependent weights, whereas matching that reach with 3x3 convs would need roughly a hundred stacked layers. A single conv is local regardless of training tricks, and convs are not universally better &mdash; their strength is cheap local processing, not long-range reach. The reach requirement is what selects attention here.</>}
+        stretch={<>If compute were the binding constraint at very long n, which efficient-attention variant might you reach for instead?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="avc-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 -- Small-data image task"
+        scenario={<>On a small image dataset, a from-scratch pure-attention model badly underfits-then-overfits while a comparable CNN trains well. A teammate concludes attention is simply a worse architecture. Pick the soundest diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`small image dataset, trained from scratch
+pure attention: poor generalization
+CNN: trains well
+which architectural property explains the gap?`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Conv's locality bias helps on small data; attention lacks it and needs more data or pretraining to match.", correct: true },
+          { key: "b", text: "Attention is fundamentally worse, since its global mixing cannot capture image structure the way convs can.", correct: false },
+          { key: "c", text: "The CNN simply has more parameters, so the gap closes once the attention model is made equally large.", correct: false },
+          { key: "d", text: "The attention model's learning rate is wrong, since architecture never affects data efficiency at this scale.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) attention can match or beat convs with enough data; it is not fundamentally worse. (c) the gap is about inductive bias, not raw parameter count. (d) architecture clearly affects data efficiency; that is the whole point.</>}
+        lens={<>A conv bakes in a locality inductive bias &mdash; nearby pixels matter and weights are shared &mdash; which is a strong, correct prior on small image datasets. Pure attention has no such built-in locality; it must learn spatial structure from data, so it is data-hungry and underperforms when trained from scratch on little data. With large datasets or pretraining (as in ViT), attention matches or exceeds convs. The gap is about inductive bias and data scale, not a fixed quality ranking.</>}
+        stretch={<>How do hybrid designs or pretraining give attention models the locality prior they otherwise lack?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="avc-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 -- Why one attention layer is global"
+        scenario={<>A teammate cannot see why a single self-attention layer reaches every position when a single conv layer does not. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`attention output_i = sum_j softmax(q_i . k_j) * v_j
+the sum runs over ALL j
+conv output_i = sum over a fixed small window of j`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Attention sums over all positions j, so every token can contribute to each output in a single layer.", correct: true },
+          { key: "b", text: "Attention slides a wider filter than a conv, so its larger fixed window happens to cover the whole sequence.", correct: false },
+          { key: "c", text: "Attention recurs over positions internally, so information propagates end to end within one layer's pass.", correct: false },
+          { key: "d", text: "Attention downsamples the sequence to a single vector first, which is why one layer touches everything at once.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) attention is not a wide fixed filter; it sums over all positions with data-dependent weights. (c) attention is not recurrent; the global reach is from the all-positions sum. (d) attention does not collapse the sequence to one vector.</>}
+        lens={<>Each attention output is a weighted sum over every position j, with the weights coming from query-key similarity, so any token can contribute to any output within one layer &mdash; that is what makes it global. A conv sums only over a fixed small window, so a single layer is local. Attention is neither a wide fixed filter nor recurrent nor a pooling-to-one-vector operation; the global reach is a direct consequence of the sum ranging over all positions.</>}
+        stretch={<>Since the sum is over all positions, how does the number of terms relate to attention's quadratic cost?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="avc-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 -- Same distance, different interaction"
+        scenario={<>Two token pairs sit the same distance apart, but in one pair the tokens are semantically related and in the other they are unrelated. A teammate expects a conv and attention to treat both pairs identically since the distance is equal. Predict the non-obvious difference.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pair P: related tokens, distance d apart
+pair Q: unrelated tokens, same distance d apart
+conv weight depends on offset; attention weight depends on content`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "The conv treats both pairs the same (offset-based), but attention can weight the related pair more strongly.", correct: true },
+          { key: "b", text: "Both treat the two pairs identically, since the equal distance fully determines how strongly tokens interact.", correct: false },
+          { key: "c", text: "The conv weights the related pair more strongly, since its filter learns to emphasize semantically linked tokens.", correct: false },
+          { key: "d", text: "Attention treats both pairs the same, since its weights depend only on position once training has finished.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) distance determines the conv weight but not the attention weight. (c) a conv weight depends on offset, not on token content. (d) attention weights are content-dependent, not position-only after training.</>}
+        lens={<>A conv's weight depends only on the relative offset, so two pairs at the same distance get the same treatment regardless of content. Attention's weight comes from query-key similarity, so it can attend strongly between the semantically related pair and weakly between the unrelated pair even though their distance is identical. This content-dependent routing &mdash; treating equal-distance pairs differently based on what they are &mdash; is exactly the flexibility a fixed conv filter cannot provide.</>}
+        stretch={<>What is the cost of giving every pair its own data-dependent weight, compared to a conv's offset-indexed weight?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="avc-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 -- Matching primitive to constraint"
+        scenario={<>You are choosing a sequence-mixing primitive for a streaming task with very long inputs where per-step compute is tightly budgeted and dependencies are mostly local. Pick the soundest choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`inputs: very long sequences
+constraint: tight per-step compute budget
+dependencies: mostly local`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Use convolution, since its linear cost and local bias fit a tight budget and mostly-local dependencies.", correct: true },
+          { key: "b", text: "Use full self-attention, since global mixing is always preferable regardless of cost or dependency range.", correct: false },
+          { key: "c", text: "Use full self-attention, since its quadratic cost is negligible once the sequence is long enough to matter.", correct: false },
+          { key: "d", text: "Use full self-attention with no positional information, since locality emerges on its own from the data.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) global mixing is not always preferable when dependencies are local and compute is tight. (c) quadratic cost grows worse, not negligible, as sequences lengthen. (d) attention does not get locality for free; that is its weakness here.</>}
+        lens={<>With very long inputs, a tight compute budget, and mostly-local dependencies, convolution is the better fit: its cost is linear in length and its locality bias matches the dependency structure, so it spends compute exactly where the signal is. Full self-attention's O(n squared) cost grows worse with length, and its lack of locality bias is a liability rather than an asset here. Matching the primitive to the constraint and dependency range, not defaulting to attention, is the senior move.</>}
+        stretch={<>If a few long-range dependencies did exist, how might you combine conv with sparse or windowed attention to get both?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="avc-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 -- The exploding conv stack"
+        scenario={<>To capture very long-range dependencies, a team keeps adding conv layers until the network is hundreds deep, then hits training instability and huge compute. They blame the optimizer. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`goal: very long-range dependencies
+approach: stack conv layers until receptive field is wide enough
+result: hundreds of layers, instability, heavy compute`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Reaching long range via conv depth is the wrong tool; one attention layer gives that reach directly.", correct: true },
+          { key: "b", text: "The optimizer is at fault, so switching optimizers will let the hundreds-deep conv stack train cleanly.", correct: false },
+          { key: "c", text: "The filters are too small, so widening every conv to span the full sequence keeps the stack shallow and stable.", correct: false },
+          { key: "d", text: "The data is insufficient, so collecting more examples will stabilize the very deep conv stack as designed.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) the optimizer is not the root cause; the architecture forces impractical depth. (c) a full-width conv is effectively a dense layer per position, losing conv's efficiency and locality. (d) more data does not fix the structural depth explosion.</>}
+        lens={<>Using conv depth to reach long range forces a receptive field that grows only about 2 positions per 3x3 layer, so spanning hundreds of positions needs hundreds of layers &mdash; the source of the instability and compute blow-up. Self-attention gives that full reach in a single layer, which is the right tool for long-range structure. Widening filters to full-sequence size discards conv's efficiency and locality, and neither a new optimizer nor more data addresses the structural mismatch.</>}
+        stretch={<>If memory then becomes attention's problem at long n, which efficient-attention variant trades global reach for cost?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">
+            <strong>Attention Is All You Need</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(self-attention vs recurrent/convolutional layers; path length and complexity)</span>
+          <br/>Compares self-attention with convolution on maximum path length between positions and per-layer complexity, the basis for attention's long-range claim.
         </li>
       </ul>
     </VIS.Section>

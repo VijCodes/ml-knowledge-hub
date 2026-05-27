@@ -2167,288 +2167,279 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: RoPE -- ROTARY POSITION EMBEDDINGS.
+// Delta: RoPE injects position by ROTATING the query and key vectors by an angle proportional to their absolute
+//   position, in 2D coordinate pairs. Because a rotation by theta_m on Q and theta_n on K leaves their dot product
+//   depending only on (m - n), the attention score is a function of RELATIVE distance even though only absolute
+//   positions were used to rotate. No learned position table, nothing added to the embedding; the geometry of the
+//   rotation carries the signal. Diagram shows the rotation SETUP only; it never prints the relative-distance result.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="DL"
+      title="RoPE: Rotary Position Embeddings"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Transformers" },
+        { label: "Subtopic", value: "RoPE rotates Q and K by an angle proportional to absolute position, so their dot product depends only on relative distance -- giving length generalization with no learned position table; used in LLaMA, GPT-NeoX, and most modern LLMs" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong><VIS.Term def="Rotary Position Embedding: encodes token position by rotating each query and key vector by an angle proportional to its position, applied in 2D coordinate pairs before the attention dot product.">RoPE</VIS.Term> rotates
+      each query and key vector by an angle proportional to its absolute position, so the attention dot product between
+      positions m and n ends up depending only on the relative offset m &minus; n.</strong>{" "}
+      The rotation is applied per 2D coordinate pair, with different pairs spun at different frequencies, and crucially it
+      is applied to <strong>Q and K only</strong> &mdash; the value vectors and the residual stream are untouched. Because a
+      rotation by an angle scaling with m on the query and an angle scaling with n on the key combine into a function of
+      (m &minus; n), the score is naturally <VIS.Term def="The attention weight between two tokens depends on how far apart they are, not on their absolute slot numbers. RoPE achieves this even though it rotates using absolute positions.">relative</VIS.Term>,
+      which is what gives strong <VIS.Term def="A model trained on short sequences still behaves sensibly on longer ones, because the score depends on offset rather than absolute index. Base/frequency scaling (NTK / linear) stretches this further with light fine-tuning.">length generalization</VIS.Term>.
+      The failure modes: thinking RoPE adds a vector to the embedding (it multiplies/rotates instead), thinking it rotates
+      the values too, thinking the score depends on absolute index, and thinking context can be extended for free without
+      adjusting the rotation base frequency.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 -- Why absolute position tables generalize poorly">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate trains a model with a learned position-embedding table of 2048 rows and then tries to run it on 4096-token
+        inputs at inference, and is surprised the model breaks. They propose just adding 2048 more rows initialized to zero.
+        Before reading on, work out what property of the position scheme &mdash; not the table size &mdash; is the real issue.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`learned table: row p = a vector added to token at position p
+trained positions: 0 .. 2047
+inference positions: 0 .. 4095   (rows 2048..4095 never trained)
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+what does a learned absolute table tie the model to?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Contrast this with a scheme where the score between two tokens is a function of how far apart they sit, not which
+        absolute slots they occupy. Derive what that buys you when the sequence grows past training length.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 -- Worked example: rotating Q and K, then taking the dot product">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`take one 2D coordinate pair of the query at position m and the key at position n
+rotate the query pair by an angle proportional to m
+rotate the key pair by an angle proportional to n
+now form the dot product of the two rotated pairs
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+the values V and the residual stream are NOT rotated
+different coordinate pairs use different rotation frequencies
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+what does the rotated dot product depend on -- m, n, or m - n?`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Rotating the query by an angle that scales with m and the key by an angle that scales with n means their inner
+        product collapses to a term governed by the difference of the two angles, i.e. by (m &minus; n). So two tokens 5
+        apart give the same score contribution whether they sit at positions (3, 8) or (300, 305). The absolute indices were
+        used to rotate, but they cancel; only the relative offset survives. (Why this in turn enables base-frequency context
+        extension is unpacked in the drill lenses.)
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 -- RoPE vs a learned absolute position table">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of RoPE</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>How position enters</td><td>Rotates Q and K by an angle set by absolute position</td></tr>
+          <tr><td>What the score depends on</td><td>Relative offset m &minus; n, not absolute index</td></tr>
+          <tr><td>What is modified</td><td>Q and K only &mdash; never V or the residual stream</td></tr>
+          <tr><td>Length generalization</td><td>Strong; base/frequency scaling extends context further</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Absolute rotation, relative score">
+        RoPE uses absolute positions to choose the rotation angle, yet the quantity the model actually consumes &mdash; the
+        Q-K dot product &mdash; depends only on the gap between tokens. That is the whole trick: no extra parameters, no
+        vector added to the embedding, and a score that behaves the same at position 5 as at position 5000 for a fixed
+        offset. A learned absolute table has none of these properties, which is why it stalls past its trained length.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill -- trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>RoPE rotates Q and K by an angle proportional to absolute
+        position, so the attention score depends only on relative distance m &minus; n, with V and the residual stream left
+        untouched.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="rope-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 -- How RoPE injects position"
+        scenario={<>A teammate describes RoPE as "a position vector that gets added to each token embedding before the first layer." Pick the statement that correctly describes how RoPE injects position.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`token at position m
+its query / key vector, in 2D coordinate pairs
+how is position applied?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It rotates each query and key vector by an angle proportional to that token's absolute position.", correct: true },
+          { key: "b", text: "It adds a fixed learned position vector to each token embedding before the first attention layer runs.", correct: false },
+          { key: "c", text: "It concatenates a one-hot index to each token so the model can read the slot number directly off it.", correct: false },
+          { key: "d", text: "It scales each token embedding by a factor that grows with the token's distance from the start.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) is the learned-additive-table view, not RoPE. (c) concatenating an index is neither additive embeddings nor RoPE. (d) RoPE rotates, it does not rescale magnitudes.</>}
+        lens={<>RoPE applies position as a rotation: each query and key vector is split into 2D coordinate pairs and each pair is rotated by an angle proportional to the token's absolute position. Nothing is added to the embedding and no magnitude is rescaled; the position lives entirely in the angle of Q and K. This is why RoPE introduces no new parameters and why it acts inside attention rather than at the embedding input.</>}
+        stretch={<>If only the angle changes and not the magnitude, what quantity inside attention ends up carrying the position signal?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="rope-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 -- What RoPE rotates"
+        scenario={<>A teammate says "RoPE rotates the queries, keys, and values so the whole attention block is position-aware." Pick the statement that correctly identifies what RoPE rotates.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`attention inputs per token: query, key, value
+residual stream also flows around the block
+which of these does RoPE rotate?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Only the query and key vectors are rotated; values and the residual stream are left untouched.", correct: true },
+          { key: "b", text: "Queries, keys, and values are all rotated so the entire attention computation carries position.", correct: false },
+          { key: "c", text: "Only the value vectors are rotated, since values are what actually flow forward into the output.", correct: false },
+          { key: "d", text: "The residual stream is rotated once per block so position propagates through the whole network.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) rotating V is not part of RoPE; it would distort the content being aggregated. (c) values carry content, not position; they stay unrotated. (d) the residual stream is never rotated.</>}
+        lens={<>RoPE rotates queries and keys only. Position needs to shape the attention scores, which come from the Q-K dot product, so only Q and K are rotated; the values carry content that gets mixed by those scores and are left as-is, as is the residual stream. Rotating the values would scramble the content being aggregated rather than encode where it came from, which is why RoPE deliberately touches just Q and K.</>}
+        stretch={<>Given only Q and K are rotated, where in the attention computation does position actually take effect?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="rope-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 -- Same offset, different absolute positions"
+        scenario={<>Two tokens sit 5 apart. In one batch they are at positions (3, 8); in another at (300, 305). A teammate predicts very different RoPE score contributions because 300 is far larger than 3. Pick the soundest prediction.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`pair A: query at 3,  key at 8    (offset 5)
+pair B: query at 300, key at 305 (offset 5)
+RoPE rotates each by its absolute position`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Both pairs give the same score contribution, since the rotated dot product depends only on the offset 5.", correct: true },
+          { key: "b", text: "Pair B gives a much larger contribution, since its absolute positions 300 and 305 are far bigger.", correct: false },
+          { key: "c", text: "Pair B gives a near-zero contribution, since large absolute angles rotate the vectors past each other.", correct: false },
+          { key: "d", text: "The two differ unpredictably, since the contribution depends on both absolute positions separately.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) reads off absolute magnitude; the absolute angles cancel in the dot product. (c) there is no decay from large absolute index alone. (d) the contribution is a clean function of the offset, not of each position separately.</>}
+        lens={<>Rotating the query by an angle set by m and the key by an angle set by n makes their dot product depend on the difference of those angles, hence on (m &minus; n). With offset 5 fixed, (3, 8) and (300, 305) give the same score contribution; the absolute positions were used to rotate but cancel out. That relative-only behavior is exactly why RoPE generalizes across positions rather than treating index 300 as intrinsically different from index 3.</>}
+        stretch={<>If the score depends only on offset, what changes when you push the model to offsets far larger than any seen in training?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="rope-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 -- Extending context length"
+        scenario={<>A RoPE model trained at 2k context must serve 8k inputs. A teammate proposes adding 6k new rows to a position-embedding table. Pick the soundest approach for this architecture.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`trained context: 2k
+target context: 8k
+position scheme: RoPE (rotation by frequency)`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Scale the RoPE base/frequency (NTK or linear) and lightly fine-tune, since there is no table to extend.", correct: true },
+          { key: "b", text: "Add 6k new rows to a learned position table, initialized to zero, so the longer range is covered.", correct: false },
+          { key: "c", text: "Retrain the model from scratch at 8k, since RoPE offers no way to reuse the 2k-trained weights at all.", correct: false },
+          { key: "d", text: "Leave RoPE unchanged and simply feed 8k tokens, since relative scores need no adjustment whatsoever.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) RoPE has no learned table to extend; rows are not how it stores position. (c) RoPE weights transfer; from-scratch is wasteful. (d) untouched RoPE degrades past trained length because high-frequency pairs alias at large offsets.</>}
+        lens={<>RoPE stores no position table, so there are no rows to add; position is the rotation frequency. To reach longer context you scale that frequency &mdash; linear interpolation or NTK-aware base scaling &mdash; so the offsets seen in training cover the longer range, then fine-tune lightly. Feeding 8k tokens with unchanged RoPE degrades because the fastest-spinning coordinate pairs encounter offsets they never saw, so frequency scaling is the principled lever rather than a table edit or a full retrain.</>}
+        stretch={<>Why does the highest-frequency coordinate pair, not the lowest, set the practical limit on how far you can extend?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="rope-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 -- Why absolute rotation yields a relative score"
+        scenario={<>A teammate cannot see how rotating by absolute positions could ever produce a score that depends only on relative distance. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`query rotated by angle proportional to m
+key   rotated by angle proportional to n
+score = dot product of the two rotated vectors
+what governs that dot product?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "The dot product of two rotated vectors depends on the angle between them, which is proportional to m minus n.", correct: true },
+          { key: "b", text: "The model learns during training to subtract the absolute positions, so the score becomes relative over time.", correct: false },
+          { key: "c", text: "A softmax normalization removes the absolute positions afterward, leaving only the relative part of the score.", correct: false },
+          { key: "d", text: "The query and key are rotated by the same shared angle, so position cancels and only content is left.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the relativity is geometric, not learned. (c) softmax normalizes across keys; it does not subtract absolute angles. (d) Q and K are rotated by different angles (m vs n); they are not the same.</>}
+        lens={<>A rotation preserves lengths and turns the inner product of two rotated vectors into a function of the angle between them. Rotating Q by an angle proportional to m and K by an angle proportional to n makes that angular gap proportional to (m &minus; n), so the dot product depends only on the offset. The relativity falls straight out of the geometry of rotation; it is not something the optimizer must learn and it is not produced by the softmax.</>}
+        stretch={<>Since a rotation preserves vector length, what property of the un-rotated Q-K score is left unchanged?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="rope-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 -- Which pairs limit extrapolation"
+        scenario={<>RoPE spins different coordinate pairs at different frequencies: some rotate slowly across positions, others fast. A model is pushed to offsets far beyond training. A teammate expects the slow pairs to break first. Predict the non-obvious behavior.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`low-frequency pairs: angle changes slowly with position
+high-frequency pairs: angle changes fast with position
+offsets at inference: far larger than any seen in training`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "The high-frequency pairs alias first, since their fast-changing angle meets offsets it never saw in training.", correct: true },
+          { key: "b", text: "The low-frequency pairs break first, since their slow angle cannot represent very large distances at all.", correct: false },
+          { key: "c", text: "All pairs degrade equally, since extrapolation stresses every coordinate by the same proportional amount.", correct: false },
+          { key: "d", text: "No pair degrades, since the relative-distance property guarantees identical behavior at any offset whatever.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) slow pairs change little over the extra range and stay in familiar territory. (c) the stress is frequency-dependent, not uniform. (d) the relative property holds within trained offsets but high-frequency pairs still see unseen large angles.</>}
+        lens={<>The fastest-spinning pairs sweep through their full angular range quickly, so at offsets well beyond training they land in angle regions the model never observed and effectively alias, which is what degrades long-context behavior first. The slow pairs barely move over the extra distance and stay near familiar angles. This is why context-extension recipes target the rotation base/frequency &mdash; they re-scale precisely the pairs that would otherwise alias.</>}
+        stretch={<>Given that insight, why does NTK-aware scaling adjust high and low frequencies by different amounts rather than uniformly?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="rope-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 -- Where RoPE sits in the attention path"
+        scenario={<>You are wiring RoPE into a decoder block and must place the rotation correctly relative to the Q/K projections and the softmax. Pick the soundest placement.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`per layer: x -> project to Q, K, V -> scores = QK^T -> softmax -> @ V
+RoPE rotation must be inserted somewhere in this path`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Rotate Q and K right after their projections, before the QK^T scores are formed in that layer.", correct: true },
+          { key: "b", text: "Rotate the layer input x once before the Q/K/V projections, so all three inherit the position.", correct: false },
+          { key: "c", text: "Apply the rotation to the attention scores after softmax, so the normalized weights become position-aware.", correct: false },
+          { key: "d", text: "Rotate the value vectors after softmax, so the aggregated output carries the positional information forward.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) rotating x before projection would also rotate V and is not how RoPE is defined. (c) post-softmax weights are already normalized; rotating them is ill-defined. (d) values must stay unrotated to preserve content.</>}
+        lens={<>RoPE is applied to Q and K immediately after their projections and before the scores are computed, in every layer that uses it. That placement ensures only Q and K carry position and that the rotation shapes the raw QK dot products, which is where relative distance must enter. Rotating x pre-projection would drag V along, and rotating post-softmax weights or values would either be undefined or corrupt the content being aggregated.</>}
+        stretch={<>RoPE is re-applied in every layer rather than once at the input -- what would be lost if you applied it only once?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="rope-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 -- Degradation past trained length"
+        scenario={<>A RoPE model trained at 4k is fed 16k-token inputs unchanged and produces incoherent long-range output, though short inputs are fine. A teammate blames the attention softmax and swaps it for a sharper temperature. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`trained length: 4k
+served length: 16k (RoPE unchanged)
+symptom: short inputs fine, long-range output incoherent
+attempted fix: sharpen softmax temperature`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Offsets beyond 4k push high-frequency pairs into unseen angles; rescale the RoPE base/frequency instead.", correct: true },
+          { key: "b", text: "The softmax temperature is the cause, so sharpening it will restore coherent long-range behavior here.", correct: false },
+          { key: "c", text: "The value vectors lost position at long range, so additionally rotating V will fix the long-range output.", correct: false },
+          { key: "d", text: "The model simply needs more attention heads at 16k, since each head covers a fixed span of positions.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) temperature does not address unseen rotation angles; the cause is positional, not sharpness. (c) rotating V breaks content and is never part of RoPE. (d) head count is unrelated to the offset-extrapolation failure.</>}
+        lens={<>Short inputs work because their offsets fall within the trained range; at 16k the offsets exceed anything seen in training, so the fastest-spinning RoPE pairs land in unfamiliar angle regions and the relative-distance signal degrades. The fix is to rescale the RoPE base/frequency (linear or NTK) and fine-tune, so the extended offsets map back into the trained angular range. Sharpening the softmax, rotating values, or adding heads all leave the actual cause &mdash; out-of-range rotation angles &mdash; untouched.</>}
+        stretch={<>After base scaling, why is a short fine-tune usually still needed rather than zero-shot extension?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">
+            <strong>RoFormer: Enhanced Transformer with Rotary Position Embedding</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(rotation construction, relative-distance property, frequency design)</span>
+          <br/>Derives why rotating Q and K by absolute-position angles yields a dot product that depends only on relative offset, and why the values are left unrotated.
         </li>
       </ul>
     </VIS.Section>

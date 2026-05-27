@@ -2167,288 +2167,277 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: KV CACHE for autoregressive decoding.
+// Delta: during generation, the keys and values of all PAST tokens never change, so the decoder CACHES them and each
+//   new token only computes its own Q,K,V and attends against the stored K,V -- O(n) per step instead of recomputing the
+//   full O(n^2) attention every step. The trade is MEMORY: the cache holds K and V for every layer and every past token,
+//   growing LINEARLY with context, and is a primary inference memory cost. Confusions: caching Q (wrong -- Q is per-step),
+//   thinking it speeds up training (no -- training is parallel), thinking it changes the output, thinking cache is free.
+//   Diagram shows the cache SETUP only; it never prints the per-step-cost or GB result.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="DL"
+      title="KV Cache for Autoregressive Decoding"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Transformers" },
+        { label: "Subtopic", value: "At inference the decoder caches past keys and values so each new token is O(n) instead of recomputing all attention; the cache grows linearly with context and is a primary inference memory cost" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>During autoregressive generation, the <VIS.Term def="The key and value vectors that each past token contributes to attention. Once a token is processed, its K and V never change, so they can be stored and reused.">keys and values</VIS.Term> of
+      all past tokens never change, so the decoder stores them in a <VIS.Term def="A per-layer buffer holding the key and value vectors of every token generated so far, so they need not be recomputed when generating the next token.">KV cache</VIS.Term> and
+      each new token computes only its own query, key, and value, then attends against the cached K and V.</strong>{" "}
+      This turns each generation step from recomputing the full O(n squared) attention into an O(n) operation against the
+      stored history. The trade is memory: the cache holds K and V for <strong>every layer and every past token</strong>, so
+      it grows <VIS.Term def="The cache size is proportional to the number of tokens generated so far times layers times model width. Doubling the context roughly doubles the cache.">linearly with context</VIS.Term> and
+      is a primary inference memory cost. The failure modes: thinking queries are cached (they are recomputed each step),
+      thinking the cache speeds up training (training is already parallel), thinking it changes the model's output (it does
+      not), and forgetting the cache itself can dominate inference memory at long context.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 -- Why naive generation redoes the same work">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate generates text by, at each step, re-running the model over the entire sequence so far and keeping only the
+        last token's prediction. Generation gets slower with every token and they blame the GPU. Before reading on, work out
+        what is being recomputed that did not change.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`step t: feed tokens 0..t-1, recompute attention over all of them, take prediction
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+note: the key/value vectors of tokens 0..t-2 are identical to last step
+      only the newest token's K, V are new
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+what is being recomputed needlessly at every step?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Consider that once a token has been processed, the key and value it contributes to attention are fixed. Derive what
+        you could store to avoid recomputing them, and what the new per-step cost would be.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 -- Worked example: caching K,V and sizing it">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`with a KV cache, step t does:
+  compute Q, K, V for the NEW token only
+  append the new K, V to the per-layer cache
+  attend new Q against the cached K, V (length ~ t)   -> O(t) per step
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+cache size ~ 2 (K and V) * layers * tokens * d * bytes_per_value
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+13B model: 40 layers, d=5120, fp16 (2 bytes), 2048 tokens
+  ~ 2 * 40 * 2048 * 5120 * 2 bytes  ~  1.7 GB per sequence`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Each step computes Q, K, V only for the new token, appends its K and V to the per-layer cache, and attends against
+        the stored history &mdash; O(n) per step instead of recomputing the whole O(n squared) attention. The cost is that
+        the cache stores K and V for every layer and every past token, which for a 13B model at 2048 tokens is roughly 1.7 GB
+        per sequence and grows linearly as the context lengthens. (Why MQA/GQA exist to shrink this is unpacked in the drill
+        lenses.)
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 -- KV cache: what is and is not true">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>What is true of the KV cache</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>What is cached</td><td>Keys and values of past tokens &mdash; not queries</td></tr>
+          <tr><td>Per-step cost</td><td>O(n) attention against the cache, not O(n squared) recompute</td></tr>
+          <tr><td>Memory growth</td><td>Linear in context, across all layers &mdash; a primary inference cost</td></tr>
+          <tr><td>Effect on output</td><td>None &mdash; it is an exact speedup, identical results</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Store the unchanging past">
+        Past keys and values do not change as generation proceeds, so caching them lets each new token attend against stored
+        history instead of recomputing everything &mdash; an exact O(n)-per-step speedup with no change to the output. The
+        price is memory: K and V for every layer and every token, growing linearly with context. That cache is often the
+        dominant inference memory cost, which is exactly what MQA and GQA were designed to shrink.
       </VIS.Callout>
     </VIS.Section>
 
-    <VIS.Section id="sec-drill" title="Drill — trap problems">
+    <VIS.Section id="sec-drill" title="Drill -- trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>past keys/values are fixed, so caching them makes each generation
+        step O(n) instead of O(n squared) recompute; the trade is a memory cost that grows linearly with context across all
+        layers.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="kv-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 -- What gets cached"
+        scenario={<>A teammate says "the KV cache stores the queries, keys, and values of past tokens so nothing is recomputed." Pick the statement that correctly describes what is cached.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`per past token: query, key, value were computed
+generating the next token needs to attend against the past
+which of these stay useful and are cached?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "Only the keys and values of past tokens are cached; the query is recomputed fresh for each new token.", correct: true },
+          { key: "b", text: "The queries, keys, and values of past tokens are all cached, so none of the three is ever recomputed.", correct: false },
+          { key: "c", text: "Only the queries of past tokens are cached, since the query is what selects which past tokens to attend to.", correct: false },
+          { key: "d", text: "Only the final attention outputs of past tokens are cached, since storing outputs avoids redoing the softmax.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) past queries are never reused; only the new token's query is needed. (c) it is K and V that the new query attends against, not cached queries. (d) caching outputs would not let the new token attend to the past correctly.</>}
+        lens={<>Only the keys and values of past tokens are cached, because they are what the new token's query attends against and they do not change once computed. Each step recomputes a fresh query for the new token only; past queries are irrelevant going forward. Caching past queries or final outputs would not support attending the new token against history, which is why the cache is specifically of K and V &mdash; hence the name.</>}
+        stretch={<>Since only the new token's query is computed each step, what is the per-step attention cost against a cache of length n?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="kv-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 -- What the cache changes"
+        scenario={<>A teammate worries that enabling the KV cache will subtly change the model's generated text compared to recomputing each step. Pick the statement that correctly describes its effect.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`with cache: attend new Q against stored K, V
+without cache: recompute K, V then attend
+are the stored K, V the same as the recomputed ones?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "It changes nothing in the output; cached K and V equal the recomputed ones, so it is an exact speedup.", correct: true },
+          { key: "b", text: "It subtly changes the output, since cached values drift from freshly recomputed ones over many steps.", correct: false },
+          { key: "c", text: "It improves the output, since reusing stable cached vectors reduces numerical noise in the attention.", correct: false },
+          { key: "d", text: "It changes the output only at long context, where the cache must be truncated and information is lost.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) past K and V are deterministic functions of past tokens; they do not drift. (c) the cache is not a denoiser; results are identical, not better. (d) a full (untruncated) cache loses nothing; truncation is a separate choice.</>}
+        lens={<>The KV cache is an exact optimization: the keys and values it stores are identical to what recomputation would produce, because they are fixed functions of the already-decided past tokens. So enabling it changes nothing about the generated text &mdash; same logits, same samples &mdash; it only avoids redundant work. It neither degrades nor improves quality, and an untruncated cache loses no information; only a deliberate cache truncation (a different decision) would.</>}
+        stretch={<>If the cache is exact, what is the only resource it trades against that speed?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="kv-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 -- Where the cache helps"
+        scenario={<>A teammate enables the KV cache and expects it to speed up both training and inference. Pick the soundest statement about where it helps.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`training: full sequence processed in parallel, one pass
+inference: tokens generated one at a time
+where is past K, V reused across steps?`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "It speeds up autoregressive inference only; training already processes the whole sequence in one parallel pass.", correct: true },
+          { key: "b", text: "It speeds up both training and inference equally, since both repeatedly recompute attention over the sequence.", correct: false },
+          { key: "c", text: "It speeds up training only, since training runs many epochs while inference runs each prompt just once.", correct: false },
+          { key: "d", text: "It speeds up neither; the cache only reduces memory and leaves both training and inference time unchanged.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) training does not generate step by step, so there is no past to reuse across steps. (c) the cache is an inference-time mechanism; training has no incremental decoding. (d) the cache reduces compute time at inference, and actually costs memory.</>}
+        lens={<>The KV cache helps only autoregressive inference, where tokens are produced one at a time and the past K and V are reused across steps. Training processes the entire sequence in a single parallel pass with a causal mask, so there is no incremental decoding and nothing to cache across steps. The cache is therefore an inference-time speedup that, far from saving memory, spends memory to avoid recompute.</>}
+        stretch={<>Why does the parallel, masked training pass have no step-to-step reuse to exploit in the first place?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="kv-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 -- Cache memory limits batch size"
+        scenario={<>A serving system can fit only a few concurrent long-context sequences before running out of memory, and profiling shows the KV cache dominates. A teammate proposes a larger model to "use the memory better." Pick the soundest move.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`serving: few concurrent long sequences before OOM
+profile: KV cache dominates memory
+cache ~ 2 * layers * tokens * d per sequence`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Shrink the per-token cache with MQA/GQA (share K,V across heads), since the cache is the binding memory cost.", correct: true },
+          { key: "b", text: "Use a larger model, since more parameters let the system pack more sequences into the available memory.", correct: false },
+          { key: "c", text: "Increase the model width d, since a wider model amortizes the cache better across its larger hidden state.", correct: false },
+          { key: "d", text: "Raise the per-step batch size, since batching more sequences reduces the cache needed for each one of them.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) a larger model increases parameters and the cache, worsening memory. (c) larger d makes the cache bigger, not smaller. (d) batching more sequences multiplies total cache, it does not reduce per-sequence cache.</>}
+        lens={<>The cache is the binding constraint, so the lever is to make it smaller per token: multi-query (MQA) or grouped-query attention (GQA) share K and V across attention heads, cutting cache size by a large factor with minimal quality loss. A larger model or wider d increases both parameters and cache, and batching more sequences multiplies total cache rather than shrinking per-sequence cost. Attacking the cache's per-token footprint is what raises concurrent capacity.</>}
+        stretch={<>Roughly how much does MQA shrink the KV cache relative to standard multi-head attention?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="kv-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 -- Why caching is even valid"
+        scenario={<>A teammate asks why it is safe to cache a past token's key and value rather than recompute them, given the model keeps generating. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`token p was processed at step p
+its K, V are functions of tokens 0..p (causal)
+do later tokens change them?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Causal masking means token p's K and V depend only on tokens 0..p, so later tokens never change them.", correct: true },
+          { key: "b", text: "The K and V are recomputed lazily anyway, so the cache is just a hint and correctness never depends on it.", correct: false },
+          { key: "c", text: "Later tokens do update past K and V, but the changes are small enough to ignore for generation speed.", correct: false },
+          { key: "d", text: "The model freezes its weights at inference, so all K and V become constants regardless of the token positions.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) the cache is used, not a discardable hint; correctness relies on its values being right. (c) later tokens do not change past K and V at all, so there is nothing to ignore. (d) frozen weights alone would not prevent later tokens from influencing past K,V; causal masking is the reason.</>}
+        lens={<>Under causal masking, token p attends only to positions 0..p, so its key and value are functions solely of tokens up to p and are unaffected by anything generated afterward. That invariance is what makes caching exact: stored K and V remain correct for the rest of generation. It is not a discardable hint and there is no small error to ignore; the causal dependence structure, not just frozen weights, guarantees the past does not change.</>}
+        stretch={<>Would this caching argument still hold for a bidirectional (encoder) self-attention layer? Why or why not?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="kv-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 -- Compute down, memory up"
+        scenario={<>A teammate enables the KV cache expecting overall inference resource use to drop across the board. Predict the non-obvious effect on the two resources.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`without cache: recompute attention every step (heavy compute)
+with cache: store K, V for all layers and tokens
+what happens to compute vs memory?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Per-step compute drops sharply, but memory use rises and grows with context as the cache fills.", correct: true },
+          { key: "b", text: "Both compute and memory drop, since reusing stored vectors avoids work and storing less data overall.", correct: false },
+          { key: "c", text: "Compute is unchanged but memory drops, since the cache is a compact summary of the full attention matrix.", correct: false },
+          { key: "d", text: "Both compute and memory rise, since maintaining and indexing the cache adds overhead on top of recompute.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) memory rises, it does not drop; the cache is extra storage. (c) compute drops too, and the cache is not a compressed summary. (d) compute drops sharply; the cache replaces recompute rather than adding to it.</>}
+        lens={<>The KV cache is a classic compute-for-memory trade: it eliminates the per-step recomputation of past attention (compute drops sharply, each step becomes O(n) instead of O(n squared)) but it must store K and V for every layer and token, so memory rises and keeps growing as the context lengthens. It is not a free win on both axes, nor a compressed summary; it spends memory precisely to buy back the wasted compute.</>}
+        stretch={<>Given memory grows with context, what eventually limits the maximum context length you can serve with a fixed GPU?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="kv-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 -- Sizing the cache"
+        scenario={<>You must estimate the KV cache for one sequence: 40 layers, d=5120, fp16, 2048 tokens, storing both K and V. Pick the soundest estimate.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`cache ~ 2 (K and V) * layers * tokens * d * bytes
+layers=40, tokens=2048, d=5120, bytes=2 (fp16)`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "About 1.7 GB, since 2 times 40 layers times 2048 tokens times 5120 times 2 bytes lands near that figure.", correct: true },
+          { key: "b", text: "About 21 MB, since you store only the 2048 tokens times 5120 of the most recent layer's keys and values.", correct: false },
+          { key: "c", text: "About 0.8 GB, since only the keys are cached and the values are recomputed cheaply at each generation step.", correct: false },
+          { key: "d", text: "About 84 MB, since the cache holds one layer's K and V and is reused unchanged across all 40 layers.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) ignores the factor of layers and the factor of 2 for K and V. (c) both K and V are cached, not just K. (d) each layer has its own K,V cache; it is not shared across layers.</>}
+        lens={<>The cache stores K and V for every layer and every token, so 2 (K and V) times 40 layers times 2048 tokens times 5120 times 2 bytes is roughly 1.7 GB per sequence. Dropping the layer factor, caching only K, or assuming one shared cache across layers all undercount badly. The per-layer, per-token, both-K-and-V structure is exactly why the cache becomes a primary inference memory cost at scale.</>}
+        stretch={<>How does this 1.7 GB scale if you serve 32 such sequences concurrently?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="kv-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 -- Slowdown that grows per token"
+        scenario={<>A team's generation throughput drops steadily as outputs get longer, and a profiler shows attention being recomputed over the full sequence each step. They respond by upgrading to faster GPUs. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`symptom: throughput falls as outputs lengthen
+profile: full-sequence attention recomputed every step
+response: buy faster GPUs`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Attention is being recomputed each step with no cache; enable the KV cache to make each step O(n).", correct: true },
+          { key: "b", text: "The GPUs are simply too slow, so upgrading hardware is the principled cure for the growing slowdown.", correct: false },
+          { key: "c", text: "The model is too deep, so removing layers will stop throughput from falling as the output grows longer.", correct: false },
+          { key: "d", text: "The sampling temperature is too high, so lowering it will restore steady generation throughput per token.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) faster GPUs only shift a quadratic-per-sequence curve; they do not remove the redundant recompute. (c) depth is constant per step; it does not explain the growth with length. (d) sampling temperature does not affect attention recompute cost.</>}
+        lens={<>Throughput falling as outputs lengthen, with the profiler showing full-sequence attention recomputed every step, is the signature of generating without a KV cache: each step redoes O(n) work that grows with the output, making the whole generation quadratic. Enabling the cache stores past K and V so each step attends against history in O(n) without recompute. Faster GPUs, fewer layers, or lower temperature do not address the redundant recomputation that is the actual cause.</>}
+        stretch={<>After enabling the cache, what becomes the next scaling concern as outputs get very long?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener">
+            <strong>Fast Transformer Decoding: One Write-Head is All You Need</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(KV-cache memory bandwidth bottleneck, multi-query attention)</span>
+          <br/>Analyzes how the per-step KV cache dominates incremental decoding cost and introduces multi-query attention to shrink the cached keys and values.
         </li>
       </ul>
     </VIS.Section>

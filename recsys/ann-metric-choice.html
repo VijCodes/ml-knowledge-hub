@@ -2167,288 +2167,286 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: ANN METRIC CHOICE (dot product vs cosine vs L2).
+// Delta: the metric the ANN index searches with MUST match the metric the embedding model was trained to optimize.
+//   Dot product rewards high-norm (often popular) vectors; cosine divides out the norm so only direction matters; L2
+//   penalizes both direction and magnitude differences. A model trained on dot product but served with a cosine index
+//   silently changes the ranking - popular high-norm items vanish - and recall drops with NO error thrown. The bug is
+//   invisible because every component "works"; only the metric is inconsistent. Diagram shows the train-vs-index
+//   metric mismatch SETUP only.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="RecSys"
+      title="ANN Metric Choice: Dot vs Cosine vs L2"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Embeddings & Approximate Nearest Neighbor" },
+        { label: "Subtopic", value: "The index's similarity metric must match the metric the embedding model was trained on; dot product favors high-norm vectors, cosine normalizes them out, L2 differs again, and a mismatch silently tanks recall" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>The metric your ANN index searches with must be the same metric the embedding model was trained to
+      optimize.</strong>{" "}
+      <VIS.Term def="Dot product = sum of elementwise products; it grows with both alignment of direction and the magnitudes (norms) of the two vectors.">Dot product</VIS.Term> rewards
+      vectors with large norm, so a two-tower model trained on dot product often learns to give popular items a big
+      norm as a built-in popularity prior. <VIS.Term def="Cosine = dot product divided by both norms; it measures only the angle between vectors, ignoring their magnitudes.">Cosine</VIS.Term> divides
+      that norm out, keeping only direction, and <VIS.Term def="L2 (Euclidean) distance = the straight-line distance between two points; it grows with both directional and magnitude differences.">L2 distance</VIS.Term> penalizes
+      both direction and magnitude gaps. Because these rank vectors differently, building the index with a different
+      metric than training silently reorders results: popular high-norm items can disappear, and recall falls with no
+      exception raised &mdash; every component looks healthy, only the metric is inconsistent. The failure modes:
+      defaulting the index to cosine when the model trained on dot product, normalizing vectors before indexing without
+      realizing that turns dot product into cosine, and debugging the model when the real bug is the metric.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Three metrics, three rankings">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        Your two-tower retrieval model was trained so that the score of a (user, item) pair is their dot product. The
+        ANN index was configured by a teammate to use cosine similarity. The readout shows two candidate items for one
+        user query. Work out how the ranking flips between dot product and cosine, and why no error is thrown either way.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`user query vector u (direction fixed)
+item P (popular): same direction as u, large norm |P| = 4
+item N (niche):   same direction as u, small norm |N| = 1
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+dot(u, P) > dot(u, N)         (norm makes P win)
+cosine(u, P) = cosine(u, N)   (same direction -> tie)
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+model trained on: dot product
+index searches with: cosine`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Derive which item the trained model intended to rank first, what the cosine index would do instead, and why this
+        mismatch produces a silent recall drop rather than a crash.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the silent recall drop">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`step 1 - what the model learned:
+   trained on dot product -> popular items got large norms
+   so dot(u, popular) is intentionally high
+
+step 2 - what the cosine index does:
+   cosine ignores norm -> strips the popularity signal
+   popular items no longer ranked up by their norm
+
+step 3 - observable effect:
+   popular items fall out of top-k
+   recall@100 drops 0.38 -> 0.22
+   no exception: cosine of valid vectors is always defined`}</pre>
+      <p>
+        The model deliberately encoded popularity in the norm because it was trained on dot product. A cosine index
+        throws that information away, so popular items lose the ranking boost the model intended, and recall collapses.
+        Nothing errors because cosine of two real vectors is always a valid number &mdash; the system is confidently
+        computing the wrong ranking. The fix is to set the index metric to dot product, matching training.
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — What each metric encodes">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Metric</th><th>What it rewards / ignores</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Dot product</td><td>Rewards both direction and large norm, so high-norm popular vectors rank up</td></tr>
+          <tr><td>Cosine</td><td>Rewards direction only, dividing the norm out so magnitude carries no signal</td></tr>
+          <tr><td>L2 distance</td><td>Penalizes both directional and magnitude gaps, so near points in space rank up</td></tr>
+          <tr><td>Match to training</td><td>Whatever the model optimized is the only metric that preserves its intended ranking</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="The index metric is part of the model contract, not a free knob">
+        An embedding model does not just produce vectors; it produces vectors whose meaning is defined relative to the
+        metric it was trained on. Dot product treats norm as signal (often popularity), cosine erases norm, L2 weighs
+        spatial distance. Picking a different metric at index time silently reinterprets every vector and reorders
+        results &mdash; and because all metrics are well-defined on valid vectors, you get a quiet recall regression
+        instead of a crash. Always set the ANN metric to whatever the training objective used.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>the ANN index metric must match the training metric; dot
+        product treats norm as signal, cosine erases it, and a mismatch silently reorders results with no error.</strong>{" "}
+        Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="mc-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — How dot product and cosine differ"
+        scenario={<>A teammate says "dot product and cosine give the same ranking, so the index metric never matters." Pick the statement that correctly describes the difference.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`dot(a,b) = |a| |b| cos(angle)
+cosine(a,b) = cos(angle)        (norm divided out)`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "Dot product scales with vector norm while cosine divides it out, so they rank differently whenever norms vary.", correct: true },
+          { key: "b", text: "Dot product and cosine always produce the same ranking, since both are monotone functions of the angle alone." },
+          { key: "c", text: "Cosine rewards larger-norm vectors more strongly than dot product, since dividing by the norm amplifies magnitude." },
+          { key: "d", text: "Dot product ignores direction entirely and ranks purely on norm, while cosine ranks purely on coordinate sign." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
-      />
-
-      <VIS.TrapProblem
-        id="bart-a2"
-        difficulty="medium"
-        axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
-        options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
-        ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) only holds if all vectors share the same norm. (c) inverts it; dividing by norm removes magnitude, not amplifies it. (d) misstates both metrics; both depend on direction.</>}
+        lens={<>Dot product equals the product of the two norms times the cosine of the angle, so it depends on both direction and magnitude; cosine divides the norms out and keeps only the angle. They coincide only when every vector has the same norm; otherwise they rank differently, which is precisely why the index metric matters. Cosine removes magnitude rather than amplifying it, and both metrics depend on direction, so the teammate's claim that the metric never matters is false in general.</>}
+        stretch={<>Under what normalization would a dot-product index and a cosine index become identical?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="mc-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Recall dropped after an index migration"
+        scenario={<>After migrating to a new ANN library, recall@100 fell from 0.38 to 0.22 with no code change to the model. The new library defaults to cosine; the model trained on dot product. A teammate wants to retrain the model. Pick the soundest first move.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`model objective: dot product (unchanged)
+old index metric: dot product, recall 0.38
+new index metric: cosine (library default), recall 0.22`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Set the new index's metric back to dot product to match training, before touching the model at all.", correct: true },
+          { key: "b", text: "Retrain the model from scratch on cosine, since the new library's cosine default is the modern best practice." },
+          { key: "c", text: "Increase the number of retrieved candidates to 500, since pulling more items always cancels a metric mismatch." },
+          { key: "d", text: "Add an L2-normalization layer to the user tower only, since normalizing one side restores the original ranking." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) retraining is a huge effort to fix a one-line config. (c) more candidates does not undo the wrong ordering. (d) normalizing only one tower is an inconsistent half-fix that changes scores in a new way.</>}
+        lens={<>The model is unchanged and the only thing that moved is the index metric default, so the targeted fix is to set the new index to dot product, matching the training objective &mdash; a one-line config change that restores the intended ranking. Retraining on cosine throws away a working model to chase a library default; pulling more candidates does not reorder the wrong ranking back; and normalizing a single tower creates a new asymmetric scoring that matches neither metric. When a metric mismatch causes a silent recall drop, align the index to training first.</>}
+        stretch={<>What test would catch a train/serve metric mismatch in CI before it ships?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
-        difficulty="hard"
+        id="mc-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Normalizing vectors before indexing"
+        scenario={<>To "clean up" embeddings, a teammate L2-normalizes every item vector before inserting them into a dot-product index, expecting it to be harmless. The model trained on raw (unnormalized) dot product. Pick the soundest assessment.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`model trained on: raw dot product (norms carry signal)
+teammate normalizes item vectors to unit norm
+then inserts into a dot-product index`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Normalizing turns the dot-product index into cosine, erasing the norm signal the model trained to use.", correct: true },
+          { key: "b", text: "Normalizing is harmless cleanup, since unit-norm vectors preserve every ranking a dot-product index produces." },
+          { key: "c", text: "Normalizing improves recall, since unit-norm vectors are always easier for an ANN index to separate accurately." },
+          { key: "d", text: "Normalizing only affects latency, since it changes vector storage size but never changes the resulting ranking." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) is the trap: unit-norm vectors under dot product is exactly cosine, which differs from raw dot product. (c) overclaims a recall benefit. (d) normalization does not change storage size and does change ranking.</>}
+        lens={<>Dot product on unit-norm vectors is mathematically cosine similarity, so normalizing the item vectors before a dot-product index silently converts it to a cosine index and discards the norm signal &mdash; here the popularity prior the model learned. Because the model trained on raw dot product, this reorders results just like an explicit cosine index would and quietly drops recall. The change is neither harmless nor a free improvement, and it alters ranking rather than just storage. The norm is part of the model's output and must be preserved when training used raw dot product.</>}
+        stretch={<>When IS normalizing-then-dot-product the correct choice?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="mc-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why the mismatch is silent"
+        scenario={<>A teammate is baffled that a metric mismatch caused wrong rankings but threw no error, and assumes the absence of an exception proves the metric is fine. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`cosine(a, b) is defined for any nonzero a, b
+dot(a, b) is defined for any a, b
+both return a valid number -> index returns a ranked list`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Every metric returns a valid number on valid vectors, so a mismatch yields a wrong ranking, never an exception.", correct: true },
+          { key: "b", text: "The mismatch is silent only because the library suppresses the metric error, which proper logging would reveal." },
+          { key: "c", text: "No error means the metrics agree, since an inconsistent metric would always raise a dimension-mismatch exception." },
+          { key: "d", text: "The mismatch raises an error internally but the index retries with the correct metric, hiding it from the caller." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) there is no suppressed error; the computation is genuinely valid. (c) absence of error does not imply agreement. (d) no silent retry exists; the index uses whatever metric it was configured with.</>}
+        lens={<>Dot product, cosine, and L2 are all well-defined real-valued functions on any pair of valid vectors, so an index configured with the wrong metric still computes a perfectly valid number for every pair and returns a fully ranked list &mdash; just the wrong ranking. There is no exception to catch because nothing is mathematically illegal; the bug is semantic, not computational. Absence of an error therefore tells you nothing about whether the metric matches training, which is why metric mismatches are caught by recall monitoring, not by exceptions.</>}
+        stretch={<>What offline check would distinguish a metric bug from a genuine model regression?</>}
+      />
+
+      <VIS.TrapProblem
+        id="mc-c2"
+        difficulty="medium"
+        axis="Mechanism"
+        title="C2 — Why rescaling scores cannot fix it"
+        scenario={<>A teammate proposes leaving the cosine index in place but multiplying every cosine score by a constant to "restore" the dot-product behavior. Pick the correct explanation of why this fails.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`dot(u,x) = |x| * cosine(u,x)   (per-item norm factor)
+proposed fix: cosine(u,x) * constant c
+note: c is the same for all items; |x| differs per item`}</pre>}
+        options={[
+          { key: "a", text: "Dot product multiplies cosine by each item's own norm, so a single shared constant cannot recover per-item ordering.", correct: true },
+          { key: "b", text: "Multiplying by a constant fully restores dot product, since scaling every score preserves the dot-product ranking." },
+          { key: "c", text: "The fix works only if the constant equals the average norm, since the mean norm reproduces every item's true score." },
+          { key: "d", text: "Rescaling changes nothing at all, since cosine and dot product already produce the identical ranking of items." },
+        ]}
+        trap={<>(b) a global constant cannot reintroduce a per-item factor. (c) the average norm is still one number, not each item's own norm. (d) cosine and dot product do not already agree when norms vary.</>}
+        lens={<>Dot product equals cosine times the item's own norm, so the missing factor differs from item to item; multiplying every cosine score by one shared constant rescales all items equally and leaves their relative order exactly as cosine ranked them. Recovering the dot-product ranking requires re-weighting each item by its specific norm, which a single constant cannot do, and the average norm is still just one number. The only correct fix is to compute dot product directly, because the norm signal is per-item and cannot be reconstructed from cosine scores alone.</>}
+        stretch={<>Could you recover dot product if the index also stored each item's norm separately?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="mc-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Who disappears under a cosine swap"
+        scenario={<>A model trained on dot product is accidentally served with a cosine index. A teammate predicts niche, low-norm items will be the ones that disappear from results. Predict the non-obvious direction of the effect.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`under dot product: high-norm (popular) items ranked up by norm
+swap to cosine: norm divided out
+question: which items LOSE their ranking boost?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Popular high-norm items lose their norm-driven boost, so they fall out of top-k while niche items rise relatively.", correct: true },
+          { key: "b", text: "Niche low-norm items disappear, since cosine penalizes small norms more harshly than dot product ever did." },
+          { key: "c", text: "All items shift down equally, since dividing every score by its norm preserves the exact original ordering." },
+          { key: "d", text: "Only items with negative coordinates disappear, since cosine cannot rank vectors that point away from the query." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) inverts it; cosine removes the norm advantage of popular items, it does not punish small norms. (c) dividing by per-vector norms does not preserve order. (d) cosine handles all directions; sign is not the issue.</>}
+        lens={<>Under dot product, popular items were ranked up partly because the model gave them large norms; cosine divides that norm out, so it is exactly the popular high-norm items that lose their boost and drop out of the top-k, while niche items become relatively more competitive. The intuition that low-norm niche items vanish is backwards &mdash; they were never relying on a large norm. Cosine does not penalize small norms or reject directions; it simply removes the magnitude advantage, which is why a dot-to-cosine swap reads as "popular content suddenly stopped showing up."</>}
+        stretch={<>Why might that surface to users as a sudden drop in click-through on head content?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="mc-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Guarding the metric contract"
+        scenario={<>Your team keeps the training objective in one repo and the ANN index config in another. A teammate proposes documenting the intended metric in a wiki page and trusting engineers to read it. Pick the soundest safeguard.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`training repo: objective = dot product
+serving repo: index metric = ? (separate config)
+risk: the two drift apart unnoticed`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Make the trained model export its metric and have index build assert that the configured metric equals it.", correct: true },
+          { key: "b", text: "Document the metric in a wiki page and rely on engineers to check it whenever they change the index config." },
+          { key: "c", text: "Always default both repos to cosine, since cosine is the safest metric regardless of how the model was trained." },
+          { key: "d", text: "Run the index with all three metrics in parallel and serve whichever returns the most candidates per query." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) documentation does not enforce anything and drifts. (c) forcing cosine breaks any dot-product-trained model. (d) most candidates is not a correctness signal; all metrics return full lists.</>}
+        lens={<>The metric is part of the model's contract, so the robust safeguard is to make it a checked artifact: have the trained model emit the metric it was optimized for, and have the index-build step assert that its configured metric matches, failing the build on mismatch. A wiki page is advisory and drifts; forcing cosine everywhere silently breaks dot-product models; and serving the metric that returns the most candidates is meaningless because all metrics return full ranked lists. Encoding the metric in the model export turns a silent semantic bug into a loud build failure.</>}
+        stretch={<>How would you version the metric so a model rollback also rolls back the index metric?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="mc-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — L2 index on a dot-product model"
+        scenario={<>A new index is built with L2 distance, but the two-tower model was trained on dot product. Offline recall looks slightly off and a teammate says L2 and dot product are interchangeable because both measure closeness. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`model objective: maximize dot product
+index metric: minimize L2 distance
+note: argmax dot != argmin L2 when norms vary`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "L2 penalizes magnitude gaps, so it reorders results versus dot product whenever item norms differ, hurting recall.", correct: true },
+          { key: "b", text: "L2 and dot product are interchangeable, since minimizing distance and maximizing similarity always give one order." },
+          { key: "c", text: "L2 is strictly better here, since Euclidean distance is a true metric and dot product is not, so recall must rise." },
+          { key: "d", text: "L2 only changes the numeric scores but never the ranking, so recall cannot move relative to a dot-product index." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) argmax dot and argmin L2 coincide only when all norms are equal. (c) being a true metric does not make it match the training objective. (d) L2 does change ranking when norms vary.</>}
+        lens={<>Maximizing dot product and minimizing L2 distance give the same ranking only when all vectors share one norm; once norms vary &mdash; which is exactly when a dot-product model encodes popularity in the norm &mdash; the two orderings diverge, so an L2 index reorders results and recall slips. L2 being a proper metric is irrelevant to whether it matches the training objective, and it does change the ranking, not just the scores. The lesson is identical to the cosine case: any metric other than the trained one silently reinterprets the vectors.</>}
+        stretch={<>How does adding a constant norm to all item vectors change the L2-vs-dot relationship?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://github.com/facebookresearch/faiss/wiki/MetricType-and-distances" target="_blank" rel="noopener">
+            <strong>FAISS metric types and distances</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(inner product vs L2, normalization, matching training)</span>
+          <br/>Covers how each metric ranks vectors, why normalization turns inner product into cosine, and why the
+          index metric must match the objective the embeddings were trained under.
         </li>
       </ul>
     </VIS.Section>

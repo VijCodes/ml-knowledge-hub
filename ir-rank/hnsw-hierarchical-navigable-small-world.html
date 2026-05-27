@@ -2167,288 +2167,276 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: HNSW (Hierarchical Navigable Small World).
+// Delta: HNSW is a MULTI-LAYER proximity GRAPH; search greedily descends from a sparse top layer (long-range hops)
+//   to a dense bottom layer (fine search), giving ~O(log N) query time. Params: M (edges/node), efConstruction
+//   (build quality), efSearch (recall/latency at query). It stores FULL vectors + graph -> high RAM, slow build,
+//   hard to update. Diagram shows the layered-graph structure + greedy descent + the param roles only; never the answer.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="IR"
+      title="HNSW (Hierarchical Navigable Small World)"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Query Embeddings & ANN" },
+        { label: "Subtopic", value: "A multi-layer proximity graph searched by greedy descent from a sparse top layer to a dense bottom layer, giving about logarithmic query time, tuned by M, efConstruction, and efSearch" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong><VIS.Term def="An approximate nearest neighbor index built as a multi-layer proximity graph, searched by greedily walking from a sparse top layer down to a dense bottom layer.">HNSW</VIS.Term> builds
+      a multi-layer proximity graph and searches it by greedy descent: it starts at a sparse top layer that makes long-range
+      hops, then drops into denser layers for finer steps, reaching the query's neighborhood in roughly <VIS.Equation tex={"O(\\log N)"} /> hops.</strong>{" "}
+      Three parameters govern it. <VIS.Term def="HNSW build parameter: the number of graph edges kept per node, trading index size and recall against memory.">M</VIS.Term> sets
+      how many edges each node keeps, <VIS.Term def="HNSW build parameter: how many candidates are explored while inserting each node, raising build quality and build cost.">efConstruction</VIS.Term> sets
+      how hard the build works to wire good edges, and <VIS.Term def="HNSW query parameter: how many candidates the greedy search explores, trading recall against query latency.">efSearch</VIS.Term> sets
+      how much the query explores, trading recall against latency. The cost of this speed is that HNSW stores the full vectors
+      plus the graph, so it is memory-heavy, slow to build, and awkward to update incrementally. The failure modes: confusing
+      the build-time knobs with the query-time knob, expecting a static-recall index when efSearch is a live dial, and assuming
+      the in-memory graph scales to billions of vectors on one machine.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — A layered graph walked top-down">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        HNSW links each vector to a handful of near neighbors, forming a navigable graph, and stacks several such graphs in
+        layers. The top layer is sparse with long edges for coarse navigation; lower layers are progressively denser for fine
+        steps. A query enters at the top, greedily moves to the closest reachable node, then descends a layer and repeats.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`layer 2 (sparse): few nodes, long-range hops  -> coarse approach
+layer 1 (denser): more nodes, medium steps
+layer 0 (densest): all nodes, fine local search -> final candidates
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+search: greedy walk per layer, descend to the next, stop at the bottom
+~O(log N) hops because each upper layer skips large distances`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        The hierarchy is what produces the logarithmic behavior: upper layers cover ground quickly so the query reaches its
+        neighborhood without scanning the whole bottom layer.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example">
+      <p>A typical configuration on a million-vector index and what each parameter touches:</p>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`index of ~1,000,000 vectors
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+M             = edges per node            (build-time graph density)
+efConstruction= candidates while building (build-time quality / build cost)
+efSearch      = candidates while querying (query-time recall / latency)
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+a query greedily walks the log-layered graph, visiting a bounded
+set of nodes set by efSearch, and returns the top-k`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Raising M or efConstruction makes a better graph at higher build cost; raising efSearch explores more at query time for
+        higher recall. The query never scans all million vectors; it follows the graph to a small visited set.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — What each knob controls and the cost">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Parameter / property</th><th>What it controls</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>M (edges per node)</td><td>Graph density and memory at build time</td></tr>
+          <tr><td>efConstruction</td><td>Build quality versus build time</td></tr>
+          <tr><td>efSearch</td><td>Query-time recall versus latency</td></tr>
+          <tr><td>Memory and updates</td><td>Stores full vectors plus graph; heavy, hard to update</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Build knobs are not the query knob">
+        M and efConstruction shape the graph once, at build time; efSearch tunes recall live at query time. Mixing them up
+        leads to rebuilding an index to change recall when a query-time dial would have sufficed. HNSW buys near-logarithmic
+        query speed by keeping full vectors and a graph in memory, which is why it is RAM-heavy and slow to rebuild.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>HNSW is a multi-layer proximity graph searched by greedy descent
+        from a sparse top to a dense bottom for about logarithmic query time; M and efConstruction are build knobs, efSearch is
+        the query-time recall-latency knob, and it stores full vectors plus the graph so it is RAM-heavy.</strong> Commit before
+        revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="hnsw-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What kind of structure HNSW is"
+        scenario={<>A teammate describes HNSW as a tree that recursively splits the vector space into axis-aligned regions. Pick the statement that correctly identifies the HNSW structure.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`nodes connected to near neighbors, stacked in layers
+search walks edges from a sparse top to a dense bottom
+question: what is this structure?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { text: "HNSW is a multi-layer proximity graph searched by greedy descent from a sparse top layer to a dense bottom layer.", correct: true },
+          { text: "HNSW is an axis-aligned space-partitioning tree that splits dimensions recursively and searches by branch pruning.", correct: false },
+          { text: "HNSW is a flat list of cluster centroids that the query scans linearly to pick the closest centroid and its members.", correct: false },
+          { text: "HNSW is a hash table that buckets vectors by random projections and looks up the query's bucket in constant time.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>A partitioning tree is the kd-tree family, a centroid list is IVF, and projection buckets are LSH; none of these is the layered navigable graph HNSW actually uses.</>}
+        lens={<>HNSW is a hierarchy of proximity graphs: nodes link to near neighbors, and layers stack from a sparse top with long-range edges to a dense bottom. Search greedily walks edges toward the query, descending layers, which is what gives near-logarithmic query time. The decoys name different ANN families, trees, cells, and hashes, that do not share the navigable-graph mechanism HNSW is defined by.</>}
+        stretch={<>Why does the sparse top layer give the search its long-range jumps?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="hnsw-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — Which parameter tunes recall at query time"
+        scenario={<>A teammate wants to raise recall on a live HNSW index and asks which of M, efConstruction, and efSearch to change. Pick the statement that names the query-time knob.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`M, efConstruction: set when the graph is built
+efSearch: passed at query time
+question: which one moves recall without a rebuild?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { text: "efSearch is the query-time knob, so raising it explores more candidates and lifts recall without rebuilding the index.", correct: true },
+          { text: "M is the query-time knob, so raising it explores more candidates per query and lifts recall without any rebuild.", correct: false },
+          { text: "efConstruction is the query-time knob, so raising it explores more per query and lifts recall with no rebuild needed.", correct: false },
+          { text: "None of the three affects recall at query time, so the only way to raise recall is to retrain the embedding model.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>M and efConstruction are fixed at build time, so changing them requires a rebuild; recall is tunable at query time, so it is not bottlenecked on the embedding.</>}
+        lens={<>efSearch is supplied per query and sets how many candidates the greedy walk explores, so raising it visits more of the graph and recovers more true neighbors at the cost of latency, with no rebuild. M and efConstruction are baked into the graph at build time, so adjusting them means reconstructing the index. Recall is therefore a live dial through efSearch, not a property frozen by the embedding or only changeable by rebuilding.</>}
+        stretch={<>What is the runtime cost of pushing efSearch higher?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="hnsw-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — Recall is too low after launch"
+        scenario={<>An HNSW index is live and recall is below target, but a full rebuild would take hours you do not have before a deadline. A teammate insists the only path is to rebuild with a higher M. Pick the soundest immediate move.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`live index, recall below target
+rebuild with higher M: hours of build time
+deadline is soon; latency has some headroom`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { text: "Raise efSearch at query time to lift recall now, since it explores more candidates without touching the built graph.", correct: true },
+          { text: "Rebuild immediately with a higher M, since recall can only improve by adding graph edges and no query knob affects it.", correct: false },
+          { text: "Lower efSearch to speed queries, since faster search visits the neighborhood more often and incidentally raises recall.", correct: false },
+          { text: "Re-embed all documents with a new model, since recall on an HNSW index is governed solely by embedding quality.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>Recall is not only changeable by rebuilding M; lowering efSearch reduces recall, not raises it; and recall is governed by how much the query explores, not solely by the embedding.</>}
+        lens={<>Because efSearch is a query-time knob, you can raise recall immediately by exploring more candidates per query, spending the available latency headroom, with no rebuild. A higher M would help but only after an expensive reconstruction you cannot afford before the deadline, and lowering efSearch would cut recall further. The fast lever for an in-flight recall shortfall is efSearch, with a graph rebuild reserved for when latency at high efSearch is no longer acceptable.</>}
+        stretch={<>At what point does raising efSearch stop being enough and a rebuild becomes warranted?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="hnsw-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — A billion vectors that will not fit in RAM"
+        scenario={<>You must index a billion 128-dimensional float vectors on a single machine. A teammate proposes plain HNSW. Pick the soundest reading of the memory implication.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`1,000,000,000 vectors, d = 128, float32
+plain HNSW stores full vectors + graph in RAM
+single machine memory is limited`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { text: "Plain HNSW keeps full vectors plus the graph in RAM, so a billion vectors likely overflows one box's memory budget.", correct: true },
+          { text: "Plain HNSW stores only compressed codes, so a billion vectors fit comfortably in modest RAM on a single machine.", correct: false },
+          { text: "Plain HNSW streams vectors from disk during search, so RAM size is irrelevant and any vector count fits one machine.", correct: false },
+          { text: "Plain HNSW shrinks memory as the graph grows, so larger indexes use less RAM and a billion vectors is the cheap case.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>Plain HNSW does not store compressed codes, does not stream from disk, and certainly does not use less RAM as it grows; each claim contradicts its in-memory full-vector design.</>}
+        lens={<>HNSW retains every full vector plus the proximity graph in memory, so memory scales with the vector count times the dimension plus the edge overhead, and a billion float vectors at that dimension overruns a single machine. This is exactly the regime where a compressed or disk-backed index, such as IVF with product quantization, is chosen instead, accepting slightly lower recall to fit the budget. Plain HNSW's speed comes from holding the data in RAM, which is also why it does not scale to billions on one box.</>}
+        stretch={<>Which index family would you switch to so a billion vectors fits, and what do you trade?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="hnsw-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why query time is near logarithmic"
+        scenario={<>A teammate cannot see why a greedy walk on HNSW touches only a small number of nodes rather than most of the graph. Pick the explanation of the near-logarithmic behavior.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`top layers: sparse, long edges that skip large distances
+lower layers: progressively denser, short edges
+search descends layer by layer, greedily toward the query`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { text: "Sparse upper layers skip long distances so each level roughly halves the gap, giving about logarithmic descent.", correct: true },
+          { text: "The search scans every node in the bottom layer once, so query time is linear despite the layered structure above.", correct: false },
+          { text: "Each query sorts all nodes by distance first, so the logarithmic time comes from binary-searching that sorted order.", correct: false },
+          { text: "The graph stores precomputed answers for all queries, so lookups are constant time and the layers play no real role.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>HNSW does not scan the full bottom layer, does not sort all nodes (no global order in high-d), and does not precompute per-query answers; the savings come from the layered long-range hops.</>}
+        lens={<>The sparse upper layers carry long edges that jump across large distances, so the greedy walk closes most of the gap to the query in a few coarse hops, then refines in denser layers with short steps. Because each descent roughly shrinks the remaining distance by a constant factor, the number of hops grows like the logarithm of the vector count, so a query visits only a small set of nodes. The decoys describe linear scans, a nonexistent global sort, or precomputation that the navigable-graph mechanism does not use.</>}
+        stretch={<>What does increasing M do to the connectivity that supports this descent?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="hnsw-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Bigger M raised recall but also memory and build time"
+        scenario={<>A teammate doubles M expecting only faster queries, but build time and memory both jump while query latency at fixed efSearch barely changes. They call the result paradoxical. Predict the non-obvious reason.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`M doubled
+memory up, build time up
+query latency at fixed efSearch: about the same
+recall: improved`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { text: "M adds edges per node, raising graph size and build work, while efSearch, not M, sets how much each query explores.", correct: true },
+          { text: "M is the query-time knob, so doubling it should have cut latency, and the flat latency proves the index is corrupted.", correct: false },
+          { text: "More edges always slow every query proportionally, so flat latency after doubling M means the measurement is wrong.", correct: false },
+          { text: "M controls embedding dimension, so doubling it grew the vectors, which is why memory rose but recall should not move.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>M is not the query-time knob and does not control dimension; flat latency at fixed efSearch is expected, not a corruption or a measurement error.</>}
+        lens={<>M sets the number of edges stored per node, so doubling it enlarges the graph, which raises memory and makes the build do more work to choose edges, and richer connectivity improves recall. Query latency is governed by efSearch, how many candidates the walk explores, so holding efSearch fixed keeps the visited-set size and thus latency roughly constant. The counterintuitive lesson is that M is a build-and-memory lever, while the latency-versus-recall trade lives in efSearch.</>}
+        stretch={<>If you wanted faster queries at the same recall, which knob would you actually move?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="hnsw-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — A high-churn catalog with constant deletes"
+        scenario={<>Your catalog changes constantly with many deletions and edits, and an HNSW index must stay fresh. A teammate assumes deletes are cheap in-place. Pick the soundest operational reading.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`workload: frequent deletes and edits
+HNSW: graph edges wired among existing nodes
+question: how well does HNSW handle in-place churn?`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { text: "HNSW is awkward to update in place, so heavy churn favors periodic rebuilds or an index family designed for updates.", correct: true },
+          { text: "HNSW deletes are free and instant, so unlimited churn never degrades the graph and rebuilds are never necessary.", correct: false },
+          { text: "HNSW reorganizes itself on every delete, so the graph stays optimal automatically no matter how high the churn is.", correct: false },
+          { text: "HNSW ignores deletes entirely with no effect, so removed items simply never appear and the structure is unaffected.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>HNSW deletes are not free, the graph does not self-optimize on every delete, and ignoring deletes is not harmless because stale nodes and broken edges degrade the graph.</>}
+        lens={<>HNSW wires edges among existing nodes, so removing or changing many of them leaves the graph fragmented and degrades navigability, which makes in-place high-churn updates awkward. The practical pattern is to batch changes and rebuild periodically, or to choose a structure built for incremental updates, rather than relying on cheap in-place deletes that HNSW does not provide. Treating deletes as free or self-healing leads to silent recall decay as the graph stales.</>}
+        stretch={<>What signal would tell you the graph has degraded enough to warrant a rebuild?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="hnsw-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Rebuilding to fix recall when a dial would do"
+        scenario={<>Recall dips slightly below target. A team schedules a multi-hour rebuild with a higher M for every such dip, treating rebuilds as the standard recall fix. Latency has headroom. Pick the soundest diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`recall slightly under target
+team's reflex: hours-long rebuild with higher M
+latency budget: has slack
+efSearch: left at its current value`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { text: "efSearch can raise recall instantly within the latency slack, so a costly rebuild is the wrong first lever for small dips.", correct: true },
+          { text: "Rebuilding with higher M is the only recall fix, since query-time settings cannot influence recall on a built graph.", correct: false },
+          { text: "A recall dip always means the embedding regressed, so neither efSearch nor M helps and the model must be retrained.", correct: false },
+          { text: "Recall cannot be raised once the index is live, so accepting the lower recall is the only available course of action.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>Query-time efSearch does influence recall, the dip is not necessarily an embedding regression, and recall is not stuck once live; the rebuild reflex ignores the cheap dial.</>}
+        lens={<>A small recall dip with latency to spare is exactly what efSearch is for: raising it explores more candidates per query and lifts recall immediately, no rebuild required. Defaulting to a multi-hour rebuild with higher M wastes time and is warranted only when even high efSearch cannot meet recall within the latency budget. The misdiagnosis is treating the build knob as the routine recall fix when the query-time dial is the right first move.</>}
+        stretch={<>What observation would justify escalating from efSearch to a graph rebuild?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Hierarchical_navigable_small_world" target="_blank" rel="noopener">
+            <strong>Hierarchical navigable small world</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(layered proximity graph, greedy search, M and ef parameters)</span>
+          <br/>Covers the multi-layer graph construction, the greedy descent, and the roles of M, efConstruction, and efSearch.
         </li>
       </ul>
     </VIS.Section>

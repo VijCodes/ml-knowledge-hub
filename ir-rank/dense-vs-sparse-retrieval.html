@@ -2167,288 +2167,272 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: Dense vs sparse retrieval.
+// Delta: sparse (BM25 over an inverted index) matches EXACT terms — strong on rare tokens/IDs, no training,
+//   interpretable; dense (embeddings + ANN) matches SEMANTICS/synonyms but can miss exact strings and needs
+//   training data. The two fail on complementary queries, so hybrid fusion usually beats either alone.
+//   Diagram shows the two pipelines + a query's match behavior only; never prints which wins.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="IR"
+      title="Dense vs sparse retrieval"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Query Embeddings & ANN" },
+        { label: "Subtopic", value: "Sparse BM25 matches exact terms over an inverted index; dense embeddings plus ANN match semantics; they fail on complementary queries so hybrid fusion usually wins" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong><VIS.Term def="Retrieval that matches a query against documents using exact lexical term overlap, scored by a bag-of-words model such as BM25 over an inverted index.">Sparse retrieval</VIS.Term> matches
+      the exact terms a query uses, scoring documents by lexical overlap with a model like BM25 over an inverted index.
+      <VIS.Term def="Retrieval that encodes query and document as learned vectors and matches by vector similarity using approximate nearest neighbor search.">Dense retrieval</VIS.Term> encodes
+      query and document into learned vectors and matches by vector similarity.</strong>{" "}
+      Sparse is strong on rare tokens, product IDs, and verbatim strings, needs no training, and is interpretable, but it
+      cannot bridge a synonym or paraphrase that shares no terms. Dense captures meaning and synonyms but can miss an exact
+      string the user typed, and it requires training data to learn good vectors. Because the two methods miss on
+      complementary queries, a hybrid that fuses both score lists usually recalls more relevant documents than either alone.
+      The failure modes: assuming dense alone subsumes sparse and dropping exact-match recall, treating sparse as obsolete
+      once embeddings exist, and fusing the two without reconciling their incompatible score scales.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Two ways to decide a query matches a document">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        Sparse scores a document by the query terms it literally contains, using an inverted index from term to the
+        documents holding it. Dense embeds query and document into vectors and scores by similarity, retrieving by
+        approximate nearest neighbor. They answer different questions: did the words appear, versus does the meaning align.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`SPARSE: query terms -> inverted index -> docs containing those terms -> BM25 score
+   matches on: literal token overlap (rare tokens, IDs, exact strings)
+   training:   none
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
-
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+DENSE:  query -> embedding vector -> ANN search over doc vectors -> similarity score
+   matches on: learned semantic proximity (synonyms, paraphrase)
+   training:   needs labeled or contrastive data`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Each pipeline has a structural blind spot: sparse cannot match a synonym that shares no token, and dense can drift
+        away from an exact string it never learned to anchor on.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: one query, two behaviors">
+      <p>The query and how each side responds, with a hybrid that fuses both lists:</p>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`query: "cheap bluetooth headphones"
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+SPARSE (BM25): nails the literal terms cheap / bluetooth / headphones
+DENSE:         also surfaces "affordable wireless earbuds" (no shared token)
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+reported recall@100 (illustrative): hybrid 0.94, BM25 0.88, dense 0.86`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Sparse locks onto the exact words; dense reaches the synonym phrase that shares no token with the query. The hybrid
+        sees both kinds of match, so it recovers relevant documents that either method alone would have missed.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — Where each wins, where each breaks">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>Sparse (BM25)</th><th>Dense (embeddings + ANN)</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Matches on</td><td>Exact lexical term overlap</td><td>Learned semantic similarity</td></tr>
+          <tr><td>Strong on</td><td>Rare tokens, IDs, verbatim strings</td><td>Synonyms, paraphrase, intent</td></tr>
+          <tr><td>Training</td><td>None required</td><td>Needs training data</td></tr>
+          <tr><td>Blind spot</td><td>Synonyms sharing no token</td><td>Exact strings it never anchored</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Complementary, not redundant">
+        Dense does not strictly contain sparse: a learned vector can drift off a rare exact string that BM25 matches
+        trivially. Because the two methods miss on different queries, fusing their results raises recall above either alone,
+        which is why production search usually runs both rather than betting on one.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>sparse matches exact terms (strong on rare tokens, no training,
+        interpretable), dense matches semantics (synonyms, needs training, can miss exact strings), and because they fail on
+        complementary queries hybrid fusion usually wins.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="dvs-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What sparse retrieval matches on"
+        scenario={<>A teammate claims BM25 sparse retrieval and dense embedding retrieval both rank documents by learned semantic similarity and differ only in speed. Pick the statement that correctly characterizes sparse retrieval.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`sparse pipeline: query terms -> inverted index -> docs containing them
+question: what signal does the sparse score actually use?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { text: "Sparse scores documents by exact lexical term overlap with the query over an inverted index, no learned vectors.", correct: true },
+          { text: "Sparse scores documents by learned vector similarity in the same way dense retrieval does, just with faster math.", correct: false },
+          { text: "Sparse scores documents by their semantic proximity to the query intent, inferred from a trained language model.", correct: false },
+          { text: "Sparse scores documents by their popularity priors and recency, ignoring which query terms each document holds.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>Sparse is not a learned-vector method, so it is not dense with faster math. It does not infer semantic intent, and it does not rank by popularity; it ranks by literal term overlap.</>}
+        lens={<>Sparse retrieval scores a document by the query terms it literally contains, using an inverted index from term to the documents holding it and a weighting like BM25. There are no learned vectors and no semantic inference, which is exactly why it needs no training and stays interpretable. Conflating it with dense similarity hides its defining property: it matches words, not meaning.</>}
+        stretch={<>Which query type does this exact-term behavior handle that a semantic model often fumbles?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="dvs-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — The defining strength of sparse"
+        scenario={<>A teammate says dense embeddings strictly dominate sparse because they understand meaning, so sparse retrieval has no unique advantage left. Pick the statement that names sparse retrieval's distinctive strength.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`user types a rare product SKU and a niche brand token
+sparse: term is in the index; dense: token may be out of vocabulary
+question: where does sparse hold an edge?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { text: "Sparse excels on rare tokens, product IDs, and verbatim strings, matching them exactly with no training needed.", correct: true },
+          { text: "Sparse excels on paraphrased queries whose words never appear in the relevant document, by inferring synonyms.", correct: false },
+          { text: "Sparse excels at capturing user intent across long conversational queries, by encoding the full session context.", correct: false },
+          { text: "Sparse excels at bridging cross-language queries, by mapping foreign terms onto a shared semantic vector space.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>Paraphrase, intent encoding, and cross-language bridging are semantic abilities that need learned vectors; those are dense strengths, not sparse ones.</>}
+        lens={<>Sparse retrieval shines precisely where exact tokens carry the signal: rare words, identifiers, model numbers, and verbatim phrases that must match character-for-character. It does this with zero training and full interpretability. The decoys all describe semantic generalization, which is the dense story; attributing it to sparse erases the lexical edge that keeps sparse in production.</>}
+        stretch={<>Why might a learned embedding actively hurt recall on a rare exact identifier?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="dvs-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — A query that shares no token with its answer"
+        scenario={<>For the query "affordable wireless earbuds" the single most relevant product is titled "cheap bluetooth headphones" and shares no token with the query. A teammate proposes a pure BM25 system. Pick the soundest reading of what will happen.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`query:  affordable / wireless / earbuds
+target: cheap / bluetooth / headphones   (zero shared tokens)
+candidate system: BM25 only`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { text: "BM25 cannot retrieve the target because they share no term, so a semantic dense signal is needed to recover it.", correct: true },
+          { text: "BM25 retrieves the target easily because its weighting infers that the two phrases mean the same thing semantically.", correct: false },
+          { text: "BM25 retrieves the target because rare-term weighting automatically maps synonyms onto each other at scoring time.", correct: false },
+          { text: "BM25 retrieves the target because the inverted index links every term to all of its meaning-equivalent synonyms.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>BM25 has no notion of meaning, so none of its mechanisms map synonyms. Rare-term weighting reweights matched terms; it does not create matches between non-overlapping vocabularies.</>}
+        lens={<>BM25 scores a document only on the query terms it actually contains, so a relevant document that shares no token scores zero and is never retrieved. This is the structural blind spot of sparse retrieval, and it is exactly the case a dense embedding handles, because the two phrases sit close in a learned vector space despite zero lexical overlap. The right fix is to add the semantic signal, not to expect lexical matching to bridge meaning.</>}
+        stretch={<>How would a hybrid system surface this document while still honoring exact matches on other queries?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
-        difficulty="hard"
+        id="dvs-b2"
+        difficulty="medium"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Choosing retrieval for a code-search box"
+        scenario={<>You build search over a code repository where users often paste exact identifiers like error codes and function names, but also ask natural-language questions about behavior. A teammate proposes dense-only retrieval. Pick the soundest design.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`queries seen: exact identifiers (E_TIMEOUT_4031) AND prose questions
+risk: rare exact tokens vs paraphrased intent in the same workload
+options: dense only, sparse only, or fuse both`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { text: "Run sparse and dense together and fuse, since exact identifiers need lexical match while prose needs semantics.", correct: false },
+          { text: "Run dense only, since a strong embedding model subsumes exact matching once it is trained on enough code text.", correct: false },
+          { text: "Run sparse only, since identifiers dominate and semantics never matter for any query against a code repository.", correct: false },
+          { text: "Run a hybrid that fuses lexical and semantic signals, because the workload mixes exact tokens and prose intent.", correct: true },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>Dense-only risks missing rare exact identifiers it never anchored; sparse-only misses the prose questions. Both single-method options drop one half of a mixed workload.</>}
+        lens={<>The workload contains both exact-identifier queries, which demand lexical match, and natural-language questions, which demand semantic match, so neither method alone covers it. Fusing sparse and dense lets identifiers hit the inverted index while prose hits the embedding space, recovering relevant results for both query shapes. The two correct-sounding options say the same thing; the decoys each bet on one method and forfeit the queries it cannot serve.</>}
+        stretch={<>What practical issue arises when you try to combine the two methods' raw scores?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="dvs-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why hybrid recall exceeds either method"
+        scenario={<>A teammate is surprised that fusing sparse and dense gives higher recall than either alone, expecting the better single method to be an upper bound. Pick the explanation of why the hybrid can exceed both.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`relevant set R for a query
+sparse retrieves subset S of R; dense retrieves subset D of R
+question: how do S and D relate, and what does fusing them yield?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { text: "The two methods miss on different queries, so their retrieved sets only partly overlap and the union covers more.", correct: true },
+          { text: "Fusing always averages the two recalls, so the hybrid lands exactly between sparse recall and dense recall.", correct: false },
+          { text: "Fusing inherits whichever method is weaker on a query, so the hybrid is bounded below by the worse of the two.", correct: false },
+          { text: "Fusing duplicates the same hits both methods already find, so the hybrid recall equals the better single method.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>Fusion is not an average, and it is not bounded by the weaker method. If the two retrieved exactly the same documents, the hybrid would equal one method; the gain depends on their misses being different.</>}
+        lens={<>Because sparse fails on synonym queries and dense fails on rare exact strings, the relevant documents each one retrieves only partly overlap, so the union of their hits is larger than either set. Fusion takes that union (reweighted), recovering documents that one method missed but the other caught, which lifts recall above both. The gain is a direct consequence of the two methods having complementary, not identical, blind spots.</>}
+        stretch={<>If the two methods retrieved identical sets, what would the hybrid recall equal?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="dvs-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Dense beats sparse on average, yet loses head-to-head sometimes"
+        scenario={<>A dense model posts higher mean recall than BM25 across a query set, yet on a specific batch of queries BM25 strictly beats it. A teammate calls this a contradiction. Predict the non-obvious reason both can be true at once.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`mean recall over all queries: dense > sparse
+on the rare-exact-token query batch: sparse > dense
+both numbers measured on the same correct ground truth`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { text: "Dense wins on the many semantic queries but loses on rare-exact-token queries, so a higher mean hides a sparse win.", correct: true },
+          { text: "A higher mean recall mathematically forces dense to win on every individual query, so the batch must be mislabeled.", correct: false },
+          { text: "Sparse winning on any batch proves the dense mean was computed on the wrong query set or with a different cutoff.", correct: false },
+          { text: "Mean recall and per-batch recall measure unrelated quantities, so comparing them on one system is never meaningful.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>A higher mean does not force a win on every query; means hide per-segment reversals. The batch is not mislabeled, and per-batch recall is the same metric on a query subset, so it is comparable.</>}
+        lens={<>The dense model averages higher because most queries are semantic, where it dominates, but that mean absorbs a minority of rare-exact-token queries where sparse strictly wins. Aggregate superiority and a per-segment loss coexist with no contradiction, which is the empirical core of why hybrids exist: you keep sparse to protect the exact-match segment that drags down a dense-only system's worst queries. The mean conceals the segment where the other method is mandatory.</>}
+        stretch={<>Why does this segment-level reversal argue for fusing rather than picking the higher-mean method?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="dvs-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — A migration that drops exact-match recall"
+        scenario={<>A team replaces its BM25 system entirely with a dense retriever. Overall metrics improve, but support tickets spike for users searching exact SKUs and error codes that now return nothing. Pick the soundest operational fix.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`change: removed BM25, kept dense only
+symptom: exact-SKU and error-code queries now return nothing
+aggregate metric: up; long-tail exact queries: broken`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { text: "Keep a sparse lane alongside dense and fuse, since exact identifiers need lexical match the embedding cannot guarantee.", correct: true },
+          { text: "Retrain the dense model on more data, since enough training will let embeddings memorize every exact identifier verbatim.", correct: false },
+          { text: "Raise the dense candidate count to thousands, since a larger pool will eventually surface the exact identifier matches.", correct: false },
+          { text: "Lower the dense similarity threshold to zero, since accepting all candidates restores the missing exact-token results.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>More training, a bigger pool, or a looser threshold all still rank by learned similarity, which does not reliably anchor a rare exact token; they trade precision for a fragile hope of recall.</>}
+        lens={<>Removing the sparse lane removed the only component that matches exact tokens deterministically, so rare SKUs and error codes vanish no matter how the dense knobs are tuned, because the embedding has no guarantee of placing a rare verbatim string near its query. The fix restores a sparse lane and fuses it with dense, so exact identifiers hit the inverted index while semantics still flow through the vectors. Tuning a single dense system cannot recover a capability the architecture dropped.</>}
+        stretch={<>What guardrail metric would have caught this regression before launch?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="dvs-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Fusing two incompatible score scales"
+        scenario={<>A team sums raw BM25 scores and raw cosine similarities to fuse sparse and dense, but BM25 scores range into the tens while cosine sits in a small bounded range. Results are dominated by one side. Pick the soundest diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`fusion: final = BM25_raw + cosine_raw
+BM25_raw: unbounded, often in the tens
+cosine_raw: bounded in a small range
+observed: one side swamps the other`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { text: "The two scores live on incompatible scales, so summing raw values lets the larger-range side dominate the fusion.", correct: false },
+          { text: "The fusion proves dense and sparse measure the same quantity, so one of them is redundant and should be removed.", correct: false },
+          { text: "The dominance means BM25 is simply the better retriever, so the dense lane adds nothing and should be dropped.", correct: false },
+          { text: "Raw BM25 and raw cosine have mismatched ranges, so the wide-range score swamps the other unless they are normalized.", correct: true },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>The dominance is a scaling artifact, not evidence that one method is better or redundant; concluding either drops a complementary signal for the wrong reason.</>}
+        lens={<>Sparse and dense scores are not on a common scale, so adding raw values lets whichever score has the larger numeric range dictate the result, regardless of which method is actually more relevant for the query. The fix is to reconcile the scales first, for example by normalizing each list or fusing by rank rather than raw score, so both signals contribute. The two correct-sounding options say the same thing; the decoys misread a units mismatch as a verdict on retrieval quality.</>}
+        stretch={<>Why does fusing by rank position sidestep the scale-mismatch problem entirely?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Okapi_BM25" target="_blank" rel="noopener">
+            <strong>Okapi BM25</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(the canonical sparse lexical scoring model)</span>
+          <br/>Grounds the sparse side: how exact-term overlap is weighted over an inverted index.
         </li>
       </ul>
     </VIS.Section>

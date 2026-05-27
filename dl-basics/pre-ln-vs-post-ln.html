@@ -2167,288 +2167,290 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: PRE-LN VS POST-LN TRANSFORMERS.
+// Delta: The difference is WHERE the LayerNorm sits relative to the residual add. Post-LN (original transformer):
+//   out = LN(x + Sublayer(x)) -- the LN is OUTSIDE the residual, on the sum. This puts the normalization on the main path,
+//   so gradients to early layers are large/unstable at init and the model NEEDS learning-rate warmup to train without
+//   diverging. Pre-LN: out = x + Sublayer(LN(x)) -- the LN is INSIDE the residual branch, so the residual (identity) path
+//   is clean and ungated, giving well-behaved gradients and stable training WITHOUT warmup. Most modern LLMs are Pre-LN.
+//   The tradeoff: Pre-LN trades a small final-quality cost (~0.1-0.2 higher loss) for training stability. The trap:
+//   thinking the two are the same up to a relabel, thinking Pre-LN needs warmup (it is the one that avoids it), or
+//   thinking Post-LN is strictly obsolete (it can reach slightly lower loss when you can afford warmup). Diagram shows the
+//   two block wiring SETUPS only -- it does NOT state which needs warmup.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="DL"
+      title="Pre-LN vs Post-LN Transformers"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Normalization" },
+        { label: "Subtopic", value: "Post-LN normalizes the residual sum and needs warmup to train stably; Pre-LN normalizes inside the residual branch, leaving a clean identity path that trains without warmup. Most modern LLMs use Pre-LN -- a stability/quality tradeoff" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>The only structural difference is where the LayerNorm sits relative to the residual add. Post&#8209;LN (the
+      original transformer) normalizes the sum: out = LN(x + Sublayer(x)), so the LN is on the main path. Pre&#8209;LN
+      normalizes inside the residual branch: out = x + Sublayer(LN(x)), leaving the identity path clean.</strong>{" "}
+      That placement controls gradient flow. Post&#8209;LN puts normalization on the main path, so gradients to early layers
+      are large and unstable at initialization and the model needs{" "}
+      <VIS.Term def="A schedule that ramps the learning rate up from near zero over the first few thousand steps, letting the model stabilize before taking large steps.">learning&#8209;rate warmup</VIS.Term> to
+      train without diverging. Pre&#8209;LN keeps an ungated{" "}
+      <VIS.Term def="The skip path that adds the input straight to the sublayer output. When nothing sits on it (no LN), gradients flow through it unattenuated, like an identity.">identity residual path</VIS.Term>,
+      giving well&#8209;behaved gradients and stable training without warmup &mdash; which is why most modern LLMs are Pre&#8209;LN.
+      The tradeoff: Pre&#8209;LN tends to a slightly higher final loss (about 0.1&ndash;0.2) in exchange for that stability. The
+      failure modes: treating the two as a mere relabel, thinking Pre&#8209;LN is the one that needs warmup, and calling
+      Post&#8209;LN strictly obsolete when it can reach marginally lower loss if you can afford warmup.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Where does the LN sit?">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        A teammate says "Pre&#8209;LN and Post&#8209;LN are the same block with the LayerNorm relabeled; pick either." Write out the
+        two block equations and work out, for each, whether the residual (identity) path passes through a LayerNorm.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`Post-LN (original transformer):
+   out = LN( x + Sublayer(x) )      -- LN is on the SUM (main path)
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+Pre-LN:
+   out = x + Sublayer( LN(x) )      -- LN is INSIDE the residual branch
+                                       identity path x -> out is clean
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+question: in which variant does the straight x -> out path
+          pass through a LayerNorm, and in which is it clean?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
+        Reason about what an ungated identity path does for gradients reaching the earliest layers, and which variant
+        therefore needs a careful learning&#8209;rate ramp at the start of training.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: warmup need and the quality gap">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`Post-LN, no warmup:
+   LN sits on the main path -> early-layer gradients large at init
+   high lr from step 0 -> often diverges
+   FIX: ~2k-step warmup -> trains stably, can reach slightly lower loss
 
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
+Pre-LN, no warmup:
+   identity path is clean -> gradients well-behaved at init
+   trains stably from step 0, no warmup needed
+   COST: tends to ~0.1-0.2 higher final loss
 
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
+modern LLMs: Pre-LN (stability at scale wins)`}</pre>
       <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Post&#8209;LN keeps the LayerNorm on the main path, so at initialization the gradients reaching early layers are large
+        and the run tends to diverge unless a warmup ramp eases the learning rate up &mdash; with warmup it trains well and
+        can even reach marginally lower loss. Pre&#8209;LN's clean identity path makes gradients well&#8209;behaved from step 0, so
+        it trains without warmup, at the cost of a slightly higher final loss. At large scale that stability is usually
+        worth the small quality gap, which is why modern LLMs default to Pre&#8209;LN.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-contrast" title="Beat 3 — Pre-LN vs Post-LN at a glance">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Property</th><th>Pre-LN vs Post-LN</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>LN placement</td><td>Pre: inside residual branch / Post: on the residual sum</td></tr>
+          <tr><td>Identity path</td><td>Pre: clean / Post: passes through LN</td></tr>
+          <tr><td>Warmup needed</td><td>Pre: no / Post: yes (or it diverges)</td></tr>
+          <tr><td>Final loss</td><td>Pre: ~0.1-0.2 higher / Post: slightly lower with warmup</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Placement buys stability, costs a little quality">
+        Moving the LayerNorm inside the residual branch (Pre&#8209;LN) leaves a clean identity path, so gradients behave at
+        initialization and warmup becomes unnecessary &mdash; the property that makes Pre&#8209;LN the safe default at scale.
+        Keeping it on the sum (Post&#8209;LN) can reach slightly lower loss but only with a warmup ramp to survive the early
+        steps. It is a stability&#8209;versus&#8209;quality tradeoff, not a relabel.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>Post&#8209;LN normalizes the residual sum (main&#8209;path LN, needs
+        warmup); Pre&#8209;LN normalizes inside the branch (clean identity path, trains without warmup, slightly higher final
+        loss).</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="preln-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — Where the LN sits in each variant"
+        scenario={<>A teammate says "in both Pre&#8209;LN and Post&#8209;LN the LayerNorm sits on the residual sum." Pick the statement that correctly places the LN in each variant.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`variant P: out = LN(x + Sublayer(x))
+variant Q: out = x + Sublayer(LN(x))
+question: which places LN on the sum, which inside the branch?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "Post-LN puts the norm on the residual sum, while Pre-LN puts the norm inside the residual sublayer branch.", correct: true },
+          { key: "b", text: "Pre-LN puts the norm on the residual sum, while Post-LN puts the norm inside the residual sublayer branch.", correct: false },
+          { key: "c", text: "Both variants put the norm on the residual sum, differing only in the order they apply attention and the feedforward.", correct: false },
+          { key: "d", text: "Both variants put the norm inside the branch, differing only in whether they also normalize the block's final output.", correct: false },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) reverses the two: Post-LN is on the sum, Pre-LN is in the branch. (c) only Post-LN is on the sum. (d) only Pre-LN is in the branch. The placement is the entire distinction.</>}
+        lens={<>Post&#8209;LN normalizes the residual sum (out = LN(x + Sublayer(x))); Pre&#8209;LN normalizes inside the branch (out = x + Sublayer(LN(x))). The reverse is false, and neither "both on the sum" nor "both in the branch" is correct because the two differ precisely in LN placement. That placement is what determines gradient behavior and warmup need.</>}
+        stretch={<>In which variant is the straight x-to-out identity path free of any LayerNorm?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="preln-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — Which variant needs warmup"
+        scenario={<>A teammate claims "Pre&#8209;LN is the variant that requires learning&#8209;rate warmup to train without diverging." Pick the statement that correctly assigns the warmup requirement.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`one variant trains stably from step 0; the other tends to diverge without a ramp
+question: which is which?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Post-LN tends to need warmup to avoid diverging, while Pre-LN trains stably from the first step without it.", correct: true },
+          { key: "b", text: "Pre-LN tends to need warmup to avoid diverging, while Post-LN trains stably from the first step without any ramp.", correct: false },
+          { key: "c", text: "Both variants need warmup to avoid diverging, since any transformer requires a learning-rate ramp at the start.", correct: false },
+          { key: "d", text: "Neither variant needs warmup to avoid diverging, since the residual connection alone fully stabilizes both at init.", correct: false },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) reverses it: Pre-LN is the one that avoids warmup. (c) Pre-LN trains without warmup, so "both" is wrong. (d) Post-LN does tend to need warmup, so "neither" is wrong.</>}
+        lens={<>Post&#8209;LN puts the LN on the main path, so its early gradients are large at init and it tends to diverge without a warmup ramp; Pre&#8209;LN's clean identity path lets it train from step 0. The reverse is false, and "both"/"neither" are wrong because exactly Post&#8209;LN needs the ramp. This is a direct consequence of LN placement.</>}
+        stretch={<>What does Pre-LN give up in final quality in exchange for not needing warmup?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
-        difficulty="medium"
+        id="preln-b1"
+        difficulty="hard"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — A deep LLM that diverges from step 0"
+        scenario={<>You are training a very deep transformer LLM and want it to train stably from step 0 with minimal schedule tuning. A teammate proposes Post&#8209;LN with no warmup. Pick the soundest choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`very deep LLM, want stability from step 0, minimal tuning
+question: which block design best meets this?`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "Use Pre-LN, since its clean identity path gives stable gradients from step 0 without a warmup schedule at all.", correct: true },
+          { key: "b", text: "Use Post-LN with no warmup, since normalizing the residual sum already stabilizes a deep network from the first step.", correct: false },
+          { key: "c", text: "Use Post-LN with no warmup but a tiny learning rate, since a small enough step removes the need for any LN placement care.", correct: false },
+          { key: "d", text: "Use Post-LN with no warmup and gradient clipping, since clipping fully substitutes for the missing warmup in deep nets.", correct: false },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) Post-LN without warmup tends to diverge in deep nets; the sum-path LN is the issue. (c) a tiny lr cripples learning and still does not address the placement. (d) clipping caps spikes but does not fix the systematic large-gradient regime Post-LN has at init.</>}
+        lens={<>Pre&#8209;LN's ungated identity path makes gradients well&#8209;behaved at initialization, so a deep LLM trains stably from step 0 with no warmup &mdash; the reason it is the modern default. Post&#8209;LN without warmup tends to diverge; a tiny learning rate trades divergence for crawling progress; and clipping only caps spikes without fixing the placement. Choose Pre&#8209;LN for stability at depth.</>}
+        stretch={<>If you instead used Post-LN, roughly how long a warmup would you budget, and why does that length scale with depth?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="preln-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Squeezing the last bit of quality"
+        scenario={<>You can afford careful schedule tuning and want the lowest possible final loss on a moderate&#8209;depth transformer, accepting a warmup phase. A teammate insists Pre&#8209;LN always reaches lower loss. Pick the soundest assessment.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`moderate depth, warmup affordable, goal = lowest final loss
+question: which variant can edge out the other on final loss?`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Post-LN with warmup can reach a slightly lower final loss, the small quality edge Pre-LN gives up for stability.", correct: true },
+          { key: "b", text: "Pre-LN always reaches a strictly lower final loss, so warmup-tuned Post-LN can never match it on any transformer.", correct: false },
+          { key: "c", text: "Post-LN with warmup reaches a far lower final loss, large enough to make Pre-LN obsolete for every modern model.", correct: false },
+          { key: "d", text: "Pre-LN and Post-LN reach exactly the same final loss, so the choice between them never affects model quality at all.", correct: false },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) Pre-LN is not strictly better on loss; it trades a little quality for stability. (c) the gap is small (~0.1-0.2), not large, and Pre-LN remains the scale default. (d) there is a small but real quality gap, so "exactly the same" is wrong.</>}
+        lens={<>With warmup affordable, Post&#8209;LN can reach a marginally lower final loss &mdash; precisely the small quality edge that Pre&#8209;LN trades away for stability. Pre&#8209;LN is not strictly better on loss, the gap is small rather than large, and the two do not match exactly. The right choice depends on whether you value step&#8209;0 stability or the last fraction of loss.</>}
+        stretch={<>Why does the stability advantage of Pre-LN matter more as model scale and depth grow?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="preln-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why Pre-LN's identity path helps gradients"
+        scenario={<>A teammate asks mechanically why putting the LN inside the residual branch (rather than on the sum) tames the gradients reaching early layers. Pick the correct explanation.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`Pre-LN: out = x + Sublayer(LN(x))  -> d out/d x has a clean +1 term
+Post-LN: out = LN(x + Sublayer(x)) -> the +1 term passes through LN's Jacobian
+question: which keeps an undamped identity term in the gradient?`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Pre-LN leaves an undamped identity term in the gradient, while Post-LN routes that term through the LN Jacobian.", correct: true },
+          { key: "b", text: "Post-LN leaves an undamped identity term in the gradient, while Pre-LN routes that term through the LN Jacobian.", correct: false },
+          { key: "c", text: "Both variants route the identity term through the LN Jacobian, so the placement has no effect on the early gradients.", correct: false },
+          { key: "d", text: "Neither variant has an identity term in the gradient, since the LayerNorm removes the residual shortcut in both cases.", correct: false },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) reverses it: in Post-LN the sum (including the identity term) goes through LN. (c) only Post-LN passes the identity term through LN's Jacobian. (d) the residual shortcut is not removed; Pre-LN keeps a clean one.</>}
+        lens={<>In Pre&#8209;LN the output is x plus a branch, so the derivative with respect to x retains a clean identity term that carries gradients to early layers undamped; in Post&#8209;LN the LN wraps the whole sum, so even the identity term passes through LN's Jacobian and is rescaled. The reverse is false, the two are not symmetric, and the residual shortcut is not removed. The clean identity term is why Pre&#8209;LN needs no warmup.</>}
+        stretch={<>How is this clean-identity-term argument the same one used to explain why residual connections help very deep nets in general?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="preln-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Two runs, same hyperparameters, no warmup"
+        scenario={<>Two identical deep transformers are trained with the same high learning rate and no warmup; one is Pre&#8209;LN, one is Post&#8209;LN. A teammate predicts they will behave the same early on "since the architectures are nearly identical." Predict the non&#8209;obvious early&#8209;training outcome.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`same deep net, same high lr, no warmup
+run A = Pre-LN, run B = Post-LN
+question: how do the two early-training trajectories differ?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "The Pre-LN run stays stable while the Post-LN run tends to diverge early, despite the near-identical architectures.", correct: true },
+          { key: "b", text: "The Post-LN run stays stable while the Pre-LN run tends to diverge early, since Pre-LN is the more fragile design.", correct: false },
+          { key: "c", text: "Both runs diverge early in exactly the same way, since with no warmup the LN placement makes no practical difference.", correct: false },
+          { key: "d", text: "Both runs stay perfectly stable early, since a high learning rate is harmless to a transformer regardless of placement.", correct: false },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) reverses it: Post-LN is the fragile one without warmup. (c) the placement makes a large practical difference exactly when warmup is absent. (d) a high lr with no warmup is precisely what destabilizes Post-LN.</>}
+        lens={<>With a high learning rate and no warmup, the Pre&#8209;LN run's clean identity path keeps it stable while the Post&#8209;LN run's main&#8209;path LN produces large early gradients and tends to diverge &mdash; a large behavioral gap despite near&#8209;identical block structure. The reverse is false, the placement matters most precisely here, and a high lr without warmup is not harmless to Post&#8209;LN. Small wiring change, big stability difference.</>}
+        stretch={<>What minimal change to the Post-LN run would let it survive the same high learning rate?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="preln-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Choosing a block for a new LLM codebase"
+        scenario={<>You are setting the default transformer block for a new large&#8209;model codebase where many teams will train at scale with varied schedules. You must pick a robust default. Pick the soundest choice.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`many teams, large scale, varied schedules, want a safe default
+question: which block design minimizes training-instability surprises?`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Default to Pre-LN, since stable training without mandatory warmup is the safer choice across many teams at scale.", correct: true },
+          { key: "b", text: "Default to Post-LN, since it is the original transformer block and therefore the safest choice for any new codebase.", correct: false },
+          { key: "c", text: "Default to Post-LN without warmup, since dropping warmup simplifies every team's schedule and avoids tuning overhead.", correct: false },
+          { key: "d", text: "Default to either at random, since the block choice does not affect training stability once the model is large enough.", correct: false },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) "original" does not mean safest; Post-LN demands warmup. (c) Post-LN without warmup is exactly the divergence-prone setup. (d) the block choice strongly affects stability, especially at scale.</>}
+        lens={<>Pre&#8209;LN trains stably without mandatory warmup, so it is the robust default when many teams run varied schedules at scale &mdash; the reason modern LLMs adopt it. Being the original design does not make Post&#8209;LN safest, Post&#8209;LN without warmup is the divergence&#8209;prone case, and the choice matters more (not less) at scale. Choose the stable default.</>}
+        stretch={<>What single training failure would most cleanly signal that a team accidentally used Post-LN without warmup?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="preln-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — Loss explodes in the first hundred steps"
+        scenario={<>A deep transformer's loss explodes within the first 100 steps at a learning rate that works fine later in training. The block is Post&#8209;LN and the schedule has no warmup. A teammate blames a data bug. Pick the correct diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`Post-LN block, no warmup, deep net
+symptom: loss explodes in first ~100 steps, fine if it survives
+question: which design choice most likely causes this?`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "Post-LN's main-path norm makes early gradients large, so the missing warmup lets the first steps blow up the loss.", correct: true },
+          { key: "b", text: "The data pipeline is feeding corrupted batches early on, so the explosion is unrelated to the LN placement or warmup.", correct: false },
+          { key: "c", text: "The model is overfitting within the first hundred steps, so adding dropout will prevent the early loss explosion here.", correct: false },
+          { key: "d", text: "The weight decay is set far too high, so the parameters collapse to zero and the loss explodes in the first few steps.", correct: false },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) blaming data ignores the textbook Post-LN-without-warmup signature: early explosion, stable later. (c) overfitting does not explode loss in 100 steps; that is an instability signature. (d) high weight decay does not cause an early loss explosion of this kind.</>}
+        lens={<>An early loss explosion at a learning rate that is fine later, with Post&#8209;LN and no warmup, is the classic signature of Post&#8209;LN's large initial gradients on the main path &mdash; the fix is to add warmup (or switch to Pre&#8209;LN). It is not a data bug, not overfitting (which is gradual), and not excessive weight decay. The schedule, not the data, is the culprit.</>}
+        stretch={<>Why does the run train fine once it survives the first few hundred steps, even at the same learning rate?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener">
+            <strong>On Layer Normalization in the Transformer Architecture (Xiong et al., 2020)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(Pre-LN gradients are bounded at init; Post-LN needs warmup)</span>
+          <br/>Shows analytically why Pre&#8209;LN trains without warmup while Post&#8209;LN's main&#8209;path norm demands it.
+        </li>
+        <li>
+          <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">
+            <strong>Attention Is All You Need (Vaswani et al., 2017)</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(the original Post-LN block and its warmup schedule)</span>
+          <br/>The original transformer, which normalizes the residual sum and pairs it with a warmup learning&#8209;rate schedule.
         </li>
       </ul>
     </VIS.Section>

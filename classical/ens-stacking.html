@@ -2167,288 +2167,295 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-// Concept explainer: BART DENOISING AUTOENCODER.
-// Delta: BART pretrains a full encoder-decoder by corrupting a document with several NOISE TRANSFORMATIONS (token
-//   masking, token DELETION, text-infilling of spans by a single mask, sentence permutation, document rotation) and
-//   training the model to RECONSTRUCT the ORIGINAL clean text. The encoder is bidirectional (sees the whole corrupted
-//   input at once); the decoder is autoregressive (left-to-right). So BART unifies BERT-style bidirectional encoding
-//   with GPT-style autoregressive decoding, which is why it fine-tunes well for both generation (summarization) and
-//   classification. Unlike BERT's fixed [MASK] prediction at fixed positions, BART's text-infilling does not reveal HOW
-//   MANY tokens a masked span hid, so the decoder must also predict span length. Trap surface: thinking BART is
-//   encoder-only like BERT, thinking the objective predicts the noise rather than reconstructing the source, thinking
-//   text-infilling tells the model the deleted span's length, and thinking only masking is used. Diagram shows the
-//   corruption pipeline / objective only; never prints "therefore BART is an encoder-decoder".
+// Concept explainer: STACKING / STACKED GENERALIZATION.
+// Delta: stacking trains DIVERSE base learners, then trains a META-LEARNER on their predictions to learn the
+//   best combination. The critical correctness rule: the meta-learner must be trained on OUT-OF-FOLD (OOF)
+//   predictions — each base model predicts a row only when that row was NOT in its training fold — NOT on
+//   in-sample predictions, or the meta-learner overfits to leaked base-model fits. The diagram shows the
+//   two-level structure and the OOF-prediction construction only; the candidate must infer WHY in-sample
+//   predictions leak and that base-learner DIVERSITY (not just accuracy) is what the meta-learner exploits.
 
 const App = () => (
   <main style={{ maxWidth: 880, margin: "2em auto", padding: "0 16px", fontSize: 16, lineHeight: 1.65 }}>
     <VIS.Hero
-      pill="NLP"
-      title="BART Denoising Autoencoder"
+      pill="Classical"
+      title="Stacking / Stacked Generalization"
       byline={[
-        { label: "Topic", value: "Seq2Seq Pretraining" },
-        { label: "Subtopic", value: "BART corrupts a document with several noise transformations and trains a bidirectional encoder plus autoregressive decoder to reconstruct the original clean text, unifying BERT-style encoding with GPT-style generation" },
+        { label: "Topic", value: "Ensemble Methods" },
+        { label: "Subtopic", value: "Stacking trains diverse base learners then a meta-learner on their out-of-fold predictions to learn the best combination; using out-of-fold (not in-sample) predictions is what prevents the meta-learner from overfitting leaked fits" },
       ]} />
 
     <VIS.TLDR>
-      <strong><VIS.Term def="BART (Bidirectional and Auto-Regressive Transformers): a sequence-to-sequence model pretrained as a denoising autoencoder, with a bidirectional encoder and an autoregressive decoder.">BART</VIS.Term> corrupts
-      a document with several noise transformations and trains a full encoder-decoder to reconstruct the <em>original</em>
-      clean text.</strong>{" "}
-      The <VIS.Term def="Encoder: the half of the model that reads the entire (corrupted) input at once and builds contextual representations of it.">encoder</VIS.Term> is
-      bidirectional, so it reads the whole corrupted input at once, while the <VIS.Term def="Decoder: the half of the model that generates the output one token at a time, conditioning on what it has produced so far.">decoder</VIS.Term> is
-      autoregressive, generating the reconstruction left to right. The corruptions include token masking, token deletion,
-      <VIS.Term def="Text infilling: replacing a contiguous span of tokens (possibly length zero) with a single mask token, so the model cannot tell how many tokens were hidden.">text-infilling</VIS.Term> of
-      spans by a single mask, sentence permutation, and document rotation. Because the reconstruction target is the source,
-      not the noise, BART learns to both understand and generate, which is why it fine-tunes well for summarization and
-      classification alike. The failure modes: thinking BART is encoder-only like BERT, thinking the objective predicts the
-      applied noise rather than reconstructing the source, thinking text-infilling reveals the hidden span's length, and
-      thinking masking is the only corruption used.
+      <strong>Stacking trains several <VIS.Term def="Base models chosen to make different kinds of errors — for example a tree ensemble, a linear model, and a nearest-neighbour model. The meta-learner profits from their disagreement, not just their individual accuracy.">diverse base learners</VIS.Term>, then
+      trains a <VIS.Term def="A second-level model that takes the base models' predictions as its input features and learns how to weight or combine them into a final prediction.">meta-learner</VIS.Term> on
+      their <VIS.Term def="Predictions a base model makes for rows it did NOT train on, produced via cross-validation: each fold's rows are predicted by a model trained on the other folds. This keeps the meta-features honest.">out-of-fold</VIS.Term> predictions
+      to learn the best combination.</strong>{" "}
+      The base models form the first level; the meta-learner forms the second, taking the base predictions as its
+      features. The correctness hinge is which predictions train the meta-learner: they must be out-of-fold, so
+      each base model only predicts rows it did not see in training, generated via cross-validation. If you train
+      the meta-learner on in-sample predictions instead &mdash; base models scoring the very rows they fit &mdash;
+      those predictions are unrealistically good and the meta-learner overfits to that leaked optimism, then
+      collapses in production. Diversity matters more than individual accuracy: the meta-learner exploits base
+      models that err differently. The failure modes: training the meta-learner on in-sample predictions and
+      leaking; stacking near-identical base models and gaining nothing; and judging base models by solo accuracy
+      rather than complementarity.
     </VIS.TLDR>
 
-    <VIS.Section id="sec-define" title="Beat 1 — What BART reconstructs and with what architecture">
+    <VIS.Section id="sec-define" title="Beat 1 — Two levels, and the out-of-fold rule">
       <p>
-        A teammate is about to describe BART as &quot;BERT with a few more mask types, encoder-only, predicting which tokens
-        were corrupted.&quot; A corrupted document and the training target are shown below. Work out what BART actually
-        reconstructs and what architecture produces that reconstruction.
+        Stacking has a first level of diverse base models and a second-level meta-learner trained on their
+        predictions. Below is the two-level structure and how the meta-learner&rsquo;s training inputs are built
+        with cross-validation. Read them and work out why each base model must predict only rows it did not train
+        on, and what the meta-learner is really exploiting.
       </p>
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`original document:
-   "The cat sat on the mat. It was warm."
+      <div style={{ margin: "16px 0" }}>
+        <VIS.Equation display tex={"\\text{meta-features for row } i: \\big(\\hat{y}^{(1)}_{-f(i)},\\, \\hat{y}^{(2)}_{-f(i)}, \\dots\\big), \\quad \\text{each base model trained without fold } f(i)"} />
+      </div>
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`level 1 (base): diverse models, e.g. tree-ensemble, linear, kNN
+level 2 (meta): a model whose FEATURES are the base predictions
 
-corrupted input fed to the model:
-   "warm. It was [MASK] the mat. The cat"   (infill + sentence permute)
+building meta training data (out-of-fold via K folds):
+  for each fold, train each base model on the OTHER folds,
+  predict THIS fold -> those predictions become meta-features
 
-training target the model must produce:
-   ???   (the applied noise, or the original clean document?)
-
-who reads the corrupted input, and who emits the target?`}</pre>
+what breaks if a base model predicts rows it trained on?`}</pre>
       <p>
-        One reading has BART label which tokens were noised, encoder-only. Another has it regenerate the original document
-        with an encoder that reads the corruption and a decoder that emits text. Decide which.
-      </p>
-    </VIS.Section>
-
-    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: the corruption pipeline and the objective">
-      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`noise transformations BART samples from:
-   token masking      : replace random tokens with [MASK]
-   token deletion     : delete random tokens (model must find WHERE)
-   text infilling     : replace a span (len 0..k) with ONE [MASK]  -> length hidden
-   sentence permute   : shuffle sentence order
-   document rotation  : rotate doc to start at a random token
-
-architecture:
-   bidirectional encoder  reads the FULL corrupted input
-   autoregressive decoder produces tokens left-to-right
-
-objective:
-   maximize  log P(original clean document | corrupted input)
-   (cross-entropy of the decoder's tokens against the SOURCE)`}</pre>
-      <p>
-        BART feeds the corrupted document to a bidirectional encoder and asks an autoregressive decoder to emit the original
-        document token by token, scored by cross-entropy against the clean source. Text-infilling is the key corruption: a
-        span of several tokens (or zero tokens) is replaced by a single mask, so the model is not told how many tokens were
-        removed and must predict span length as well as content. Deletion hides even the position of the missing tokens. The
-        target is always the original text, never a description of the noise. (Why this unifies understanding and generation
-        is unpacked in the drills.)
+        Notice each meta-feature for a row comes from a base model that never saw that row. Decide what would leak
+        if it had, and why the base models being different from each other is the point.
       </p>
     </VIS.Section>
 
-    <VIS.Section id="sec-contrast" title="Beat 3 — What BART actually does">
+    <VIS.Section id="sec-worked" title="Beat 2 — Worked example: out-of-fold versus leaked predictions">
+      <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`in-sample meta-features (WRONG):
+  each base model predicts rows it trained on
+  -> those predictions look near-perfect (the model memorised them)
+  -> meta-learner trusts them, overfits, collapses in production
+
+out-of-fold meta-features (RIGHT):
+  5-fold CV: each row predicted by a base model trained on other folds
+  -> predictions reflect true generalisation
+  -> meta-learner learns an honest combination`}</pre>
+      <p>
+        If each base model scores the rows it was trained on, those in-sample predictions are unrealistically
+        accurate because the model partly memorised them; the meta-learner then learns to lean on predictions that
+        will never be that good on unseen data, so it overfits and fails in production. The out-of-fold
+        construction fixes this: with K-fold cross-validation, every row&rsquo;s meta-features come from base
+        models trained on the other folds, so the predictions reflect genuine generalisation and the meta-learner
+        learns an honest combination. Diversity is what gives the meta-learner something to do &mdash; if the base
+        models agree everywhere, there is no useful combination to learn. (How blending and the choice of
+        meta-learner differ is taken up in the drill lenses.)
+      </p>
+    </VIS.Section>
+
+    <VIS.Section id="sec-contrast" title="Beat 3 — Out-of-fold versus in-sample meta-features">
       <table>
-        <thead><tr><th>Aspect</th><th>How BART behaves</th></tr></thead>
+        <thead><tr><th>Aspect</th><th>Out-of-fold (correct)</th><th>In-sample (leaks)</th></tr></thead>
         <tbody>
-          <tr><td>Architecture</td><td>Bidirectional encoder plus autoregressive decoder (full seq2seq)</td></tr>
-          <tr><td>Training target</td><td>The original clean document, not the applied noise</td></tr>
-          <tr><td>Corruptions</td><td>Masking, deletion, text-infilling, sentence permute, doc rotation</td></tr>
-          <tr><td>Text-infilling</td><td>One mask hides a whole span, so span length is hidden and predicted</td></tr>
-          <tr><td>Why it transfers</td><td>Encoder understands, decoder generates, so summarization and classification both fit</td></tr>
+          <tr><td>Who predicts a row</td><td>A model that never saw it</td><td>The model that trained on it</td></tr>
+          <tr><td>Prediction realism</td><td>Reflects generalisation</td><td>Unrealistically optimistic</td></tr>
+          <tr><td>Meta-learner result</td><td>Honest combination</td><td>Overfits the leaked optimism</td></tr>
+          <tr><td>What it needs</td><td>Cross-validation</td><td>Nothing; that is the trap</td></tr>
         </tbody>
       </table>
-      <VIS.Callout kind="insight" title="A denoising seq2seq, not an encoder-only masker">
-        BART's identity is a denoising autoencoder over text: corrupt a document many ways, then reconstruct the original
-        with a bidirectional encoder feeding an autoregressive decoder. That pairing is what lets it serve both generation
-        and classification, and what separates it from BERT's encoder-only fixed-position mask prediction.
+      <VIS.Callout kind="insight" title="Out-of-fold predictions and diversity make stacking work">
+        Stacking learns how to combine base models, but only if the meta-learner is fed predictions that look like
+        what it will get at serving time. Out-of-fold predictions &mdash; each row scored by a base model trained
+        without it &mdash; provide exactly that; in-sample predictions leak the base models&rsquo; memorised
+        optimism and the meta-learner overfits. And the gain comes from base-model diversity: complementary errors
+        give the meta-learner room to improve on any single model. Solo accuracy without diversity, or accuracy
+        measured on leaked in-sample predictions, defeats the method.
       </VIS.Callout>
     </VIS.Section>
 
     <VIS.Section id="sec-drill" title="Drill — trap problems">
       <p style={{ color: "#475569", marginBottom: 16 }}>
-        Every problem hinges on this delta &mdash; <strong>BART corrupts a document with several noise transformations and
-        trains a bidirectional encoder plus autoregressive decoder to reconstruct the ORIGINAL clean text, with
-        text-infilling hiding span length.</strong> Commit before revealing the lens.
+        Every problem hinges on this delta &mdash; <strong>stacking trains a meta-learner on diverse base
+        models&rsquo; out-of-fold predictions; in-sample predictions leak memorised optimism, and diversity (not
+        solo accuracy) is what the meta-learner exploits.</strong> Commit before revealing the lens.
       </p>
 
       <h3 style={{ marginTop: 24, color: "#1f3a5f" }}>A. Identity</h3>
 
       <VIS.TrapProblem
-        id="bart-a1"
+        id="stk-a1"
         difficulty="medium"
         axis="Identity"
-        title="A1 — What BART produces"
-        scenario={<>A teammate says &quot;BART is just BERT with more mask types: an encoder that labels which input tokens were corrupted.&quot; Pick the statement that correctly describes BART's architecture and output.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`corrupted input -> [ ??? ] -> output
-candidate output: a label per input token, or the clean document?`}</pre>}
+        title="A1 — What stacking is"
+        scenario={<>A teammate says &ldquo;stacking just averages several models&rsquo; predictions together.&rdquo; Pick the statement that correctly characterises stacking.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`several diverse base models produce predictions
+claim: stacking just averages them
+question: what does stacking actually do with those predictions?`}</pre>}
         options={[
-          { key: "a", text: "A bidirectional encoder reads the corruption and an autoregressive decoder regenerates the clean document.", correct: true },
-          { key: "b", text: "An encoder-only stack outputs, for each input token, a label saying whether that token was corrupted.", correct: false },
-          { key: "c", text: "A decoder-only stack continues the corrupted text forward without ever reading it bidirectionally first.", correct: false },
-          { key: "d", text: "Two separate encoders score the corrupted and clean documents and the model maximizes their agreement.", correct: false },
+          { key: "a", text: "It trains a meta-learner on the base models' out-of-fold predictions to learn how best to combine them.", correct: true },
+          { key: "b", text: "It averages the base models' predictions with equal weights, with no second-level model learned at all." },
+          { key: "c", text: "It picks the single best base model on validation and discards the predictions of all the others entirely." },
+          { key: "d", text: "It trains the base models sequentially, each on the previous model's errors, exactly as boosting does." },
         ]}
-        trap={<>(b) per-token corruption labels describe a discriminative tagger, not BART's generative reconstruction. (c) decoder-only continuation is the GPT recipe and skips the bidirectional encoder. (d) BART has one encoder-decoder, not twin scoring encoders.</>}
-        lens={<>BART is a full encoder-decoder: a bidirectional encoder ingests the entire corrupted document, and an autoregressive decoder regenerates the original clean text token by token. It is not encoder-only (that is BERT), it is not decoder-only (that is GPT), and it does not score two documents for agreement. The encoder-plus-decoder pairing is exactly what lets BART both understand input and generate fluent output.</>}
-        stretch={<>Why does pairing a bidirectional encoder with an autoregressive decoder make BART suit both classification and generation?</>}
+        trap={<>(b) equal-weight averaging is voting, not stacking; stacking learns the combination. (c) stacking combines models; it does not select one. (d) sequential error-fitting is boosting, not stacking.</>}
+        lens={<>Stacking trains a second-level meta-learner whose features are the base models&rsquo; predictions, learning a data-driven combination rather than a fixed average. Crucially it uses out-of-fold predictions for that training. Equal-weight averaging is plain voting, selecting one model discards the ensemble idea, and sequential error-fitting is boosting &mdash; all distinct from stacking&rsquo;s learned two-level combination.</>}
+        stretch={<>How does a learned meta-combination differ from a simple weighted average in what it can express?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-a2"
+        id="stk-a2"
         difficulty="medium"
         axis="Identity"
-        title="A2 — Reconstruct the source, not the noise"
-        scenario={<>A teammate believes &quot;BART's loss rewards correctly naming which corruption was applied, masking versus deletion versus shuffle.&quot; Pick the statement that correctly describes the training target.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`loss = cross-entropy( decoder output , TARGET )
-candidate TARGET: a name for the noise, or the original document?`}</pre>}
+        title="A2 — What the meta-learner is trained on"
+        scenario={<>A teammate is unsure what data the meta-learner should be trained on. Pick the statement that correctly names it.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`base models produce predictions that become meta-features
+option 1: predictions on rows each base model trained on
+option 2: predictions on rows each base model did NOT train on
+question: which trains the meta-learner?`}</pre>}
         options={[
-          { key: "a", text: "The target is the original clean document, scored as cross-entropy over the decoder's emitted tokens.", correct: true },
-          { key: "b", text: "The target is a categorical label naming which of the five corruption types was applied to the input.", correct: false },
-          { key: "c", text: "The target is the set of positions that were masked, which the model predicts as a binary sequence.", correct: false },
-          { key: "d", text: "The target is the next sentence after the document, as a contrastive sentence-order prediction signal.", correct: false },
+          { key: "a", text: "Out-of-fold predictions, where each base model scored only rows it was not trained on, via cross-validation.", correct: true },
+          { key: "b", text: "In-sample predictions, where each base model scored the very rows it was trained on, for the most accurate signal." },
+          { key: "c", text: "The raw input features alone, since the meta-learner should ignore base predictions and re-learn the task itself." },
+          { key: "d", text: "The true labels directly, since the meta-learner learns best by training on the targets rather than predictions." },
         ]}
-        trap={<>(b) naming the corruption is a classification head BART never has; the goal is reconstruction. (c) predicting masked positions is a BERT-like discriminative signal, not BART's generative one. (d) next-sentence prediction is a BERT auxiliary task, unrelated to BART's objective.</>}
-        lens={<>BART maximizes the probability of the original document given the corrupted input, scored by cross-entropy on the decoder's tokens against the clean source. The model never names the noise, never predicts a mask-position bitmap, and never does sentence-order classification; it regenerates the source. Reconstructing the original is what forces the model to learn how language is actually structured.</>}
-        stretch={<>Why is reconstructing the full source a richer learning signal than classifying which corruption was applied?</>}
+        trap={<>(b) in-sample predictions leak memorised optimism and are exactly what to avoid. (c) the meta-learner&rsquo;s job is to combine base predictions, not re-learn from raw features. (d) labels are the target, not the meta-features.</>}
+        lens={<>The meta-learner must be trained on out-of-fold predictions: with cross-validation, each row&rsquo;s meta-features come from base models trained on the other folds, so the predictions reflect true generalisation. In-sample predictions are unrealistically good because the base model saw those rows, and training the meta-learner on them leaks that optimism. The labels are the prediction target; the meta-features are the honest out-of-fold base predictions.</>}
+        stretch={<>After cross-validation produces the meta-features, on what data are the final base models refit for serving?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>B. Application</h3>
 
       <VIS.TrapProblem
-        id="bart-b1"
+        id="stk-b1"
         difficulty="medium"
         axis="Application"
-        title="B1 — Choosing BART for summarization"
-        scenario={<>You need a model to fine-tune for abstractive summarization, where the output is free-form text shorter than the input. A teammate proposes a frozen encoder-only model with a classification head. Pick the soundest choice.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`task: long article -> short novel-wording summary
-need: a component that GENERATES variable-length text`}</pre>}
+        title="B1 — A stack that flatters itself"
+        scenario={<>An engineer builds a stack by training each base model on all the data, then feeding their predictions on that same data to the meta-learner. Offline the stack looks spectacular; in production it underperforms the best single model. Pick the soundest read.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`build: base models trained on all data
+meta-features: their predictions on that SAME data
+offline: spectacular; production: below the best single model`}</pre>}
         options={[
-          { key: "a", text: "Use BART, whose autoregressive decoder generates the free-form summary while the encoder reads the article.", correct: true },
-          { key: "b", text: "Use an encoder-only classifier head, since summarization is just selecting which input tokens to keep.", correct: false },
-          { key: "c", text: "Use a fixed-position mask predictor and read off the masked slots as the summary text in order.", correct: false },
-          { key: "d", text: "Use a bag-of-words regressor over the article, since word frequencies already capture the summary.", correct: false },
+          { key: "a", text: "In-sample meta-features leaked the base models' optimism; rebuild them out-of-fold via cross-validation.", correct: true },
+          { key: "b", text: "The base models are too weak, so swapping in stronger base models will close the offline-to-production gap." },
+          { key: "c", text: "The meta-learner is too simple, so a deeper meta-learner on the same in-sample predictions will fix production." },
+          { key: "d", text: "The production data drifted, since a large offline-to-production gap can only be caused by a distribution change." },
         ]}
-        trap={<>(b) a classifier head cannot emit novel free-form text; that is extractive selection, not abstractive generation. (c) fixed-position mask prediction has no mechanism to produce arbitrary-length new text. (d) word frequencies discard the ordering and phrasing a summary needs.</>}
-        lens={<>Abstractive summarization requires generating variable-length, possibly novel text, which is precisely what BART's autoregressive decoder does while its encoder reads the source article. An encoder-only classifier can only label or select existing tokens, fixed-position mask prediction cannot produce arbitrary new spans, and a bag-of-words model throws away order and phrasing. BART's seq2seq shape matches the generative nature of the task.</>}
-        stretch={<>How does BART's pretraining on reconstruction give it a head start over a randomly initialized seq2seq for summarization?</>}
+        trap={<>(b) base-model strength is not the issue; the meta-features are leaked. (c) a deeper meta-learner on leaked features overfits more, not less. (d) the gap is explained by the in-sample leak, not drift.</>}
+        lens={<>Training the meta-learner on in-sample predictions &mdash; base models scoring rows they trained on &mdash; feeds it unrealistically accurate features, so it learns to trust predictions that will never be that good at serving time; offline it dazzles, in production it collapses. The fix is to regenerate the meta-features out-of-fold via cross-validation so they reflect real generalisation. Stronger base models or a deeper meta-learner do not address the leak, and the gap is the leak&rsquo;s signature, not drift.</>}
+        stretch={<>Why does a more flexible meta-learner make the in-sample leak worse rather than better?</>}
       />
 
       <VIS.TrapProblem
-        id="bart-b2"
+        id="stk-b2"
         difficulty="hard"
         axis="Application"
-        title="B2 — Picking corruptions for a noisy-OCR domain"
-        scenario={<>Your downstream inputs are OCR scans where whole runs of characters drop out and word order stays intact. A teammate wants to pretrain using only sentence-permutation noise. Pick the soundest corruption emphasis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`domain noise: contiguous spans vanish; order preserved
-candidate corruptions: permute-only, or infilling/deletion of spans?`}</pre>}
+        title="B2 — Stacking three near-identical models"
+        scenario={<>A team stacks three gradient boosters with nearly identical settings, all making the same errors on the same rows, and the stack barely beats one of them. A colleague suggests adding a fourth near-identical booster. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`base models: 3 boosters, near-identical, same errors on same rows
+result: stack barely beats a single booster
+colleague's plan: add a 4th near-identical booster`}</pre>}
         options={[
-          { key: "a", text: "Emphasize text-infilling and deletion, which mirror the vanished spans the model must regenerate in place.", correct: true },
-          { key: "b", text: "Emphasize sentence permutation only, since reordering best simulates characters dropping out of a scan.", correct: false },
-          { key: "c", text: "Emphasize document rotation only, since a rotated start best matches contiguous spans going missing.", correct: false },
-          { key: "d", text: "Skip corruption and pretrain on clean copying, since OCR errors are too unpredictable to model usefully.", correct: false },
+          { key: "a", text: "Replace some bases with diverse model types that err differently; the meta-learner needs disagreement to exploit.", correct: true },
+          { key: "b", text: "Add a fourth near-identical booster, since more copies of a strong model always improve a stacked ensemble." },
+          { key: "c", text: "Train the meta-learner on in-sample predictions, since richer features let it separate the identical models." },
+          { key: "d", text: "Drop the meta-learner and average the three boosters, since averaging identical models raises accuracy markedly." },
         ]}
-        trap={<>(b) permutation simulates reordering, not missing spans, so it mismatches the domain noise. (c) rotation changes the start point, again not the loss of contiguous content. (d) clean copying teaches no denoising and wastes BART's reconstruction strength.</>}
-        lens={<>Because the domain loses contiguous spans while preserving order, the corruptions that mirror it are text-infilling and deletion, both of which remove spans the model must regenerate in place, including inferring how long the missing run was. Sentence permutation and document rotation simulate reordering, not deletion, and pretraining on clean copies teaches no reconstruction at all. Match the pretraining noise to the noise the model will actually face.</>}
-        stretch={<>Why does aligning pretraining corruption with downstream noise tend to improve transfer over a generic noise mix?</>}
+        trap={<>(b) another identical model adds no diversity; the stack still cannot improve. (c) in-sample predictions leak and overfit; they do not help. (d) averaging near-identical models barely changes anything.</>}
+        lens={<>Stacking gains from base models that make complementary errors, because the meta-learner can lean on whichever model is right where the others are wrong. Three near-identical boosters err in unison, so there is nothing to combine and the stack barely improves &mdash; and a fourth clone adds no diversity. The fix is to introduce genuinely different model families (linear, nearest-neighbour, a differently-configured tree ensemble) so their disagreement gives the meta-learner signal to exploit.</>}
+        stretch={<>How would you measure base-model diversity before committing them to a stack?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>C. Mechanism</h3>
 
       <VIS.TrapProblem
-        id="bart-c1"
+        id="stk-c1"
         difficulty="hard"
         axis="Mechanism"
-        title="C1 — Why text-infilling is harder than fixed masking"
-        scenario={<>A teammate claims &quot;text-infilling is identical to BERT masking: replace tokens with [MASK] and predict them back.&quot; Pick the correct account of what text-infilling adds.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BERT mask:   "the [MASK] sat"        -> predict 1 token at a known slot
-BART infill: "the [MASK] mat"         -> [MASK] hid 0..k tokens; length unknown`}</pre>}
+        title="C1 — Why out-of-fold prevents the leak"
+        scenario={<>A teammate asks how predicting only rows a base model did not train on actually prevents the meta-learner from overfitting. Pick the correct account of the mechanism.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`in-sample: base model has seen the row -> prediction is optimistic
+out-of-fold: base model has NOT seen the row -> prediction is realistic
+meta-learner trusts the meta-features it is trained on`}</pre>}
         options={[
-          { key: "a", text: "One mask can stand for a span of unknown length, so the model must predict how many tokens were hidden too.", correct: true },
-          { key: "b", text: "It marks each hidden token with its own mask, so the model always knows exactly how many to produce here.", correct: false },
-          { key: "c", text: "It only ever hides exactly one token, identical to BERT, differing solely in the special token's name used.", correct: false },
-          { key: "d", text: "It swaps tokens for random other tokens rather than a mask, so position and count stay fully visible here.", correct: false },
+          { key: "a", text: "Out-of-fold predictions match serving-time accuracy, so the meta-learner trusts them by the right amount.", correct: true },
+          { key: "b", text: "Out-of-fold predictions are more accurate than in-sample ones, so the meta-learner simply gets a stronger signal." },
+          { key: "c", text: "Out-of-fold prediction removes the need for any meta-learner, since the folds already combine the base models." },
+          { key: "d", text: "Out-of-fold prediction increases the number of training rows, and it is that larger sample that prevents overfitting." },
         ]}
-        trap={<>(b) BART uses a single mask for the whole span, so per-token marking that reveals the count is wrong. (c) infilling spans 0..k tokens, not exactly one; it is strictly more general than BERT masking. (d) random-token replacement is a different corruption and would keep count visible.</>}
-        lens={<>Text-infilling replaces a contiguous span of length zero to k with a single mask token, so the model is not told how many tokens were removed and must predict the span's length along with its content. BERT's masking, by contrast, marks each hidden token at a known position. The hidden-length aspect is what makes infilling a stronger generative signal, since the decoder learns to produce variable-length content from one placeholder.</>}
-        stretch={<>How does hiding the span length push BART toward the length-flexible generation that summarization needs?</>}
+        trap={<>(b) out-of-fold predictions are less accurate than in-sample ones (and that is the point) &mdash; they are realistic, not stronger. (c) the meta-learner is still needed to learn the combination. (d) the row count is unchanged; honesty of the features is what matters.</>}
+        lens={<>A meta-learner calibrates how much to trust each base prediction based on how accurate those predictions are in its training data. In-sample predictions are optimistically accurate because the base model memorised those rows, so the meta-learner over-trusts them and overfits. Out-of-fold predictions are exactly as accurate as the base models will be at serving time, so the meta-learner trusts them by the correct amount. It is the realism of the meta-features, not their strength or quantity, that prevents the leak.</>}
+        stretch={<>Why must the same out-of-fold scheme be mirrored when generating predictions on a held-out test set?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>D. Intuition</h3>
 
       <VIS.TrapProblem
-        id="bart-d1"
+        id="stk-d1"
         difficulty="hard"
         axis="Intuition"
-        title="D1 — Why one model fits both NLU and NLG"
-        scenario={<>Your team must support both document classification and abstractive generation and wants one pretrained backbone. A teammate assumes a generation-pretrained model must be weak at classification. Predict the non-obvious reason BART serves both.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`encoder: bidirectional, reads whole input (good for understanding)
-decoder: autoregressive, emits text   (good for generation)
-both are pretrained jointly on reconstruction`}</pre>}
+        title="D1 — Accurate-but-redundant versus weaker-but-diverse"
+        scenario={<>You may add one of two base models to a stack: model R is highly accurate but makes the same errors as a model already in the stack, or model D is somewhat less accurate but errs on different rows. A teammate assumes the more accurate model R must help the stack more. Predict the non-obvious choice that helps the meta-learner more.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`existing stack already contains a strong model M
+candidate R: more accurate, but errs on the SAME rows as M
+candidate D: a bit less accurate, but errs on DIFFERENT rows
+question: which addition helps the meta-learner more?`}</pre>}
         options={[
-          { key: "a", text: "Its bidirectional encoder yields understanding features while its decoder generates, so both heads attach cleanly.", correct: true },
-          { key: "b", text: "Generation pretraining erases understanding ability, so BART must be retrained from scratch for classification.", correct: false },
-          { key: "c", text: "Classification uses a wholly separate network, so BART's shared pretraining contributes nothing to that task.", correct: false },
-          { key: "d", text: "Only the decoder is ever used, so classification reads the very last generated token as the predicted class.", correct: false },
+          { key: "a", text: "Model D helps more, because its different errors give the meta-learner cases where it can outvote the existing model.", correct: true },
+          { key: "b", text: "Model R helps more, because the meta-learner always benefits most from adding the single most accurate base model." },
+          { key: "c", text: "Both help equally, because a stack's quality depends only on the average accuracy of its base models." },
+          { key: "d", text: "Neither helps, because adding any base model to an existing stack cannot change the meta-learner's output." },
         ]}
-        trap={<>(b) reconstruction pretraining builds, not erases, the encoder's understanding features. (c) classification reuses the shared pretrained encoder, so it benefits from the same pretraining. (d) BART feeds the same input to encoder and decoder and pools the decoder's final state, not a single generated token in isolation.</>}
-        lens={<>BART's denoising objective trains a bidirectional encoder that learns rich understanding representations and an autoregressive decoder that learns fluent generation, jointly. So a classification head can attach to the encoder-decoder's pooled representation while a generation task uses the decoder directly, both leveraging the same pretraining. Generation pretraining does not erase understanding, classification is not a disconnected network, and BART does not reduce classification to one emitted token. The shared denoising is the common foundation.</>}
-        stretch={<>Why might a denoising objective transfer to classification at least as well as a purely masked-token objective?</>}
+        trap={<>(b) a more accurate but redundant model adds little, since it errs where the stack already errs. (c) diversity, not just average accuracy, drives stack quality. (d) adding a base model does change the meta-features and output.</>}
+        lens={<>A meta-learner improves on the existing stack only where a new model is right and the others are wrong. Model R, accurate but redundant, errs on the same rows as the existing model, so it offers little new information; model D, though slightly weaker overall, is right on rows where the stack currently fails, giving the meta-learner cases to exploit. So complementary errors beat marginal solo accuracy &mdash; the counterintuitive result that the less accurate but diverse model strengthens the stack more.</>}
+        stretch={<>How does this echo why a random forest decorrelates its trees rather than just making each tree more accurate?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>E. Operations</h3>
 
       <VIS.TrapProblem
-        id="bart-e1"
+        id="stk-e1"
         difficulty="medium"
         axis="Operations"
-        title="E1 — Feeding the classifier head at fine-tune time"
-        scenario={<>You fine-tune BART for sentence classification. A teammate proposes feeding the sentence only to the encoder and ignoring the decoder entirely to save compute. Pick the soundest setup.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`BART classify recipe: feed input to BOTH encoder and decoder
-read the decoder's FINAL-token hidden state -> classifier head`}</pre>}
+        title="E1 — Choosing the meta-learner"
+        scenario={<>You are building a stack and must pick the second-level model. A colleague proposes a large deep neural network as the meta-learner on top of a handful of base predictions, for maximum flexibility. Pick the soundest plan.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`meta-features: a handful of base-model predictions
+candidate meta-learner: large deep neural network
+concern: very few features, learned on limited meta-data`}</pre>}
         options={[
-          { key: "a", text: "Feed the input to both stacks and pool the decoder's final hidden state into the classification head.", correct: true },
-          { key: "b", text: "Feed the input to the encoder only and discard the decoder, since classification needs no generation step.", correct: false },
-          { key: "c", text: "Generate a full paraphrase first, then run a separate bag-of-words classifier over that generated text.", correct: false },
-          { key: "d", text: "Average the raw input token embeddings before any layers, since deep features add nothing for the label.", correct: false },
+          { key: "a", text: "Use a simple regularized meta-learner such as logistic or linear regression to avoid overfitting few meta-features.", correct: true },
+          { key: "b", text: "Use a large deep network as the meta-learner, since more capacity always combines a handful of features better." },
+          { key: "c", text: "Use the most complex base model again as the meta-learner, since reusing it guarantees the best combination." },
+          { key: "d", text: "Skip the meta-learner and feed base predictions back as inputs to one base model retrained on everything." },
         ]}
-        trap={<>(b) BART's standard classification recipe routes the input through the decoder too and reads its final state; encoder-only discards half the pretrained model. (c) generating then classifying adds a noisy intermediate step and extra compute. (d) raw averaged embeddings throw away all the contextual learning.</>}
-        lens={<>BART's documented classification setup feeds the same input to both encoder and decoder and uses the decoder's final-token hidden state as the sequence representation for the head, so the whole pretrained model contributes. Dropping the decoder wastes pretrained capacity, generating a paraphrase first adds noise and cost, and averaging raw embeddings ignores the contextual features. Use the full stack as pretrained, then attach the head.</>}
-        stretch={<>Why does reading the decoder's final state, rather than an encoder pooled token, align with how BART was pretrained?</>}
+        trap={<>(b) a large network on a few meta-features overfits the limited meta-data. (c) reusing a complex base model as the meta-learner adds capacity without justification and risks overfitting. (d) feeding predictions back into a base model is not a clean stack and risks leakage.</>}
+        lens={<>The meta-learner sees only a handful of features (the base predictions) and is trained on limited meta-data, so a simple, regularized model &mdash; logistic or linear regression &mdash; is the standard, robust choice; it learns sensible combination weights without overfitting. A large deep network has far too much capacity for a few inputs and would overfit the meta-set. Simplicity at the second level is a feature of well-built stacks, not a limitation.</>}
+        stretch={<>When might a slightly more expressive meta-learner (e.g. a shallow gradient booster) be justified?</>}
       />
 
       <h3 style={{ marginTop: 32, color: "#1f3a5f" }}>F. Failure modes</h3>
 
       <VIS.TrapProblem
-        id="bart-f1"
+        id="stk-f1"
         difficulty="hard"
         axis="Failure modes"
-        title="F1 — Treating BART as encoder-only"
-        scenario={<>An engineer wires BART like BERT: input to the encoder, a token-classification head, no decoder. Generation tasks fail outright and summarization is impossible. A teammate blames the learning rate. Pick the correct diagnosis.</>}
-        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`wired: encoder + token-classification head, decoder removed
-observed: cannot generate; summarization impossible`}</pre>}
+        title="F1 — The test set scored the wrong way"
+        scenario={<>A team builds meta-features out-of-fold correctly for training, but to score the held-out test set they let each base model predict the test rows after refitting on all training data, then realise their reported test number still looks inflated relative to a clean baseline. A teammate blames the meta-learner. Pick the most likely diagnosis.</>}
+        diagram={<pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 14, borderRadius: 8, overflowX: "auto", fontSize: 13 }}>{`training meta-features: built out-of-fold (correct)
+test scoring: investigate how test meta-features were produced
+symptom: reported test number looks inflated`}</pre>}
         options={[
-          { key: "a", text: "Removing the decoder strips BART's generative half, so no free-form text can be produced; restore the decoder.", correct: true },
-          { key: "b", text: "The learning rate is too high, and lowering it will let the encoder-only setup learn to generate summaries.", correct: false },
-          { key: "c", text: "The vocabulary is too small, and enlarging it will let the token-classification head emit fluent sentences.", correct: false },
-          { key: "d", text: "The encoder is bidirectional, and switching it to left-to-right will restore generation without any decoder.", correct: false },
+          { key: "a", text: "The test meta-features were likely built inconsistently with training, so re-audit the test pipeline for leakage.", correct: true },
+          { key: "b", text: "The meta-learner is at fault, since a correct out-of-fold training setup cannot ever produce an inflated test number." },
+          { key: "c", text: "The base models are too diverse, so reducing their diversity is what brings the inflated test number back down." },
+          { key: "d", text: "The test set is too small, so enlarging it is the only thing that can correct an inflated reported test number." },
         ]}
-        trap={<>(b) a learning-rate change cannot add a generation mechanism that the architecture lacks. (c) vocabulary size does not give a classification head the ability to autoregressively generate. (d) making the encoder causal still leaves no decoder to emit a target sequence.</>}
-        lens={<>The root cause is structural: BART generates with its autoregressive decoder, and removing it leaves only an encoder plus a tagging head, which cannot emit free-form text, so summarization is impossible by construction. The fix is to restore the encoder-decoder and use the decoder for generation. Tuning the learning rate, enlarging the vocabulary, or making the encoder causal, none of them reinstate a decoder. The decoder is essential, not optional, for BART's generative tasks.</>}
-        stretch={<>What class of tasks remains feasible with an encoder-only truncation of BART, and which become impossible?</>}
+        trap={<>(b) correct training does not guarantee a correct test pipeline; leakage can enter at test scoring. (c) diversity helps the stack; it does not inflate test numbers. (d) test-set size affects variance of the estimate, not a systematic inflation from leakage.</>}
+        lens={<>An inflated test number despite correct out-of-fold training points to the test-scoring pipeline: meta-features for the test set must be produced consistently with how the meta-learner expects them, and any path by which test rows influence the base or meta fits (or by which folds overlap the test set) reintroduces leakage. The right move is to audit the test pipeline end to end for such overlap, not to blame the meta-learner, the diversity, or the test-set size &mdash; leakage at scoring is the usual culprit.</>}
+        stretch={<>What single invariant about train/test separation should hold at every stage of a stacked pipeline?</>}
       />
     </VIS.Section>
 
     <VIS.Section id="sec-further" title="Further reading">
       <ul>
         <li>
-          <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">
-            <strong>BART: Denoising Sequence-to-Sequence Pre-training (Lewis et al., 2019)</strong></a>{" "}
-          <span style={{ color: "#64748b", fontSize: 14 }}>(the paper introducing BART)</span>
-          <br/>Defines the noise transformations, shows text-infilling works best, and reports strong results on summarization and generation while remaining competitive on classification.
+          <a href="https://en.wikipedia.org/wiki/Ensemble_learning#Stacking" target="_blank" rel="noopener">
+            <strong>Stacked generalization</strong></a>{" "}
+          <span style={{ color: "#64748b", fontSize: 14 }}>(meta-learner, out-of-fold predictions, base-model diversity)</span>
+          <br/>Covers how a meta-learner combines diverse base models and why out-of-fold predictions are required to keep the meta-features honest.
         </li>
       </ul>
     </VIS.Section>
